@@ -108,6 +108,7 @@ impl Surface {
             ..Default::default()
         };
         let term = Term::new(config, &size, proxy.clone());
+        proxy.0.lock().unwrap().size = Some(size);
         Self {
             term,
             parser: Processor::new(),
@@ -217,5 +218,13 @@ mod tests {
         proxy.send_event(Event::ColorRequest(256, format));
         let writes = proxy.0.lock().unwrap().pty_writes.clone();
         assert!(writes[0].starts_with("\x1b]10;rgb:"));
+    }
+
+    #[test]
+    fn size_query_uses_construction_dimensions() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        let format = Arc::new(|ws: WindowSize| format!("{}x{}", ws.num_cols, ws.num_lines));
+        s.proxy.send_event(Event::TextAreaSizeRequest(format));
+        assert_eq!(s.take_pty_writes(), vec!["10x3".to_string()]);
     }
 }
