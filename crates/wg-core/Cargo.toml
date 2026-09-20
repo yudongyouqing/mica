@@ -1,0 +1,11 @@
+[package]
+name = "wg-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Terminal core: screen state machine, pty, input encoding (no GUI deps)"
+
+[dependencies]
+alacritty_terminal = { workspace = true }
+portable-pty = { workspace = true }
+anyhow = { workspace = true }

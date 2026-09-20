@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/wg-core", "crates/wg-render", "crates/wg-app"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+font8x8 = "0.3.1"
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+anyhow = "1"
+pollster = "0.3"
+raw-window-handle = "0.6"
+
+[profile.dev]
+# 终端是吞吐敏感负载,opt 1 让本地开发不用忍 10x 慢的 debug 渲染
+opt-level = 1

@@ -1,0 +1,12 @@
+[package]
+name = "wg-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Windows shell: Win32 window, input routing, terminal wiring"
+
+[dependencies]
+wg-core = { path = "../wg-core" }
+wg-render = { path = "../wg-render" }
+wgpu = { workspace = true }
+anyhow = { workspace = true }
