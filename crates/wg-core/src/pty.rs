@@ -177,9 +177,8 @@ mod tests {
 
     #[test]
     fn resize_is_accepted() {
-        let (_session, _reader) = PtySession::spawn(echo_cmd(), 80, 24).unwrap();
-        // drop 之前 resize 一次,不 panic、不报错即可
-        drop(_reader);
+        let (session, _reader) = PtySession::spawn(echo_cmd(), 80, 24).unwrap();
+        session.resize(100, 30).expect("resize after spawn");
     }
 
     #[cfg(windows)]
