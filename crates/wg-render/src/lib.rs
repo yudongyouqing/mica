@@ -1,1 +1,5 @@
-//! Grid-to-GPU renderer. Knows cells, never windows. Modules land in Tasks 5-6.
+//! Grid-to-GPU renderer. Knows cells, never windows.
+
+pub mod atlas;
+pub mod color;
+pub mod frame;
