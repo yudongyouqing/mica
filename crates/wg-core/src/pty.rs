@@ -13,7 +13,8 @@ pub struct PtyReader {
 }
 
 impl PtyReader {
-    /// Next chunk of output, or `None` after the pty closed without data.
+    /// Next chunk of output, or `None` on timeout *or* pty close —
+    /// use `PtySession::try_wait` to tell a child exit apart from a quiet pty.
     pub fn recv_timeout(&self, timeout: Duration) -> Option<Vec<u8>> {
         self.rx.recv_timeout(timeout).ok()
     }

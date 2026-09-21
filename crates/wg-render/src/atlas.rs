@@ -11,6 +11,14 @@ pub const FIRST_CHAR: u32 = 32;
 pub const LAST_CHAR: u32 = 126;
 pub const GLYPH_COUNT: usize = (LAST_CHAR - FIRST_CHAR + 1) as usize;
 
+// 编译期锁死:两 crate 的格子度量不得漂移(spec 全局约束)
+const _: () = assert!(
+    // u32::from 在 const 上下文尚未稳定,这里用宽化 as 转换
+    CELL_WIDTH == wg_core::surface::CELL_WIDTH as u32
+        && CELL_HEIGHT == wg_core::surface::CELL_HEIGHT as u32,
+    "cell metrics drifted between wg-core and wg-render"
+);
+
 /// R8 (luminance) atlas: one row of glyphs, each `CELL_WIDTH` wide.
 pub struct Atlas {
     pub width: u32,

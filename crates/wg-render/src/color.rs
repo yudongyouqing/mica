@@ -27,7 +27,8 @@ pub const BASE16: [[u8; 3]; 16] = [
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
 /// Resolve any terminal color to RGB. Default-ink colors become the given
-/// defaults; `Dim*` base colors render as their plain base in M0.
+/// defaults; other named colors (including `Dim*` and `Cursor`) fall through
+/// to `BASE16[15]`; the vte parser does not emit them in practice.
 pub fn resolve(color: Color, default_fg: Rgb, default_bg: Rgb) -> [u8; 3] {
     match color {
         Color::Spec(rgb) => [rgb.r, rgb.g, rgb.b],
