@@ -1,4 +1,15 @@
-/// Windows shell entry point. Replaced by the real window shell in Task 7.
+//! Windows shell. All interesting code lives in `app`; non-Windows builds are
+//! empty because the windowing APIs do not exist there.
+
+#[cfg(windows)]
+mod app;
+
+#[cfg(windows)]
 pub fn run() {
-    println!("mica-app skeleton (window shell lands in the windowing task)");
+    app::run();
+}
+
+#[cfg(not(windows))]
+pub fn run() {
+    eprintln!("mica-app only runs on Windows.");
 }
