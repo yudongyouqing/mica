@@ -3,3 +3,4 @@
 pub mod atlas;
 pub mod color;
 pub mod frame;
+pub mod pipeline;
