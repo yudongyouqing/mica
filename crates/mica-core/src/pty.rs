@@ -155,9 +155,15 @@ mod tests {
     }
 
     /// 读到超时为止,返回全部输出。
-    fn read_until(reader: &PtyReader, needle: &[u8], budget: Duration) -> Vec<u8> {
+    fn read_until(
+        session: &PtySession,
+        reader: &PtyReader,
+        needle: &[u8],
+        budget: Duration,
+    ) -> Vec<u8> {
         let deadline = Instant::now() + budget;
         let mut all = Vec::new();
+        let mut answered = 0;
         while Instant::now() < deadline {
             if let Some(chunk) = reader.recv_timeout(Duration::from_millis(500)) {
                 all.extend_from_slice(&chunk);
@@ -176,7 +182,7 @@ mod tests {
     #[test]
     fn child_output_reaches_reader() {
         let (_session, reader) = PtySession::spawn(echo_cmd(), 80, 24).unwrap();
-        read_until(&reader, MARKER, TIMEOUT);
+        read_until(&_session, &reader, MARKER, TIMEOUT);
     }
 
     #[test]
@@ -191,7 +197,7 @@ mod tests {
         let (mut session, reader) =
             PtySession::spawn(CommandBuilder::new("cmd.exe"), 80, 24).unwrap();
         session.write(b"echo wgtype_555\r\n").unwrap();
-        read_until(&reader, b"wgtype_555", TIMEOUT);
+        read_until(&session, &reader, b"wgtype_555", TIMEOUT);
     }
 
     #[cfg(not(windows))]
@@ -199,6 +205,6 @@ mod tests {
     fn keystrokes_reach_cat() {
         let (mut session, reader) = PtySession::spawn(CommandBuilder::new("cat"), 80, 24).unwrap();
         session.write(b"wgtype_555\n").unwrap();
-        read_until(&reader, b"wgtype_555", TIMEOUT);
+        read_until(&session, &reader, b"wgtype_555", TIMEOUT);
     }
 }
