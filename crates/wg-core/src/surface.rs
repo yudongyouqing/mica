@@ -60,6 +60,12 @@ struct ProxyState {
     size: Option<ScreenSize>,
 }
 
+/// 锁获取:持锁 panic 只会毒化标记,内部状态并未损坏
+/// (无跨字段不变量),取回继续用,别让一个坏事件炸掉整个标签。
+fn lock(state: &Mutex<ProxyState>) -> std::sync::MutexGuard<'_, ProxyState> {
+    state.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `Term`'s event sink. Everything the terminal wants to say to the *outside*
 /// world lands here so `Surface` can drain it deterministically.
 #[derive(Clone, Default)]
@@ -67,7 +73,7 @@ pub(crate) struct EventProxy(Arc<Mutex<ProxyState>>);
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = lock(&self.0);
         match event {
             Event::PtyWrite(s) => state.pty_writes.push(s),
             Event::Title(title) => state.title = Some(title),
@@ -108,7 +114,7 @@ impl Surface {
             ..Default::default()
         };
         let term = Term::new(config, &size, proxy.clone());
-        proxy.0.lock().unwrap().size = Some(size);
+        lock(&proxy.0).size = Some(size);
         Self {
             term,
             parser: Processor::new(),
@@ -125,16 +131,16 @@ impl Surface {
     pub fn resize(&mut self, size: ScreenSize) {
         self.size = size;
         self.term.resize(size);
-        self.proxy.0.lock().unwrap().size = Some(size);
+        lock(&self.proxy.0).size = Some(size);
     }
 
     /// Drain replies that must be written back into the pty (DSR/OSC answers).
     pub fn take_pty_writes(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.proxy.0.lock().unwrap().pty_writes)
+        std::mem::take(&mut lock(&self.proxy.0).pty_writes)
     }
 
     pub fn take_title(&mut self) -> Option<String> {
-        std::mem::take(&mut self.proxy.0.lock().unwrap().title)
+        std::mem::take(&mut lock(&self.proxy.0).title)
     }
 
     pub fn grid(&self) -> &Grid<Cell> {
@@ -198,6 +204,22 @@ mod tests {
         let mut s = Surface::new(ScreenSize::new(10, 3));
         s.feed(b"\x1b]0;my title\x07");
         assert_eq!(s.take_title(), Some("my title".to_string()));
+    }
+
+    #[test]
+    fn poisoned_proxy_state_is_recovered_not_fatal() {
+        let proxy = EventProxy::default();
+        // 人为毒化:持锁 panic(静默 panic hook,保持测试输出干净)
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = proxy.0.lock().unwrap();
+            panic!("deliberate poison");
+        }));
+        std::panic::set_hook(prev_hook);
+        // 毒化后事件投递必须继续工作,而不是连锁 panic 炸掉标签
+        proxy.send_event(Event::Bell);
+        assert!(lock(&proxy.0).pty_writes.is_empty());
     }
 
     #[test]
