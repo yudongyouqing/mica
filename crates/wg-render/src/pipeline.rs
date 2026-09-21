@@ -5,7 +5,7 @@ use bytemuck::cast_slice;
 use wgpu::util::DeviceExt;
 
 use crate::atlas::{Atlas, CELL_HEIGHT, CELL_WIDTH};
-use crate::frame::CellInstance;
+use crate::frame::{CellInstance, DEFAULT_BG};
 
 /// Adapter + device + queue, created once per window.
 pub struct GpuContext {
@@ -65,6 +65,7 @@ pub struct Renderer {
     instance_buf: wgpu::Buffer,
     instance_capacity: usize,
     atlas_size: [f32; 2],
+    clear_color: wgpu::Color,
 }
 
 impl Renderer {
@@ -258,6 +259,14 @@ impl Renderer {
             instance_buf,
             instance_capacity,
             atlas_size: [atlas.width as f32, atlas.height as f32],
+            // 清屏色 = 默认背景:客户区非 8/16 整数倍时,右/下残余的
+            // 不足一格像素会露出清屏色,与背景同色才不显突兀
+            clear_color: wgpu::Color {
+                r: f64::from(DEFAULT_BG.r) / 255.0,
+                g: f64::from(DEFAULT_BG.g) / 255.0,
+                b: f64::from(DEFAULT_BG.b) / 255.0,
+                a: 1.0,
+            },
         }
     }
 
@@ -306,9 +315,10 @@ impl Renderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
-                    // M0 全量重绘,clear 色永不露出;黑底即可
+                    // 全量重绘,但客户区非 8/16 整数倍时右/下边缘
+                    // 不足一格的像素露清屏色 —— 用背景色使其融入
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(self.clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
