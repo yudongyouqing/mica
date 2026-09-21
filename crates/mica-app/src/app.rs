@@ -139,9 +139,18 @@ unsafe fn init_terminal(hwnd: HWND) {
 
     let ctx = pollster::block_on(create_context(&instance, Some(&wgpu_surface)))
         .expect("no usable GPU adapter (need DX12/WARP)");
-    let config = wgpu_surface
+    let mut config = wgpu_surface
         .get_default_config(&ctx.adapter, width, height)
         .expect("surface unsupported by adapter");
+    if config.format.is_srgb() {
+        let caps = wgpu_surface.get_capabilities(&ctx.adapter);
+        config.format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .expect("no non-srgb surface format");
+    }
     wgpu_surface.configure(&ctx.device, &config);
     let renderer = Renderer::new(&ctx, config.format);
 
@@ -171,7 +180,8 @@ unsafe fn message_loop(hwnd: HWND) {
     loop {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).0 != 0 {
             if msg.message == WM_QUIT {
-                return; // Terminal 的 Drop 会杀掉子 shell
+                STATE.with(|cell| cell.borrow_mut().take());
+                return; // Terminal 的 Drop 在 TLS 存活时显式执行,退出期回调不再摸已销毁的 STATE
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
