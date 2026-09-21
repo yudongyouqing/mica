@@ -2,6 +2,7 @@
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::Rgb;
 
 use wg_core::surface::Surface;
@@ -68,6 +69,10 @@ pub fn build_instances(surface: &Surface) -> Vec<CellInstance> {
             let cell = &grid[Line(line as i32)][Column(col)];
             let mut fg = resolve(cell.fg, DEFAULT_FG, DEFAULT_BG);
             let mut bg = resolve(cell.bg, DEFAULT_FG, DEFAULT_BG);
+            // SGR 7 反色(PSReadLine 选中高亮依赖);其余 flags(BOLD/WIDE/…)M0 仍忽略
+            if cell.flags.contains(Flags::INVERSE) {
+                std::mem::swap(&mut fg, &mut bg);
+            }
             if line == cursor_line && col == cursor_col {
                 std::mem::swap(&mut fg, &mut bg);
             }
@@ -129,6 +134,35 @@ mod tests {
         s.feed(b"a\r\nb");
         let inst = build_instances(&s);
         assert_eq!(inst[4].pos_glyph, [0.0, 16.0, atlas_glyph_index('b'), 0.0]);
+    }
+
+    #[test]
+    fn sgr_reverse_video_swaps_fg_bg() {
+        let mut s = Surface::new(ScreenSize::new(4, 2));
+        s.feed(b"\x1b[7mA\x1b[mB");
+        let inst = build_instances(&s);
+        // 反色格:fg 变暗底、bg 变白
+        assert_eq!(
+            inst[0].fg,
+            [
+                0x1e as f32 / 255.0,
+                0x1e as f32 / 255.0,
+                0x1e as f32 / 255.0,
+                0.0
+            ]
+        );
+        assert_eq!(inst[0].bg, [1.0, 1.0, 1.0, 0.0]);
+        // 紧随其后的普通格不受影响
+        assert_eq!(inst[1].fg, [1.0, 1.0, 1.0, 0.0]);
+        assert_eq!(
+            inst[1].bg,
+            [
+                0x1e as f32 / 255.0,
+                0x1e as f32 / 255.0,
+                0x1e as f32 / 255.0,
+                0.0
+            ]
+        );
     }
 
     #[test]

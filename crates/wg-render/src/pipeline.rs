@@ -70,6 +70,12 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(ctx: &GpuContext, format: wgpu::TextureFormat) -> Self {
+        // shader 不做 gamma 转换:sRGB swapchain 会把颜色二次编码
+        // (深底洗浅、全色偏色)。宁可启动即失败,不可静默偏色。
+        assert!(
+            !is_srgb(format),
+            "surface 格式必须选非 sRGB 变体(见计划 Task 7 执行者必读)"
+        );
         let device = &ctx.device;
         let atlas = Atlas::ascii();
 
@@ -341,16 +347,36 @@ impl Renderer {
     fn upload_instances(&mut self, instances: &[CellInstance]) {
         let bytes = cast_slice(instances);
         if bytes.len() > self.instance_capacity * std::mem::size_of::<CellInstance>() {
-            self.instance_buf = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("instances"),
-                    contents: bytes,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                });
-            self.instance_capacity = instances.len();
-        } else {
-            self.queue.write_buffer(&self.instance_buf, 0, bytes);
+            // 几何扩容:拖拽放大时 cell 数单调递增,按精确大小重建会逐帧分配
+            let new_capacity = instances.len().max(self.instance_capacity * 2);
+            self.instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("instances"),
+                size: (new_capacity * std::mem::size_of::<CellInstance>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.instance_capacity = new_capacity;
         }
+        self.queue.write_buffer(&self.instance_buf, 0, bytes);
+    }
+}
+
+/// shader 的颜色路径不做 gamma 转换,surface 格式不得为 sRGB 变体
+/// (否则硬件二次编码,深色背景被洗浅、全色偏色)。
+fn is_srgb(format: wgpu::TextureFormat) -> bool {
+    format.is_srgb()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_srgb;
+    use wgpu::TextureFormat;
+
+    #[test]
+    fn detects_srgb_swapchain_variants() {
+        assert!(is_srgb(TextureFormat::Bgra8UnormSrgb));
+        assert!(is_srgb(TextureFormat::Rgba8UnormSrgb));
+        assert!(!is_srgb(TextureFormat::Bgra8Unorm));
+        assert!(!is_srgb(TextureFormat::Rgba8Unorm));
     }
 }
