@@ -16,14 +16,16 @@ use mica_core::pty::{PtyReader, PtySession, default_shell_command};
 use mica_core::surface::{CELL_HEIGHT, CELL_WIDTH, ScreenSize, Surface};
 use mica_render::frame::build_instances;
 use mica_render::pipeline::{Renderer, create_context};
-use windows::Win32::Foundation::{HBRUSH, HICON, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_MENU,
     VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
 };
+use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
     DispatchMessageW, GetClientRect, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
@@ -177,7 +179,8 @@ unsafe fn message_loop(hwnd: HWND) {
 
         let mut needs_redraw = false;
         STATE.with(|cell| {
-            let Some(t) = cell.borrow_mut().as_mut() else {
+            let mut t_guard = cell.borrow_mut();
+            let Some(t) = t_guard.as_mut() else {
                 return;
             };
             let bytes = t.reader.drain();
@@ -205,7 +208,8 @@ unsafe fn message_loop(hwnd: HWND) {
 
 fn draw_frame() {
     STATE.with(|cell| {
-        let Some(t) = cell.borrow_mut().as_mut() else {
+        let mut t_guard = cell.borrow_mut();
+        let Some(t) = t_guard.as_mut() else {
             return;
         };
         let instances = build_instances(&t.term);
@@ -219,7 +223,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         WM_CHAR => {
             STATE.with(|cell| {
-                let Some(t) = cell.borrow_mut().as_mut() else {
+                let mut t_guard = cell.borrow_mut();
+                let Some(t) = t_guard.as_mut() else {
                     return;
                 };
                 // Windows 把退格发成 0x08,终端世界统一 DEL(0x7f)
@@ -252,7 +257,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             let mut resized = false;
             STATE.with(|cell| {
-                let Some(t) = cell.borrow_mut().as_mut() else {
+                let mut t_guard = cell.borrow_mut();
+                let Some(t) = t_guard.as_mut() else {
                     return;
                 };
                 let cols = (width / u32::from(CELL_WIDTH)).max(1) as u16;
