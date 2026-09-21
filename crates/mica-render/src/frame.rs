@@ -5,7 +5,7 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::Rgb;
 
-use wg_core::surface::Surface;
+use mica_core::surface::Surface;
 
 use crate::atlas::atlas_glyph_index;
 use crate::color::resolve;
@@ -92,7 +92,7 @@ pub fn build_instances(surface: &Surface) -> Vec<CellInstance> {
 mod tests {
     use super::*;
     use crate::color::BASE16;
-    use wg_core::surface::ScreenSize;
+    use mica_core::surface::ScreenSize;
 
     #[test]
     fn instance_count_is_cells_and_layout_is_pod_48() {

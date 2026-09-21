@@ -1,5 +1,5 @@
 [package]
-name = "wg-core"
+name = "mica-core"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

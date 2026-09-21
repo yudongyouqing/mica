@@ -1,12 +1,16 @@
 [package]
-name = "wg-app"
+name = "mica-app"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Windows shell: Win32 window, input routing, terminal wiring"
 
 [dependencies]
-wg-core = { path = "../wg-core" }
-wg-render = { path = "../wg-render" }
+mica-core = { path = "../mica-core" }
+mica-render = { path = "../mica-render" }
 wgpu = { workspace = true }
 anyhow = { workspace = true }
+
+[[bin]]
+name = "mica"
+path = "src/main.rs"

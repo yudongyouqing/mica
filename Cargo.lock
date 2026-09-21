@@ -541,6 +541,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "mica-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mica-core",
+ "mica-render",
+ "wgpu",
+]
+
+[[package]]
+name = "mica-core"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "portable-pty",
+]
+
+[[package]]
+name = "mica-render"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "bytemuck",
+ "font8x8",
+ "mica-core",
+ "wgpu",
+]
+
+[[package]]
 name = "miow"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1234,37 +1265,6 @@ checksum = "9fbddc4a036f00ec4f18c83445bd3115cb306a91da554919a099d9222fe4a7f8"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "wg-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "wg-core",
- "wg-render",
- "wgpu",
-]
-
-[[package]]
-name = "wg-core"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "portable-pty",
-]
-
-[[package]]
-name = "wg-render"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "bytemuck",
- "font8x8",
- "wg-core",
- "wgpu",
 ]
 
 [[package]]

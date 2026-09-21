@@ -27,5 +27,5 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p wg-core -p wg-render --all-targets -- -D warnings
-      - run: cargo test -p wg-core -p wg-render
+      - run: cargo clippy -p mica-core -p mica-render --all-targets -- -D warnings
+      - run: cargo test -p mica-core -p mica-render

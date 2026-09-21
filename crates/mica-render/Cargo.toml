@@ -1,12 +1,12 @@
 [package]
-name = "wg-render"
+name = "mica-render"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Grid-to-GPU renderer: atlas, color resolve, wgpu pipeline"
 
 [dependencies]
-wg-core = { path = "../wg-core" }
+mica-core = { path = "../mica-core" }
 alacritty_terminal = { workspace = true }
 wgpu = { workspace = true }
 font8x8 = { workspace = true }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/wg-core", "crates/wg-render", "crates/wg-app"]
+members = ["crates/mica-core", "crates/mica-render", "crates/mica-app"]
 
 [workspace.package]
 edition = "2024"

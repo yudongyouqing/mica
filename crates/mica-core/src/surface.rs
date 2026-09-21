@@ -40,7 +40,7 @@ impl Dimensions for ScreenSize {
 }
 
 /// Cell pixel metrics reported to terminal size queries; must stay in sync
-/// with `wg_render::atlas` (M1 replaces both with font-derived metrics).
+/// with `mica_render::atlas` (M1 replaces both with font-derived metrics).
 pub const CELL_WIDTH: u16 = 8;
 pub const CELL_HEIGHT: u16 = 16;
 

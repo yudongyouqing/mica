@@ -1,8 +1,8 @@
-# winGhostty 设计文档
+# Mica 设计文档
 
 - 日期:2026-09-20
 - 状态:设计已经所有者逐节确认
-- 工作名:winGhostty(**发布前必须更名**,见 §13 开放问题)
+- 命名:**Mica** 于 2026-09-21 定稿(原工作名 winGhostty,已弃用);名字取自 Windows 11 招牌材质——本项目原生身份的直接宣示,渲染层真实使用(`DWMWA_SYSTEMBACKDROP_TYPE`)
 
 ## 1. 目标与定位
 
@@ -54,21 +54,21 @@
 ## 3. 总体架构
 
 ```
-winGhostty/
+Mica/
 ├── docs/superpowers/           # 设计文档与实施计划
 ├── crates/
-│   ├── wg-core/                # 终端核心:解析、状态机、PTY、配置、协议(纯 Rust,零 GUI 依赖)
+│   ├── mica-core/                # 终端核心:解析、状态机、PTY、配置、协议(纯 Rust,零 GUI 依赖)
 │   │   ├── parser/             # VT 序列解析(vte 起步)
 │   │   ├── term/               # 屏幕状态机(grid/scrollback/cursor/modes,alacritty_terminal 起步)
 │   │   ├── pty/                # PTY 抽象(portable-pty/ConPTY 实现)
 │   │   ├── config/             # Ghostty 语法配置解析 + 热重载
 │   │   ├── protocol/           # kitty keyboard、OSC 52、2026、OSC 8 等增量协议
 │   │   └── surface/            # Surface:一个终端实例 = Pty + Term + Config 的门面
-│   ├── wg-render/              # 渲染器:wgpu 管线、字形图集、脏区跟踪(只认 grid,不认窗口)
+│   ├── mica-render/              # 渲染器:wgpu 管线、字形图集、脏区跟踪(只认 grid,不认窗口)
 │   │   ├── atlas/              # 字形图集管理
 │   │   ├── pipeline/           # 着色器、脏区、呈现
 │   │   └── font/               # DirectWrite 光栅化 + harfbuzz shaping
-│   └── wg-app/                 # Windows 壳(bin)
+│   └── mica-app/                 # Windows 壳(bin)
 │       ├── win32/              # 窗口、DWM、输入、剪贴板、IME
 │       ├── ui/                 # 标签栏、分屏布局、快捷键、quick terminal
 │       └── platform/           # 默认终端注册、jump list、右键菜单、单实例 IPC
@@ -80,15 +80,15 @@ winGhostty/
 2. **渲染器只认网格**:输入 `Grid + 样式`,输出三角形。不知道标签页/窗口的存在。
 3. **壳层最薄**:只做窗口管理与输入路由,不含终端逻辑。
 
-## 4. 核心层 wg-core
+## 4. 核心层 mica-core
 
 - **解析**:起步用 `vte` crate(SIMD、久经 fuzz)。自研 SIMD 解析器为远期优化项,前期 YAGNI。
 - **状态机**:起步用 `alacritty_terminal` crate,全部访问收口在 `Surface` trait 后,保证未来可替换/可自研。注意 Alacritty **没有** kitty keyboard protocol——这是我们在 `protocol/` 的自有增量。
 - **PTY**:`portable-pty`,藏于 `Pty` trait。ConPTY 要求 Windows 10 1809+。
-- **配置**:Ghostty 同款 `key = value` 语法;`notify` crate 监听热重载;坏配置保留旧值继续运行。配置位置:`%APPDATA%\winGhostty\config`。
+- **配置**:Ghostty 同款 `key = value` 语法;`notify` crate 监听热重载;坏配置保留旧值继续运行。配置位置:`%APPDATA%\Mica\config`。
 - **协议**(集中在 `protocol/`,按里程碑交付):kitty keyboard protocol(渐进增强 flags)、OSC 52 剪贴板、bracketed paste、DECSET 2026 同步输出、OSC 8 超链接、OSC 133 shell integration、主题变更通知(OSC 10/11 查询)。
 
-## 5. 渲染层 wg-render
+## 5. 渲染层 mica-render
 
 - wgpu,D3D12 为主后端;枚举不到合适适配器时降级 WARP 软渲染。
 - 字形:DirectWrite 光栅化(原生 COLR 彩色 emoji);**连字用 harfbuzz**(M2 交付)。
@@ -96,7 +96,7 @@ winGhostty/
 - 性能:脏区跟踪只重绘变化行;输入到上屏延迟目标 <5ms;吞吐目标 `cat` 大文件不丢帧。
 - 每个版本发布公开跑分(对照 Windows Terminal / Alacritty / WezTerm)——验收手段兼营销手段。
 
-## 6. 壳层 wg-app(windows-rs 裸 Win32)
+## 6. 壳层 mica-app(windows-rs 裸 Win32)
 
 - **窗口**:Win32 创建;`DWMWA_SYSTEMBACKDROP_TYPE` 出 Mica;`DWMWA_USE_IMMERSIVE_DARK_MODE` 暗色标题栏;`WM_NCHITTEST` 自定义标题栏,标签栏绘于客户区顶部(Windows Terminal 同款布局)。Mica 在 Win10 优雅降级为纯色。
 - **标签**:自绘 tab strip;每标签一个独立 `TerminalSurface`;**后台标签 PTY 持续收数据**,脏标记,激活时切渲染视口。
@@ -104,7 +104,7 @@ winGhostty/
 - **Quick Terminal**:顶部下拉 quake 窗口,`RegisterHotKey` 全局热键,可失焦自动收起。
 - **IME**:Imm32 全套,候选框跟随光标(中文输入一等公民)。
 - **剪贴板**:`CF_UNICODETEXT` + OSC 52;右键菜单用 `TrackPopupMenu`(原生白给)。
-- **系统集成**:Win11 默认终端注册(defterm)、WSL profile、jump list、"在此处打开"资源管理器右键菜单;单实例 + named pipe IPC(`wg new-tab` 在已有窗口开标签)。
+- **系统集成**:Win11 默认终端注册(defterm)、WSL profile、jump list、"在此处打开"资源管理器右键菜单;单实例 + named pipe IPC(`mica new-tab` 在已有窗口开标签)。
 - 无障碍(UIA)按里程碑后置(M5)。
 
 ## 7. 数据流
@@ -141,10 +141,10 @@ resize:WM_SIZE → 字体度量算新网格尺寸 → ConPTY resize → 渲染�
 
 | 阶段 | 内容 | 验收标准 |
 |------|------|----------|
-| **M0 骨架** | workspace + CI、wg-core 接 vte/alacritty_terminal/portable-pty、单窗单标签、wgpu 基础渲染、ConPTY 跑 PowerShell | 能日常敲命令 |
+| **M0 骨架** | workspace + CI、mica-core 接 vte/alacritty_terminal/portable-pty、单窗单标签、wgpu 基础渲染、ConPTY 跑 PowerShell | 能日常敲命令 |
 | **M1 渲染补全** | DirectWrite 字形图集、CJK 宽字符、truecolor、Ghostty 语法配置 + 主题 + 热重载 | 中文日常可用 |
 | **M2 窗口体验** | 多标签、分屏、快捷键体系、右键菜单、OSC 52、连字 | 可替代 Windows Terminal 日常使用 |
-| **M3 系统集成** | 默认终端注册、WSL profile、quick terminal、jump list、安装包(MSIX/NSIS)、**定品牌名** | 别人能装能用 |
+| **M3 系统集成** | 默认终端注册、WSL profile、quick terminal、jump list、安装包(MSIX/NSIS)、品牌域名与图标(**名已定:Mica**) | 别人能装能用 |
 | **M4 协议补全** | kitty keyboard、DECSET 2026、OSC 8、OSC 133 shell integration、kitty graphics 预研 | Claude Code 长输出/协议体验不输 mac Ghostty |
 | **M5 1.0** | UIA 无障碍、公开跑分、文档/官网/社区基建 | 正式发布 |
 
@@ -164,12 +164,12 @@ resize:WM_SIZE → 字体度量算新网格尺寸 → ConPTY resize → 渲染�
 | ConPTY 怪癖(Win10 resize 全量重绘、行尾空格等) | 集成测试覆盖;Win11 特性优雅降级 |
 | alacritty_terminal 依赖耦合 | 全部收口在 Surface trait 后,可替换 |
 | wgpu/DX12 兼容性 | WARP 兜底;CI 覆盖硬件与 WARP 两套适配器 |
-| 品牌商标风险(Ghostty 名称属上游) | M3 前完成更名与品牌设计 |
+| 品牌商标风险(Ghostty 名称属上游) | ✅ 已解决:2026-09-21 定名 Mica(域名/图标 M3 前补齐) |
 | 单人带宽 | 里程碑切小;核心依赖成熟 crate;AI 辅助开发;文档从 M0 起就写 |
 
 ## 13. 开放问题
 
-1. **品牌名**:winGhostty 仅为工作名,M3 前定稿(名称、域名、图标)。
-2. **Windows 10 支持深度**:建议 1809+ 尽量支持,Win11 专属特性(Mica 等)优雅降级——待 M1 实测后定稿。
+1. ~~**品牌名**~~ 已解决:定名 **Mica**(2026-09-21,终端/dev-tool 领域查无撞车);域名与图标 M3 前补齐。
+2. **Windows 10 支持深度**:建议 1809+ 尽量支持,Win11 专属特性(Mica 材质、圆角等)优雅降级——待 M1 实测后定稿。
 3. **ARM64 Windows**:Rust/ConPTY 均无障碍,列入 M3 安装包矩阵,优先级待定。
 4. **kitty graphics 协议实现深度**:M4 预研后定范围(完整图片协议 vs 基础内联图)。
