@@ -13,5 +13,10 @@ bytemuck = { workspace = true }
 anyhow = { workspace = true }
 unicode-width = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Graphics_DirectWrite",
+] }
+
 [dev-dependencies]
 pollster = { workspace = true }

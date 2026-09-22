@@ -2,6 +2,8 @@
 //! The DirectWrite rasterizer lives in `dwrite` behind #[cfg(windows)].
 
 pub mod atlas;
+#[cfg(windows)]
+pub mod dwrite;
 pub mod metrics;
 pub mod router;
 

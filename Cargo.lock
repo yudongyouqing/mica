@@ -567,6 +567,7 @@ dependencies = [
  "pollster",
  "unicode-width",
  "wgpu",
+ "windows",
 ]
 
 [[package]]

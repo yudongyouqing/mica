@@ -16,6 +16,7 @@ anyhow = "1"
 pollster = "0.3"
 raw-window-handle = "0.6"
 unicode-width = "0.2"
+windows = "0.62"
 
 [profile.dev]
 # 终端是吞吐敏感负载,opt 1 让本地开发不用忍 10x 慢的 debug 渲染
