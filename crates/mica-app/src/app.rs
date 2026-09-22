@@ -14,7 +14,9 @@ use std::time::Duration;
 use mica_core::input::{self, Key, Mods};
 use mica_core::pty::{PtyReader, PtySession, default_shell_command};
 use mica_core::surface::{ScreenSize, Surface};
+use mica_render::font::GlyphStyle;
 use mica_render::font::metrics::FontMetrics;
+use mica_render::font::router::{GlyphInfo, GlyphRouter};
 use mica_render::frame::build_instances;
 use mica_render::pipeline::{Renderer, create_context};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -229,15 +231,29 @@ unsafe fn message_loop(hwnd: HWND) {
     }
 }
 
+/// T5 占位路由:所有字形回全零 GlyphInfo(uv 尺寸 0 → shader ink 恒 0,
+/// 非空格格只剩清屏底色)。真正的 DirectWrite 路由在 Task 7 接线。
+struct StubRouter;
+
+impl GlyphRouter for StubRouter {
+    fn route(&mut self, _ch: char, _style: GlyphStyle) -> GlyphInfo {
+        GlyphInfo {
+            uv: [0.0; 4],
+            size_px: [0.0; 2],
+            offset_px: [0.0; 2],
+        }
+    }
+}
+
 fn draw_frame() {
     STATE.with(|cell| {
         let mut t_guard = cell.borrow_mut();
         let Some(t) = t_guard.as_mut() else {
             return;
         };
-        // T4 中间态:build_instances 函数体为 todo!,Task 5 按 64B 实例 +
-        // GlyphRouter 重建(签名将增加 router 参数),此处届时同步接线
-        let instances = build_instances(&t.term, &FALLBACK_METRICS);
+        // T5 接线:router 占位,T7 换 dwrite 真路由(届时先 route 刷图集再 build)
+        let mut router = StubRouter;
+        let instances = build_instances(&t.term, &mut router, &FALLBACK_METRICS);
         t.renderer.draw(&t.wgpu_surface, &t.config, &instances);
     });
 }

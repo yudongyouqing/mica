@@ -3,6 +3,7 @@
 
 pub mod atlas;
 pub mod metrics;
+pub mod router;
 
 use alacritty_terminal::term::cell::Flags;
 use unicode_width::UnicodeWidthChar;
