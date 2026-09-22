@@ -31,7 +31,12 @@ pub struct GlyphAtlas {
     shelves: Vec<Shelf>,
     /// 重排保真用条目表(M1 字形量级百级,克隆成本可忽略)
     entries: Vec<(GlyphBitmap, Rect)>,
+    /// 仅 grow(重排搬动全部条目)递增。DwriteRouter 据此清 UV 缓存;
+    /// 普通插入不动它,否则每个新字形都白清一次缓存。
     version: u64,
+    /// 每次内容写入(普通 insert 与 grow)都递增。`Renderer::set_atlas`
+    /// 据此决定是否重传纹理——普通插入也得重传,漏了字形就隐形。
+    revision: u64,
 }
 
 impl GlyphAtlas {
@@ -44,6 +49,7 @@ impl GlyphAtlas {
             shelves: Vec::new(),
             entries: Vec::new(),
             version: 0,
+            revision: 0,
         }
     }
 
@@ -63,11 +69,17 @@ impl GlyphAtlas {
         self.version
     }
 
+    /// 纹理内容修订号:任何写入(普通 insert 或 grow 重排)都递增。
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn insert(&mut self, bmp: &GlyphBitmap) -> Rect {
         loop {
             if let Some(rect) = self.try_place(bmp.width, bmp.height) {
                 self.blit(bmp, rect);
                 self.entries.push((bmp.clone(), rect));
+                self.revision += 1;
                 return rect;
             }
             self.grow(bmp.width);
@@ -118,6 +130,7 @@ impl GlyphAtlas {
         self.data = vec![0; (self.width * self.height) as usize];
         self.shelves.clear();
         self.version += 1;
+        self.revision += 1;
         let entries = std::mem::take(&mut self.entries);
         for (bmp, _) in entries {
             let rect = self
@@ -184,10 +197,12 @@ mod tests {
         let mut a = GlyphAtlas::new(32, 32);
         let r1 = a.insert(&bmp(16, 16, 9));
         assert_eq!(a.version(), 0);
+        assert_eq!(a.revision(), 1);
         // 高度 30 的字形在 32 高图集放不下 → 倍增重排
         let r2 = a.insert(&bmp(16, 30, 5));
         assert_eq!(a.height(), 64);
         assert!(a.version() >= 1);
+        assert!(a.revision() >= 2);
         // 两个矩形的内容都还在(位置可能变了)
         for (r, tag) in [(r1, 9u8), (r2, 5u8)] {
             for y in 0..r.h {
@@ -217,6 +232,17 @@ mod tests {
         // 后续常规插入继续正常
         let r2 = a.insert(&bmp(5, 5, 4));
         assert!(r2.u + r2.w <= a.width() && r2.v + r2.h <= a.height());
+    }
+
+    /// C1 回归锁:普通插入必须递增 revision(set_atlas 门控靠它重传),
+    /// 且不动 version(那是重排信号,动了会白清 dwrite 缓存)。
+    #[test]
+    fn plain_insert_bumps_revision_without_repack() {
+        let mut a = GlyphAtlas::new(64, 64);
+        a.insert(&bmp(10, 10, 1));
+        a.insert(&bmp(5, 5, 2));
+        assert_eq!(a.version(), 0, "未触发 grow,不应发重排信号");
+        assert_eq!(a.revision(), 2, "两次写入都算内容修订");
     }
 
     #[test]
