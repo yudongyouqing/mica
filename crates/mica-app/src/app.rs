@@ -1,4 +1,5 @@
-//! The M0 shell: one window, one terminal, ConPTY + PowerShell.
+//! The M1a shell: one window, one terminal, ConPTY + PowerShell,
+//! DirectWrite-rasterized glyphs (DwriteRouter owns metrics and the atlas).
 //!
 //! Input/render run on the main thread; pty output arrives on the reader
 //! thread and is drained each loop iteration. M1 replaces this 8ms polling
@@ -14,9 +15,9 @@ use std::time::Duration;
 use mica_core::input::{self, Key, Mods};
 use mica_core::pty::{PtyReader, PtySession, default_shell_command};
 use mica_core::surface::{ScreenSize, Surface};
-use mica_render::font::GlyphStyle;
+use mica_render::font::DEFAULT_FAMILIES;
+use mica_render::font::dwrite::DwriteRouter;
 use mica_render::font::metrics::FontMetrics;
-use mica_render::font::router::{GlyphInfo, GlyphRouter};
 use mica_render::frame::build_instances;
 use mica_render::pipeline::{Renderer, create_context};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -37,31 +38,33 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
-const COLS: u16 = 80;
-const ROWS: u16 = 24;
-
-/// 格子度量的占位值(T7 接 dwrite 真值),数值与退役的 8×16 硬编码常量一致
-const FALLBACK_METRICS: FontMetrics = FontMetrics {
-    cell_width: 8.0,
-    line_height: 16.0,
-    ascent: 12.0,
-    descent: 4.0,
-};
+const COLS: u16 = 100;
+const ROWS: u16 = 30;
+/// 字号(pt);M1-B 接配置后从主题读取
+const FONT_SIZE_PT: f32 = 12.0;
 
 thread_local! {
     static STATE: RefCell<Option<Terminal>> = const { RefCell::new(None) };
+    /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
+    /// 高代理暂存于此,低代理到达时重组成码点
+    static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 struct Terminal {
     term: Surface,
     session: PtySession,
     reader: PtyReader,
+    router: DwriteRouter,
+    metrics: FontMetrics,
     ctx: mica_render::pipeline::GpuContext,
     renderer: Renderer,
     wgpu_surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     cols: u16,
     rows: u16,
+    /// 已传给 Renderer 的图集修订号(C1:普通 insert 也递增);u64::MAX
+    /// 起步保证空图集(修订 0)也完成首次上传,不踩 set_atlas 契约
+    renderer_atlas_revision: u64,
 }
 
 pub fn run() {
@@ -84,12 +87,17 @@ pub fn run() {
         };
         assert_ne!(RegisterClassExW(&wc), 0, "RegisterClassExW failed");
 
-        // 客户区 80x24 格,反推窗口外框
+        // T7:度量先于窗口——客户区初始尺寸按真字体度量换算
+        let router = DwriteRouter::new(FONT_SIZE_PT, DEFAULT_FAMILIES).expect("no fonts resolved");
+        eprintln!("font families in use: {:?}", router.families_in_use()); // 冒烟期观察回退链
+        let metrics = router.metrics();
+
+        // 客户区 COLSxROWS 格,反推窗口外框
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: i32::from(COLS) * FALLBACK_METRICS.cell_width as i32,
-            bottom: i32::from(ROWS) * FALLBACK_METRICS.line_height as i32,
+            right: (f32::from(COLS) * metrics.cell_width).round() as i32,
+            bottom: (f32::from(ROWS) * metrics.line_height).round() as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false).expect("AdjustWindowRect");
         let class_name = HSTRING::from("mica_app_class"); // Param<PCWSTR> 的已证实实现
@@ -119,12 +127,12 @@ pub fn run() {
             std::mem::size_of::<i32>() as u32,
         );
 
-        init_terminal(hwnd);
+        init_terminal(hwnd, router, metrics);
         message_loop(hwnd);
     }
 }
 
-unsafe fn init_terminal(hwnd: HWND) {
+unsafe fn init_terminal(hwnd: HWND, router: DwriteRouter, metrics: FontMetrics) {
     // wgpu 30:display handle 挂在 Instance 上,窗口路线用无显示构造
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     // SAFETY: hwnd 活到进程结束,长于 wgpu_surface
@@ -163,15 +171,18 @@ unsafe fn init_terminal(hwnd: HWND) {
             .expect("no non-srgb surface format");
     }
     wgpu_surface.configure(&ctx.device, &config);
-    let cell = [FALLBACK_METRICS.cell_width, FALLBACK_METRICS.line_height];
     // T4:Globals 不再携带 cell/shader v2 纯矩形化,Renderer::new 退掉 cell 参
     let renderer = Renderer::new(&ctx, config.format);
 
-    let cols = ((width as f32 / FALLBACK_METRICS.cell_width).max(1.0)) as u16;
-    let rows = ((height as f32 / FALLBACK_METRICS.line_height).max(1.0)) as u16;
+    let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
+    let rows = ((height as f32 / metrics.line_height).max(1.0)) as u16;
     let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
-    // 查询应答(DSR/OSC 尺寸)用格子度量;T7 换 dwrite 真值
-    term.set_cell_metrics(cell[0] as u16, cell[1] as u16);
+    // 查询应答(DSR/OSC 尺寸)用格子度量;应答值取整不截断(I3:真度量如
+    // 8.53px 时 as u16 会答 8,应答与像素网格漂移;布局换算保持 f32)
+    term.set_cell_metrics(
+        metrics.cell_width.round() as u16,
+        metrics.line_height.round() as u16,
+    );
     let (session, reader) =
         PtySession::spawn(default_shell_command(), cols, rows).expect("spawn shell");
 
@@ -180,12 +191,15 @@ unsafe fn init_terminal(hwnd: HWND) {
             term,
             session,
             reader,
+            router,
+            metrics,
             ctx,
             renderer,
             wgpu_surface,
             config,
             cols,
             rows,
+            renderer_atlas_revision: u64::MAX,
         });
     });
 }
@@ -231,29 +245,19 @@ unsafe fn message_loop(hwnd: HWND) {
     }
 }
 
-/// T5 占位路由:所有字形回全零 GlyphInfo(uv 尺寸 0 → shader ink 恒 0,
-/// 非空格格只剩清屏底色)。真正的 DirectWrite 路由在 Task 7 接线。
-struct StubRouter;
-
-impl GlyphRouter for StubRouter {
-    fn route(&mut self, _ch: char, _style: GlyphStyle) -> GlyphInfo {
-        GlyphInfo {
-            uv: [0.0; 4],
-            size_px: [0.0; 2],
-            offset_px: [0.0; 2],
-        }
-    }
-}
-
 fn draw_frame() {
     STATE.with(|cell| {
         let mut t_guard = cell.borrow_mut();
         let Some(t) = t_guard.as_mut() else {
             return;
         };
-        // T5 接线:router 占位,T7 换 dwrite 真路由(届时先 route 刷图集再 build)
-        let mut router = StubRouter;
-        let instances = build_instances(&t.term, &mut router, &FALLBACK_METRICS);
+        // 先 build(路由新字形、改图集)再比修订号:同帧新增字形同帧上传
+        let instances = build_instances(&t.term, &mut t.router, &t.metrics);
+        let revision = t.router.atlas_revision();
+        if t.renderer_atlas_revision != revision {
+            t.renderer.set_atlas(t.router.atlas());
+            t.renderer_atlas_revision = revision;
+        }
         t.renderer.draw(&t.wgpu_surface, &t.config, &instances);
     });
 }
@@ -263,18 +267,41 @@ fn draw_frame() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_CHAR => {
+            // 代理对重组:Rust 的 char 不含代理码位,不重组的话 emoji
+            // 两个 WM_CHAR 都在 from_u32 处变 None 被丢弃,永远发不出去
+            let code = wparam.0 as u32;
+            let ch = match code {
+                0xD800..=0xDBFF => {
+                    PENDING_SURROGATE.with(|s| s.set(code));
+                    return LRESULT(0); // 等低代理
+                }
+                0xDC00..=0xDFFF => {
+                    let hi = PENDING_SURROGATE.with(|s| s.replace(0));
+                    if hi == 0 {
+                        return LRESULT(0); // 裸低代理:无效序列丢弃
+                    }
+                    // 合并码点域恒为 0x10000..=0x10FFFF,标量值必合法
+                    char::from_u32(0x10000 + ((hi - 0xD800) << 10) + (code - 0xDC00))
+                        .expect("surrogate pair maps to valid scalar")
+                }
+                _ => {
+                    PENDING_SURROGATE.with(|s| s.set(0)); // 防异常序列残留污染下一对
+                    match char::from_u32(code) {
+                        Some(c) => c,
+                        None => return LRESULT(0),
+                    }
+                }
+            };
+            // Windows 把退格发成 0x08,终端世界统一 DEL(0x7f)
+            let bytes: Vec<u8> = if ch == '\u{8}' {
+                vec![0x7f]
+            } else {
+                ch.to_string().into_bytes() // UTF-8,中文/emoji 原样
+            };
             STATE.with(|cell| {
-                let mut t_guard = cell.borrow_mut();
-                let Some(t) = t_guard.as_mut() else {
-                    return;
-                };
-                // Windows 把退格发成 0x08,终端世界统一 DEL(0x7f)
-                let bytes: Vec<u8> = match char::from_u32(wparam.0 as u32) {
-                    Some('\u{8}') => vec![0x7f],
-                    Some(c) => c.to_string().into_bytes(), // UTF-8,中文/控制字符原样
-                    None => return,
-                };
-                let _ = t.session.write(&bytes);
+                if let Some(t) = cell.borrow_mut().as_mut() {
+                    let _ = t.session.write(&bytes);
+                }
             });
             LRESULT(0)
         }
@@ -302,8 +329,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let Some(t) = t_guard.as_mut() else {
                     return;
                 };
-                let cols = ((width as f32 / FALLBACK_METRICS.cell_width).max(1.0)) as u16;
-                let rows = ((height as f32 / FALLBACK_METRICS.line_height).max(1.0)) as u16;
+                let cols = ((width as f32 / t.metrics.cell_width).max(1.0)) as u16;
+                let rows = ((height as f32 / t.metrics.line_height).max(1.0)) as u16;
                 if cols == t.cols && rows == t.rows {
                     return;
                 }
@@ -311,8 +338,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 t.rows = rows;
                 t.term.resize(ScreenSize::new(cols as usize, rows as usize));
                 t.term.set_cell_metrics(
-                    FALLBACK_METRICS.cell_width as u16,
-                    FALLBACK_METRICS.line_height as u16,
+                    t.metrics.cell_width.round() as u16,
+                    t.metrics.line_height.round() as u16,
                 );
                 let _ = t.session.resize(cols, rows);
                 t.config.width = width;
