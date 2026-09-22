@@ -12,3 +12,4 @@ wgpu = { workspace = true }
 font8x8 = { workspace = true }
 bytemuck = { workspace = true }
 anyhow = { workspace = true }
+unicode-width = { workspace = true }

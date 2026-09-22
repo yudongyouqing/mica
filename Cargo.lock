@@ -571,6 +571,7 @@ dependencies = [
  "bytemuck",
  "font8x8",
  "mica-core",
+ "unicode-width",
  "wgpu",
 ]
 
