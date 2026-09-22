@@ -48,7 +48,8 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-09-20-win-ghostty-design.md` — 设计文档,所有决策的依据(§2 决策记录含被否选项)。
 - `docs/superpowers/plans/2026-09-20-m0-skeleton.md` — M0 实施计划(已完成,含复查附录)。
 - `docs/superpowers/specs/2026-09-22-m1-render-config-design.md` — M1 设计(D8-D12 决策)。
-- `docs/superpowers/plans/2026-09-22-m1-fonts-cjk.md` — M1-A 计划(字体与中文,T1-T7 完成、2026-09-22 真机冒烟通过;文末终审附录含 C1-I3 处方与留观清单);配置/主题/DECCKM/事件化/脏区为 M1-B(待写计划)。
+- `docs/superpowers/plans/2026-09-22-m1-fonts-cjk.md` — M1-A 计划(字体与中文,T1-T7 完成、2026-09-22 真机冒烟通过;文末终审附录含 C1-I3 处方与留观清单)。
+- `docs/superpowers/plans/2026-09-23-m1b-config-input-events.md` — M1-B 计划(配置/主题/OSC 4/12/DECCKM/事件化/脏区,9 任务,待执行;API 已核实,主题库来源变更见其 Global Constraints)。
 - 里程碑:M0 骨架(✅)→ M1 渲染补全(A:字体与中文 ✅;B:配置与体验 待启动)→ M2 窗口体验 → M3 系统集成 → M4 协议 → M5 1.0。
 
 ## 当前边界(M1-A 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
