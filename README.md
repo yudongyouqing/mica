@@ -22,11 +22,11 @@ Mica is a **Windows-native** terminal emulator aiming to bring the three pillars
 
 ## 状态 / Status
 
-**M0(骨架)已合并** — workspace + 双平台 CI、终端状态机、ConPTY 会话、wgpu 渲染管线就绪;Win32 壳(单窗口 + PowerShell)在 Windows 真机上落地中。
+**M0(骨架)完成** — 单窗口 Win32 壳 + ConPTY + PowerShell 在 Windows 真机验收通过(2026-09-22),双平台 CI 全绿。下一个里程碑:M1 渲染补全(DirectWrite 字形、CJK、配置与主题)。
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
-| M0 骨架 | 三 crate 架构 + 核心层 + 渲染管线 + CI | ✅ |
+| M0 骨架 | 三 crate 架构 + 核心层 + 渲染管线 + Win32 壳 + CI | ✅ |
 | M1 渲染补全 | DirectWrite 字形、CJK 宽字符、配置与主题 | 🚧 |
 | M2 窗口体验 | 多标签、分屏、快捷键体系 | |
 | M3 系统集成 | 默认终端注册、WSL、Quick Terminal、安装包 | |
