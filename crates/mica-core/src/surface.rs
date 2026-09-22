@@ -39,11 +39,6 @@ impl Dimensions for ScreenSize {
     }
 }
 
-/// Cell pixel metrics reported to terminal size queries; must stay in sync
-/// with `mica_render::atlas` (M1 replaces both with font-derived metrics).
-pub const CELL_WIDTH: u16 = 8;
-pub const CELL_HEIGHT: u16 = 16;
-
 /// Palette entries reported for OSC 10/11 default-ink queries.
 /// Indices follow `NamedColor`: 256 = foreground, 257 = background.
 fn default_rgb(index: usize) -> [u8; 3] {
@@ -53,11 +48,23 @@ fn default_rgb(index: usize) -> [u8; 3] {
     }
 }
 
-#[derive(Default)]
 struct ProxyState {
     pty_writes: Vec<String>,
     title: Option<String>,
     size: Option<ScreenSize>,
+    /// 查询应答用的格子像素尺寸,默认与退役的 8×16 常量一致
+    cell: (u16, u16),
+}
+
+impl Default for ProxyState {
+    fn default() -> Self {
+        Self {
+            pty_writes: Vec::new(),
+            title: None,
+            size: None,
+            cell: (8, 16),
+        }
+    }
 }
 
 /// 锁获取:持锁 panic 只会毒化标记,内部状态并未损坏
@@ -86,8 +93,8 @@ impl EventListener for EventProxy {
                 let ws = WindowSize {
                     num_cols: size.columns as u16,
                     num_lines: size.screen_lines as u16,
-                    cell_width: CELL_WIDTH,
-                    cell_height: CELL_HEIGHT,
+                    cell_width: state.cell.0,
+                    cell_height: state.cell.1,
                 };
                 state.pty_writes.push(format(ws));
             }
@@ -132,6 +139,11 @@ impl Surface {
         self.size = size;
         self.term.resize(size);
         lock(&self.proxy.0).size = Some(size);
+    }
+
+    /// 查询应答用的格子像素尺寸(dwrite 度量产出自 mica-render,启动后立即设置真值)
+    pub fn set_cell_metrics(&mut self, cell_width: u16, cell_height: u16) {
+        self.proxy.0.lock().unwrap_or_else(|e| e.into_inner()).cell = (cell_width, cell_height);
     }
 
     /// Drain replies that must be written back into the pty (DSR/OSC answers).
@@ -248,5 +260,23 @@ mod tests {
         let format = Arc::new(|ws: WindowSize| format!("{}x{}", ws.num_cols, ws.num_lines));
         s.proxy.send_event(Event::TextAreaSizeRequest(format));
         assert_eq!(s.take_pty_writes(), vec!["10x3".to_string()]);
+    }
+
+    #[test]
+    fn size_query_reports_default_then_set_cell_metrics() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        // 默认 8x16,与退役前的常量一致
+        let format = Arc::new(|ws: WindowSize| {
+            format!(
+                "{}x{}x{}x{}",
+                ws.num_cols, ws.num_lines, ws.cell_width, ws.cell_height
+            )
+        });
+        s.proxy
+            .send_event(Event::TextAreaSizeRequest(format.clone()));
+        assert_eq!(s.take_pty_writes(), vec!["10x3x8x16".to_string()]);
+        s.set_cell_metrics(12, 24);
+        s.proxy.send_event(Event::TextAreaSizeRequest(format));
+        assert_eq!(s.take_pty_writes(), vec!["10x3x12x24".to_string()]);
     }
 }

@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use mica_core::input::{self, Key, Mods};
 use mica_core::pty::{PtyReader, PtySession, default_shell_command};
-use mica_core::surface::{CELL_HEIGHT, CELL_WIDTH, ScreenSize, Surface};
+use mica_core::surface::{ScreenSize, Surface};
+use mica_render::font::metrics::FontMetrics;
 use mica_render::frame::build_instances;
 use mica_render::pipeline::{Renderer, create_context};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -36,6 +37,14 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
+
+/// 格子度量的占位值(T7 接 dwrite 真值),数值与退役的 8×16 硬编码常量一致
+const FALLBACK_METRICS: FontMetrics = FontMetrics {
+    cell_width: 8.0,
+    line_height: 16.0,
+    ascent: 12.0,
+    descent: 4.0,
+};
 
 thread_local! {
     static STATE: RefCell<Option<Terminal>> = const { RefCell::new(None) };
@@ -77,8 +86,8 @@ pub fn run() {
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: i32::from(COLS) * i32::from(CELL_WIDTH),
-            bottom: i32::from(ROWS) * i32::from(CELL_HEIGHT),
+            right: i32::from(COLS) * FALLBACK_METRICS.cell_width as i32,
+            bottom: i32::from(ROWS) * FALLBACK_METRICS.line_height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false).expect("AdjustWindowRect");
         let class_name = HSTRING::from("mica_app_class"); // Param<PCWSTR> 的已证实实现
@@ -152,11 +161,14 @@ unsafe fn init_terminal(hwnd: HWND) {
             .expect("no non-srgb surface format");
     }
     wgpu_surface.configure(&ctx.device, &config);
-    let renderer = Renderer::new(&ctx, config.format);
+    let cell = [FALLBACK_METRICS.cell_width, FALLBACK_METRICS.line_height];
+    let renderer = Renderer::new(&ctx, config.format, cell);
 
-    let cols = (width / u32::from(CELL_WIDTH)).max(1) as u16;
-    let rows = (height / u32::from(CELL_HEIGHT)).max(1) as u16;
-    let term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
+    let cols = ((width as f32 / FALLBACK_METRICS.cell_width).max(1.0)) as u16;
+    let rows = ((height as f32 / FALLBACK_METRICS.line_height).max(1.0)) as u16;
+    let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
+    // 查询应答(DSR/OSC 尺寸)用格子度量;T7 换 dwrite 真值
+    term.set_cell_metrics(cell[0] as u16, cell[1] as u16);
     let (session, reader) =
         PtySession::spawn(default_shell_command(), cols, rows).expect("spawn shell");
 
@@ -222,7 +234,7 @@ fn draw_frame() {
         let Some(t) = t_guard.as_mut() else {
             return;
         };
-        let instances = build_instances(&t.term);
+        let instances = build_instances(&t.term, &FALLBACK_METRICS);
         t.renderer.draw(&t.wgpu_surface, &t.config, &instances);
     });
 }
@@ -271,14 +283,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let Some(t) = t_guard.as_mut() else {
                     return;
                 };
-                let cols = (width / u32::from(CELL_WIDTH)).max(1) as u16;
-                let rows = (height / u32::from(CELL_HEIGHT)).max(1) as u16;
+                let cols = ((width as f32 / FALLBACK_METRICS.cell_width).max(1.0)) as u16;
+                let rows = ((height as f32 / FALLBACK_METRICS.line_height).max(1.0)) as u16;
                 if cols == t.cols && rows == t.rows {
                     return;
                 }
                 t.cols = cols;
                 t.rows = rows;
                 t.term.resize(ScreenSize::new(cols as usize, rows as usize));
+                t.term.set_cell_metrics(
+                    FALLBACK_METRICS.cell_width as u16,
+                    FALLBACK_METRICS.line_height as u16,
+                );
                 let _ = t.session.resize(cols, rows);
                 t.config.width = width;
                 t.config.height = height;

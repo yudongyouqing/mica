@@ -4,7 +4,7 @@
 use bytemuck::cast_slice;
 use wgpu::util::DeviceExt;
 
-use crate::atlas::{Atlas, CELL_HEIGHT, CELL_WIDTH};
+use crate::atlas::Atlas;
 use crate::frame::{CellInstance, DEFAULT_BG};
 
 /// Adapter + device + queue, created once per window.
@@ -65,11 +65,13 @@ pub struct Renderer {
     instance_buf: wgpu::Buffer,
     instance_capacity: usize,
     atlas_size: [f32; 2],
+    /// 格子像素尺寸(shader 定位用);来源是运行时字体度量,T7 前由壳层传占位值
+    cell: [f32; 2],
     clear_color: wgpu::Color,
 }
 
 impl Renderer {
-    pub fn new(ctx: &GpuContext, format: wgpu::TextureFormat) -> Self {
+    pub fn new(ctx: &GpuContext, format: wgpu::TextureFormat, cell: [f32; 2]) -> Self {
         // shader 不做 gamma 转换:sRGB swapchain 会把颜色二次编码
         // (深底洗浅、全色偏色)。宁可启动即失败,不可静默偏色。
         assert!(
@@ -141,7 +143,7 @@ impl Renderer {
             label: Some("globals"),
             contents: cast_slice(&[Globals {
                 viewport: [1.0, 1.0],
-                cell: [CELL_WIDTH as f32, CELL_HEIGHT as f32],
+                cell,
                 atlas: [atlas.width as f32, atlas.height as f32],
                 _pad: [0.0; 2],
             }]),
@@ -265,6 +267,7 @@ impl Renderer {
             instance_buf,
             instance_capacity,
             atlas_size: [atlas.width as f32, atlas.height as f32],
+            cell,
             // 清屏色 = 默认背景:客户区非 8/16 整数倍时,右/下残余的
             // 不足一格像素会露出清屏色,与背景同色才不显突兀
             clear_color: wgpu::Color {
@@ -302,7 +305,7 @@ impl Renderer {
             0,
             cast_slice(&[Globals {
                 viewport: [config.width as f32, config.height as f32],
-                cell: [CELL_WIDTH as f32, CELL_HEIGHT as f32],
+                cell: self.cell,
                 atlas: self.atlas_size,
                 _pad: [0.0; 2],
             }]),

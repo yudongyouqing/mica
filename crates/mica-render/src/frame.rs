@@ -9,6 +9,7 @@ use mica_core::surface::Surface;
 
 use crate::atlas::atlas_glyph_index;
 use crate::color::resolve;
+use crate::font::metrics::FontMetrics;
 
 pub const DEFAULT_FG: Rgb = Rgb {
     r: 0xff,
@@ -54,7 +55,7 @@ impl CellInstance {
 
 /// Snapshot the visible screen into draw instances. One instance per cell
 /// (spaces included, so the background paints); M0 redraws everything.
-pub fn build_instances(surface: &Surface) -> Vec<CellInstance> {
+pub fn build_instances(surface: &Surface, metrics: &FontMetrics) -> Vec<CellInstance> {
     let grid = surface.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
@@ -77,8 +78,8 @@ pub fn build_instances(surface: &Surface) -> Vec<CellInstance> {
                 std::mem::swap(&mut fg, &mut bg);
             }
             out.push(CellInstance::new(
-                col as f32 * crate::atlas::CELL_WIDTH as f32,
-                line as f32 * crate::atlas::CELL_HEIGHT as f32,
+                col as f32 * metrics.cell_width,
+                line as f32 * metrics.line_height,
                 atlas_glyph_index(cell.c),
                 fg,
                 bg,
@@ -94,10 +95,20 @@ mod tests {
     use crate::color::BASE16;
     use mica_core::surface::ScreenSize;
 
+    // 与退役的 8×16 常量等值,保证既有断言数值不变
+    fn metrics() -> FontMetrics {
+        FontMetrics {
+            cell_width: 8.0,
+            line_height: 16.0,
+            ascent: 12.0,
+            descent: 4.0,
+        }
+    }
+
     #[test]
     fn instance_count_is_cells_and_layout_is_pod_48() {
         let s = Surface::new(ScreenSize::new(4, 2));
-        assert_eq!(build_instances(&s).len(), 8);
+        assert_eq!(build_instances(&s, &metrics()).len(), 8);
         assert_eq!(std::mem::size_of::<CellInstance>(), 48);
     }
 
@@ -105,7 +116,7 @@ mod tests {
     fn typed_characters_land_at_expected_positions() {
         let mut s = Surface::new(ScreenSize::new(10, 2));
         s.feed(b"OK");
-        let inst = build_instances(&s);
+        let inst = build_instances(&s, &metrics());
         assert_eq!(inst[0].pos_glyph, [0.0, 0.0, atlas_glyph_index('O'), 0.0]);
         assert_eq!(inst[1].pos_glyph, [8.0, 0.0, atlas_glyph_index('K'), 0.0]);
         // 后续空格是 glyph 0
@@ -116,7 +127,7 @@ mod tests {
     fn sgr_colors_flow_into_instances() {
         let mut s = Surface::new(ScreenSize::new(10, 2));
         s.feed(b"\x1b[31mX");
-        let inst = build_instances(&s);
+        let inst = build_instances(&s, &metrics());
         assert_eq!(
             inst[0].fg,
             [
@@ -132,7 +143,7 @@ mod tests {
     fn second_row_offsets_by_cell_height() {
         let mut s = Surface::new(ScreenSize::new(4, 2));
         s.feed(b"a\r\nb");
-        let inst = build_instances(&s);
+        let inst = build_instances(&s, &metrics());
         assert_eq!(inst[4].pos_glyph, [0.0, 16.0, atlas_glyph_index('b'), 0.0]);
     }
 
@@ -140,7 +151,7 @@ mod tests {
     fn sgr_reverse_video_swaps_fg_bg() {
         let mut s = Surface::new(ScreenSize::new(4, 2));
         s.feed(b"\x1b[7mA\x1b[mB");
-        let inst = build_instances(&s);
+        let inst = build_instances(&s, &metrics());
         // 反色格:fg 变暗底、bg 变白
         assert_eq!(
             inst[0].fg,
@@ -169,7 +180,7 @@ mod tests {
     fn cursor_cell_swaps_fg_bg() {
         let mut s = Surface::new(ScreenSize::new(4, 2));
         s.feed(b"a");
-        let inst = build_instances(&s);
+        let inst = build_instances(&s, &metrics());
         // 光标停在 (1,0):该格 fg 变暗底色、bg 变白(白块光标)
         assert_eq!(
             inst[1].fg,

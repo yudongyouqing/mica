@@ -1,6 +1,8 @@
 //! Font pipeline: style/width policy (pure), metrics math, atlas, routing.
 //! The DirectWrite rasterizer lives in `dwrite` behind #[cfg(windows)].
 
+pub mod metrics;
+
 use alacritty_terminal::term::cell::Flags;
 use unicode_width::UnicodeWidthChar;
 
