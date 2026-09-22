@@ -56,21 +56,23 @@ fn blank(x_px: f32, y_px: f32, metrics: &FontMetrics, fg: [u8; 3], bg: [u8; 3]) 
     }
 }
 
-/// Snapshot the visible screen into draw instances. Two-instance contract:
-/// EVERY cell first emits a full-cell background quad (`blank`, ink_mask 0);
-/// non-blank cells then emit the glyph quad on top of it. Blank cells
-/// (space / `WIDE_CHAR_SPACER`) stay a single instance. The shader has no
-/// blending, so the cell background would otherwise only paint inside the
-/// glyph bbox — INVERSE/selection/colored backgrounds would leak the clear
-/// color everywhere else. Glyph quads redundantly paint their own bg over
-/// the bbox (harmless overdraw); painter's order within the single instanced
-/// draw guarantees bg below glyph. M0 redraws everything.
+/// Snapshot the visible screen into draw instances. Two-instance, two-pass
+/// contract: pass 1 emits a full-cell background quad (`blank`, ink_mask 0)
+/// for EVERY cell, row-major; pass 2 then emits the glyph quad for every
+/// non-blank cell (blank cells — space / `WIDE_CHAR_SPACER` — emit nothing
+/// in pass 2). Both segments share the single instance buffer and instanced
+/// draw. The shader has no blending (last-write-wins), so the interleaved
+/// per-cell order would let the NEXT cell's bg quad erase a wide glyph's
+/// right half — and any earlier glyph's bleed (italic overhang, descenders).
+/// Emitting all bgs before all glyphs makes "every glyph above every bg"
+/// true globally, not just within a cell. Glyph quads redundantly paint
+/// their own bg over the bbox (harmless overdraw). M0 redraws everything.
 ///
-/// 语义:空格与 `WIDE_CHAR_SPACER` → 仅 `blank`(背景正常);其余字符先
-/// blank 再经 router 出字形,绘制位置 = 格左上 + `offset_px`、尺寸 =
-/// `size_px`(宽字形天然 2 格宽,宽度来自 WIDE_CHAR 格语义而非
-/// `char_width`);INVERSE 与光标各交换一次 fg/bg——先反色后光标,
-/// 双交换抵消,光标在反色选区上仍可辨(已裁定顺序)。
+/// 语义:第一段每格发整格背景 quad(行优先);第二段按格序对非空白格经
+/// router 出字形(空格与 `WIDE_CHAR_SPACER` 不发),绘制位置 = 格左上 +
+/// `offset_px`、尺寸 = `size_px`(宽字形天然 2 格宽,宽度来自 WIDE_CHAR
+/// 格语义而非 `char_width`);INVERSE 与光标各交换一次 fg/bg——先反色后
+/// 光标,双交换抵消,光标在反色选区上仍可辨(已裁定顺序)。
 pub fn build_instances(
     surface: &Surface,
     router: &mut dyn GlyphRouter,
@@ -82,8 +84,10 @@ pub fn build_instances(
     let cursor = grid.cursor.point;
     let cursor_line = usize::try_from(cursor.line.0).unwrap_or(usize::MAX);
     let cursor_col = cursor.column.0;
-    // 上界 = 每格 2 实例(bg + 字形;空白格只有 bg)
+    // 上界 = 每格 2 实例(bg 段 + 字形段;空白格只有 bg)
     let mut out = Vec::with_capacity(cols * rows * 2);
+    // 字形段先攒后拼:保证全部 bg 先于全部字形(跨格画家序,见 doc)
+    let mut glyphs = Vec::with_capacity(cols * rows);
     for line in 0..rows {
         for col in 0..cols {
             let cell = &grid[Line(line as i32)][Column(col)];
@@ -98,13 +102,13 @@ pub fn build_instances(
             }
             let x = col as f32 * metrics.cell_width;
             let y = line as f32 * metrics.line_height;
-            // bg quad 恒在先:整格背景,不依赖字形 bbox 覆盖
+            // bg 段:整格背景,不依赖字形 bbox 覆盖
             out.push(blank(x, y, metrics, fg, bg));
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.c == ' ' {
                 continue;
             }
             let g = router.route(cell.c, GlyphStyle::from_flags(cell.flags));
-            out.push(CellInstance {
+            glyphs.push(CellInstance {
                 pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
                 size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
                 fg: to_color(fg),
@@ -112,6 +116,7 @@ pub fn build_instances(
             });
         }
     }
+    out.extend(glyphs);
     out
 }
 
@@ -190,16 +195,16 @@ mod tests {
             wide: |_| false,
         };
         let inst = build_instances(&s, &mut r, &metrics_8x16());
-        // 双实例约定:格 0 = A。inst[0] 整格背景 quad(先于字形)
+        // 两段式:bg 段 inst[0..4) 行优先每格一整格 quad,字形段随后
+        assert_eq!(inst.len(), 5, "4 bg + 1 字形");
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(inst[0].size_uv, [8.0, 16.0, 0.0, 0.0]);
-        // inst[1] = A 的字形:格左上 (0,0) + offset (1,2);尺寸 6x12;uv 来自路由
-        assert_eq!(inst[1].pos_uv, [1.0, 2.0, 0.25, 0.25]);
-        assert_eq!(inst[1].size_uv, [6.0, 12.0, 6.0 / 64.0, 12.0 / 64.0]);
-        assert_eq!(inst.len(), 5, "A(2) + 3 空格(各 1)");
-        // 格 1..3 空格:单实例 blank——尺寸 = 格尺寸,uv 尺寸 0
+        // 字形段 inst[4] = A 的字形:格左上 (0,0) + offset (1,2);尺寸 6x12;uv 来自路由
+        assert_eq!(inst[4].pos_uv, [1.0, 2.0, 0.25, 0.25]);
+        assert_eq!(inst[4].size_uv, [6.0, 12.0, 6.0 / 64.0, 12.0 / 64.0]);
+        // bg 段其余:格 1..3 空格 blank——尺寸 = 格尺寸,uv 尺寸 0
         for (i, x) in [8.0, 16.0, 24.0].into_iter().enumerate() {
-            let b = &inst[2 + i];
+            let b = &inst[1 + i];
             assert_eq!(b.pos_uv[0], x, "空格格 {i} x");
             assert_eq!(b.size_uv, [8.0, 16.0, 0.0, 0.0], "空格格 {i} 整格背景");
         }
@@ -217,14 +222,14 @@ mod tests {
             wide: |_| true,
         };
         let inst = build_instances(&s, &mut r, &metrics_8x16());
-        assert_eq!(inst.len(), 5, "宽字形(2) + spacer(1) + 2 空格");
-        // inst[0] = 格 0 的整格背景;inst[1] = 宽字形在其上
+        assert_eq!(inst.len(), 5, "4 bg + 1 宽字形(spacer 不出字形)");
+        // bg 段:格 0 与 spacer 格(格 1)都是整格 blank
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(inst[0].size_uv, [8.0, 16.0, 0.0, 0.0]);
-        assert_eq!(inst[1].size_uv[0], 12.0, "宽字形横跨 2 格");
-        // inst[2] = spacer 格(格 1)为空白背景
-        assert_eq!(inst[2].pos_uv[0], 8.0, "spacer 在格 1");
-        assert_eq!(inst[2].size_uv, [8.0, 16.0, 0.0, 0.0]);
+        assert_eq!(inst[1].pos_uv[0], 8.0, "spacer 在格 1");
+        assert_eq!(inst[1].size_uv, [8.0, 16.0, 0.0, 0.0]);
+        // 字形段:宽字形在全部 bg 之后,横跨 2 格
+        assert_eq!(inst[4].size_uv[0], 12.0, "宽字形横跨 2 格");
     }
 
     #[test]
@@ -258,8 +263,9 @@ mod tests {
         };
         let inst = build_instances(&s, &mut r, &metrics_8x16());
         // 顺序:A@0(bold)、B@1(反色)、光标@2(空格)、空格@3
-        assert_eq!(inst.len(), 6, "A、B 各 2(bg+字形),2 空格各 1");
-        // 样式确实到达路由:两个非空格字形,第一个带 bold(bg quad 不经路由)
+        // 两段式:bg 段 [0..4) = A、B、光标格、空格;字形段 [4..6) = A、B
+        assert_eq!(inst.len(), 6, "4 bg + A、B 两个字形");
+        // 样式确实到达路由:两个非空格字形,第一个带 bold(bg 段不经路由)
         assert_eq!(
             *seen_styles.borrow(),
             vec![
@@ -282,10 +288,21 @@ mod tests {
                 0.0
             ]
         );
-        // inst[1] = A 的字形(bold 样式的几何)
-        assert_eq!(inst[1].pos_uv, [1.0, 2.0, 0.25, 0.25]);
-        assert_eq!(inst[1].size_uv, [6.0, 12.0, 6.0 / 64.0, 12.0 / 64.0]);
-        // inst[2] = B 的背景 quad:INVERSE 交换一次——fg 暗底、bg 白
+        // inst[1] = B 的背景 quad:INVERSE 交换一次——fg 暗底、bg 白
+        assert_eq!(inst[1].pos_uv[0], 8.0, "B 在格 1");
+        assert_eq!(
+            inst[1].fg,
+            [
+                0x1e as f32 / 255.0,
+                0x1e as f32 / 255.0,
+                0x1e as f32 / 255.0,
+                0.0
+            ]
+        );
+        assert_eq!(inst[1].bg, [1.0, 1.0, 1.0, 0.0]);
+        // inst[2] = 光标格 (2,0) 的空白背景:默认色上仅光标交换一次
+        // (无 INVERSE,无双交换)→ 白块光标:fg 暗、bg 白
+        assert_eq!(inst[2].pos_uv[0], 16.0);
         assert_eq!(
             inst[2].fg,
             [
@@ -296,10 +313,13 @@ mod tests {
             ]
         );
         assert_eq!(inst[2].bg, [1.0, 1.0, 1.0, 0.0]);
-        // inst[3] = B 的字形:同一对交换色(字形自绘 bg 盖 bbox,无害叠绘)
-        assert_eq!(inst[3].pos_uv, [9.0, 2.0, 0.25, 0.25]);
+        // 字形段 inst[4] = A 的字形(bold 样式的几何)
+        assert_eq!(inst[4].pos_uv, [1.0, 2.0, 0.25, 0.25]);
+        assert_eq!(inst[4].size_uv, [6.0, 12.0, 6.0 / 64.0, 12.0 / 64.0]);
+        // inst[5] = B 的字形:同一对交换色(字形自绘 bg 盖 bbox,无害叠绘)
+        assert_eq!(inst[5].pos_uv, [9.0, 2.0, 0.25, 0.25]);
         assert_eq!(
-            inst[3].fg,
+            inst[5].fg,
             [
                 0x1e as f32 / 255.0,
                 0x1e as f32 / 255.0,
@@ -307,19 +327,34 @@ mod tests {
                 0.0
             ]
         );
-        assert_eq!(inst[3].bg, [1.0, 1.0, 1.0, 0.0]);
-        // inst[4] = 光标格 (2,0) 的空白背景:默认色上仅光标交换一次
-        // (无 INVERSE,无双交换)→ 白块光标:fg 暗、bg 白
-        assert_eq!(inst[4].pos_uv, [16.0, 0.0, 0.0, 0.0]);
-        assert_eq!(
-            inst[4].fg,
-            [
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0.0
-            ]
-        );
-        assert_eq!(inst[4].bg, [1.0, 1.0, 1.0, 0.0]);
+        assert_eq!(inst[5].bg, [1.0, 1.0, 1.0, 0.0]);
+    }
+
+    /// 跨格画家序回归:旧逐格交错序下,spacer 格的 bg 后发,blend:None
+    /// 直接擦掉宽字形右半。两段式下全部 bg 必须先于全部字形。
+    #[test]
+    fn wide_glyph_instance_follows_all_backgrounds() {
+        let mut s = Surface::new(ScreenSize::new(4, 1));
+        s.feed("中".as_bytes());
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 6.0,
+            glyph_h: 12.0,
+            wide: |_| true,
+        };
+        let inst = build_instances(&s, &mut r, &metrics_8x16());
+        // bg 段:全部 4 格在前,均整格 blank(uv 尺寸 0),行优先
+        for (i, cell) in inst.iter().take(4).enumerate() {
+            assert_eq!(
+                cell.size_uv,
+                [8.0, 16.0, 0.0, 0.0],
+                "inst[{i}] 应为整格背景"
+            );
+            assert_eq!(cell.pos_uv[0], i as f32 * 8.0, "inst[{i}] 行优先格 x");
+        }
+        // 字形段:宽字形在全部 bg 之后(索引 4),横跨 2 格,其后无实例
+        assert_eq!(inst.len(), 5, "宽字形之后不得再有任何实例");
+        assert_eq!(inst[4].size_uv, [12.0, 12.0, 12.0 / 64.0, 12.0 / 64.0]);
     }
 }
