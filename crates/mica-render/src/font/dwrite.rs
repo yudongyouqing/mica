@@ -3,8 +3,10 @@
 //!
 //! 家族链语义:按序找第一个含该字符的家族;缺家族整条跳过,全缺则 new 报错。
 //! 空白字符与全链 miss 都路由到空白 GlyphInfo,不占图集。
-//! 光栅化约定:NATURAL_SYMMETRIC 灰度 AA(合 R8 图集);基线原点取 (0,0),
+//! 光栅化约定:NATURAL_SYMMETRIC + CLEARTYPE_3x1 纹理(每像素 3 字节),
+//! 取 R 通道作 8 位灰度 coverage(合 R8 图集);基线原点取 (0,0),
 //! 字形 bounds 按基线相对解读,offset_px = ascent + bounds.top。
+//! 注意纹理类型必须匹配渲染模式——ALIASED_1x1 在 NATURAL 系下 bounds 恒空。
 
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -14,7 +16,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET,
     DWRITE_GLYPH_RUN, DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
-    DWRITE_TEXTURE_ALIASED_1x1, DWriteCreateFactory, IDWriteFactory, IDWriteFont,
+    DWRITE_TEXTURE_CLEARTYPE_3x1, DWriteCreateFactory, IDWriteFactory, IDWriteFont,
     IDWriteFontCollection, IDWriteFontFace,
 };
 use windows::core::{BOOL, HSTRING};
@@ -236,10 +238,12 @@ impl DwriteRouter {
         drop(unsafe { ManuallyDrop::take(&mut run.fontFace) });
         let analysis = analysis.ok()?;
 
-        // SAFETY: 常规查询
+        // SAFETY: 常规查询。纹理类型必须匹配渲染模式:NATURAL_SYMMETRIC 下
+        // ALIASED_1x1 的 bounds 恒空(每字符都落空白兜底 → 全屏无墨,黑屏);
+        // CLEARTYPE_3x1 每像素 3 字节,取 R 通道即 8 位灰度 coverage
         let bounds = unsafe {
             analysis
-                .GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1)
+                .GetAlphaTextureBounds(DWRITE_TEXTURE_CLEARTYPE_3x1)
                 .ok()?
         };
         let (w, h) = (
@@ -250,13 +254,16 @@ impl DwriteRouter {
             return Some(blank_glyph()); // 空字形(如组合符单发)不占图集
         }
         let (w, h) = (w as u32, h as u32);
-        let mut pixels = vec![0u8; w as usize * h as usize]; // ALIASED_1x1:1 字节/像素
-        // SAFETY: 缓冲恰好 bounds 大小,1 字节/像素
+        let mut raw = vec![0u8; w as usize * h as usize * 3]; // 3x1:RGB 亚像素
+        // SAFETY: 缓冲恰好 bounds 大小 × 3 字节/像素
         unsafe {
             analysis
-                .CreateAlphaTexture(DWRITE_TEXTURE_ALIASED_1x1, &bounds, &mut pixels)
+                .CreateAlphaTexture(DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, &mut raw)
                 .ok()?
         };
+        // 亚像素三通道即三份水平错位的 coverage:取 R 通道,单通道做墨量
+        // 是亚像素纹理转灰度的标准做法(等价灰度 AA,合 R8 图集)
+        let pixels: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
         let rect = self.atlas.insert(&GlyphBitmap {
             width: w,
             height: h,
@@ -293,5 +300,70 @@ impl GlyphRouter for DwriteRouter {
         let info = self.rasterize(ch, style).unwrap_or_else(blank_glyph);
         self.cache.insert(key, info);
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真机回归锁:光栅化链必须产出有墨字形。曾经 ALIASED_1x1 纹理配
+    /// NATURAL_SYMMETRIC 模式 bounds 恒空,每字符都落空白兜底——
+    /// 背景照画、全屏无墨,症状是"黑屏"(T7 冒烟发现的)。
+    #[test]
+    fn rasterize_yields_inked_glyphs() {
+        let mut r = DwriteRouter::new(12.0, crate::font::DEFAULT_FAMILIES).expect("router");
+        for ch in ['A', 'a', '0', '中'] {
+            let g = r.route(ch, GlyphStyle::PLAIN);
+            assert!(
+                g.size_px[0] > 0.0 && g.size_px[1] > 0.0,
+                "{ch:?} 字形尺寸为零(blank 兜底泄漏)"
+            );
+            assert!(
+                g.uv[2] > 0.0 && g.uv[3] > 0.0,
+                "{ch:?} uv 尺寸为零(blank 兜底泄漏)"
+            );
+        }
+        let atlas = r.atlas();
+        let ink = atlas.texture().iter().filter(|&&p| p > 0).count();
+        assert!(ink > 0, "图集无墨:路由未产出任何位图");
+    }
+
+    /// bold 面回归锁:bold 样式必须路由到与 plain 不同的字形位图。
+    /// (T7 冒烟发现 bold 不变粗时先跑此测试分诊:红了说明 GetFirstMatchingFont
+    /// 对 BOLD weight 回落到了 regular 面——家族缺 bold 变体;绿了说明
+    /// 终端侧链路完好,问题在输入侧没发出 SGR 1。)
+    #[test]
+    fn bold_face_gives_distinct_glyph() {
+        let mut r = DwriteRouter::new(12.0, crate::font::DEFAULT_FAMILIES).expect("router");
+        let plain = r.route('B', GlyphStyle::PLAIN);
+        let bold = r.route(
+            'B',
+            GlyphStyle {
+                bold: true,
+                italic: false,
+            },
+        );
+        assert!(
+            plain.uv != bold.uv || plain.size_px != bold.size_px,
+            "bold 与 plain 字形位图相同:.bold 面未生效(GetFirstMatchingFont 回落?)"
+        );
+    }
+
+    /// 字形几何落在格内:offset + 尺寸以格左上为参照,不越出格子行高。
+    #[test]
+    fn glyph_geometry_stays_within_line() {
+        let mut r = DwriteRouter::new(12.0, crate::font::DEFAULT_FAMILIES).expect("router");
+        let m = r.metrics();
+        for ch in ['A', 'g', '中'] {
+            let g = r.route(ch, GlyphStyle::PLAIN);
+            let top = g.offset_px[1];
+            let bottom = top + g.size_px[1];
+            assert!(
+                top >= 0.0 && bottom <= m.line_height + 1.0,
+                "{ch:?} 纵向越界: top={top} bottom={bottom} line={}",
+                m.line_height
+            );
+        }
     }
 }
