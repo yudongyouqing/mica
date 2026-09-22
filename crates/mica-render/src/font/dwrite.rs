@@ -169,9 +169,10 @@ impl DwriteRouter {
         &self.atlas
     }
 
-    /// app 每帧比对此版本号,变了才 `Renderer::set_atlas`。
-    pub fn atlas_version(&self) -> u64 {
-        self.atlas.version()
+    /// app 每帧比对此修订号,变了才 `Renderer::set_atlas`——内容变更
+    /// (普通 insert 或 grow)都得重传,与是否重排无关。
+    pub fn atlas_revision(&self) -> u64 {
+        self.atlas.revision()
     }
 
     pub fn families_in_use(&self) -> Vec<String> {

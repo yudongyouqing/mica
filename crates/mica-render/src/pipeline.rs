@@ -64,8 +64,8 @@ pub struct Renderer {
     globals_buf: wgpu::Buffer,
     instance_buf: wgpu::Buffer,
     instance_capacity: usize,
-    /// 已上传图集的 version;变化才重传
-    atlas_version: u64,
+    /// 已上传图集的 revision;变化才重传
+    atlas_revision: u64,
     /// 持有当前图集纹理供 bind group 引用(替换时旧纹理随之释放)
     atlas_texture: Option<wgpu::Texture>,
     clear_color: wgpu::Color,
@@ -194,7 +194,7 @@ impl Renderer {
             globals_buf,
             instance_buf,
             instance_capacity,
-            atlas_version: 0,
+            atlas_revision: 0,
             atlas_texture: None,
             // 清屏色 = 默认背景:客户区非 8/16 整数倍时,右/下残余的
             // 不足一格像素会露出清屏色,与背景同色才不显突兀
@@ -207,12 +207,14 @@ impl Renderer {
         }
     }
 
-    /// 图集更新(version 变化才重传;首次调用建立纹理与 bind group)。
+    /// 图集更新(revision 变化才重传;首次调用建立纹理与 bind group)。
+    /// 门控用 revision 而非 version:普通 insert 不重排但改了纹理内容,
+    /// 漏传会让新字形隐形(GPU 侧还是旧数据,ink=0)。
     pub fn set_atlas(&mut self, atlas: &GlyphAtlas) {
-        if self.atlas_version == atlas.version() && self.atlas_texture.is_some() {
+        if self.atlas_revision == atlas.revision() && self.atlas_texture.is_some() {
             return;
         }
-        self.atlas_version = atlas.version();
+        self.atlas_revision = atlas.revision();
         let size = wgpu::Extent3d {
             width: atlas.width(),
             height: atlas.height(),
@@ -434,8 +436,20 @@ mod tests {
         let rect = atlas.insert(&bmp);
         assert!(rect.u + rect.w <= atlas.width());
         renderer.set_atlas(&atlas);
-        // 同 version 再次调用:不应重传也不应 panic(version 门早退)
+        // 内容未变再次调用:revision 门早退,不重传也不应 panic
         renderer.set_atlas(&atlas);
+        // C1 回归锁:普通插入(不触发 grow)version 不动但 revision 递增,
+        // set_atlas 必须重传——旧门控只看 version 时这类插入会静默漏传
+        let plain = GlyphBitmap {
+            width: 6,
+            height: 9,
+            pixels: vec![200; 6 * 9],
+        };
+        atlas.insert(&plain);
+        assert_eq!(atlas.version(), 0, "此插入不应触发 grow");
+        renderer.set_atlas(&atlas);
+        // 直接读私有字段:门控必须消费 insert 后的 revision
+        assert_eq!(renderer.atlas_revision, atlas.revision());
         // 高 250 的字形在剩余空间放不下(12+250>256)→ grow 后 version 递增;
         // set_atlas 走"重建纹理+重传"路径(新尺寸 256×512)
         let big = GlyphBitmap {
