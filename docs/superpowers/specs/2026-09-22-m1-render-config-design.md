@@ -55,7 +55,7 @@ M0 复查账本与主 spec 汇总后,所有者选定**全量**:
 - `CellInstance` 64B(见 D11),布局锁死测试与 WGSL 三 location 对齐更新
 - **宽字符**:`WIDE_CHAR` 格以 2×cell_w 绘制字形;`WIDE_CHAR_SPACER` 格跳过绘制(alacritty 网格语义)
 - **BOLD/ITALIC**:经 `GlyphStyle` 走字体变体查询(不做人造加粗)
-- **脏区**:`term.damage()` 接入——`Full` → 重建全部 instances;`Partial` → 仅重建受影响行(`LineDamageBounds.line - display_offset` 换算视口行,负数或越界跳过);无 damage → 跳过 CPU 重建。GPU 侧仍整缓冲上传(上传成本 ≪ 网格遍历,先取 90% 收益;分块上传 M2 再论)
+- **脏区**:`term.damage()` 接入——`Full` → 重建全部 instances;`Partial` → 仅重建受影响行(**已核实 2026-09-22:迭代器产出的 `LineDamageBounds.line` 已是视口行号**(0 = 当前显示视口顶行),不可见行被迭代器过滤,消费端只需 `< screen_lines` 裁剪,无需任何换算);无 damage → 跳过 CPU 重建。GPU 侧仍整缓冲上传(上传成本 ≪ 网格遍历,先取 90% 收益;分块上传 M2 再论)
 - **Palette 收敛**:`Palette { 16 色 + fg + bg + cursor }` 单一来源移入 **mica-core**(`config` 模块旁);mica-render 的 `BASE16/DEFAULT_FG/DEFAULT_BG` 与 surface 的 `default_rgb` 全部改为消费 Palette
 - **OSC 4**(palette 索引 0-15)与 **OSC 12**(光标色)应答走 Palette,格式 `\x1b]4;<i>;rgb:rrrr/gggg/bbbb\x1b\\`——复查账本两笔欠账清除
 
@@ -105,7 +105,7 @@ M0 复查账本与主 spec 汇总后,所有者选定**全量**:
 |---|---|
 | DirectWrite API 面大(COM、分析器布局) | 先核实签名再写(主 spec 纪律);dwrite.rs 隔离在单文件 cfg 门控内;M1a 冒烟最早真机验证 |
 | 用户未装 Sarasa | 回退链自动落 Cascadia;README 写安装指引;M3 随安装器分发 |
-| damage 行号换算错(scrollback 绝对行 vs 视口行) | 换算逻辑纯函数化 + 专项测试(含 display_offset>0 的滚动场景) |
+| damage 行号语义用错 | ✅ 已核实:迭代器产出即视口行号(0=视口顶),alacritty 源码 term/mod.rs:206-212 佐证;消费端仅做 `< screen_lines` 裁剪 |
 | 主题库个别文件含 M1 未支持的键 | 解析器对未知键**容忍跳过**(Ghostty 同款行为),金样本测试锁住"零错误" |
 | PostMessage 跨线程 HWND 失效 | app 保证读线程先于窗口销毁停止(退出流程显式 join) |
 | include_dir 增大二进制 | 300+ 纯文本片段约数百 KB,可接受;实测超预期再考虑 zstd |
