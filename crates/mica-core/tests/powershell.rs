@@ -14,9 +14,16 @@ fn powershell_echo_roundtrip() {
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut all = Vec::new();
+    let mut answered = 0; // 已应答的 DSR 查询数(同 pty.rs read_until 的契约)
     while Instant::now() < deadline {
         if let Some(chunk) = reader.recv_timeout(Duration::from_millis(500)) {
             all.extend_from_slice(&chunk);
+            // powershell 启动即发 ESC[6n 查光标并阻塞等回包,替终端应答
+            let pending = all.windows(4).filter(|w| *w == b"\x1b[6n").count();
+            for _ in answered..pending {
+                session.write(b"\x1b[1;1R").expect("reply to DSR query");
+            }
+            answered = pending;
             if all.windows(11).any(|w| w == b"psmarker_42") {
                 return;
             }

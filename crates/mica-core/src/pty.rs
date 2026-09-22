@@ -154,19 +154,26 @@ mod tests {
         }
     }
 
-    /// 读到超时为止,返回全部输出。
+    /// 读到超时为止,返回全部输出。收到 DSR 光标查询(`ESC[6n`)时以
+    /// `ESC[1;1R` 应答——cmd/powershell 启动即查询并阻塞等回包,
+    /// 测试就是"终端",得替它答(与 EventProxy take_pty_writes 同一契约)。
     fn read_until(
-        session: &PtySession,
+        session: &mut PtySession,
         reader: &PtyReader,
         needle: &[u8],
         budget: Duration,
     ) -> Vec<u8> {
         let deadline = Instant::now() + budget;
         let mut all = Vec::new();
-        let mut answered = 0;
+        let mut answered = 0; // 已应答的查询数:扫描的是累计缓冲,防重复回包
         while Instant::now() < deadline {
             if let Some(chunk) = reader.recv_timeout(Duration::from_millis(500)) {
                 all.extend_from_slice(&chunk);
+                let pending = all.windows(4).filter(|w| *w == b"\x1b[6n").count();
+                for _ in answered..pending {
+                    session.write(b"\x1b[1;1R").expect("reply to DSR query");
+                }
+                answered = pending;
                 if all.windows(needle.len()).any(|w| w == needle) {
                     return all;
                 }
@@ -181,8 +188,8 @@ mod tests {
 
     #[test]
     fn child_output_reaches_reader() {
-        let (_session, reader) = PtySession::spawn(echo_cmd(), 80, 24).unwrap();
-        read_until(&_session, &reader, MARKER, TIMEOUT);
+        let (mut session, reader) = PtySession::spawn(echo_cmd(), 80, 24).unwrap();
+        read_until(&mut session, &reader, MARKER, TIMEOUT);
     }
 
     #[test]
@@ -197,7 +204,7 @@ mod tests {
         let (mut session, reader) =
             PtySession::spawn(CommandBuilder::new("cmd.exe"), 80, 24).unwrap();
         session.write(b"echo wgtype_555\r\n").unwrap();
-        read_until(&session, &reader, b"wgtype_555", TIMEOUT);
+        read_until(&mut session, &reader, b"wgtype_555", TIMEOUT);
     }
 
     #[cfg(not(windows))]
@@ -205,6 +212,6 @@ mod tests {
     fn keystrokes_reach_cat() {
         let (mut session, reader) = PtySession::spawn(CommandBuilder::new("cat"), 80, 24).unwrap();
         session.write(b"wgtype_555\n").unwrap();
-        read_until(&session, &reader, b"wgtype_555", TIMEOUT);
+        read_until(&mut session, &reader, b"wgtype_555", TIMEOUT);
     }
 }
