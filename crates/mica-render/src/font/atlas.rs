@@ -70,7 +70,7 @@ impl GlyphAtlas {
                 self.entries.push((bmp.clone(), rect));
                 return rect;
             }
-            self.grow();
+            self.grow(bmp.width);
         }
     }
 
@@ -107,8 +107,13 @@ impl GlyphAtlas {
         None
     }
 
-    fn grow(&mut self) {
-        // 高度倍增;单字形超宽时宽度也提到能容纳
+    fn grow(&mut self, pending_w: u32) {
+        // 单字形超宽:宽度提到能容纳它的 2 的幂——既保证本轮必能放下,
+        // 也保持纹理边长为 2 的幂(GPU 纹理友好,UV 归一化稳定)。
+        if pending_w > self.width {
+            self.width = pending_w.next_power_of_two();
+        }
+        // 高度倍增
         self.height = self.height.saturating_mul(2).max(1);
         self.data = vec![0; (self.width * self.height) as usize];
         self.shelves.clear();
@@ -195,6 +200,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn glyph_wider_than_atlas_grows_width_and_terminates() {
+        let mut a = GlyphAtlas::new(16, 16);
+        let r = a.insert(&bmp(40, 8, 3)); // 比图集宽
+        assert!(r.u + r.w <= a.width() && r.v + r.h <= a.height());
+        assert!(a.width() >= 40);
+        // 内容落位
+        for y in 0..r.h {
+            for x in 0..r.w {
+                assert_eq!(a.texture()[((r.v + y) * a.width() + r.u + x) as usize], 3);
+            }
+        }
+        // 后续常规插入继续正常
+        let r2 = a.insert(&bmp(5, 5, 4));
+        assert!(r2.u + r2.w <= a.width() && r2.v + r2.h <= a.height());
     }
 
     #[test]
