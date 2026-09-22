@@ -3,6 +3,8 @@
 //!
 //! 家族链语义:按序找第一个含该字符的家族;缺家族整条跳过,全缺则 new 报错。
 //! 空白字符与全链 miss 都路由到空白 GlyphInfo,不占图集。
+//! 光栅化约定:NATURAL_SYMMETRIC 灰度 AA(合 R8 图集);基线原点取 (0,0),
+//! 字形 bounds 按基线相对解读,offset_px = ascent + bounds.top。
 
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -11,7 +13,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE,
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET,
-    DWRITE_GLYPH_RUN, DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_DEFAULT,
+    DWRITE_GLYPH_RUN, DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
     DWRITE_TEXTURE_ALIASED_1x1, DWriteCreateFactory, IDWriteFactory, IDWriteFont,
     IDWriteFontCollection, IDWriteFontFace,
 };
@@ -50,6 +52,8 @@ pub struct DwriteRouter {
     em_size_dip: f32,
     metrics: FontMetrics,
     atlas: GlyphAtlas,
+    /// 图集版本哨兵:grow 会重排搬动全部条目,缓存里的 UV 是按当时尺寸归一的
+    last_atlas_version: u64,
     cache: HashMap<(char, u8), GlyphInfo>,
 }
 
@@ -74,6 +78,15 @@ fn glyph_index_for(face: &IDWriteFontFace, ch: char) -> anyhow::Result<u16> {
     // SAFETY: 一进一出,指针与计数严格对应
     unsafe { face.GetGlyphIndices(code.as_ptr(), 1, idx.as_mut_ptr())? };
     Ok(idx[0])
+}
+
+/// font → face → 非零字形索引;.notdef 与 COM 失败都归 None(供 plain 面回退)。
+/// face 随 Some 一并返回(run 构造要用);miss 时 face 在此就地释放,无泄漏。
+fn face_with_glyph(font: &IDWriteFont, ch: char) -> Option<(IDWriteFontFace, u16)> {
+    // SAFETY: CreateFontFace 返回带引用计数的 face
+    let face = unsafe { font.CreateFontFace().ok()? };
+    let glyph = glyph_index_for(&face, ch).ok()?;
+    (glyph != 0).then_some((face, glyph))
 }
 
 impl DwriteRouter {
@@ -143,6 +156,7 @@ impl DwriteRouter {
             em_size_dip,
             metrics,
             atlas: GlyphAtlas::new(256, 256),
+            last_atlas_version: 0,
             cache: HashMap::new(),
         })
     }
@@ -174,20 +188,19 @@ impl DwriteRouter {
             return Some(blank_glyph());
         }
         let family = self.family_for(ch)?;
-        let font = match (style.bold, style.italic) {
-            (true, _) => &family.bold,
-            (false, true) => &family.italic,
-            _ => &family.plain,
+        let styled_font = match (style.bold, style.italic) {
+            (true, _) => Some(&family.bold),
+            (false, true) => Some(&family.italic),
+            _ => None,
         };
-        // SAFETY: CreateFontFace 返回带引用计数的 face
-        let face = unsafe { font.CreateFontFace().ok()? };
-        let glyph = glyph_index_for(&face, ch).ok()?;
-        if glyph == 0 {
-            return None; // .notdef → 空白兜底
-        }
+        // 样式面缺字形(如斜体面缺 CJK)→ 回退家族 plain 面;
+        // plain 也 miss(None)即全链空白,交 route 兜底
+        let (face, glyph) = match styled_font.and_then(|f| face_with_glyph(f, ch)) {
+            Some(pair) => pair,
+            None => face_with_glyph(&family.plain, ch)?,
+        };
 
         let em = self.em_size_dip;
-        let baseline_y = self.metrics.ascent;
         let offset = DWRITE_GLYPH_OFFSET {
             advanceOffset: 0.0,
             ascenderOffset: 0.0,
@@ -203,22 +216,24 @@ impl DwriteRouter {
             isSideways: BOOL::default(),
             bidiLevel: 0,
         };
-        // SAFETY: run 各指针均指向本侧存活数据;pixelsPerDip=1 ⇒ DIP 即像素
+        // 基线原点取 (0,0):bounds 的"基线相对 vs 绝对"两种语义在原点为 0 时数值重合
+        // SAFETY: run 各指针均指向本侧存活数据;pixelsPerDip=1 ⇒ DIP 即像素;
+        // DEFAULT 非法于此调用(MSDN),对称灰度 AA 正合 R8 图集
         let analysis = unsafe {
-            self.factory
-                .CreateGlyphRunAnalysis(
-                    &run,
-                    1.0,
-                    None,
-                    DWRITE_RENDERING_MODE_DEFAULT,
-                    DWRITE_MEASURING_MODE_NATURAL,
-                    0.0,
-                    baseline_y,
-                )
-                .ok()?
+            self.factory.CreateGlyphRunAnalysis(
+                &run,
+                1.0,
+                None,
+                DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                0.0,
+            )
         };
-        // SAFETY: 取回 face 所有权以正常释放引用计数(run 之后不再使用)
+        // SAFETY: 无论成败先取回 face 所有权——错误路径同样不漏引用计数
+        // (run 之后不再使用)
         drop(unsafe { ManuallyDrop::take(&mut run.fontFace) });
+        let analysis = analysis.ok()?;
 
         // SAFETY: 常规查询
         let bounds = unsafe {
@@ -256,13 +271,20 @@ impl DwriteRouter {
                 rect.h as f32 / ah,
             ],
             size_px: [w as f32, h as f32],
-            offset_px: [bounds.left as f32, baseline_y + bounds.top as f32],
+            offset_px: [bounds.left as f32, self.metrics.ascent + bounds.top as f32],
         })
     }
 }
 
 impl GlyphRouter for DwriteRouter {
     fn route(&mut self, ch: char, style: GlyphStyle) -> GlyphInfo {
+        // 图集 grow 重排后全部条目换了位置,旧缓存的 UV 按当时尺寸归一已失效——
+        // 版本号一动即清缓存(本轮新插入本就按当前尺寸计算,不受影响)
+        let version = self.atlas.version();
+        if version != self.last_atlas_version {
+            self.cache.clear();
+            self.last_atlas_version = version;
+        }
         let key = (ch, style_bits(style));
         if let Some(g) = self.cache.get(&key) {
             return *g;
