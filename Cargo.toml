@@ -16,6 +16,7 @@ anyhow = "1"
 pollster = "0.3"
 raw-window-handle = "0.6"
 unicode-width = "0.2"
+include_dir = "0.7"
 windows = "0.62"
 
 [profile.dev]
