@@ -9,7 +9,9 @@ description = "Grid-to-GPU renderer: atlas, color resolve, wgpu pipeline"
 mica-core = { path = "../mica-core" }
 alacritty_terminal = { workspace = true }
 wgpu = { workspace = true }
-font8x8 = { workspace = true }
 bytemuck = { workspace = true }
 anyhow = { workspace = true }
 unicode-width = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }

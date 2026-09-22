@@ -162,7 +162,8 @@ unsafe fn init_terminal(hwnd: HWND) {
     }
     wgpu_surface.configure(&ctx.device, &config);
     let cell = [FALLBACK_METRICS.cell_width, FALLBACK_METRICS.line_height];
-    let renderer = Renderer::new(&ctx, config.format, cell);
+    // T4:Globals 不再携带 cell/shader v2 纯矩形化,Renderer::new 退掉 cell 参
+    let renderer = Renderer::new(&ctx, config.format);
 
     let cols = ((width as f32 / FALLBACK_METRICS.cell_width).max(1.0)) as u16;
     let rows = ((height as f32 / FALLBACK_METRICS.line_height).max(1.0)) as u16;
@@ -234,6 +235,8 @@ fn draw_frame() {
         let Some(t) = t_guard.as_mut() else {
             return;
         };
+        // T4 中间态:build_instances 函数体为 todo!,Task 5 按 64B 实例 +
+        // GlyphRouter 重建(签名将增加 router 参数),此处届时同步接线
         let instances = build_instances(&t.term, &FALLBACK_METRICS);
         t.renderer.draw(&t.wgpu_surface, &t.config, &instances);
     });
