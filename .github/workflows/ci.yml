@@ -1,10 +1,23 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 jobs:
+  # main 只接受 dev 的合并(分支与合并规范,CLAUDE.md):head 不是 dev 直接红,
+  # required status check 锁住绕行路径
+  merge-gate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: main only accepts merges from dev
+        run: |
+          if [ "${{ github.event.pull_request.base.ref }}" = "main" ] && [ "${{ github.event.pull_request.head.ref }}" != "dev" ]; then
+            echo "::error::PR into main must come from dev (got: ${{ github.event.pull_request.head.ref }})" >&2
+            exit 1
+          fi
+
   windows:
     runs-on: windows-latest
     steps:

@@ -66,3 +66,10 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 ## 提交规范
 
 Conventional commits(`feat:`/`fix:`/`test:`/`docs:`/`chore:`),正文讲"为什么"。所有贡献者提交以本人身份署名。
+
+## 分支与合并规范
+
+- **分支命名**:`<type>/<slug>`——type 与提交规范同集(`feat`/`fix`/`test`/`docs`/`chore`),slug 小写连字符、≤5 词。例:`feat/m1b-config`、`fix/atlas-gate-miss`。不用裸词分支名。
+- **拓扑**:feature 分支从 `dev` 切、PR 回 `dev`(required checks 全绿才可合并,合并即删分支);**`main` 只接受来自 `dev` 的 PR**——merge-gate CI 强制(见 `.github/workflows/ci.yml`,PR→main 且 head≠dev 直接红),里程碑稳定后 dev→main 发版。
+- **保护**(GitHub branch protection,已配置):`main` 禁直推、禁 force push、必须 PR + required checks(windows/macos/merge-gate);`dev` 禁 force push(允许直推作为单人集成的快通道)。历史已按新拓扑整理。
+
