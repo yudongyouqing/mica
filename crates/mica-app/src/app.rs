@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::num::NonZeroIsize;
 use std::time::Duration;
 
+use mica_core::config::palette::Palette;
 use mica_core::input::{self, Key, Mods};
 use mica_core::pty::{PtyReader, PtySession, default_shell_command};
 use mica_core::surface::{ScreenSize, Surface};
@@ -172,7 +173,7 @@ unsafe fn init_terminal(hwnd: HWND, router: DwriteRouter, metrics: FontMetrics) 
     }
     wgpu_surface.configure(&ctx.device, &config);
     // T4:Globals 不再携带 cell/shader v2 纯矩形化,Renderer::new 退掉 cell 参
-    let renderer = Renderer::new(&ctx, config.format);
+    let mut renderer = Renderer::new(&ctx, config.format);
 
     let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
     let rows = ((height as f32 / metrics.line_height).max(1.0)) as u16;
@@ -183,6 +184,10 @@ unsafe fn init_terminal(hwnd: HWND, router: DwriteRouter, metrics: FontMetrics) 
         metrics.cell_width.round() as u16,
         metrics.line_height.round() as u16,
     );
+    // 调色板接线:OSC 4/10/11/12 应答与渲染/清屏同源。当前先走 DEFAULT
+    // (与退役的三处常量字节等价,画面零回归);T4/T5 换成 Settings 解析值。
+    term.set_palette(&Palette::DEFAULT);
+    renderer.set_clear_color(&Palette::DEFAULT);
     let (session, reader) =
         PtySession::spawn(default_shell_command(), cols, rows).expect("spawn shell");
 
@@ -252,7 +257,7 @@ fn draw_frame() {
             return;
         };
         // 先 build(路由新字形、改图集)再比修订号:同帧新增字形同帧上传
-        let instances = build_instances(&t.term, &mut t.router, &t.metrics);
+        let instances = build_instances(&t.term, &mut t.router, &t.metrics, &Palette::DEFAULT);
         let revision = t.router.atlas_revision();
         if t.renderer_atlas_revision != revision {
             t.renderer.set_atlas(t.router.atlas());

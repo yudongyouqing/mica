@@ -3,25 +3,14 @@
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::Rgb;
 
+use mica_core::config::palette::Palette;
 use mica_core::surface::Surface;
 
 use crate::color::resolve;
 use crate::font::GlyphStyle;
 use crate::font::metrics::FontMetrics;
 use crate::font::router::GlyphRouter;
-
-pub const DEFAULT_FG: Rgb = Rgb {
-    r: 0xff,
-    g: 0xff,
-    b: 0xff,
-};
-pub const DEFAULT_BG: Rgb = Rgb {
-    r: 0x1e,
-    g: 0x1e,
-    b: 0x1e,
-};
 
 /// One drawable quad. `pos_uv = [x_px, y_px, u, v]`(uv 为图集内左上,0..1),
 /// `size_uv = [w_px, h_px, uw, uvh]`(像素尺寸 + uv 尺寸,0..1)。
@@ -77,6 +66,7 @@ pub fn build_instances(
     surface: &Surface,
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
+    palette: &Palette,
 ) -> Vec<CellInstance> {
     let grid = surface.grid();
     let cols = grid.columns();
@@ -91,8 +81,8 @@ pub fn build_instances(
     for line in 0..rows {
         for col in 0..cols {
             let cell = &grid[Line(line as i32)][Column(col)];
-            let mut fg = resolve(cell.fg, DEFAULT_FG, DEFAULT_BG);
-            let mut bg = resolve(cell.bg, DEFAULT_FG, DEFAULT_BG);
+            let mut fg = resolve(cell.fg, palette);
+            let mut bg = resolve(cell.bg, palette);
             // 先反色后光标(双交换抵消,光标在选区仍可辨——已裁定顺序)
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
@@ -180,7 +170,10 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| false,
         };
-        assert_eq!(build_instances(&s, &mut r, &metrics_8x16()).len(), 8);
+        assert_eq!(
+            build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT).len(),
+            8
+        );
     }
 
     #[test]
@@ -194,7 +187,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| false,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16());
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
         // 两段式:bg 段 inst[0..4) 行优先每格一整格 quad,字形段随后
         assert_eq!(inst.len(), 5, "4 bg + 1 字形");
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -221,7 +214,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16());
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
         assert_eq!(inst.len(), 5, "4 bg + 1 宽字形(spacer 不出字形)");
         // bg 段:格 0 与 spacer 格(格 1)都是整格 blank
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -261,7 +254,7 @@ mod tests {
                 wide: |_| false,
             },
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16());
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
         // 顺序:A@0(bold)、B@1(反色)、光标@2(空格)、空格@3
         // 两段式:bg 段 [0..4) = A、B、光标格、空格;字形段 [4..6) = A、B
         assert_eq!(inst.len(), 6, "4 bg + A、B 两个字形");
@@ -343,7 +336,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16());
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
         // bg 段:全部 4 格在前,均整格 blank(uv 尺寸 0),行优先
         for (i, cell) in inst.iter().take(4).enumerate() {
             assert_eq!(
@@ -356,5 +349,46 @@ mod tests {
         // 字形段:宽字形在全部 bg 之后(索引 4),横跨 2 格,其后无实例
         assert_eq!(inst.len(), 5, "宽字形之后不得再有任何实例");
         assert_eq!(inst[4].size_uv, [12.0, 12.0, 12.0 / 64.0, 12.0 / 64.0]);
+    }
+
+    /// 实例颜色必须来自传入的 palette,而非任何内置常量:
+    /// 槽 1 喂红色前景、bg 换浅色,两段(bg quad + 字形)都随行。
+    #[test]
+    fn instance_colors_flow_from_palette() {
+        let mut s = Surface::new(ScreenSize::new(4, 1));
+        s.feed(b"\x1b[31mA");
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 6.0,
+            glyph_h: 12.0,
+            wide: |_| false,
+        };
+        let mut pal = Palette::DEFAULT;
+        pal.apply_pair("palette", "1=#112233").unwrap();
+        pal.apply_pair("background", "#abcdef").unwrap();
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &pal);
+        // bg 段 inst[0]:A 的背景 = palette.bg(浅色),前景 = 槽 1
+        assert_eq!(
+            inst[0].bg,
+            [
+                0xab as f32 / 255.0,
+                0xcd as f32 / 255.0,
+                0xef as f32 / 255.0,
+                0.0
+            ]
+        );
+        assert_eq!(
+            inst[0].fg,
+            [
+                0x11 as f32 / 255.0,
+                0x22 as f32 / 255.0,
+                0x33 as f32 / 255.0,
+                0.0
+            ]
+        );
+        // 字形段 inst[4]:同一对颜色(自绘 bg 盖 bbox,无害叠绘)
+        assert_eq!(inst[4].fg, inst[0].fg);
+        assert_eq!(inst[4].bg, inst[0].bg);
     }
 }

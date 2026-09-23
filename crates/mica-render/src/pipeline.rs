@@ -4,8 +4,10 @@
 use bytemuck::cast_slice;
 use wgpu::util::DeviceExt;
 
+use mica_core::config::palette::Palette;
+
 use crate::font::atlas::GlyphAtlas;
-use crate::frame::{CellInstance, DEFAULT_BG};
+use crate::frame::CellInstance;
 
 /// Adapter + device + queue, created once per window.
 pub struct GpuContext {
@@ -53,6 +55,17 @@ struct Globals {
 }
 
 const INSTANCE_CAPACITY: usize = 4096;
+
+/// 清屏色 = 调色板背景:客户区非 8/16 整数倍时,右/下残余的
+/// 不足一格像素会露出清屏色,与背景同色才不显突兀。
+fn bg_clear_color(palette: &Palette) -> wgpu::Color {
+    wgpu::Color {
+        r: f64::from(palette.bg.r) / 255.0,
+        g: f64::from(palette.bg.g) / 255.0,
+        b: f64::from(palette.bg.b) / 255.0,
+        a: 1.0,
+    }
+}
 
 pub struct Renderer {
     device: wgpu::Device,
@@ -196,15 +209,14 @@ impl Renderer {
             instance_capacity,
             atlas_revision: 0,
             atlas_texture: None,
-            // 清屏色 = 默认背景:客户区非 8/16 整数倍时,右/下残余的
-            // 不足一格像素会露出清屏色,与背景同色才不显突兀
-            clear_color: wgpu::Color {
-                r: f64::from(DEFAULT_BG.r) / 255.0,
-                g: f64::from(DEFAULT_BG.g) / 255.0,
-                b: f64::from(DEFAULT_BG.b) / 255.0,
-                a: 1.0,
-            },
+            clear_color: bg_clear_color(&Palette::DEFAULT),
         }
+    }
+
+    /// 换肤时同步清屏色(app 在 `surface.set_palette` 后调用);
+    /// 与格子背景同源,边缘残余像素才不会露出旧主题色。
+    pub fn set_clear_color(&mut self, palette: &Palette) {
+        self.clear_color = bg_clear_color(palette);
     }
 
     /// 图集更新(revision 变化才重传;首次调用建立纹理与 bind group)。
@@ -386,8 +398,9 @@ fn is_srgb(format: wgpu::TextureFormat) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuContext, Renderer, is_srgb};
+    use super::{GpuContext, Renderer, bg_clear_color, is_srgb};
     use crate::font::atlas::{GlyphAtlas, GlyphBitmap};
+    use mica_core::config::palette::Palette;
     use wgpu::TextureFormat;
 
     #[test]
@@ -396,6 +409,22 @@ mod tests {
         assert!(is_srgb(TextureFormat::Rgba8UnormSrgb));
         assert!(!is_srgb(TextureFormat::Bgra8Unorm));
         assert!(!is_srgb(TextureFormat::Rgba8Unorm));
+    }
+
+    /// 清屏色数学(u8/255)随 palette.bg 走——换肤后边缘残余像素同色。
+    #[test]
+    fn clear_color_follows_palette_bg() {
+        let c = bg_clear_color(&Palette::DEFAULT);
+        assert_eq!(c.r, f64::from(0x1e) / 255.0);
+        assert_eq!(c.g, f64::from(0x1e) / 255.0);
+        assert_eq!(c.b, f64::from(0x1e) / 255.0);
+        assert_eq!(c.a, 1.0);
+        let mut p = Palette::DEFAULT;
+        p.apply_pair("background", "#abcdef").unwrap();
+        let c = bg_clear_color(&p);
+        assert_eq!(c.r, f64::from(0xab) / 255.0);
+        assert_eq!(c.g, f64::from(0xcd) / 255.0);
+        assert_eq!(c.b, f64::from(0xef) / 255.0);
     }
 
     /// 无 GPU 也可跑的纯逻辑测试之外的设备冒烟:cells.wgsl 的 naga 校验、
@@ -460,5 +489,10 @@ mod tests {
         atlas.insert(&big);
         assert!(atlas.version() > 0, "高度不足应触发 grow+版本递增");
         renderer.set_atlas(&atlas);
+        // 换肤路径:构造后的 set_clear_color 更新内部清屏色(读私有字段验证)
+        let mut themed = Palette::DEFAULT;
+        themed.apply_pair("background", "#abcdef").unwrap();
+        renderer.set_clear_color(&themed);
+        assert_eq!(renderer.clear_color, bg_clear_color(&themed));
     }
 }

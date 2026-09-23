@@ -8,7 +8,9 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Processor, Rgb};
+use alacritty_terminal::vte::ansi::Processor;
+
+use crate::config::palette::Palette;
 
 /// Visible screen dimensions. `total_lines` reports the screen only, matching
 /// upstream's `TermSize`; scrollback capacity comes from `Config::scrolling_history`.
@@ -39,21 +41,17 @@ impl Dimensions for ScreenSize {
     }
 }
 
-/// Palette entries reported for OSC 10/11 default-ink queries.
-/// Indices follow `NamedColor`: 256 = foreground, 257 = background.
-fn default_rgb(index: usize) -> [u8; 3] {
-    match index {
-        257 => [0x1e, 0x1e, 0x1e],
-        _ => [0xff, 0xff, 0xff],
-    }
-}
-
+/// Palette entries reported for OSC 4/10/11/12 queries.
+/// Indices follow `NamedColor`: 0..=15 slots, 256 = foreground,
+/// 257 = background, 258 = cursor.
 struct ProxyState {
     pty_writes: Vec<String>,
     title: Option<String>,
     size: Option<ScreenSize>,
     /// 查询应答用的格子像素尺寸,默认与退役的 8×16 常量一致
     cell: (u16, u16),
+    /// OSC 4/10/11/12 应答与渲染同源(单一来源:config::palette)
+    palette: Palette,
 }
 
 impl Default for ProxyState {
@@ -63,6 +61,7 @@ impl Default for ProxyState {
             title: None,
             size: None,
             cell: (8, 16),
+            palette: Palette::DEFAULT,
         }
     }
 }
@@ -85,8 +84,8 @@ impl EventListener for EventProxy {
             Event::PtyWrite(s) => state.pty_writes.push(s),
             Event::Title(title) => state.title = Some(title),
             Event::ColorRequest(index, format) => {
-                let [r, g, b] = default_rgb(index);
-                state.pty_writes.push(format(Rgb { r, g, b }));
+                let rgb = state.palette.query(index);
+                state.pty_writes.push(format(rgb));
             }
             Event::TextAreaSizeRequest(format) => {
                 let size = state.size.unwrap_or(ScreenSize::new(80, 24));
@@ -144,6 +143,12 @@ impl Surface {
     /// 查询应答用的格子像素尺寸(dwrite 度量产出自 mica-render,启动后立即设置真值)
     pub fn set_cell_metrics(&mut self, cell_width: u16, cell_height: u16) {
         self.proxy.0.lock().unwrap_or_else(|e| e.into_inner()).cell = (cell_width, cell_height);
+    }
+
+    /// 热替换调色板:此后 OSC 4/10/11/12 查询按新 palette 应答。
+    /// 渲染侧的同步换肤由调用方(app)一并驱动,两处同源才不各说各话。
+    pub fn set_palette(&mut self, palette: &Palette) {
+        lock(&self.proxy.0).palette = *palette;
     }
 
     /// Drain replies that must be written back into the pty (DSR/OSC answers).
@@ -252,6 +257,42 @@ mod tests {
         proxy.send_event(Event::ColorRequest(256, format));
         let writes = proxy.0.lock().unwrap().pty_writes.clone();
         assert!(writes[0].starts_with("\x1b]10;rgb:"));
+    }
+
+    /// 回答应答值的直读格式:6 位 hex,便于断言具体颜色。
+    fn fmt_rgb() -> Arc<dyn Fn(Rgb) -> String + Send + Sync> {
+        Arc::new(|rgb: Rgb| format!("{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b))
+    }
+
+    #[test]
+    fn color_request_answers_palette_after_set_palette() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        let mut custom = Palette::DEFAULT;
+        custom.apply_pair("palette", "1=#ff5555").unwrap();
+        s.set_palette(&custom);
+        // OSC 4 查询槽 1:必须答替换后的 palette 值,而非旧的全白
+        s.proxy.send_event(Event::ColorRequest(1, fmt_rgb()));
+        assert_eq!(s.take_pty_writes(), vec!["ff5555".to_string()]);
+    }
+
+    #[test]
+    fn color_request_osc12_answers_cursor_color() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        let mut custom = Palette::DEFAULT;
+        custom.apply_pair("cursor-color", "#00ff00").unwrap();
+        s.set_palette(&custom);
+        s.proxy.send_event(Event::ColorRequest(258, fmt_rgb()));
+        assert_eq!(s.take_pty_writes(), vec!["00ff00".to_string()]);
+    }
+
+    #[test]
+    fn color_request_default_answers_fg_and_bg() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        // 256=前景(白)、257=背景(#1e1e1e)——M0 全答白是欠账,现在按 palette 分流
+        s.proxy.send_event(Event::ColorRequest(256, fmt_rgb()));
+        assert_eq!(s.take_pty_writes(), vec!["ffffff".to_string()]);
+        s.proxy.send_event(Event::ColorRequest(257, fmt_rgb()));
+        assert_eq!(s.take_pty_writes(), vec!["1e1e1e".to_string()]);
     }
 
     #[test]
