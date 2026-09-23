@@ -23,10 +23,10 @@ use mica_core::config::palette::Palette;
 use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
 use mica_core::input::{self, Key, Mods};
 use mica_core::pty::{PtyReader, PtySession, default_shell_command};
-use mica_core::surface::{ScreenSize, Surface};
+use mica_core::surface::{Damage, ScreenSize, Surface};
 use mica_render::font::dwrite::DwriteRouter;
 use mica_render::font::metrics::FontMetrics;
-use mica_render::frame::build_instances;
+use mica_render::frame::{RowInst, build_rows, repack};
 use mica_render::pipeline::{Renderer, create_context};
 use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
@@ -95,6 +95,13 @@ struct Terminal {
     /// 已传给 Renderer 的图集修订号(C1:普通 insert 也递增);u64::MAX
     /// 起步保证空图集(修订 0)也完成首次上传,不踩 set_atlas 契约
     renderer_atlas_revision: u64,
+    /// 行级实例缓存(Task 8):draw_frame 按 damage 增量重建,容量恒等于
+    /// 视口行数(结构守恒在 frame::build_rows 内兜底)
+    row_insts: Vec<RowInst>,
+    /// 结构性失配(resize、热重载换字体/主题)置位:下一帧无视 term 脏区
+    /// 强制全量重建。Term::resize 自身会标 full,但那属于上游实现细节,
+    /// 几何失配必须显式钉死在本层
+    force_full: bool,
 }
 
 pub fn run() {
@@ -396,6 +403,8 @@ unsafe fn reload_config(hwnd: HWND) {
             metrics.line_height.round() as u16,
         );
         let _ = t.session.resize(cols, rows);
+        // 几何/字形全换:行缓存结构性失配,显式全量(Task 8)
+        t.force_full = true;
         t.term.set_palette(&settings.palette);
         t.renderer.set_clear_color(&settings.palette);
         t.palette = settings.palette;
@@ -488,6 +497,8 @@ unsafe fn init_terminal(
             cols,
             rows,
             renderer_atlas_revision: u64::MAX,
+            row_insts: Vec::new(), // 首建即空:build_rows 的长度守恒兜底 → 首帧全量
+            force_full: true,      // 首帧显式全量,不依赖哨兵的先后
         });
     });
     (reader, pty_buf)
@@ -542,13 +553,31 @@ fn draw_frame() {
         let Some(t) = t_guard.as_mut() else {
             return;
         };
+        // 脏区分路(Task 8):结构性失配(resize/热重载)显式 Full,其余交
+        // 给 term 脏区——空 Lines 时 build_rows 原样保留行缓存,重建成本只
+        // 落在真正变化的行(路由缓存兜住重复字形的光栅化)
+        let damage = if std::mem::take(&mut t.force_full) {
+            Damage::Full
+        } else {
+            t.term.take_damage()
+        };
         // 先 build(路由新字形、改图集)再比修订号:同帧新增字形同帧上传
-        let instances = build_instances(&t.term, &mut t.router, &t.metrics, &t.palette);
+        build_rows(
+            &t.term,
+            &mut t.router,
+            &t.metrics,
+            &t.palette,
+            &damage,
+            &mut t.row_insts,
+        );
         let revision = t.router.atlas_revision();
         if t.renderer_atlas_revision != revision {
             t.renderer.set_atlas(t.router.atlas());
             t.renderer_atlas_revision = revision;
         }
+        // repack 恢复全局两遍发射序后整缓冲上传(spec:GPU 侧仍整帧提交,
+        // 收益在 CPU 侧的行级重建)
+        let instances = repack(&t.row_insts);
         t.renderer.draw(&t.wgpu_surface, &t.config, &instances);
     });
 }
@@ -635,6 +664,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     t.metrics.line_height.round() as u16,
                 );
                 let _ = t.session.resize(cols, rows);
+                // 行缓存与视口几何脱节:显式全量(Task 8)——resize 后 term
+                // 脏区可能为空,增量路径会拿旧几何的行缓存绘制
+                t.force_full = true;
                 t.config.width = width;
                 t.config.height = height;
                 t.wgpu_surface.configure(&t.ctx.device, &t.config);

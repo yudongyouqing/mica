@@ -7,10 +7,20 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::term::cell::Cell;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 
 use crate::config::palette::Palette;
+
+/// 视口脏区(Task 8):`Full` = 全屏重建;`Lines` = 仅列出的视口行
+/// (0 = 顶,升序、无重复)。行号语义已对齐 alacritty 0.26:`Term::damage()`
+/// 迭代器产出的 `LineDamageBounds::line` 已是视口行(滚动出屏的不可见行被
+/// 上游过滤),消费方只需按行号增量重建。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Damage {
+    Full,
+    Lines(Vec<usize>),
+}
 
 /// Visible screen dimensions. `total_lines` reports the screen only, matching
 /// upstream's `TermSize`; scrollback capacity comes from `Config::scrolling_history`.
@@ -110,6 +120,9 @@ pub struct Surface {
     parser: Processor,
     proxy: EventProxy,
     size: ScreenSize,
+    /// take_damage 首帧哨兵:TermDamageState 构造即 full=true,本应自然
+    /// Full,但那是上游实现细节——本层显式保证"第一次消费必是 Full"。
+    has_drawn: bool,
 }
 
 impl Surface {
@@ -126,6 +139,7 @@ impl Surface {
             parser: Processor::new(),
             proxy,
             size,
+            has_drawn: false,
         }
     }
 
@@ -149,6 +163,41 @@ impl Surface {
     /// 渲染侧的同步换肤由调用方(app)一并驱动,两处同源才不各说各话。
     pub fn set_palette(&mut self, palette: &Palette) {
         lock(&self.proxy.0).palette = *palette;
+    }
+
+    /// Drain damage accumulated since the last call, then reset the term's
+    /// damage state (upstream contract: consume implies reset).
+    ///
+    /// 视口行以外(滚出屏的历史行)一律丢弃:渲染只见视口。已知语义:上游
+    /// `Term::damage()` 恒把当前光标行计入(保守正确),所以经本 API 拿到
+    /// 空集 `Lines(vec![])` 不可达;空集分支是 render 层的库级兜底。
+    pub fn take_damage(&mut self) -> Damage {
+        if !self.has_drawn {
+            // 首帧哨兵:无消费历史,强制全量。仍要先消费一次 damage():它的
+            // 副作用是把上游 last_cursor 同步到当前光标——若跳过,首帧之后
+            // 光标一动,(0,0) 旧位会被误伤一行假脏(对拍测试踩出的坑)。
+            // 此时 damage 状态构造即 full,消费结果必为 Full,返回值可弃
+            self.has_drawn = true;
+            let _ = self.term.damage();
+            self.term.reset_damage();
+            return Damage::Full;
+        }
+        let screen_lines = self.size.screen_lines();
+        let damage = match self.term.damage() {
+            TermDamage::Full => Damage::Full,
+            TermDamage::Partial(bounds) => {
+                let mut rows: Vec<usize> = bounds
+                    .filter_map(|b| (b.line < screen_lines).then_some(b.line))
+                    .collect();
+                // 上游迭代器按行升序且唯一;显式排序去重把契约钉在本层,
+                // 不依赖上游迭代器的实现细节
+                rows.sort_unstable();
+                rows.dedup();
+                Damage::Lines(rows)
+            }
+        };
+        self.term.reset_damage();
+        damage
     }
 
     /// Drain replies that must be written back into the pty (DSR/OSC answers).
@@ -318,6 +367,45 @@ mod tests {
         let format = Arc::new(|ws: WindowSize| format!("{}x{}", ws.num_cols, ws.num_lines));
         s.proxy.send_event(Event::TextAreaSizeRequest(format));
         assert_eq!(s.take_pty_writes(), vec!["10x3".to_string()]);
+    }
+
+    // ---- Task 8: 脏区跟踪 ----
+
+    #[test]
+    fn take_damage_first_frame_is_full() {
+        // 首帧哨兵:term 的 damage 状态构造即 full,本应自然 Full;哨兵把该
+        // 前提钉死在本层,不赌上游实现
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        assert_eq!(s.take_damage(), Damage::Full);
+    }
+
+    #[test]
+    fn damage_reports_exactly_touched_rows_sorted_deduped() {
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.take_damage(); // 首帧哨兵烧掉
+        s.feed(b"one"); // 行 0(光标同在行 0)
+        s.feed(b"\x1b[3;1Htwo"); // HVP 到行 2 写入:行 0 旧光标位 + 行 2
+        assert_eq!(s.take_damage(), Damage::Lines(vec![0, 2]));
+    }
+
+    #[test]
+    fn damage_after_reset_reports_cursor_row_only() {
+        // 无输入无移动的帧:上游 Term::damage() 恒伤当前光标行(保守正确),
+        // 所以 Lines 空集经这条 API 不可达;空集分支由 frame 层单测覆盖
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.take_damage(); // 首帧哨兵
+        assert_eq!(s.take_damage(), Damage::Lines(vec![0]));
+    }
+
+    #[test]
+    fn resize_marks_full_damage() {
+        // 结构性失配(行数/列数变化)必须全量:Term::resize 标 full,
+        // take_damage 如实翻译
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.take_damage(); // 首帧哨兵
+        s.feed(b"hello");
+        s.resize(ScreenSize::new(20, 8));
+        assert_eq!(s.take_damage(), Damage::Full);
     }
 
     #[test]
