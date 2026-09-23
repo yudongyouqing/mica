@@ -10,13 +10,14 @@
 
 use std::cell::RefCell;
 use std::num::NonZeroIsize;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mica_core::config::palette::Palette;
+use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
 use mica_core::input::{self, Key, Mods};
 use mica_core::pty::{PtyReader, PtySession, default_shell_command};
 use mica_core::surface::{ScreenSize, Surface};
-use mica_render::font::DEFAULT_FAMILIES;
 use mica_render::font::dwrite::DwriteRouter;
 use mica_render::font::metrics::FontMetrics;
 use mica_render::frame::build_instances;
@@ -33,16 +34,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-    DispatchMessageW, GetClientRect, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
-    RegisterClassExW, SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY,
-    WM_KEYDOWN, WM_PAINT, WM_QUIT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    DispatchMessageW, GetClientRect, LoadCursorW, MSG, MessageBoxW, PM_REMOVE, PeekMessageW,
+    PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR,
+    WM_DESTROY, WM_KEYDOWN, WM_PAINT, WM_QUIT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
+use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK};
 use windows::core::{HSTRING, PCWSTR, w};
 
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
-/// 字号(pt);M1-B 接配置后从主题读取
-const FONT_SIZE_PT: f32 = 12.0;
 
 thread_local! {
     static STATE: RefCell<Option<Terminal>> = const { RefCell::new(None) };
@@ -59,6 +60,8 @@ struct Terminal {
     metrics: FontMetrics,
     ctx: mica_render::pipeline::GpuContext,
     renderer: Renderer,
+    /// 配置合成出的调色板:渲染实例着色与 OSC 4/10/11/12 应答同源(T2 Settings)
+    palette: Palette,
     wgpu_surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     cols: u16,
@@ -88,8 +91,16 @@ pub fn run() {
         };
         assert_ne!(RegisterClassExW(&wc), 0, "RegisterClassExW failed");
 
-        // T7:度量先于窗口——客户区初始尺寸按真字体度量换算
-        let router = DwriteRouter::new(FONT_SIZE_PT, DEFAULT_FAMILIES).expect("no fonts resolved");
+        // T4:字号与字体链来自配置(%APPDATA%\mica\config;缺失 = 全默认)
+        let settings = load_settings();
+        let router = {
+            let families: Vec<&str> = if settings.font_families.is_empty() {
+                DEFAULT_FAMILIES.to_vec() // resolve 恒填默认链,此分支纯防御
+            } else {
+                settings.font_families.iter().map(String::as_str).collect()
+            };
+            DwriteRouter::new(settings.font_size_pt, &families).expect("no fonts resolved")
+        };
         eprintln!("font families in use: {:?}", router.families_in_use()); // 冒烟期观察回退链
         let metrics = router.metrics();
 
@@ -128,12 +139,74 @@ pub fn run() {
             std::mem::size_of::<i32>() as u32,
         );
 
-        init_terminal(hwnd, router, metrics);
+        init_terminal(hwnd, router, metrics, settings);
         message_loop(hwnd);
     }
 }
 
-unsafe fn init_terminal(hwnd: HWND, router: DwriteRouter, metrics: FontMetrics) {
+/// 配置文件路径:`%APPDATA%\mica\config`;APPDATA 未设(理论上不存在,
+/// 保留兜底)落当前目录 `.mica\config`。
+fn config_path() -> PathBuf {
+    match std::env::var("APPDATA") {
+        Ok(dir) if !dir.is_empty() => Path::new(&dir).join("mica").join("config"),
+        _ => PathBuf::from(".mica").join("config"),
+    }
+}
+
+/// 读配置并合成 Settings。错误哲学(T2 同款):终端绝不因配置拒绝启动——
+/// 文件缺失 = 全默认静默;读失败或 resolve 失败 = MessageBox 警告后回落默认。
+fn load_settings() -> Settings {
+    let path = config_path();
+    let source = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
+        Err(e) => {
+            warn_box(&format!(
+                "无法读取配置文件 {}:\n{e}\n\n继续使用默认设置。",
+                path.display()
+            ));
+            return Settings::default();
+        }
+    };
+    match settings::resolve(&source) {
+        Ok(s) => s,
+        Err(err) => {
+            warn_box(&format_config_error(&path, &err));
+            Settings::default()
+        }
+    }
+}
+
+/// 错误弹窗文案:解析行错误带行号在前,值语义错误随后(与 ConfigError 同序)。
+fn format_config_error(path: &Path, err: &ConfigError) -> String {
+    let mut msg = format!("配置文件 {} 有误,已回退默认设置:", path.display());
+    for e in &err.parse {
+        msg.push_str(&format!("\n  第 {} 行: {}", e.line, e.reason));
+    }
+    for v in &err.values {
+        msg.push_str(&format!("\n  {v}"));
+    }
+    msg
+}
+
+/// 警告框:不挂窗口(启动期 hwnd 尚未创建),自带消息泵,OK 后继续初始化。
+fn warn_box(text: &str) {
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            w!("Mica"),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
+}
+
+unsafe fn init_terminal(
+    hwnd: HWND,
+    router: DwriteRouter,
+    metrics: FontMetrics,
+    settings: Settings,
+) {
     // wgpu 30:display handle 挂在 Instance 上,窗口路线用无显示构造
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     // SAFETY: hwnd 活到进程结束,长于 wgpu_surface
@@ -184,10 +257,10 @@ unsafe fn init_terminal(hwnd: HWND, router: DwriteRouter, metrics: FontMetrics) 
         metrics.cell_width.round() as u16,
         metrics.line_height.round() as u16,
     );
-    // 调色板接线:OSC 4/10/11/12 应答与渲染/清屏同源。当前先走 DEFAULT
-    // (与退役的三处常量字节等价,画面零回归);T4/T5 换成 Settings 解析值。
-    term.set_palette(&Palette::DEFAULT);
-    renderer.set_clear_color(&Palette::DEFAULT);
+    // 调色板接线:OSC 4/10/11/12 应答与渲染/清屏同源,单一来源是 Settings
+    // 解析出的 Palette(主题片段 < 用户 config 覆盖后合成)。
+    term.set_palette(&settings.palette);
+    renderer.set_clear_color(&settings.palette);
     let (session, reader) =
         PtySession::spawn(default_shell_command(), cols, rows).expect("spawn shell");
 
@@ -200,6 +273,7 @@ unsafe fn init_terminal(hwnd: HWND, router: DwriteRouter, metrics: FontMetrics) 
             metrics,
             ctx,
             renderer,
+            palette: settings.palette,
             wgpu_surface,
             config,
             cols,
@@ -257,7 +331,7 @@ fn draw_frame() {
             return;
         };
         // 先 build(路由新字形、改图集)再比修订号:同帧新增字形同帧上传
-        let instances = build_instances(&t.term, &mut t.router, &t.metrics, &Palette::DEFAULT);
+        let instances = build_instances(&t.term, &mut t.router, &t.metrics, &t.palette);
         let revision = t.router.atlas_revision();
         if t.renderer_atlas_revision != revision {
             t.renderer.set_atlas(t.router.atlas());
