@@ -557,6 +557,11 @@ fn draw_frame() {
         // 给 term 脏区——空 Lines 时 build_rows 原样保留行缓存,重建成本只
         // 落在真正变化的行(路由缓存兜住重复字形的光栅化)
         let damage = if std::mem::take(&mut t.force_full) {
+            // 结构性重建也必须先消费一次脏区:take_damage 是上游 last_cursor
+            // 旋转的唯一触发点,跳过它则下一帧 Partial 拿着过期的“上一光标
+            // 位”(真 resize 后是 (0,0),同尺寸热重载后是更早的任意位)——
+            // 本帧 Full 画下的反色光标块从此无人重绘,成为永久残影
+            let _ = t.term.take_damage();
             Damage::Full
         } else {
             t.term.take_damage()

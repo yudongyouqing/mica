@@ -409,6 +409,31 @@ mod tests {
     }
 
     #[test]
+    fn clear_screen_marks_full_damage() {
+        // ED 2(cls 等价):上游 clear_screen 走 mark_fully_damaged
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.take_damage(); // 首帧哨兵
+        s.feed(b"hello");
+        s.feed(b"\x1b[2J");
+        assert_eq!(s.take_damage(), Damage::Full);
+    }
+
+    #[test]
+    fn sentinel_consumes_damage_so_cursor_chain_stays_synced() {
+        // 回归(Task 8 复审):哨兵若不消费 damage(),last_cursor 停在默认
+        // (0,0),下一帧光标在非零行时会把 (0,0) 误伤进来。烧哨兵前先把
+        // 光标挪到非零行——本用例恰好区分“消费过”与“只 reset 过”
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.feed(b"\x1b[3;1HX"); // 光标停行 2(哨兵燃烧前)
+        assert_eq!(s.take_damage(), Damage::Full); // 哨兵
+        assert_eq!(
+            s.take_damage(),
+            Damage::Lines(vec![2]),
+            "last_cursor 已同步到行 2:不得出现 (0,0) 假伤"
+        );
+    }
+
+    #[test]
     fn size_query_reports_default_then_set_cell_metrics() {
         let mut s = Surface::new(ScreenSize::new(10, 3));
         // 默认 8x16,与退役前的常量一致
