@@ -11,7 +11,11 @@
 use std::cell::RefCell;
 use std::num::NonZeroIsize;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use notify::{Event, RecursiveMode, Watcher};
 
 use mica_core::config::palette::Palette;
 use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
@@ -35,15 +39,33 @@ use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
     DispatchMessageW, GetClientRect, LoadCursorW, MSG, MessageBoxW, PM_REMOVE, PeekMessageW,
-    PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR,
-    WM_DESTROY, WM_KEYDOWN, WM_PAINT, WM_QUIT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage,
+    WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_PAINT, WM_QUIT, WM_SIZE, WNDCLASSEXW,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK};
 use windows::core::{HSTRING, PCWSTR, w};
 
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
+
+/// WM_APP 用户消息区(0x8000 起)。+1 预留给 Task 7 的 WM_APP_RENDER
+/// (pty 读线程唤醒渲染),勿占用
+const WM_APP_CONFIG: u32 = 0x8000 + 2;
+
+/// watch 线程持有的窗口句柄哨兵:退出流程先置 None 再停线程,保证不再向
+/// (可能已销毁的)窗口投递消息;Post 到死句柄本就无害,纪律照守(T7 同序)。
+/// 存裸 isize 而非 HWND——windows-rs 的句柄包着 *mut c_void,不是 Send,
+/// 投递侧再包回 HWND。
+type SharedHwnd = Arc<Mutex<Option<isize>>>;
+
+/// 热重载组件打包:退出时按 哨兵置 None → drop watcher → join 线程 拆除
+/// (序在 message_loop 的 WM_QUIT 分支,先于既有 teardown)。
+struct ReloadHandle {
+    hwnd_slot: SharedHwnd,
+    watcher: notify::RecommendedWatcher,
+    thread: std::thread::JoinHandle<()>,
+}
 
 thread_local! {
     static STATE: RefCell<Option<Terminal>> = const { RefCell::new(None) };
@@ -139,8 +161,11 @@ pub fn run() {
             std::mem::size_of::<i32>() as u32,
         );
 
+        // T5:热重载 watcher 在窗口创建后启动(投递 WM_APP_CONFIG 需要 hwnd);
+        // config 文件缺失(全默认启动)则不监听——首次创建配置需重启生效
+        let reload = spawn_config_watcher(hwnd);
         init_terminal(hwnd, router, metrics, settings);
-        message_loop(hwnd);
+        message_loop(hwnd, reload);
     }
 }
 
@@ -198,6 +223,138 @@ fn warn_box(text: &str) {
             w!("Mica"),
             MB_OK | MB_ICONWARNING,
         );
+    }
+}
+
+/// 配置热重载 watcher(最佳努力,绝不致命——T4 错误哲学同款):
+/// notify 推荐后端(Windows = ReadDirectoryChangesW;对文件路径它实际监视
+/// 父目录并按路径过滤,原子替换/重建不失联)监听 config 文件,事件经 mpsc
+/// 交给去抖线程。None = 未监听(文件缺失或 watch 失败,热重载降级关闭)。
+fn spawn_config_watcher(hwnd: HWND) -> Option<ReloadHandle> {
+    let path = config_path();
+    if !path.exists() {
+        eprintln!("config watcher: {} 不存在,热重载未启用", path.display());
+        return None;
+    }
+    // notify 的 EventHandler 直接支持 std mpsc Sender<Result<Event>>;
+    // watcher 持有发送端,Drop 时后端停止、通道断开,线程随之退出
+    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+    let mut watcher = notify::recommended_watcher(tx).expect("create config watcher");
+    if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+        eprintln!(
+            "config watcher: 无法监听 {}: {e};热重载未启用",
+            path.display()
+        );
+        return None;
+    }
+    let hwnd_slot: SharedHwnd = Arc::new(Mutex::new(Some(hwnd.0 as isize)));
+    let thread_slot = Arc::clone(&hwnd_slot);
+    let thread = std::thread::Builder::new()
+        .name("config-watcher".into())
+        .spawn(move || debounce_loop(path, rx, thread_slot))
+        .expect("spawn config watcher thread");
+    Some(ReloadHandle {
+        hwnd_slot,
+        watcher,
+        thread,
+    })
+}
+
+/// 去抖线程:notify 后端已按被监视文件过滤事件,收到的必是 config 的动静。
+/// 编辑器原子保存 = Delete+Create+Write 连发,不去抖会触发多轮重载并撞上
+/// 瞬时缺失窗——故收首个事件后持续吞事件,直到 300ms 静默窗走完才投递一次;
+/// 路径在静默结束时仍不存在(原子替换途中)则跳过本轮。通道断开(watcher
+/// 已 Drop)即退出。
+fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<notify::Result<Event>>, hwnd_slot: SharedHwnd) {
+    const QUIET: Duration = Duration::from_millis(300);
+    loop {
+        if rx.recv().is_err() {
+            return; // watcher 已停,通道断开
+        }
+        loop {
+            match rx.recv_timeout(QUIET) {
+                Ok(_) => {} // 风暴未息,续等
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        if !path.exists() {
+            continue;
+        }
+        let hwnd = *hwnd_slot.lock().expect("hwnd slot poisoned");
+        if let Some(hwnd) = hwnd {
+            // 失败(队列满/窗口已死)忽略即可;Post 到死句柄无害
+            let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_CONFIG, WPARAM(0), LPARAM(0)) };
+        }
+    }
+}
+
+/// 热重载主路径(WM_APP_CONFIG,主线程):重读+合成;失败弹窗保旧、现状态
+/// 不动;成功则重建 DwriteRouter(旧 router Drop 释放图集,新字形随绘制自然
+/// 重光栅化,无需显式清缓存)、按**不变的窗口像素尺寸**重算网格、resize 终端
+/// 与会话、换 palette 与清屏色,最后全量重绘。
+unsafe fn reload_config(hwnd: HWND) {
+    let path = config_path();
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        // 去抖后仍读不到:文件被删而非瞬时缺失,提示后保旧
+        warn_box(&format!(
+            "无法读取配置文件 {}:\n热重载跳过,继续使用当前设置。",
+            path.display()
+        ));
+        return;
+    };
+    let settings = match settings::resolve(&source) {
+        Ok(s) => s,
+        Err(err) => {
+            warn_box(&format_config_error(&path, &err));
+            return; // 保旧
+        }
+    };
+    let families: Vec<&str> = settings.font_families.iter().map(String::as_str).collect();
+    let Ok(router) = DwriteRouter::new(settings.font_size_pt, &families) else {
+        warn_box("重建字体链失败,继续使用当前设置。");
+        return; // 保旧
+    };
+    eprintln!("font families in use: {:?}", router.families_in_use()); // 冒烟期观察回退链
+    let metrics = router.metrics();
+
+    let mut reloaded = false;
+    STATE.with(|cell| {
+        let mut t_guard = cell.borrow_mut();
+        let Some(t) = t_guard.as_mut() else {
+            return;
+        };
+        // 客户区像素尺寸不变(不碰窗口尺寸),按新度量重算网格
+        let mut rect = RECT::default();
+        GetClientRect(hwnd, &mut rect).expect("GetClientRect");
+        let width = rect.right.max(1) as u32;
+        let height = rect.bottom.max(1) as u32;
+        let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
+        let rows = ((height as f32 / metrics.line_height).max(1.0)) as u16;
+
+        t.router = router;
+        t.metrics = metrics;
+        // 修订号镜像回到 u64::MAX:新路由的空图集(修订 0)也保证完成首次
+        // 上传,不会拿旧图集渲染新字形(与 init 同款契约)
+        t.renderer_atlas_revision = u64::MAX;
+        t.cols = cols;
+        t.rows = rows;
+        t.term.resize(ScreenSize::new(cols as usize, rows as usize));
+        // 应答值取整与布局换算 f32 的分工同 init(I3)
+        t.term.set_cell_metrics(
+            metrics.cell_width.round() as u16,
+            metrics.line_height.round() as u16,
+        );
+        let _ = t.session.resize(cols, rows);
+        t.term.set_palette(&settings.palette);
+        t.renderer.set_clear_color(&settings.palette);
+        t.palette = settings.palette;
+        reloaded = true;
+    });
+    // draw_frame 自己也要借 STATE,必须在 with 之外调用
+    if reloaded {
+        draw_frame();
     }
 }
 
@@ -283,11 +440,20 @@ unsafe fn init_terminal(
     });
 }
 
-unsafe fn message_loop(hwnd: HWND) {
+unsafe fn message_loop(hwnd: HWND, reload: Option<ReloadHandle>) {
     let mut msg = MSG::default();
     loop {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).0 != 0 {
             if msg.message == WM_QUIT {
+                // 退出序(参照 T7 纪律):先落 None 哨兵(watch 线程此后不再
+                // Post)→ drop watcher(其 Drop 停止后端并断开发送端,线程随之
+                // 退出)→ join 兜底;完事才做既有 teardown(Terminal 的 Drop
+                // 杀 pty)。残余 Post 到已销毁窗口只是失败返回,无害
+                if let Some(reload) = reload {
+                    *reload.hwnd_slot.lock().expect("hwnd slot poisoned") = None;
+                    drop(reload.watcher);
+                    let _ = reload.thread.join();
+                }
                 STATE.with(|cell| cell.borrow_mut().take());
                 return; // Terminal 的 Drop 在 TLS 存活时显式执行,退出期回调不再摸已销毁的 STATE
             }
@@ -435,6 +601,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_PAINT => {
             // 绘制节奏由消息循环控制;这里只清掉无效区积压
             let _ = ValidateRect(Some(hwnd), None);
+            LRESULT(0)
+        }
+        WM_APP_CONFIG => {
+            // 配置热重载(watch 线程去抖后投递);主线程执行,失败保旧
+            reload_config(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
