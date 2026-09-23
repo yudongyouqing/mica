@@ -1,9 +1,11 @@
-//! The M1a shell: one window, one terminal, ConPTY + PowerShell,
+//! The M1 shell: one window, one terminal, ConPTY + PowerShell,
 //! DirectWrite-rasterized glyphs (DwriteRouter owns metrics and the atlas).
 //!
-//! Input/render run on the main thread; pty output arrives on the reader
-//! thread and is drained each loop iteration. M1 replaces this 8ms polling
-//! loop with an event-driven wake-up (reader thread posts to the queue).
+//! Event-driven (T7): the main thread parks in `GetMessageW` — zero polling.
+//! A pty forwarder thread (app-owned) moves output into a shared buffer and
+//! posts `WM_APP_RENDER`; the handler drains the buffer, feeds the terminal,
+//! writes query replies back to the pty and redraws. Input paths only write
+//! to the pty; echo comes back through the same render wake-up.
 
 // 本模块整体是 Win32 FFI 区,再套细粒度 unsafe 块只是噪音(edition 2024 默认告警)
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -26,7 +28,7 @@ use mica_render::font::dwrite::DwriteRouter;
 use mica_render::font::metrics::FontMetrics;
 use mica_render::frame::build_instances;
 use mica_render::pipeline::{Renderer, create_context};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::Graphics::Gdi::ValidateRect;
@@ -38,10 +40,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-    DispatchMessageW, GetClientRect, LoadCursorW, MSG, MessageBoxW, PM_REMOVE, PeekMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_PAINT, WM_QUIT, WM_SIZE, WNDCLASSEXW,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    DispatchMessageW, GetClientRect, GetMessageW, LoadCursorW, MSG, MessageBoxW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR,
+    WM_DESTROY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK};
 use windows::core::{HSTRING, PCWSTR, w};
@@ -49,20 +50,20 @@ use windows::core::{HSTRING, PCWSTR, w};
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-/// WM_APP 用户消息区(0x8000 起)。+1 预留给 Task 7 的 WM_APP_RENDER
-/// (pty 读线程唤醒渲染),勿占用
+/// WM_APP 用户消息区(0x8000 起):
+/// +1 = WM_APP_RENDER(T7,pty 转发线程唤醒渲染);+2 = WM_APP_CONFIG(T5,热重载)
+const WM_APP_RENDER: u32 = 0x8000 + 1;
 const WM_APP_CONFIG: u32 = 0x8000 + 2;
 
-/// watch 线程持有的窗口句柄哨兵:退出流程先置 None 再停线程,保证不再向
-/// (可能已销毁的)窗口投递消息;Post 到死句柄本就无害,纪律照守(T7 同序)。
-/// 存裸 isize 而非 HWND——windows-rs 的句柄包着 *mut c_void,不是 Send,
-/// 投递侧再包回 HWND。
+/// watch/转发线程共持的窗口句柄哨兵,唯一语义是"窗口是否存活":退出序第一
+/// 步统一落 None,两个后台线程自此不再向窗口投递消息;Post 到死句柄本就无害,
+/// 纪律照守。存裸 isize 而非 HWND——windows-rs 的句柄包着 *mut c_void,不是
+/// Send,投递侧再包回 HWND。
 type SharedHwnd = Arc<Mutex<Option<isize>>>;
 
-/// 热重载组件打包:退出时按 哨兵置 None → drop watcher → join 线程 拆除
-/// (序在 message_loop 的 WM_QUIT 分支,先于既有 teardown)。
+/// 热重载组件打包:退出时按 哨兵置 None(共用,见 SharedHwnd)→ drop watcher
+/// → join 线程 拆除(序在 message_loop 的退出分支,先于既有 teardown)。
 struct ReloadHandle {
-    hwnd_slot: SharedHwnd,
     watcher: notify::RecommendedWatcher,
     thread: std::thread::JoinHandle<()>,
 }
@@ -77,7 +78,10 @@ thread_local! {
 struct Terminal {
     term: Surface,
     session: PtySession,
-    reader: PtyReader,
+    /// pty 输出落点:转发线程(独占 PtyReader 通道)往里追加,WM_APP_RENDER
+    /// 在主线程取空。放 Terminal 里让 handler 借 STATE 一次取齐,退出时随
+    /// Terminal 一起拆
+    pty_buf: Arc<Mutex<Vec<u8>>>,
     router: DwriteRouter,
     metrics: FontMetrics,
     ctx: mica_render::pipeline::GpuContext,
@@ -161,11 +165,21 @@ pub fn run() {
             std::mem::size_of::<i32>() as u32,
         );
 
+        // T5/T7:后台线程共用的窗口哨兵,窗口创建后建立(两个线程都要投递)
+        let hwnd_slot: SharedHwnd = Arc::new(Mutex::new(Some(hwnd.0 as isize)));
+
         // T5:热重载 watcher 在窗口创建后启动(投递 WM_APP_CONFIG 需要 hwnd);
         // config 文件缺失(全默认启动)则不监听——首次创建配置需重启生效
-        let reload = spawn_config_watcher(hwnd);
-        init_terminal(hwnd, router, metrics, settings);
-        message_loop(hwnd, reload);
+        let reload = spawn_config_watcher(Arc::clone(&hwnd_slot));
+        // T7:pty 会话与转发线程(reader 通道由转发线程独占消费,数据落
+        // Terminal.pty_buf 共享缓冲)
+        let (reader, pty_buf) = init_terminal(hwnd, router, metrics, settings);
+        let forwarder = spawn_render_forwarder(reader, pty_buf, Arc::clone(&hwnd_slot));
+
+        // 首帧显式化:旧轮询循环里第一帧混在首轮 drain 中,事件化后没有输出
+        // 就没人画——进循环前先铺一帧(底色+空网格),不等第一条 pty 输出
+        draw_frame();
+        message_loop(reload, hwnd_slot, forwarder);
     }
 }
 
@@ -230,7 +244,8 @@ fn warn_box(text: &str) {
 /// notify 推荐后端(Windows = ReadDirectoryChangesW;对文件路径它实际监视
 /// 父目录并按路径过滤,原子替换/重建不失联)监听 config 文件,事件经 mpsc
 /// 交给去抖线程。None = 未监听(文件缺失或 watch 失败,热重载降级关闭)。
-fn spawn_config_watcher(hwnd: HWND) -> Option<ReloadHandle> {
+/// 哨兵由 run() 统一建立后传入——与转发线程共用"窗口存活"这一个事实。
+fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle> {
     let path = config_path();
     if !path.exists() {
         eprintln!("config watcher: {} 不存在,热重载未启用", path.display());
@@ -247,17 +262,51 @@ fn spawn_config_watcher(hwnd: HWND) -> Option<ReloadHandle> {
         );
         return None;
     }
-    let hwnd_slot: SharedHwnd = Arc::new(Mutex::new(Some(hwnd.0 as isize)));
     let thread_slot = Arc::clone(&hwnd_slot);
     let thread = std::thread::Builder::new()
         .name("config-watcher".into())
         .spawn(move || debounce_loop(path, rx, thread_slot))
         .expect("spawn config watcher thread");
-    Some(ReloadHandle {
-        hwnd_slot,
-        watcher,
-        thread,
-    })
+    Some(ReloadHandle { watcher, thread })
+}
+
+/// pty → 渲染转发线程(T7,app 所有;pty.rs 零 GUI 纪律:core 不碰 win32)。
+/// 泊在 `PtyReader::recv_block` 上独占消费 reader 通道(单消费者,顺序天然
+/// 保序):数据到达先落共享缓冲,再向窗口 Post WM_APP_RENDER。消息队列天然
+/// 帧合并:突发输出只多压几条消息,缓冲被第一条取空后,余下的唤醒在
+/// handler 里空转一次即过。退出语义:哨兵落 None 后不再 Post;线程本体要
+/// 等 pty 关闭(通道断开,recv_block 得 None)才退——所以退出序必须先杀
+/// pty 再 join,见 message_loop。
+fn spawn_render_forwarder(
+    reader: PtyReader,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    hwnd_slot: SharedHwnd,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("pty-forwarder".into())
+        .spawn(move || {
+            loop {
+                match reader.recv_block() {
+                    Some(chunk) => {
+                        {
+                            // 锁只罩 extend,绝不跨 PostMessageW 持锁
+                            let mut pending = buffer.lock().expect("pty buffer poisoned");
+                            pending.extend_from_slice(&chunk);
+                        }
+                        let hwnd = *hwnd_slot.lock().expect("hwnd slot poisoned");
+                        if let Some(raw) = hwnd {
+                            // 失败(队列满/窗口已死)忽略即可;Post 到死句柄无害
+                            let hwnd = HWND(raw as *mut std::ffi::c_void);
+                            let _ = unsafe {
+                                PostMessageW(Some(hwnd), WM_APP_RENDER, WPARAM(0), LPARAM(0))
+                            };
+                        }
+                    }
+                    None => return, // pty 读线程挂断:通道断开,转发使命结束
+                }
+            }
+        })
+        .expect("spawn pty forwarder")
 }
 
 /// 去抖线程:notify 后端已按被监视文件过滤事件,收到的必是 config 的动静。
@@ -358,12 +407,14 @@ unsafe fn reload_config(hwnd: HWND) {
     }
 }
 
+/// 初始化终端状态,返回 (pty 读端, 共享输出缓冲):读端连同缓冲交给转发
+/// 线程(T7),缓冲同时存进 Terminal 供 WM_APP_RENDER 取空。
 unsafe fn init_terminal(
     hwnd: HWND,
     router: DwriteRouter,
     metrics: FontMetrics,
     settings: Settings,
-) {
+) -> (PtyReader, Arc<Mutex<Vec<u8>>>) {
     // wgpu 30:display handle 挂在 Instance 上,窗口路线用无显示构造
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     // SAFETY: hwnd 活到进程结束,长于 wgpu_surface
@@ -420,12 +471,13 @@ unsafe fn init_terminal(
     renderer.set_clear_color(&settings.palette);
     let (session, reader) =
         PtySession::spawn(default_shell_command(), cols, rows).expect("spawn shell");
+    let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
     STATE.with(|cell| {
         *cell.borrow_mut() = Some(Terminal {
             term,
             session,
-            reader,
+            pty_buf: Arc::clone(&pty_buf),
             router,
             metrics,
             ctx,
@@ -438,56 +490,50 @@ unsafe fn init_terminal(
             renderer_atlas_revision: u64::MAX,
         });
     });
+    (reader, pty_buf)
 }
 
-unsafe fn message_loop(hwnd: HWND, reload: Option<ReloadHandle>) {
+/// 主循环:GetMessageW 阻塞等消息,零轮询(T7)。返回 0 = 取到 WM_QUIT,
+/// -1 = 错误,其余为有消息——不能按真值判(-1 也非零),先精确判 -1 再判 0。
+/// 渲染唤醒(WM_APP_RENDER)、输入、尺寸、热重载全在 wndproc 侧处理。
+unsafe fn message_loop(
+    reload: Option<ReloadHandle>,
+    hwnd_slot: SharedHwnd,
+    forwarder: std::thread::JoinHandle<()>,
+) {
     let mut msg = MSG::default();
     loop {
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).0 != 0 {
-            if msg.message == WM_QUIT {
-                // 退出序(参照 T7 纪律):先落 None 哨兵(watch 线程此后不再
-                // Post)→ drop watcher(其 Drop 停止后端并断开发送端,线程随之
-                // 退出)→ join 兜底;完事才做既有 teardown(Terminal 的 Drop
-                // 杀 pty)。残余 Post 到已销毁窗口只是失败返回,无害
-                if let Some(reload) = reload {
-                    *reload.hwnd_slot.lock().expect("hwnd slot poisoned") = None;
-                    drop(reload.watcher);
-                    let _ = reload.thread.join();
-                }
-                STATE.with(|cell| cell.borrow_mut().take());
-                return; // Terminal 的 Drop 在 TLS 存活时显式执行,退出期回调不再摸已销毁的 STATE
-            }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        let ret = GetMessageW(&mut msg, None, 0, 0);
+        if ret.0 == 0 {
+            break; // WM_QUIT:走退出序
         }
-
-        let mut needs_redraw = false;
-        STATE.with(|cell| {
-            let mut t_guard = cell.borrow_mut();
-            let Some(t) = t_guard.as_mut() else {
-                return;
-            };
-            let bytes = t.reader.drain();
-            if bytes.is_empty() {
-                return;
-            }
-            t.term.feed(&bytes);
-            // 终端对查询的应答(DSR/OSC)必须写回 pty,否则 shell 会卡在等待
-            for reply in t.term.take_pty_writes() {
-                let _ = t.session.write(reply.as_bytes());
-            }
-            if let Some(title) = t.term.take_title() {
-                let _ = SetWindowTextW(hwnd, &HSTRING::from(title));
-            }
-            needs_redraw = true;
-        });
-
-        if needs_redraw {
-            draw_frame();
+        if ret.0 as i32 == -1 {
+            // MSDN 明言别拿返回值当 bool:-1 是错误,消息内容未定义,只记录
+            eprintln!("GetMessageW failed, GetLastError={}", GetLastError().0);
+            break;
         }
-        // M0 轮询节流;M1 改为 reader 线程向队列投递消息唤醒
-        std::thread::sleep(Duration::from_millis(8));
+        let _ = TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
+
+    // 退出序 = T5 序的推广(哨兵 → 断源 → join):
+    // 1) 哨兵落 None,watch/转发线程自此不再向窗口 Post(残余 Post 到已销毁
+    //    窗口只是失败返回,无害);
+    // 2) drop watcher 断开 notify 通道,去抖线程随之退出,join 兜底;
+    // 3) STATE.take() 显式 Drop Terminal:杀 pty → pty 读线程 EOF 退出 →
+    //    通道断开 → 泊在 recv_block 上的转发线程拿到 None 退场;
+    // 4) join 转发线程兜底。
+    // 计划原文把 join 排在杀 pty 之前,前提是"转发线程至多阻塞在 PostMessageW
+    // 上(异步不阻塞,join 安全)";本实现它泊在 recv_block,pty 不断开就
+    // 不醒,先杀后 join 才不悬挂(偏差已记 task 报告)。
+    *hwnd_slot.lock().expect("hwnd slot poisoned") = None;
+    if let Some(reload) = reload {
+        drop(reload.watcher);
+        let _ = reload.thread.join();
+    }
+    STATE.with(|cell| cell.borrow_mut().take());
+    let _ = forwarder.join();
+    // Terminal 的 Drop 在 TLS 存活时显式执行,退出期回调不再摸已销毁的 STATE
 }
 
 fn draw_frame() {
@@ -596,6 +642,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             });
             // draw_frame 自己也要借 STATE,必须在 with 之外调用
             if resized {
+                draw_frame();
+            }
+            LRESULT(0)
+        }
+        WM_APP_RENDER => {
+            // pty 数据到了(转发线程 Post):取空共享缓冲 → 喂终端 → 查询
+            // 应答写回(否则 shell 卡在等应答)→ 标题 → 重绘。输入路径不在
+            // 此画:回显经 pty 回来,走的是同一个唤醒(见 WM_CHAR)
+            let mut drew = false;
+            STATE.with(|cell| {
+                let mut t_guard = cell.borrow_mut();
+                let Some(t) = t_guard.as_mut() else {
+                    return;
+                };
+                let bytes = std::mem::take(&mut *t.pty_buf.lock().expect("pty buffer poisoned"));
+                if bytes.is_empty() {
+                    return; // 队列里积压的重复唤醒:缓冲已被上一条取空,免重绘
+                }
+                t.term.feed(&bytes);
+                // 终端对查询的应答(DSR/OSC)必须写回 pty,否则 shell 会卡在等待
+                for reply in t.term.take_pty_writes() {
+                    let _ = t.session.write(reply.as_bytes());
+                }
+                if let Some(title) = t.term.take_title() {
+                    let _ = SetWindowTextW(hwnd, &HSTRING::from(title));
+                }
+                drew = true;
+            });
+            // draw_frame 自己也要借 STATE,必须在 with 之外调用
+            if drew {
                 draw_frame();
             }
             LRESULT(0)

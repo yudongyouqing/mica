@@ -27,6 +27,16 @@ impl PtyReader {
         }
         out
     }
+
+    /// Block until the next chunk arrives. Unlike `recv_timeout`, a `None`
+    /// here is unambiguous: it means *only* that the pty reader thread has
+    /// hung up (channel disconnected — pty closed or app shut down). A
+    /// quiet-but-alive pty keeps this parked. Pure channel plumbing, no GUI:
+    /// this is what lets the app's forwarder thread park here and still
+    /// notice shutdown without polling.
+    pub fn recv_block(&self) -> Option<Vec<u8>> {
+        self.rx.recv().ok()
+    }
 }
 
 /// A running child on a pseudo-terminal.
@@ -132,6 +142,7 @@ impl Drop for PtySession {
 mod tests {
     use super::*;
     use portable_pty::CommandBuilder;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     const MARKER: &[u8] = b"wgmark_777";
@@ -213,5 +224,18 @@ mod tests {
         let (mut session, reader) = PtySession::spawn(CommandBuilder::new("cat"), 80, 24).unwrap();
         session.write(b"wgtype_555\n").unwrap();
         read_until(&mut session, &reader, b"wgtype_555", TIMEOUT);
+    }
+
+    /// T7:`recv_block` 的 None 必须只代表"读线程挂断(通道断开)",不得像
+    /// recv_timeout 那样把"暂时没数据"也折叠成 None——转发线程泊在它上面,
+    /// 靠这个区分继续泊车与退场。纯通道构造,不起真 pty,mac 上即可跑。
+    #[test]
+    fn recv_block_none_only_on_disconnect() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let reader = PtyReader { rx };
+        tx.send(b"chunk".to_vec()).expect("send chunk");
+        assert_eq!(reader.recv_block().as_deref(), Some(&b"chunk"[..]));
+        drop(tx); // 读线程挂断 = 发送端消失
+        assert!(reader.recv_block().is_none());
     }
 }
