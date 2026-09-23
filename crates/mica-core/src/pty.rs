@@ -130,7 +130,9 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        // 杀子进程:测试不留僵尸 shell;真实退出流程由 Task 7 的 exited 态处理。
+        // 杀子进程:测试不留僵尸 shell。注:子进程真实退出的 exited 态尚未
+        // 实现——shell 自行退出后窗口仍存活、输入静默失败;观察项在 M1-B
+        // 计划 T9,UX 处理归 M2。
         // portable-pty 的 kill 是 SIGHUP→轮询→SIGKILL 升级,但 SIGKILL 路径
         // 不 wait —— 补一次收割,否则 trap 了 HUP 的子进程每个留一个僵尸。
         let _ = self.child.kill();

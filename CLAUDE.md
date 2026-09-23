@@ -58,9 +58,9 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - 快速拖动窗口有瞬态白块(DXGI 重建 backbuffer 未初始化内容 + 8ms 轮询丢帧窗口;M2 事件化渲染一并解决)
 - 鼠标选择/复制(M2);WM_CHAR 无代理对之外的 IME 组合窗口(M3 系统级 IME)
 - 不用 damage API,每帧全量重绘(计划 B 做脏区)
-- DECCKM 应用光标模式未实现;Alt 修饰符前缀未实现(计划 B)
+- Alt 编码已实现于 core;窗口路由(WM_SYSKEYDOWN/WM_SYSCHAR)未接,真机 Alt 组合当前整体不达(M2)
 - 渲染循环是 8ms 轮询(计划 B 事件化)
-- 调色板 OSC 4/12 查询全答白色;调色板三处定义(计划 B 收敛)
+- OSC 10/11/12 正确;OSC 4 索引 0-15 正确、16-255 答光标色(M4 修立方/灰阶)
 - 连字/COLR 彩色 emoji/光标样式变体(M2);bold-italic 复用 bold 面(M2);DPI 写死 96(spec §11)
 
 ## 提交规范

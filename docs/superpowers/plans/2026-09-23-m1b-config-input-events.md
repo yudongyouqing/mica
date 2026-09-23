@@ -198,11 +198,14 @@ pub fn take_damage(&mut self) -> Damage {
 3. config 坏行(如 `foo`)保存 → 错误提示,现配置不动
 4. `printf '\e]4;1;?\e\\'` 类探测(或 base16-shell/tmux 探测脚本)不误判——OSC 4 答主题色而非全白
 5. vim 打开 → 方向键移动正确(DECCKM SS3);`vim` 内 Home/End 正常
-6. Alt+Backspace/Alt+B 词删除(pwsh PSReadLine)正常
+6. Alt+Backspace/Alt+B 词删除(pwsh PSReadLine)**预计不达**——core 编码已实现,但窗口层 WM_SYSKEYDOWN/WM_SYSCHAR 未路由,真机 Alt 组合整体进不来;若验失败属已知缺口非回归,修复形状=wndproc 增挂 SYS 消息(排 M2 或随 T9 顺手)
 7. 空闲时任务管理器 CPU ≈0%(事件化生效)
 8. `dir /s` 长输出流畅、无残影;`cls` 后重打正常(脏区正确性)
 9. 未装 Sarasa 回退 Cascadia 不变;`themes/README.md` provenance 可查
 10. 推送后 CI 双平台绿;README 状态推进 M1c/M1d
+11. 主题名不变只改字号保存 → 屏幕内容保留(同尺寸 resize 早退,已源码级验证,真机确认)
+12. 用 PowerShell 5 写的 config(BOM/UTF-16)→ BOM 剥离生效或 UTF-16 弹窗提示
+13. 长滚动输出(`dir /s`)预期全量重建成本(上游滚动恒 mark full)——脏区收益在交互单行场景,勿以滚动 CPU 判脏区成败
 
 - [ ] **Step 2: 文档收尾**——CLAUDE.md"当前边界"清账(OSC 4/12、DECCKM、Alt、轮询、脏区五笔下账;8/16 硬编码残留核查);README 里程碑表 M1 全 ✅
 - [ ] **Step 3: Commit + push** `docs: M1-B complete, ledger updated`(分支 `m1b-config`,PR 流程同 M1-A)

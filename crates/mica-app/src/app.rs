@@ -214,18 +214,22 @@ fn load_settings() -> Settings {
             return Settings::default();
         }
     };
-    match settings::resolve(&source) {
+    // PowerShell 5 `Out-File` 等工具写 UTF-8 会带 BOM:不剥则首键(常是
+    // theme/font-family)被静默吞掉,配置"半生效"且无任何提示
+    let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
+    match settings::resolve(source) {
         Ok(s) => s,
         Err(err) => {
-            warn_box(&format_config_error(&path, &err));
+            warn_box(&format_config_error(&path, &err, "已回退默认设置"));
             Settings::default()
         }
     }
 }
 
 /// 错误弹窗文案:解析行错误带行号在前,值语义错误随后(与 ConfigError 同序)。
-fn format_config_error(path: &Path, err: &ConfigError) -> String {
-    let mut msg = format!("配置文件 {} 有误,已回退默认设置:", path.display());
+/// 结尾措辞按调用点参数化:启动路径回退默认,热重载路径保留当前设置。
+fn format_config_error(path: &Path, err: &ConfigError, outcome: &str) -> String {
+    let mut msg = format!("配置文件 {} 有误,{outcome}:", path.display());
     for e in &err.parse {
         msg.push_str(&format!("\n  第 {} 行: {}", e.line, e.reason));
     }
@@ -261,7 +265,15 @@ fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle> {
     // notify 的 EventHandler 直接支持 std mpsc Sender<Result<Event>>;
     // watcher 持有发送端,Drop 时后端停止、通道断开,线程随之退出
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let mut watcher = notify::recommended_watcher(tx).expect("create config watcher");
+    // 创建/监听/起线程三步都按"绝不致命"降级:失败只记日志、热重载关闭,
+    // 绝不 expect 崩终端
+    let mut watcher = match notify::recommended_watcher(tx) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("config watcher: 创建失败:{e};热重载未启用");
+            return None;
+        }
+    };
     if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
         eprintln!(
             "config watcher: 无法监听 {}: {e};热重载未启用",
@@ -270,10 +282,16 @@ fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle> {
         return None;
     }
     let thread_slot = Arc::clone(&hwnd_slot);
-    let thread = std::thread::Builder::new()
+    let thread = match std::thread::Builder::new()
         .name("config-watcher".into())
         .spawn(move || debounce_loop(path, rx, thread_slot))
-        .expect("spawn config watcher thread");
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("config watcher: 线程创建失败:{e};热重载未启用");
+            return None; // watcher 随之 Drop,后端停止
+        }
+    };
     Some(ReloadHandle { watcher, thread })
 }
 
@@ -360,10 +378,12 @@ unsafe fn reload_config(hwnd: HWND) {
         ));
         return;
     };
-    let settings = match settings::resolve(&source) {
+    // 与启动路径同一 BOM 剥离:热重载不该比首读更挑剔编码
+    let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
+    let settings = match settings::resolve(source) {
         Ok(s) => s,
         Err(err) => {
-            warn_box(&format_config_error(&path, &err));
+            warn_box(&format_config_error(&path, &err, "已保留当前设置"));
             return; // 保旧
         }
     };
@@ -515,13 +535,13 @@ unsafe fn message_loop(
     let mut msg = MSG::default();
     loop {
         let ret = GetMessageW(&mut msg, None, 0, 0);
-        if ret.0 == 0 {
-            break; // WM_QUIT:走退出序
-        }
-        if ret.0 as i32 == -1 {
+        if ret.0 == -1 {
             // MSDN 明言别拿返回值当 bool:-1 是错误,消息内容未定义,只记录
             eprintln!("GetMessageW failed, GetLastError={}", GetLastError().0);
             break;
+        }
+        if ret.0 == 0 {
+            break; // WM_QUIT:走退出序
         }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
