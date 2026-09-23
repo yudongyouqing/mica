@@ -196,7 +196,7 @@ pub fn take_damage(&mut self) -> Damage {
 1. `%APPDATA%\mica\config` 写 `theme = Dracula` 保存 → 即时换肤,16 色+底色+光标全换
 2. `font-size = 16` 保存 → 字号即时变,窗口尺寸不变、网格重排
 3. config 坏行(如 `foo`)保存 → 错误提示,现配置不动
-4. `printf '\e]4;1;?\e\\'` 类探测(或 base16-shell/tmux 探测脚本)不误判——OSC 4 答主题色而非全白
+4. `printf '\e]4;1;?\e\\'` 类探测(或 base16-shell/tmux 探测脚本)不误判——OSC 4 答主题色而非全白(注:`\e]4;*;?` 通配符探测被 vte 上游静默丢弃(无应答)——**静默是预期**,勿当损坏;数字索引探测才有应答)
 5. vim 打开 → 方向键移动正确(DECCKM SS3);`vim` 内 Home/End 正常
 6. Alt+Backspace/Alt+B 词删除(pwsh PSReadLine)**预计不达**——core 编码已实现,但窗口层 WM_SYSKEYDOWN/WM_SYSCHAR 未路由,真机 Alt 组合整体进不来;若验失败属已知缺口非回归,修复形状=wndproc 增挂 SYS 消息(排 M2 或随 T9 顺手)
 7. 空闲时任务管理器 CPU ≈0%(事件化生效)
