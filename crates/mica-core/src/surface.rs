@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::term::cell::Cell;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 
 use crate::config::palette::Palette;
@@ -164,6 +164,12 @@ impl Surface {
         self.term.grid()
     }
 
+    /// DECCKM(DECSET 1)application cursor keys:编码器据此把导航键发成
+    /// SS3 而非 CSI。
+    pub fn app_cursor_mode(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
     pub fn size(&self) -> ScreenSize {
         self.size
     }
@@ -221,6 +227,17 @@ mod tests {
         let mut s = Surface::new(ScreenSize::new(10, 3));
         s.feed(b"\x1b]0;my title\x07");
         assert_eq!(s.take_title(), Some("my title".to_string()));
+    }
+
+    #[test]
+    fn decset_cursor_keys_toggles_app_cursor_mode() {
+        // DECSET 1 (DECCKM):编码器据此决定导航键走 SS3 还是 CSI
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert!(!s.app_cursor_mode());
+        s.feed(b"\x1b[?1h");
+        assert!(s.app_cursor_mode());
+        s.feed(b"\x1b[?1l");
+        assert!(!s.app_cursor_mode());
     }
 
     #[test]

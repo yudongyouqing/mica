@@ -551,14 +551,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            let bytes = vkey_bytes(wparam.0 as u32, current_mods());
-            if let Some(bytes) = bytes {
-                STATE.with(|cell| {
-                    if let Some(t) = cell.borrow_mut().as_mut() {
-                        let _ = t.session.write(&bytes);
-                    }
-                });
-            }
+            // 编码要读 term 的 DECCKM 模式,索性连同写回共用一次借用
+            //(RefCell 内不嵌套第二借用,app_cursor_mode 只借走 &t.term)
+            STATE.with(|cell| {
+                if let Some(t) = cell.borrow_mut().as_mut()
+                    && let Some(bytes) =
+                        vkey_bytes(wparam.0 as u32, current_mods(), t.term.app_cursor_mode())
+                {
+                    let _ = t.session.write(&bytes);
+                }
+            });
             LRESULT(0)
         }
         WM_SIZE => {
@@ -616,7 +618,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-fn vkey_bytes(vk: u32, mods: Mods) -> Option<Vec<u8>> {
+fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
     let key = match VIRTUAL_KEY(vk as u16) {
         VK_UP => Key::Up,
         VK_DOWN => Key::Down,
@@ -629,7 +631,7 @@ fn vkey_bytes(vk: u32, mods: Mods) -> Option<Vec<u8>> {
         VK_NEXT => Key::PageDown,
         _ => return None,
     };
-    input::encode(key, mods)
+    Some(input::encode(key, mods, app_cursor))
 }
 
 fn current_mods() -> Mods {

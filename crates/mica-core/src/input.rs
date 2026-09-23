@@ -42,9 +42,22 @@ pub enum Key {
     PageDown,
 }
 
-/// Encode a key press. `None` = no M0 mapping (caller drops the event).
-pub fn encode(key: Key, mods: Mods) -> Option<Vec<u8>> {
+/// Encode a key press into the byte sequence the pty expects.
+///
+/// `app_cursor` mirrors DECCKM (DECSET 1, application cursor keys): when set
+/// and *no* modifier is held, Up/Down/Right/Left/Home/End emit SS3 sequences
+/// (`\x1bO…`). SS3 carries no modifier parameter, so any held modifier keeps
+/// the CSI form (`\x1b[1;<p><ch>`).
+///
+/// Alt uses xterm meta encoding: any non-empty sequence gains a leading ESC
+/// (Alt+Backspace -> ESC DEL, Alt+Enter -> ESC CR, Alt+Up -> ESC + CSI).
+/// Alt+Escape therefore doubles to ESC ESC — indistinguishable from a bare
+/// ESC followed by another, the same ambiguity xterm itself has. Alt+Tab
+/// would encode as ESC + TAB, but Windows consumes Alt+Tab at the OS level
+/// before it ever reaches the window.
+pub fn encode(key: Key, mods: Mods, app_cursor: bool) -> Vec<u8> {
     let p = mods.xterm_param();
+    let app_nav = app_cursor && mods == Mods::NONE;
     let tilde = |n: u8| {
         if mods == Mods::NONE {
             format!("\x1b[{n}~").into_bytes()
@@ -59,12 +72,18 @@ pub fn encode(key: Key, mods: Mods) -> Option<Vec<u8>> {
             format!("\x1b[1;{p}{letter}").into_bytes()
         }
     };
-    Some(match key {
+    let seq = match key {
         Key::Enter => b"\r".to_vec(),
         Key::Backspace => b"\x7f".to_vec(),
         Key::Tab if mods.shift => b"\x1b[Z".to_vec(),
         Key::Tab => b"\t".to_vec(),
         Key::Escape => b"\x1b".to_vec(),
+        Key::Up if app_nav => b"\x1bOA".to_vec(),
+        Key::Down if app_nav => b"\x1bOB".to_vec(),
+        Key::Right if app_nav => b"\x1bOC".to_vec(),
+        Key::Left if app_nav => b"\x1bOD".to_vec(),
+        Key::Home if app_nav => b"\x1bOH".to_vec(),
+        Key::End if app_nav => b"\x1bOF".to_vec(),
         Key::Up => cs('A'),
         Key::Down => cs('B'),
         Key::Right => cs('C'),
@@ -74,7 +93,15 @@ pub fn encode(key: Key, mods: Mods) -> Option<Vec<u8>> {
         Key::Delete => tilde(3),
         Key::PageUp => tilde(5),
         Key::PageDown => tilde(6),
-    })
+    };
+    if mods.alt {
+        let mut out = Vec::with_capacity(seq.len() + 1);
+        out.push(b'\x1b');
+        out.extend_from_slice(&seq);
+        out
+    } else {
+        seq
+    }
 }
 
 #[cfg(test)]
@@ -82,7 +109,7 @@ mod tests {
     use super::*;
 
     fn enc(key: Key, mods: Mods) -> Vec<u8> {
-        encode(key, mods).expect("key should encode")
+        encode(key, mods, false)
     }
 
     #[test]
@@ -164,6 +191,136 @@ mod tests {
                 }
             ),
             b"\x1b[5;2~"
+        );
+    }
+
+    #[test]
+    fn app_cursor_mode_emits_ss3_for_six_nav_keys() {
+        // DECCKM: 无修饰时六个导航键走 SS3(\x1bO<ch>)
+        let cases = [
+            (Key::Up, b'A'),
+            (Key::Down, b'B'),
+            (Key::Right, b'C'),
+            (Key::Left, b'D'),
+            (Key::Home, b'H'),
+            (Key::End, b'F'),
+        ];
+        for (key, ch) in cases {
+            assert_eq!(encode(key, Mods::NONE, true), [0x1b, b'O', ch]);
+        }
+    }
+
+    #[test]
+    fn app_cursor_mode_with_any_modifier_stays_csi() {
+        // SS3 没有修饰参数;xterm 规范规定带修饰的键回落 CSI
+        assert_eq!(
+            encode(
+                Key::Up,
+                Mods {
+                    ctrl: true,
+                    ..Mods::NONE
+                },
+                true
+            ),
+            b"\x1b[1;5A"
+        );
+        assert_eq!(
+            encode(
+                Key::End,
+                Mods {
+                    shift: true,
+                    ..Mods::NONE
+                },
+                true
+            ),
+            b"\x1b[1;2F"
+        );
+    }
+
+    #[test]
+    fn app_cursor_mode_leaves_non_nav_keys_alone() {
+        assert_eq!(encode(Key::Enter, Mods::NONE, true), b"\r");
+        assert_eq!(encode(Key::Backspace, Mods::NONE, true), b"\x7f");
+        assert_eq!(encode(Key::Delete, Mods::NONE, true), b"\x1b[3~");
+        assert_eq!(encode(Key::Escape, Mods::NONE, true), b"\x1b");
+    }
+
+    #[test]
+    fn alt_prepends_escape_meta_encoding() {
+        // xterm meta 编码:任何非空序列前加 ESC
+        assert_eq!(
+            enc(
+                Key::Backspace,
+                Mods {
+                    alt: true,
+                    ..Mods::NONE
+                }
+            ),
+            b"\x1b\x7f"
+        );
+        assert_eq!(
+            enc(
+                Key::Enter,
+                Mods {
+                    alt: true,
+                    ..Mods::NONE
+                }
+            ),
+            b"\x1b\r"
+        );
+        // alt 使方向键走 CSI(参数 3 = 1 + alt),meta 前缀再叠在上面
+        assert_eq!(
+            enc(
+                Key::Up,
+                Mods {
+                    alt: true,
+                    ..Mods::NONE
+                }
+            ),
+            b"\x1b\x1b[1;3A"
+        );
+    }
+
+    #[test]
+    fn alt_escape_and_alt_tab_are_documented_edge_cases() {
+        // Alt+Escape 变成 ESC ESC —— 与裸 ESC 难以区分,xterm 的 meta
+        // 编码同样如此,接受这个歧义(不改特判)。
+        assert_eq!(
+            enc(
+                Key::Escape,
+                Mods {
+                    alt: true,
+                    ..Mods::NONE
+                }
+            ),
+            b"\x1b\x1b"
+        );
+        // Alt+Tab 本应编码为 ESC + TAB,但 Windows 在 OS 层就吃掉了
+        // Alt+Tab,此路径实际只在测试里可达。
+        assert_eq!(
+            enc(
+                Key::Tab,
+                Mods {
+                    alt: true,
+                    ..Mods::NONE
+                }
+            ),
+            b"\x1b\t"
+        );
+    }
+
+    #[test]
+    fn alt_shift_tab_prepends_escape_to_backtab() {
+        assert_eq!(
+            enc(
+                Key::Tab,
+                Mods {
+                    shift: true,
+                    alt: true,
+                    ..Mods::NONE
+                }
+            ),
+            b"\x1b\x1b[Z"
         );
     }
 }
