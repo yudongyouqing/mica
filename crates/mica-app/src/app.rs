@@ -42,7 +42,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
     DispatchMessageW, GetClientRect, GetMessageW, LoadCursorW, MSG, MessageBoxW, PostMessageW,
     PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR,
-    WM_DESTROY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK};
 use windows::core::{HSTRING, PCWSTR, w};
@@ -662,6 +663,54 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             });
             LRESULT(0)
+        }
+        WM_SYSKEYDOWN => {
+            // Alt 组合的窗口层路由(M1 已知缺口清账):Alt+方向/编辑键走与
+            // WM_KEYDOWN 同一条 encode 路径(alt 位已在 Mods 里,encode 加 ESC
+            // 前缀)。我们不认识的系统键(Alt+F4、Alt+Space)必须落回
+            // DefWindowProc,吞掉 return 0 会废掉系统行为
+            match vkey_bytes(wparam.0 as u32, current_mods(), false) {
+                Some(bytes) => {
+                    STATE.with(|cell| {
+                        if let Some(t) = cell.borrow_mut().as_mut() {
+                            let _ = t.session.write(&bytes);
+                        }
+                    });
+                    LRESULT(0)
+                }
+                None => DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+        }
+        WM_SYSCHAR => {
+            // Alt+可打印字符 = xterm meta 编码(ESC + 字符)。Alt+Space 等
+            // 系统助记符落回 DefWindowProc(菜单激活)
+            let code = wparam.0 as u32;
+            if code == 0x20 || (code < 0x20 && code != 0x0d && code != 0x08) {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            } else if let Some(c) = char::from_u32(code) {
+                // 退格 0x08 同 WM_CHAR 语义归一为 DEL
+                let mut bytes: Vec<u8> = if c == '\u{8}' {
+                    vec![0x7f]
+                } else {
+                    c.to_string().into_bytes()
+                };
+                STATE.with(|cell| {
+                    if let Some(t) = cell.borrow_mut().as_mut() {
+                        // Alt 修饰由消息本身保证:前置 ESC 完成 meta 编码
+                        let mut prefixed = vec![0x1b];
+                        prefixed.append(&mut bytes);
+                        let _ = t.session.write(&prefixed);
+                    }
+                });
+                LRESULT(0)
+            } else {
+                LRESULT(0)
+            }
+        }
+        WM_ERASEBKGND => {
+            // 客户区全由 wgpu 清屏:阻止系统擦背景——resize 时旧内容闪白
+            // 的来源就是这擦除(D3D 未准备好前的一帧系统底色)
+            LRESULT(1)
         }
         WM_SIZE => {
             // lparam 低位 = 客户区宽,高位 = 客户区高(像素)
