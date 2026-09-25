@@ -13,6 +13,10 @@ pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
     pub cursor: Rgb,
+    /// 选区配色(spec §5):主题库 630 个文件全带 selection-* 键,
+    /// M1 忽略、M2a 接上。
+    pub selection_fg: Rgb,
+    pub selection_bg: Rgb,
 }
 
 impl Default for Palette {
@@ -122,6 +126,16 @@ impl Palette {
             g: 0xff,
             b: 0xff,
         },
+        selection_fg: Rgb {
+            r: 0x1e,
+            g: 0x1e,
+            b: 0x1e,
+        },
+        selection_bg: Rgb {
+            r: 0xd4,
+            g: 0xd4,
+            b: 0xd4,
+        },
     };
 
     /// 应用一个主题/用户键值对。M1 键集:`palette = <0-15>=#rrggbb`、
@@ -144,6 +158,8 @@ impl Palette {
             "foreground" => self.fg = parse_hex(value)?,
             "background" => self.bg = parse_hex(value)?,
             "cursor-color" => self.cursor = parse_hex(value)?,
+            "selection-foreground" => self.selection_fg = parse_hex(value)?,
+            "selection-background" => self.selection_bg = parse_hex(value)?,
             _ => {} // 未知键静默跳过(合成层同理)
         }
         Ok(())
