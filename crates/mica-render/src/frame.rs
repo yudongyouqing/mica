@@ -1,33 +1,24 @@
 //! Grid -> render instances. Pure CPU; the GPU pass (Task 6) just draws them.
 
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::Grid;
 use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::Rgb;
 
-use mica_core::surface::Surface;
+use mica_core::config::palette::Palette;
+use mica_core::surface::{Damage, Surface};
 
 use crate::color::resolve;
 use crate::font::GlyphStyle;
 use crate::font::metrics::FontMetrics;
 use crate::font::router::GlyphRouter;
 
-pub const DEFAULT_FG: Rgb = Rgb {
-    r: 0xff,
-    g: 0xff,
-    b: 0xff,
-};
-pub const DEFAULT_BG: Rgb = Rgb {
-    r: 0x1e,
-    g: 0x1e,
-    b: 0x1e,
-};
-
 /// One drawable quad. `pos_uv = [x_px, y_px, u, v]`(uv 为图集内左上,0..1),
 /// `size_uv = [w_px, h_px, uw, uvh]`(像素尺寸 + uv 尺寸,0..1)。
 /// 背景 quad 与空白格均用 `blank` 形态:uv 尺寸 0,shader 墨恒 0。
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CellInstance {
     pub pos_uv: [f32; 4],
     pub size_uv: [f32; 4],
@@ -77,6 +68,7 @@ pub fn build_instances(
     surface: &Surface,
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
+    palette: &Palette,
 ) -> Vec<CellInstance> {
     let grid = surface.grid();
     let cols = grid.columns();
@@ -91,8 +83,8 @@ pub fn build_instances(
     for line in 0..rows {
         for col in 0..cols {
             let cell = &grid[Line(line as i32)][Column(col)];
-            let mut fg = resolve(cell.fg, DEFAULT_FG, DEFAULT_BG);
-            let mut bg = resolve(cell.bg, DEFAULT_FG, DEFAULT_BG);
+            let mut fg = resolve(cell.fg, palette);
+            let mut bg = resolve(cell.bg, palette);
             // 先反色后光标(双交换抵消,光标在选区仍可辨——已裁定顺序)
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
@@ -117,6 +109,126 @@ pub fn build_instances(
         }
     }
     out.extend(glyphs);
+    out
+}
+
+/// 一行的两段实例:bg 整格段(行内每格一实例)+ 字形段(仅非空白格)。
+/// 行主序持有;**全局**两遍发射契约(全部 bg 先于全部字形)由 [`repack`]
+/// 平铺时恢复——行内只保序,平铺才定序。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RowInst {
+    pub bg: Vec<CellInstance>,
+    pub glyphs: Vec<CellInstance>,
+}
+
+/// 行级重建入口(Task 8),按 `damage` 分路:
+///
+/// - `Full`:全部行重建(与 [`build_instances`] 全量黄金源逐字节等价,
+///   黄金对拍测试锁定);
+/// - `Lines(rows)`:只重建列出的行——受伤行取**当前** grid 状态,与上次
+///   全量的先后无关;未伤行原样保留,路由缓存兜住重复字形的光栅化成本;
+/// - `Lines(空)`:纯 no-op(零路由调用,行缓存原样)。上游 `Term::damage()`
+///   恒伤光标行,空集一般只出现在手动构造/兜底路径,分支仍须正确。
+///
+/// 结构守恒:`rows.len()` 必须等于视口行数;不符(resize 后、首建、调用方
+/// 维护失误)一律退化为全量重建——行数错位是结构性失配,增量修不回来。
+pub fn build_rows(
+    surface: &Surface,
+    router: &mut dyn GlyphRouter,
+    metrics: &FontMetrics,
+    palette: &Palette,
+    damage: &Damage,
+    rows: &mut Vec<RowInst>,
+) {
+    let grid = surface.grid();
+    let screen_lines = grid.screen_lines();
+    if rows.len() != screen_lines {
+        rebuild_all(grid, router, metrics, palette, rows);
+        return;
+    }
+    match damage {
+        Damage::Full => rebuild_all(grid, router, metrics, palette, rows),
+        Damage::Lines(lines) => {
+            for &line in lines {
+                if line < screen_lines {
+                    rows[line] = build_row(grid, line, router, metrics, palette);
+                }
+            }
+        }
+    }
+}
+
+/// 全量重建 `rows` 为恰好视口行数(清尾,适配 resize 缩行)。
+fn rebuild_all(
+    grid: &Grid<Cell>,
+    router: &mut dyn GlyphRouter,
+    metrics: &FontMetrics,
+    palette: &Palette,
+    rows: &mut Vec<RowInst>,
+) {
+    rows.clear();
+    for line in 0..grid.screen_lines() {
+        rows.push(build_row(grid, line, router, metrics, palette));
+    }
+}
+
+/// 单行两段发射:bg 段(每格一整格 quad)先行,字形段随后。与
+/// [`build_instances`](全量黄金源)的行内逻辑逐格对齐——两处必须同步修改,
+/// 黄金对拍测试锁定等价。
+fn build_row(
+    grid: &Grid<Cell>,
+    line: usize,
+    router: &mut dyn GlyphRouter,
+    metrics: &FontMetrics,
+    palette: &Palette,
+) -> RowInst {
+    let cols = grid.columns();
+    let cursor = grid.cursor.point;
+    let cursor_line = usize::try_from(cursor.line.0).unwrap_or(usize::MAX);
+    let cursor_col = cursor.column.0;
+    let mut row = RowInst::default();
+    row.bg.reserve(cols);
+    for col in 0..cols {
+        let cell = &grid[Line(line as i32)][Column(col)];
+        let mut fg = resolve(cell.fg, palette);
+        let mut bg = resolve(cell.bg, palette);
+        // 先反色后光标(双交换抵消,光标在反色上仍可辨——已裁定顺序)
+        if cell.flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if line == cursor_line && col == cursor_col {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        let x = col as f32 * metrics.cell_width;
+        let y = line as f32 * metrics.line_height;
+        row.bg.push(blank(x, y, metrics, fg, bg));
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.c == ' ' {
+            continue;
+        }
+        let g = router.route(cell.c, GlyphStyle::from_flags(cell.flags));
+        row.glyphs.push(CellInstance {
+            pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
+            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+            fg: to_color(fg),
+            bg: to_color(bg),
+        });
+    }
+    row
+}
+
+/// 平铺行结构为单实例缓冲,恢复全局两遍发射序:先所有行的 bg 段(行主序
+/// 连续),后所有行的字形段——与 [`build_instances`]/管线契约逐位一致
+/// (黄金对拍锁定)。逐帧分配暂留(计划的暂记账),缓冲复用另案。
+pub fn repack(rows: &[RowInst]) -> Vec<CellInstance> {
+    let bg_total: usize = rows.iter().map(|r| r.bg.len()).sum();
+    let glyph_total: usize = rows.iter().map(|r| r.glyphs.len()).sum();
+    let mut out = Vec::with_capacity(bg_total + glyph_total);
+    for row in rows {
+        out.extend_from_slice(&row.bg);
+    }
+    for row in rows {
+        out.extend_from_slice(&row.glyphs);
+    }
     out
 }
 
@@ -180,7 +292,10 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| false,
         };
-        assert_eq!(build_instances(&s, &mut r, &metrics_8x16()).len(), 8);
+        assert_eq!(
+            build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT).len(),
+            8
+        );
     }
 
     #[test]
@@ -194,7 +309,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| false,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16());
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
         // 两段式:bg 段 inst[0..4) 行优先每格一整格 quad,字形段随后
         assert_eq!(inst.len(), 5, "4 bg + 1 字形");
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -221,7 +336,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16());
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
         assert_eq!(inst.len(), 5, "4 bg + 1 宽字形(spacer 不出字形)");
         // bg 段:格 0 与 spacer 格(格 1)都是整格 blank
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -261,7 +376,7 @@ mod tests {
                 wide: |_| false,
             },
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16());
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
         // 顺序:A@0(bold)、B@1(反色)、光标@2(空格)、空格@3
         // 两段式:bg 段 [0..4) = A、B、光标格、空格;字形段 [4..6) = A、B
         assert_eq!(inst.len(), 6, "4 bg + A、B 两个字形");
@@ -343,7 +458,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16());
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
         // bg 段:全部 4 格在前,均整格 blank(uv 尺寸 0),行优先
         for (i, cell) in inst.iter().take(4).enumerate() {
             assert_eq!(
@@ -356,5 +471,251 @@ mod tests {
         // 字形段:宽字形在全部 bg 之后(索引 4),横跨 2 格,其后无实例
         assert_eq!(inst.len(), 5, "宽字形之后不得再有任何实例");
         assert_eq!(inst[4].size_uv, [12.0, 12.0, 12.0 / 64.0, 12.0 / 64.0]);
+    }
+
+    /// 实例颜色必须来自传入的 palette,而非任何内置常量:
+    /// 槽 1 喂红色前景、bg 换浅色,两段(bg quad + 字形)都随行。
+    #[test]
+    fn instance_colors_flow_from_palette() {
+        let mut s = Surface::new(ScreenSize::new(4, 1));
+        s.feed(b"\x1b[31mA");
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 6.0,
+            glyph_h: 12.0,
+            wide: |_| false,
+        };
+        let mut pal = Palette::DEFAULT;
+        pal.apply_pair("palette", "1=#112233").unwrap();
+        pal.apply_pair("background", "#abcdef").unwrap();
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &pal);
+        // bg 段 inst[0]:A 的背景 = palette.bg(浅色),前景 = 槽 1
+        assert_eq!(
+            inst[0].bg,
+            [
+                0xab as f32 / 255.0,
+                0xcd as f32 / 255.0,
+                0xef as f32 / 255.0,
+                0.0
+            ]
+        );
+        assert_eq!(
+            inst[0].fg,
+            [
+                0x11 as f32 / 255.0,
+                0x22 as f32 / 255.0,
+                0x33 as f32 / 255.0,
+                0.0
+            ]
+        );
+        // 字形段 inst[4]:同一对颜色(自绘 bg 盖 bbox,无害叠绘)
+        assert_eq!(inst[4].fg, inst[0].fg);
+        assert_eq!(inst[4].bg, inst[0].bg);
+    }
+
+    // ---- Task 8: 行级脏区重建 + repack ----
+
+    fn bytes(insts: &[CellInstance]) -> &[u8] {
+        bytemuck::cast_slice(insts)
+    }
+
+    /// 计数路由:转调 FakeRouter。`calls` = route 原始调用次数(受伤行重发
+    /// 必然重复路由),`fresh` = 首见 (char, style) 数——模拟 DwriteRouter 的
+    /// 图集缓存语义:重复字形命中缓存,不再产生真实光栅化工作。
+    struct CountingRouter<'a> {
+        calls: &'a std::cell::Cell<usize>,
+        fresh: &'a std::cell::Cell<usize>,
+        seen: std::collections::HashSet<(char, crate::font::GlyphStyle)>,
+        inner: FakeRouter,
+    }
+    impl crate::font::router::GlyphRouter for CountingRouter<'_> {
+        fn route(
+            &mut self,
+            ch: char,
+            style: crate::font::GlyphStyle,
+        ) -> crate::font::router::GlyphInfo {
+            self.calls.set(self.calls.get() + 1);
+            if self.seen.insert((ch, style)) {
+                self.fresh.set(self.fresh.get() + 1);
+            }
+            self.inner.route(ch, style)
+        }
+    }
+
+    fn counting_router<'a>(
+        calls: &'a std::cell::Cell<usize>,
+        fresh: &'a std::cell::Cell<usize>,
+    ) -> CountingRouter<'a> {
+        CountingRouter {
+            calls,
+            fresh,
+            seen: std::collections::HashSet::new(),
+            inner: FakeRouter {
+                atlas_w: 64.0,
+                atlas_h: 64.0,
+                glyph_w: 6.0,
+                glyph_h: 12.0,
+                wide: |_| true, // 空格不路由,wide 与否只影响几何,计数不受影响
+            },
+        }
+    }
+
+    /// 黄金对拍(计划 Step 4):Full 全量的 rows → repack 必须与黄金源
+    /// build_instances 逐字节等价——两遍发射契约没有在行级重排中漂移。
+    /// 内容覆盖:普通字符、SGR 颜色、反色、bold、宽字形(含 spacer)、
+    /// 光标格与滚屏内容。
+    #[test]
+    fn golden_full_repack_matches_build_instances_byte_for_byte() {
+        let mut s = Surface::new(ScreenSize::new(6, 4));
+        s.feed(b"A\x1b[31mB\x1b[7mC\r\n");
+        s.feed("中D".as_bytes());
+        s.feed(b"\r\n\r\n\x1b[1mE");
+        let calls = std::cell::Cell::new(0);
+        let fresh = std::cell::Cell::new(0);
+        let mut router = counting_router(&calls, &fresh);
+        let damage = s.take_damage();
+        assert_eq!(damage, mica_core::surface::Damage::Full, "首帧哨兵必全量");
+        let mut rows = Vec::new();
+        build_rows(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &damage,
+            &mut rows,
+        );
+        let repacked = repack(&rows);
+        let golden = build_instances(&s, &mut router, &metrics_8x16(), &Palette::DEFAULT);
+        assert_eq!(
+            bytes(&repacked),
+            bytes(&golden),
+            "repack(build_rows(Full)) 必须与 build_instances 逐字节一致"
+        );
+    }
+
+    /// 行级增量:只重建受损行——路由调用次数作证,未伤行的实例位图原样。
+    #[test]
+    fn partial_damage_rebuilds_only_damaged_rows() {
+        let mut s = Surface::new(ScreenSize::new(4, 3));
+        s.feed(b"AB\x1b[3;1HC"); // 行 0 写 AB,行 2 写 C(光标停行 2)
+        let calls = std::cell::Cell::new(0);
+        let fresh = std::cell::Cell::new(0);
+        let mut router = counting_router(&calls, &fresh);
+        let mut rows = Vec::new();
+        let damage = s.take_damage();
+        assert_eq!(damage, mica_core::surface::Damage::Full, "首帧哨兵必全量");
+        build_rows(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &damage,
+            &mut rows,
+        );
+        assert_eq!(calls.get(), 3, "全量:A、B、C 各路由一次");
+        assert_eq!(fresh.get(), 3, "全量首见:A、B、C");
+        let row0_bg = bytes(&rows[0].bg).to_vec();
+        let row0_glyphs = bytes(&rows[0].glyphs).to_vec();
+        let row1 = rows[1].clone();
+
+        s.feed(b"D"); // 光标已停行 2:只伤行 2
+        let damage = s.take_damage();
+        assert_eq!(damage, mica_core::surface::Damage::Lines(vec![2]));
+        calls.set(0);
+        build_rows(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &damage,
+            &mut rows,
+        );
+        assert_eq!(calls.get(), 2, "受伤行整行重发:C(缓存命中)+ D");
+        assert_eq!(fresh.get(), 4, "图集缓存兜底:仅 D 是新字形");
+        assert_eq!(
+            bytes(&rows[0].bg),
+            &row0_bg[..],
+            "未伤行 0 的 bg 段不得变化"
+        );
+        assert_eq!(
+            bytes(&rows[0].glyphs),
+            &row0_glyphs[..],
+            "未伤行 0 的字形段不得变化"
+        );
+        assert_eq!(rows[1], row1, "未伤行 1 原样");
+        // 受伤行拿到的是当前 grid 状态
+        assert_eq!(rows[2].glyphs.len(), 2, "行 2 现有 C、D 两个字形");
+    }
+
+    /// 空 Lines 脏区 = 纯 no-op:零路由调用,行缓存位图原样。
+    /// (上游 Term::damage() 恒伤光标行,空集经 Surface::take_damage 不可达;
+    /// 此分支是"无变化不重绘"的库级兜底。)
+    #[test]
+    fn empty_damage_is_no_op() {
+        let s = Surface::new(ScreenSize::new(2, 2));
+        let calls = std::cell::Cell::new(0);
+        let fresh = std::cell::Cell::new(0);
+        let mut router = counting_router(&calls, &fresh);
+        let mut rows = Vec::new();
+        build_rows(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &mica_core::surface::Damage::Full,
+            &mut rows,
+        );
+        let snapshot = rows.clone();
+        calls.set(0);
+        build_rows(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &mica_core::surface::Damage::Lines(vec![]),
+            &mut rows,
+        );
+        assert_eq!(calls.get(), 0, "空脏区不得触发任何路由");
+        assert_eq!(rows, snapshot, "空脏区行缓存原样");
+    }
+
+    /// repack 平铺恢复全局两遍发射序:全部行的 bg 段在前(行主序连续),
+    /// 全部字形段随后——管线 blend:None 契约的行级等价物。
+    #[test]
+    fn repack_emits_all_backgrounds_before_all_glyphs() {
+        let mut s = Surface::new(ScreenSize::new(3, 2));
+        s.feed("中E".as_bytes()); // 行 0 宽字形(占 2 格)+ E
+        s.feed(b"\r\nF"); // 行 1 字形
+        let calls = std::cell::Cell::new(0);
+        let fresh = std::cell::Cell::new(0);
+        let mut router = counting_router(&calls, &fresh);
+        let mut rows = Vec::new();
+        build_rows(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &mica_core::surface::Damage::Full,
+            &mut rows,
+        );
+        let packed = repack(&rows);
+        let bg_total: usize = rows.iter().map(|r| r.bg.len()).sum();
+        assert_eq!(bg_total, 6, "每格一整格背景:2 行 x 3 格");
+        assert_eq!(packed.len(), bg_total + 3, "字形段:中、E、F");
+        for (i, inst) in packed.iter().take(bg_total).enumerate() {
+            assert_eq!(
+                inst.size_uv[2], 0.0,
+                "packed[{i}] 在 bg 段内:uv 尺寸 0(blank 形态)"
+            );
+        }
+        for (i, inst) in packed.iter().skip(bg_total).enumerate() {
+            assert!(inst.size_uv[2] > 0.0, "packed[{}] 在字形段内", bg_total + i);
+        }
+        // 行主序:bg 段内前 3 个是行 0(x = 0/8/16),后 3 个是行 1
+        for (i, x) in [0.0, 8.0, 16.0].into_iter().enumerate() {
+            assert_eq!(packed[i].pos_uv[0], x);
+            assert_eq!(packed[3 + i].pos_uv[0], x);
+        }
     }
 }

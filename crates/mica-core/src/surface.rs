@@ -7,8 +7,20 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Grid};
 use alacritty_terminal::term::cell::Cell;
-use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Processor, Rgb};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+use alacritty_terminal::vte::ansi::Processor;
+
+use crate::config::palette::Palette;
+
+/// 视口脏区(Task 8):`Full` = 全屏重建;`Lines` = 仅列出的视口行
+/// (0 = 顶,升序、无重复)。行号语义已对齐 alacritty 0.26:`Term::damage()`
+/// 迭代器产出的 `LineDamageBounds::line` 已是视口行(滚动出屏的不可见行被
+/// 上游过滤),消费方只需按行号增量重建。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Damage {
+    Full,
+    Lines(Vec<usize>),
+}
 
 /// Visible screen dimensions. `total_lines` reports the screen only, matching
 /// upstream's `TermSize`; scrollback capacity comes from `Config::scrolling_history`.
@@ -39,21 +51,17 @@ impl Dimensions for ScreenSize {
     }
 }
 
-/// Palette entries reported for OSC 10/11 default-ink queries.
-/// Indices follow `NamedColor`: 256 = foreground, 257 = background.
-fn default_rgb(index: usize) -> [u8; 3] {
-    match index {
-        257 => [0x1e, 0x1e, 0x1e],
-        _ => [0xff, 0xff, 0xff],
-    }
-}
-
+/// Palette entries reported for OSC 4/10/11/12 queries.
+/// Indices follow `NamedColor`: 0..=15 slots, 256 = foreground,
+/// 257 = background, 258 = cursor.
 struct ProxyState {
     pty_writes: Vec<String>,
     title: Option<String>,
     size: Option<ScreenSize>,
     /// 查询应答用的格子像素尺寸,默认与退役的 8×16 常量一致
     cell: (u16, u16),
+    /// OSC 4/10/11/12 应答与渲染同源(单一来源:config::palette)
+    palette: Palette,
 }
 
 impl Default for ProxyState {
@@ -63,6 +71,7 @@ impl Default for ProxyState {
             title: None,
             size: None,
             cell: (8, 16),
+            palette: Palette::DEFAULT,
         }
     }
 }
@@ -85,8 +94,8 @@ impl EventListener for EventProxy {
             Event::PtyWrite(s) => state.pty_writes.push(s),
             Event::Title(title) => state.title = Some(title),
             Event::ColorRequest(index, format) => {
-                let [r, g, b] = default_rgb(index);
-                state.pty_writes.push(format(Rgb { r, g, b }));
+                let rgb = state.palette.query(index);
+                state.pty_writes.push(format(rgb));
             }
             Event::TextAreaSizeRequest(format) => {
                 let size = state.size.unwrap_or(ScreenSize::new(80, 24));
@@ -111,6 +120,9 @@ pub struct Surface {
     parser: Processor,
     proxy: EventProxy,
     size: ScreenSize,
+    /// take_damage 首帧哨兵:TermDamageState 构造即 full=true,本应自然
+    /// Full,但那是上游实现细节——本层显式保证"第一次消费必是 Full"。
+    has_drawn: bool,
 }
 
 impl Surface {
@@ -127,6 +139,7 @@ impl Surface {
             parser: Processor::new(),
             proxy,
             size,
+            has_drawn: false,
         }
     }
 
@@ -146,6 +159,47 @@ impl Surface {
         self.proxy.0.lock().unwrap_or_else(|e| e.into_inner()).cell = (cell_width, cell_height);
     }
 
+    /// 热替换调色板:此后 OSC 4/10/11/12 查询按新 palette 应答。
+    /// 渲染侧的同步换肤由调用方(app)一并驱动,两处同源才不各说各话。
+    pub fn set_palette(&mut self, palette: &Palette) {
+        lock(&self.proxy.0).palette = *palette;
+    }
+
+    /// Drain damage accumulated since the last call, then reset the term's
+    /// damage state (upstream contract: consume implies reset).
+    ///
+    /// 视口行以外(滚出屏的历史行)一律丢弃:渲染只见视口。已知语义:上游
+    /// `Term::damage()` 恒把当前光标行计入(保守正确),所以经本 API 拿到
+    /// 空集 `Lines(vec![])` 不可达;空集分支是 render 层的库级兜底。
+    pub fn take_damage(&mut self) -> Damage {
+        if !self.has_drawn {
+            // 首帧哨兵:无消费历史,强制全量。仍要先消费一次 damage():它的
+            // 副作用是把上游 last_cursor 同步到当前光标——若跳过,首帧之后
+            // 光标一动,(0,0) 旧位会被误伤一行假脏(对拍测试踩出的坑)。
+            // 此时 damage 状态构造即 full,消费结果必为 Full,返回值可弃
+            self.has_drawn = true;
+            let _ = self.term.damage();
+            self.term.reset_damage();
+            return Damage::Full;
+        }
+        let screen_lines = self.size.screen_lines();
+        let damage = match self.term.damage() {
+            TermDamage::Full => Damage::Full,
+            TermDamage::Partial(bounds) => {
+                let mut rows: Vec<usize> = bounds
+                    .filter_map(|b| (b.line < screen_lines).then_some(b.line))
+                    .collect();
+                // 上游迭代器按行升序且唯一;显式排序去重把契约钉在本层,
+                // 不依赖上游迭代器的实现细节
+                rows.sort_unstable();
+                rows.dedup();
+                Damage::Lines(rows)
+            }
+        };
+        self.term.reset_damage();
+        damage
+    }
+
     /// Drain replies that must be written back into the pty (DSR/OSC answers).
     pub fn take_pty_writes(&mut self) -> Vec<String> {
         std::mem::take(&mut lock(&self.proxy.0).pty_writes)
@@ -157,6 +211,12 @@ impl Surface {
 
     pub fn grid(&self) -> &Grid<Cell> {
         self.term.grid()
+    }
+
+    /// DECCKM(DECSET 1)application cursor keys:编码器据此把导航键发成
+    /// SS3 而非 CSI。
+    pub fn app_cursor_mode(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
     pub fn size(&self) -> ScreenSize {
@@ -219,6 +279,17 @@ mod tests {
     }
 
     #[test]
+    fn decset_cursor_keys_toggles_app_cursor_mode() {
+        // DECSET 1 (DECCKM):编码器据此决定导航键走 SS3 还是 CSI
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert!(!s.app_cursor_mode());
+        s.feed(b"\x1b[?1h");
+        assert!(s.app_cursor_mode());
+        s.feed(b"\x1b[?1l");
+        assert!(!s.app_cursor_mode());
+    }
+
+    #[test]
     fn poisoned_proxy_state_is_recovered_not_fatal() {
         let proxy = EventProxy::default();
         // 人为毒化:持锁 panic(静默 panic hook,保持测试输出干净)
@@ -254,12 +325,112 @@ mod tests {
         assert!(writes[0].starts_with("\x1b]10;rgb:"));
     }
 
+    /// 回答应答值的直读格式:6 位 hex,便于断言具体颜色。
+    fn fmt_rgb() -> Arc<dyn Fn(Rgb) -> String + Send + Sync> {
+        Arc::new(|rgb: Rgb| format!("{:02x}{:02x}{:02x}", rgb.r, rgb.g, rgb.b))
+    }
+
+    #[test]
+    fn color_request_answers_palette_after_set_palette() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        let mut custom = Palette::DEFAULT;
+        custom.apply_pair("palette", "1=#ff5555").unwrap();
+        s.set_palette(&custom);
+        // OSC 4 查询槽 1:必须答替换后的 palette 值,而非旧的全白
+        s.proxy.send_event(Event::ColorRequest(1, fmt_rgb()));
+        assert_eq!(s.take_pty_writes(), vec!["ff5555".to_string()]);
+    }
+
+    #[test]
+    fn color_request_osc12_answers_cursor_color() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        let mut custom = Palette::DEFAULT;
+        custom.apply_pair("cursor-color", "#00ff00").unwrap();
+        s.set_palette(&custom);
+        s.proxy.send_event(Event::ColorRequest(258, fmt_rgb()));
+        assert_eq!(s.take_pty_writes(), vec!["00ff00".to_string()]);
+    }
+
+    #[test]
+    fn color_request_default_answers_fg_and_bg() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        // 256=前景(白)、257=背景(#1e1e1e)——M0 全答白是欠账,现在按 palette 分流
+        s.proxy.send_event(Event::ColorRequest(256, fmt_rgb()));
+        assert_eq!(s.take_pty_writes(), vec!["ffffff".to_string()]);
+        s.proxy.send_event(Event::ColorRequest(257, fmt_rgb()));
+        assert_eq!(s.take_pty_writes(), vec!["1e1e1e".to_string()]);
+    }
+
     #[test]
     fn size_query_uses_construction_dimensions() {
         let mut s = Surface::new(ScreenSize::new(10, 3));
         let format = Arc::new(|ws: WindowSize| format!("{}x{}", ws.num_cols, ws.num_lines));
         s.proxy.send_event(Event::TextAreaSizeRequest(format));
         assert_eq!(s.take_pty_writes(), vec!["10x3".to_string()]);
+    }
+
+    // ---- Task 8: 脏区跟踪 ----
+
+    #[test]
+    fn take_damage_first_frame_is_full() {
+        // 首帧哨兵:term 的 damage 状态构造即 full,本应自然 Full;哨兵把该
+        // 前提钉死在本层,不赌上游实现
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        assert_eq!(s.take_damage(), Damage::Full);
+    }
+
+    #[test]
+    fn damage_reports_exactly_touched_rows_sorted_deduped() {
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.take_damage(); // 首帧哨兵烧掉
+        s.feed(b"one"); // 行 0(光标同在行 0)
+        s.feed(b"\x1b[3;1Htwo"); // HVP 到行 2 写入:行 0 旧光标位 + 行 2
+        assert_eq!(s.take_damage(), Damage::Lines(vec![0, 2]));
+    }
+
+    #[test]
+    fn damage_after_reset_reports_cursor_row_only() {
+        // 无输入无移动的帧:上游 Term::damage() 恒伤当前光标行(保守正确),
+        // 所以 Lines 空集经这条 API 不可达;空集分支由 frame 层单测覆盖
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.take_damage(); // 首帧哨兵
+        assert_eq!(s.take_damage(), Damage::Lines(vec![0]));
+    }
+
+    #[test]
+    fn resize_marks_full_damage() {
+        // 结构性失配(行数/列数变化)必须全量:Term::resize 标 full,
+        // take_damage 如实翻译
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.take_damage(); // 首帧哨兵
+        s.feed(b"hello");
+        s.resize(ScreenSize::new(20, 8));
+        assert_eq!(s.take_damage(), Damage::Full);
+    }
+
+    #[test]
+    fn clear_screen_marks_full_damage() {
+        // ED 2(cls 等价):上游 clear_screen 走 mark_fully_damaged
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.take_damage(); // 首帧哨兵
+        s.feed(b"hello");
+        s.feed(b"\x1b[2J");
+        assert_eq!(s.take_damage(), Damage::Full);
+    }
+
+    #[test]
+    fn sentinel_consumes_damage_so_cursor_chain_stays_synced() {
+        // 回归(Task 8 复审):哨兵若不消费 damage(),last_cursor 停在默认
+        // (0,0),下一帧光标在非零行时会把 (0,0) 误伤进来。烧哨兵前先把
+        // 光标挪到非零行——本用例恰好区分“消费过”与“只 reset 过”
+        let mut s = Surface::new(ScreenSize::new(10, 5));
+        s.feed(b"\x1b[3;1HX"); // 光标停行 2(哨兵燃烧前)
+        assert_eq!(s.take_damage(), Damage::Full); // 哨兵
+        assert_eq!(
+            s.take_damage(),
+            Damage::Lines(vec![2]),
+            "last_cursor 已同步到行 2:不得出现 (0,0) 假伤"
+        );
     }
 
     #[test]
