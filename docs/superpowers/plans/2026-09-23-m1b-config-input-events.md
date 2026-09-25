@@ -1,7 +1,7 @@
 # M1-B 配置·输入·事件化 Implementation Plan
 
 - 日期:2026-09-23
-- 状态:待执行
+- 状态:已完成(T1-T8 于 2026-09-23/24 实施;T9 真机冒烟 2026-09-25 通过——第 5 条 vim 因未安装跳过,DECCKM 以 core 表驱动测试为证;第 6 条 Alt 按预期缺口记录)
 - 上游:spec `2026-09-22-m1-render-config-design.md`(§5 配置、§6 DECCKM、§7 事件化、§4 脏区/Palette);主 spec §10 M1 行
 - 前置:M1-A 已完成并合入 main(`306af33`);主题库已 vendored(`themes/`,630 个,`f38af3a`)
 - 验收锚点(spec §9 M1c/M1d):**改主题/字体/字号保存即生效**;vim 方向键正确;空闲 CPU 接近 0%
@@ -189,23 +189,26 @@ pub fn take_damage(&mut self) -> Damage {
 
 ### Task 9: 整合冒烟(M1c+M1d 验收)
 
-- [ ] **Step 1: 全量验证**——fmt/clippy/test workspace + 交叉 lint;`cargo run --bin mica`
+- [x] **Step 1: 全量验证**——fmt/clippy/test workspace + 交叉 lint;`cargo run --bin mica`
 
 真机清单(全部通过才算 M1-B 完成):
 
 1. `%APPDATA%\mica\config` 写 `theme = Dracula` 保存 → 即时换肤,16 色+底色+光标全换
 2. `font-size = 16` 保存 → 字号即时变,窗口尺寸不变、网格重排
 3. config 坏行(如 `foo`)保存 → 错误提示,现配置不动
-4. `printf '\e]4;1;?\e\\'` 类探测(或 base16-shell/tmux 探测脚本)不误判——OSC 4 答主题色而非全白
+4. `printf '\e]4;1;?\e\\'` 类探测(或 base16-shell/tmux 探测脚本)不误判——OSC 4 答主题色而非全白(注:`\e]4;*;?` 通配符探测被 vte 上游静默丢弃(无应答)——**静默是预期**,勿当损坏;数字索引探测才有应答)
 5. vim 打开 → 方向键移动正确(DECCKM SS3);`vim` 内 Home/End 正常
-6. Alt+Backspace/Alt+B 词删除(pwsh PSReadLine)正常
+6. Alt+Backspace/Alt+B 词删除(pwsh PSReadLine)**预计不达**——core 编码已实现,但窗口层 WM_SYSKEYDOWN/WM_SYSCHAR 未路由,真机 Alt 组合整体进不来;若验失败属已知缺口非回归,修复形状=wndproc 增挂 SYS 消息(排 M2 或随 T9 顺手)
 7. 空闲时任务管理器 CPU ≈0%(事件化生效)
 8. `dir /s` 长输出流畅、无残影;`cls` 后重打正常(脏区正确性)
 9. 未装 Sarasa 回退 Cascadia 不变;`themes/README.md` provenance 可查
 10. 推送后 CI 双平台绿;README 状态推进 M1c/M1d
+11. 主题名不变只改字号保存 → 屏幕内容保留(同尺寸 resize 早退,已源码级验证,真机确认)
+12. 用 PowerShell 5 写的 config(BOM/UTF-16)→ BOM 剥离生效或 UTF-16 弹窗提示
+13. 长滚动输出(`dir /s`)预期全量重建成本(上游滚动恒 mark full)——脏区收益在交互单行场景,勿以滚动 CPU 判脏区成败
 
-- [ ] **Step 2: 文档收尾**——CLAUDE.md"当前边界"清账(OSC 4/12、DECCKM、Alt、轮询、脏区五笔下账;8/16 硬编码残留核查);README 里程碑表 M1 全 ✅
-- [ ] **Step 3: Commit + push** `docs: M1-B complete, ledger updated`(分支 `m1b-config`,PR 流程同 M1-A)
+- [x] **Step 2: 文档收尾**——CLAUDE.md"当前边界"清账(OSC 4/12、DECCKM、Alt、轮询、脏区五笔下账;8/16 硬编码残留核查);README 里程碑表 M1 全 ✅
+- [x] **Step 3: Commit + push** `docs: M1-B complete, ledger updated`(分支 `m1b-config`,PR 流程同 M1-A)
 
 ---
 

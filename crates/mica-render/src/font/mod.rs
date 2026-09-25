@@ -38,12 +38,8 @@ pub fn char_width(ch: char) -> usize {
 }
 
 /// 默认字体回退链(D9):更纱黑体严格等宽中英混排,未安装时落系统链。
-pub const DEFAULT_FAMILIES: &[&str] = &[
-    "Sarasa Mono SC",
-    "Cascadia Mono",
-    "Microsoft YaHei",
-    "Segoe UI Emoji",
-];
+/// 单一来源在 core 的 `config::settings`(与 Settings 同源),此处仅 re-export。
+pub use mica_core::config::settings::DEFAULT_FAMILIES;
 
 #[cfg(test)]
 mod tests {

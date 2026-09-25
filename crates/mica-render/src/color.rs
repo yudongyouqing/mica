@@ -1,49 +1,36 @@
-//! Terminal colors -> concrete RGB for the renderer.
+//! Terminal colors -> concrete RGB for the renderer. Palette is the single
+//! source (mica-core `config::palette`); nothing is hardcoded here.
 
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
-/// Base 16 palette (dark theme), indices 0-15. Matches the shell's reported
-/// defaults so OSC 10/11 answers and rendering agree.
-pub const BASE16: [[u8; 3]; 16] = [
-    [0x1e, 0x1e, 0x1e], // black
-    [0xf7, 0x4b, 0x50], // red
-    [0x24, 0xb0, 0x7a], // green
-    [0xf2, 0xa6, 0x0d], // yellow
-    [0x43, 0x9e, 0xff], // blue
-    [0xd3, 0x82, 0xea], // magenta
-    [0x4f, 0xc5, 0xe1], // cyan
-    [0xd4, 0xd4, 0xd4], // white
-    [0x66, 0x66, 0x66], // bright black
-    [0xff, 0x6c, 0x70], // bright red
-    [0x3c, 0xd6, 0x96], // bright green
-    [0xff, 0xc6, 0x4d], // bright yellow
-    [0x63, 0xb3, 0xff], // bright blue
-    [0xd8, 0x98, 0xf2], // bright magenta
-    [0x6c, 0xd9, 0xfa], // bright cyan
-    [0xff, 0xff, 0xff], // bright white
-];
+use mica_core::config::palette::Palette;
 
 /// xterm 256-color cube luminance levels.
 const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
 
-/// Resolve any terminal color to RGB. Default-ink colors become the given
-/// defaults; other named colors (including `Dim*` and `Cursor`) fall through
-/// to `BASE16[15]`; the vte parser does not emit them in practice.
-pub fn resolve(color: Color, default_fg: Rgb, default_bg: Rgb) -> [u8; 3] {
+fn rgb3(rgb: Rgb) -> [u8; 3] {
+    [rgb.r, rgb.g, rgb.b]
+}
+
+/// Resolve any terminal color to RGB through the palette. Default-ink colors
+/// become `palette.fg`/`palette.bg`; other named colors (including `Dim*` and
+/// `Cursor`) fall through to `palette.colors[15]`; the vte parser does not
+/// emit them in practice.
+pub fn resolve(color: Color, palette: &Palette) -> [u8; 3] {
     match color {
         Color::Spec(rgb) => [rgb.r, rgb.g, rgb.b],
         Color::Named(NamedColor::Foreground)
         | Color::Named(NamedColor::BrightForeground)
-        | Color::Named(NamedColor::DimForeground) => [default_fg.r, default_fg.g, default_fg.b],
-        Color::Named(NamedColor::Background) => [default_bg.r, default_bg.g, default_bg.b],
-        Color::Named(named) => BASE16[(named as usize).min(15)],
-        Color::Indexed(i) => resolve_indexed(i, default_fg, default_bg),
+        | Color::Named(NamedColor::DimForeground) => rgb3(palette.fg),
+        Color::Named(NamedColor::Background) => rgb3(palette.bg),
+        Color::Named(named) => rgb3(palette.colors[(named as usize).min(15)]),
+        Color::Indexed(i) => resolve_indexed(i, palette),
     }
 }
 
-fn resolve_indexed(i: u8, _default_fg: Rgb, _default_bg: Rgb) -> [u8; 3] {
+fn resolve_indexed(i: u8, palette: &Palette) -> [u8; 3] {
     match i {
-        0..=15 => BASE16[i as usize],
+        0..=15 => rgb3(palette.colors[i as usize]),
         16..=231 => {
             let i = (i - 16) as usize;
             [
@@ -64,55 +51,83 @@ fn resolve_indexed(i: u8, _default_fg: Rgb, _default_bg: Rgb) -> [u8; 3] {
 mod tests {
     use super::*;
     use alacritty_terminal::vte::ansi::Rgb;
-
-    const FG: Rgb = Rgb {
-        r: 0xff,
-        g: 0xff,
-        b: 0xff,
-    };
-    const BG: Rgb = Rgb {
-        r: 0x1e,
-        g: 0x1e,
-        b: 0x1e,
-    };
+    use mica_core::config::palette::Palette;
 
     #[test]
     fn named_defaults_resolve_to_palette_ink() {
+        let p = Palette::DEFAULT;
         assert_eq!(
-            resolve(Color::Named(NamedColor::Foreground), FG, BG),
+            resolve(Color::Named(NamedColor::Foreground), &p),
             [0xff, 0xff, 0xff]
         );
         assert_eq!(
-            resolve(Color::Named(NamedColor::Background), FG, BG),
+            resolve(Color::Named(NamedColor::Background), &p),
             [0x1e, 0x1e, 0x1e]
         );
     }
 
     #[test]
     fn base16_named_colors_map_directly() {
-        assert_eq!(resolve(Color::Named(NamedColor::Red), FG, BG), BASE16[1]);
+        let p = Palette::DEFAULT;
         assert_eq!(
-            resolve(Color::Named(NamedColor::BrightWhite), FG, BG),
-            BASE16[15]
+            resolve(Color::Named(NamedColor::Red), &p),
+            [0xf7, 0x4b, 0x50]
+        );
+        assert_eq!(
+            resolve(Color::Named(NamedColor::BrightWhite), &p),
+            [0xff, 0xff, 0xff]
+        );
+    }
+
+    #[test]
+    fn custom_palette_drives_named_and_indexed_slots() {
+        let mut p = Palette::DEFAULT;
+        p.apply_pair("palette", "1=#ff5555").unwrap();
+        p.apply_pair("palette", "5=#010203").unwrap();
+        // Named 走槽位
+        assert_eq!(
+            resolve(Color::Named(NamedColor::Red), &p),
+            [0xff, 0x55, 0x55]
+        );
+        // 同一槽位被 256 色索引等价命中
+        assert_eq!(resolve(Color::Indexed(1), &p), [0xff, 0x55, 0x55]);
+        assert_eq!(resolve(Color::Indexed(5), &p), [1, 2, 3]);
+    }
+
+    #[test]
+    fn custom_palette_drives_default_ink() {
+        let mut p = Palette::DEFAULT;
+        p.apply_pair("foreground", "#112233").unwrap();
+        p.apply_pair("background", "#abcdef").unwrap();
+        assert_eq!(
+            resolve(Color::Named(NamedColor::Foreground), &p),
+            [0x11, 0x22, 0x33]
+        );
+        assert_eq!(
+            resolve(Color::Named(NamedColor::Background), &p),
+            [0xab, 0xcd, 0xef]
         );
     }
 
     #[test]
     fn indexed_cube_follows_xterm_formula() {
-        assert_eq!(resolve(Color::Indexed(16), FG, BG), [0, 0, 0]);
-        assert_eq!(resolve(Color::Indexed(196), FG, BG), [255, 0, 0]);
-        assert_eq!(resolve(Color::Indexed(231), FG, BG), [255, 255, 255]);
+        let p = Palette::DEFAULT;
+        assert_eq!(resolve(Color::Indexed(16), &p), [0, 0, 0]);
+        assert_eq!(resolve(Color::Indexed(196), &p), [255, 0, 0]);
+        assert_eq!(resolve(Color::Indexed(231), &p), [255, 255, 255]);
     }
 
     #[test]
     fn indexed_grayscale_ramp() {
-        assert_eq!(resolve(Color::Indexed(232), FG, BG), [8, 8, 8]);
-        assert_eq!(resolve(Color::Indexed(244), FG, BG), [128, 128, 128]);
-        assert_eq!(resolve(Color::Indexed(255), FG, BG), [238, 238, 238]);
+        let p = Palette::DEFAULT;
+        assert_eq!(resolve(Color::Indexed(232), &p), [8, 8, 8]);
+        assert_eq!(resolve(Color::Indexed(244), &p), [128, 128, 128]);
+        assert_eq!(resolve(Color::Indexed(255), &p), [238, 238, 238]);
     }
 
     #[test]
     fn direct_specs_pass_through() {
+        let p = Palette::DEFAULT;
         assert_eq!(
             resolve(
                 Color::Spec(Rgb {
@@ -120,8 +135,7 @@ mod tests {
                     g: 34,
                     b: 56
                 }),
-                FG,
-                BG
+                &p
             ),
             [12, 34, 56]
         );

@@ -26,3 +26,4 @@ windows = { workspace = true, features = [
 ] }
 pollster = { workspace = true }
 raw-window-handle = { workspace = true }
+notify = { workspace = true }
