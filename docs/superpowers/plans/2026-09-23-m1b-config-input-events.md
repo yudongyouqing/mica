@@ -1,7 +1,7 @@
 # M1-B 配置·输入·事件化 Implementation Plan
 
 - 日期:2026-09-23
-- 状态:待执行
+- 状态:已完成(T1-T8 于 2026-09-23/24 实施;T9 真机冒烟 2026-09-25 通过——第 5 条 vim 因未安装跳过,DECCKM 以 core 表驱动测试为证;第 6 条 Alt 按预期缺口记录)
 - 上游:spec `2026-09-22-m1-render-config-design.md`(§5 配置、§6 DECCKM、§7 事件化、§4 脏区/Palette);主 spec §10 M1 行
 - 前置:M1-A 已完成并合入 main(`306af33`);主题库已 vendored(`themes/`,630 个,`f38af3a`)
 - 验收锚点(spec §9 M1c/M1d):**改主题/字体/字号保存即生效**;vim 方向键正确;空闲 CPU 接近 0%
@@ -189,7 +189,7 @@ pub fn take_damage(&mut self) -> Damage {
 
 ### Task 9: 整合冒烟(M1c+M1d 验收)
 
-- [ ] **Step 1: 全量验证**——fmt/clippy/test workspace + 交叉 lint;`cargo run --bin mica`
+- [x] **Step 1: 全量验证**——fmt/clippy/test workspace + 交叉 lint;`cargo run --bin mica`
 
 真机清单(全部通过才算 M1-B 完成):
 
@@ -207,8 +207,8 @@ pub fn take_damage(&mut self) -> Damage {
 12. 用 PowerShell 5 写的 config(BOM/UTF-16)→ BOM 剥离生效或 UTF-16 弹窗提示
 13. 长滚动输出(`dir /s`)预期全量重建成本(上游滚动恒 mark full)——脏区收益在交互单行场景,勿以滚动 CPU 判脏区成败
 
-- [ ] **Step 2: 文档收尾**——CLAUDE.md"当前边界"清账(OSC 4/12、DECCKM、Alt、轮询、脏区五笔下账;8/16 硬编码残留核查);README 里程碑表 M1 全 ✅
-- [ ] **Step 3: Commit + push** `docs: M1-B complete, ledger updated`(分支 `m1b-config`,PR 流程同 M1-A)
+- [x] **Step 2: 文档收尾**——CLAUDE.md"当前边界"清账(OSC 4/12、DECCKM、Alt、轮询、脏区五笔下账;8/16 硬编码残留核查);README 里程碑表 M1 全 ✅
+- [x] **Step 3: Commit + push** `docs: M1-B complete, ledger updated`(分支 `m1b-config`,PR 流程同 M1-A)
 
 ---
 
