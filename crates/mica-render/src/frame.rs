@@ -69,6 +69,7 @@ pub fn build_instances(
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    display_offset: usize,
 ) -> Vec<CellInstance> {
     let grid = surface.grid();
     let cols = grid.columns();
@@ -82,14 +83,14 @@ pub fn build_instances(
     let mut glyphs = Vec::with_capacity(cols * rows);
     for line in 0..rows {
         for col in 0..cols {
-            let cell = &grid[Line(line as i32)][Column(col)];
+            let cell = &grid[Line(line as i32 - display_offset as i32)][Column(col)];
             let mut fg = resolve(cell.fg, palette);
             let mut bg = resolve(cell.bg, palette);
             // 先反色后光标(双交换抵消,光标在选区仍可辨——已裁定顺序)
             if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
-            if line == cursor_line && col == cursor_col {
+            if display_offset == 0 && line == cursor_line && col == cursor_col {
                 std::mem::swap(&mut fg, &mut bg);
             }
             let x = col as f32 * metrics.cell_width;
@@ -137,21 +138,22 @@ pub fn build_rows(
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    display_offset: usize,
     damage: &Damage,
     rows: &mut Vec<RowInst>,
 ) {
     let grid = surface.grid();
     let screen_lines = grid.screen_lines();
     if rows.len() != screen_lines {
-        rebuild_all(grid, router, metrics, palette, rows);
+        rebuild_all(grid, router, metrics, palette, display_offset, rows);
         return;
     }
     match damage {
-        Damage::Full => rebuild_all(grid, router, metrics, palette, rows),
+        Damage::Full => rebuild_all(grid, router, metrics, palette, display_offset, rows),
         Damage::Lines(lines) => {
             for &line in lines {
                 if line < screen_lines {
-                    rows[line] = build_row(grid, line, router, metrics, palette);
+                    rows[line] = build_row(grid, line, router, metrics, palette, display_offset);
                 }
             }
         }
@@ -164,11 +166,19 @@ fn rebuild_all(
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    display_offset: usize,
     rows: &mut Vec<RowInst>,
 ) {
     rows.clear();
     for line in 0..grid.screen_lines() {
-        rows.push(build_row(grid, line, router, metrics, palette));
+        rows.push(build_row(
+            grid,
+            line,
+            router,
+            metrics,
+            palette,
+            display_offset,
+        ));
     }
 }
 
@@ -181,6 +191,7 @@ fn build_row(
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    display_offset: usize,
 ) -> RowInst {
     let cols = grid.columns();
     let cursor = grid.cursor.point;
@@ -189,14 +200,14 @@ fn build_row(
     let mut row = RowInst::default();
     row.bg.reserve(cols);
     for col in 0..cols {
-        let cell = &grid[Line(line as i32)][Column(col)];
+        let cell = &grid[Line(line as i32 - display_offset as i32)][Column(col)];
         let mut fg = resolve(cell.fg, palette);
         let mut bg = resolve(cell.bg, palette);
         // 先反色后光标(双交换抵消,光标在反色上仍可辨——已裁定顺序)
         if cell.flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
         }
-        if line == cursor_line && col == cursor_col {
+        if display_offset == 0 && line == cursor_line && col == cursor_col {
             std::mem::swap(&mut fg, &mut bg);
         }
         let x = col as f32 * metrics.cell_width;
@@ -293,7 +304,7 @@ mod tests {
             wide: |_| false,
         };
         assert_eq!(
-            build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT).len(),
+            build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0).len(),
             8
         );
     }
@@ -309,7 +320,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| false,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0);
         // 两段式:bg 段 inst[0..4) 行优先每格一整格 quad,字形段随后
         assert_eq!(inst.len(), 5, "4 bg + 1 字形");
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -336,7 +347,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0);
         assert_eq!(inst.len(), 5, "4 bg + 1 宽字形(spacer 不出字形)");
         // bg 段:格 0 与 spacer 格(格 1)都是整格 blank
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -376,7 +387,7 @@ mod tests {
                 wide: |_| false,
             },
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0);
         // 顺序:A@0(bold)、B@1(反色)、光标@2(空格)、空格@3
         // 两段式:bg 段 [0..4) = A、B、光标格、空格;字形段 [4..6) = A、B
         assert_eq!(inst.len(), 6, "4 bg + A、B 两个字形");
@@ -458,7 +469,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0);
         // bg 段:全部 4 格在前,均整格 blank(uv 尺寸 0),行优先
         for (i, cell) in inst.iter().take(4).enumerate() {
             assert_eq!(
@@ -489,7 +500,7 @@ mod tests {
         let mut pal = Palette::DEFAULT;
         pal.apply_pair("palette", "1=#112233").unwrap();
         pal.apply_pair("background", "#abcdef").unwrap();
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &pal);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &pal, 0);
         // bg 段 inst[0]:A 的背景 = palette.bg(浅色),前景 = 槽 1
         assert_eq!(
             inst[0].bg,
@@ -582,11 +593,12 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            0,
             &damage,
             &mut rows,
         );
         let repacked = repack(&rows);
-        let golden = build_instances(&s, &mut router, &metrics_8x16(), &Palette::DEFAULT);
+        let golden = build_instances(&s, &mut router, &metrics_8x16(), &Palette::DEFAULT, 0);
         assert_eq!(
             bytes(&repacked),
             bytes(&golden),
@@ -610,6 +622,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            0,
             &damage,
             &mut rows,
         );
@@ -628,6 +641,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            0,
             &damage,
             &mut rows,
         );
@@ -663,6 +677,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            0,
             &mica_core::surface::Damage::Full,
             &mut rows,
         );
@@ -673,6 +688,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            0,
             &mica_core::surface::Damage::Lines(vec![]),
             &mut rows,
         );
@@ -696,6 +712,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            0,
             &mica_core::surface::Damage::Full,
             &mut rows,
         );

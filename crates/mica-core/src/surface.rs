@@ -5,7 +5,10 @@
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::{Dimensions, Grid};
+use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
+
+/// 滚动指令直通类型(重导出避免壳层直依赖 alacritty_terminal)。
+pub use alacritty_terminal::grid::Scroll as ScrollCommand;
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
@@ -217,6 +220,16 @@ impl Surface {
     /// SS3 而非 CSI。
     pub fn app_cursor_mode(&self) -> bool {
         self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// 视口滚动(scrollback)。Delta(正) 向历史方向,Bottom 归零跟随。
+    pub fn scroll_display(&mut self, scroll: Scroll) {
+        self.term.scroll_display(scroll);
+    }
+
+    /// 当前滚动偏移(0 = 钉在屏幕底跟随输出)。
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
     }
 
     pub fn size(&self) -> ScreenSize {

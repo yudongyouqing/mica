@@ -23,7 +23,7 @@ use mica_core::config::palette::Palette;
 use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
 use mica_core::input::{self, Key, Mods};
 use mica_core::pty::{PtyReader, PtySession, default_shell_command};
-use mica_core::surface::{Damage, ScreenSize, Surface};
+use mica_core::surface::{Damage, ScreenSize, ScrollCommand, Surface};
 use mica_render::font::dwrite::DwriteRouter;
 use mica_render::font::metrics::FontMetrics;
 use mica_render::frame::{RowInst, build_rows, repack};
@@ -42,8 +42,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
     DispatchMessageW, GetClientRect, GetMessageW, LoadCursorW, MSG, MessageBoxW, PostMessageW,
     PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK};
 use windows::core::{HSTRING, PCWSTR, w};
@@ -588,11 +588,13 @@ fn draw_frame() {
             t.term.take_damage()
         };
         // 先 build(路由新字形、改图集)再比修订号:同帧新增字形同帧上传
+        let display_offset = t.term.display_offset();
         build_rows(
             &t.term,
             &mut t.router,
             &t.metrics,
             &t.palette,
+            display_offset,
             &damage,
             &mut t.row_insts,
         );
@@ -707,6 +709,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
         }
+        WM_MOUSEWHEEL => {
+            // 高位有符号 delta,120/格;WT 惯例 3 行/格(=delta/40)。
+            // delta 正 = 滚轮向上 = 看历史(上游 Scroll::Delta 正值增 offset)
+            let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+            let mut scrolled = false;
+            STATE.with(|cell| {
+                if let Some(t) = cell.borrow_mut().as_mut() {
+                    t.term.scroll_display(ScrollCommand::Delta(delta / 40));
+                    // 视口几何变了(视口行 → buffer 行的映射整体位移):
+                    // 行缓存的"行 i"语义失效,显式全量(与 resize 同性质)
+                    t.force_full = true;
+                    scrolled = true;
+                }
+            });
+            if scrolled {
+                draw_frame();
+            }
+            LRESULT(0)
+        }
         WM_ERASEBKGND => {
             // 客户区全由 wgpu 清屏:阻止系统擦背景——resize 时旧内容闪白
             // 的来源就是这擦除(D3D 未准备好前的一帧系统底色)
@@ -767,6 +788,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return; // 队列里积压的重复唤醒:缓冲已被上一条取空,免重绘
                 }
                 t.term.feed(&bytes);
+                // 钉在历史区时仍有输出:缓存按屏幕锚更新了,显示的是历史区,
+                // 光标/行序关系整体变化,保守全量(滚动期间通常无输出,量小)
+                if t.term.display_offset() > 0 {
+                    t.force_full = true;
+                }
                 // 终端对查询的应答(DSR/OSC)必须写回 pty,否则 shell 会卡在等待
                 for reply in t.term.take_pty_writes() {
                     let _ = t.session.write(reply.as_bytes());
