@@ -22,6 +22,7 @@ use notify::{Event, RecursiveMode, Watcher};
 use mica_core::config::palette::Palette;
 use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
 use mica_core::input::{self, Key, Mods};
+use mica_core::keymap::{Action, Keymap, TriggerKey};
 use mica_core::pty::{PtyReader, PtySession, default_shell_command};
 use mica_core::surface::{
     Column, Damage, Line, Point, ScreenSize, ScrollCommand, SelectionType, Side, Surface,
@@ -79,6 +80,8 @@ thread_local! {
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// 窗口级键位表(Settings 合成;热重载时整表替换)
+    static KEYMAP: RefCell<Keymap> = RefCell::new(Keymap::wt_default());
     /// 拖选中(WM_LBUTTONDOWN 起、WM_LBUTTONUP 止)
     static MOUSE_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 上次双击的 (时刻, x, y):三击 = 同位置 450ms 内的第二次双击
@@ -138,6 +141,8 @@ pub fn run() {
 
         // T4:字号与字体链来自配置(%APPDATA%\mica\config;缺失 = 全默认)
         let settings = load_settings();
+        // 窗口级键位表与设置同源(用户 keybind 覆盖 WT 默认)
+        KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
         let router = {
             let families: Vec<&str> = if settings.font_families.is_empty() {
                 DEFAULT_FAMILIES.to_vec() // resolve 恒填默认链,此分支纯防御
@@ -440,6 +445,8 @@ unsafe fn reload_config(hwnd: HWND) {
         t.term.set_palette(&settings.palette);
         t.renderer.set_clear_color(&settings.palette);
         t.palette = settings.palette;
+        // 键位表整表替换(热重载同源)
+        KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
         reloaded = true;
     });
     // draw_frame 自己也要借 STATE,必须在 with 之外调用
@@ -672,6 +679,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // (ETX 中断,WT 同款语义);Ctrl+V / Shift+Insert → 粘贴
             let vk = wparam.0 as u32;
             let mods = current_mods();
+            // Keymap 终端外语义优先(D15):命中即消费,不再走 pty 编码
+            if let Some(trigger_key) = vk_to_trigger(vk)
+                && let Some(action) = KEYMAP.with(|k| k.borrow().lookup(mods, trigger_key))
+                && execute_action(action)
+            {
+                return LRESULT(0);
+            }
             if mods.ctrl && !mods.alt && !mods.shift && vk == 'C' as u32 {
                 let mut copied = false;
                 STATE.with(|cell| {
@@ -943,6 +957,86 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// VK → Keymap 触发键(字母/数字/Insert/导航;其余键无终端外语义)。
+fn vk_to_trigger(vk: u32) -> Option<TriggerKey> {
+    match vk {
+        // VK 常量是关联 const,进不了 pattern——守卫链对齐 vkey_bytes
+        0x41..=0x5A => Some(TriggerKey::Letter(vk as u8 as char)),
+        0x30..=0x39 => Some(TriggerKey::Digit((vk - 0x30) as u8)),
+        _ if vk == VK_INSERT.0 as u32 => Some(TriggerKey::Insert),
+        _ if vk == VK_UP.0 as u32 => Some(TriggerKey::Key(Key::Up)),
+        _ if vk == VK_DOWN.0 as u32 => Some(TriggerKey::Key(Key::Down)),
+        _ if vk == VK_LEFT.0 as u32 => Some(TriggerKey::Key(Key::Left)),
+        _ if vk == VK_RIGHT.0 as u32 => Some(TriggerKey::Key(Key::Right)),
+        _ if vk == VK_HOME.0 as u32 => Some(TriggerKey::Key(Key::Home)),
+        _ if vk == VK_END.0 as u32 => Some(TriggerKey::Key(Key::End)),
+        _ if vk == VK_DELETE.0 as u32 => Some(TriggerKey::Key(Key::Delete)),
+        _ if vk == VK_PRIOR.0 as u32 => Some(TriggerKey::Key(Key::PageUp)),
+        _ if vk == VK_NEXT.0 as u32 => Some(TriggerKey::Key(Key::PageDown)),
+        _ => None,
+    }
+}
+
+/// 执行终端外语义动作。返回 true = 已消费(不再走 pty 编码)。
+/// 标签类动作待 T7 标签池落地(TODO 占位消费,防误发 pty 序列)。
+fn execute_action(action: Action) -> bool {
+    let mut need_draw = false;
+    STATE.with(|cell| {
+        if let Some(t) = cell.borrow_mut().as_mut() {
+            match action {
+                Action::Copy => {
+                    if let Some(text) = t.term.selection_text() {
+                        clipboard::set_text(&text);
+                        t.term.selection_clear();
+                        t.force_full = true;
+                        need_draw = true;
+                    }
+                }
+                Action::Paste => {
+                    if let Some(text) = clipboard::get_text() {
+                        let normalized = clipboard::normalize_paste(&text);
+                        let _ = t.session.write(normalized.as_bytes());
+                    }
+                }
+                Action::ScrollLine(n) => {
+                    t.term.scroll_display(ScrollCommand::Delta(n));
+                    t.force_full = true;
+                    need_draw = true;
+                }
+                Action::ScrollPage(n) => {
+                    let rows = t.rows as i32;
+                    t.term.scroll_display(ScrollCommand::Delta(n * rows));
+                    t.force_full = true;
+                    need_draw = true;
+                }
+                Action::ScrollTop => {
+                    t.term.scroll_display(ScrollCommand::Top);
+                    t.force_full = true;
+                    need_draw = true;
+                }
+                Action::ScrollBottom => {
+                    t.term.scroll_display(ScrollCommand::Bottom);
+                    t.force_full = true;
+                    need_draw = true;
+                }
+                // T7 前占位:消费掉但不动作(标签池落地时接实现)
+                Action::NewTab
+                | Action::CloseTab
+                | Action::NextTab
+                | Action::PrevTab
+                | Action::GotoTab(_)
+                | Action::SplitRight
+                | Action::SplitDown
+                | Action::ClosePane => {}
+            }
+        }
+    });
+    if need_draw {
+        draw_frame();
+    }
+    true
 }
 
 /// 客户区像素 → buffer 坐标点(视口行 + display_offset)与半格侧别。

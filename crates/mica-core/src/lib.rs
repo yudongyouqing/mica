@@ -3,5 +3,6 @@
 
 pub mod config;
 pub mod input;
+pub mod keymap;
 pub mod pty;
 pub mod surface;

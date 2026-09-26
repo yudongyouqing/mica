@@ -6,6 +6,7 @@
 use crate::config::palette::Palette;
 use crate::config::parse::{self, ParseError};
 use crate::config::theme;
+use crate::keymap::{self, Keymap};
 
 /// 默认字体回退链(D9)。定义在此(core)——render 侧 re-export,
 /// 与格子度量一样保持单一来源。
@@ -26,6 +27,8 @@ pub struct Settings {
     pub font_size_pt: f32,
     pub palette: Palette,
     pub theme_name: Option<String>,
+    /// 键位表(D15):默认 WT 兼容,`keybind` 键覆盖。
+    pub keymap: Keymap,
 }
 
 impl Default for Settings {
@@ -35,6 +38,7 @@ impl Default for Settings {
             font_size_pt: DEFAULT_FONT_SIZE_PT,
             palette: Palette::DEFAULT,
             theme_name: None,
+            keymap: Keymap::wt_default(),
         }
     }
 }
@@ -103,6 +107,24 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                     .push(format!("font-size 应为 4-72 的数字,得 `{value}`")),
             },
             "theme" => settings.theme_name = Some(value),
+            "keybind" => {
+                // 值形如 `ctrl+shift+t = new_tab`;`clear` 清默认表
+                let value = value.trim();
+                if value.eq_ignore_ascii_case("clear") {
+                    settings.keymap.clear();
+                } else if let Some((trigger, action)) = value.split_once('=') {
+                    match (keymap::parse_trigger(trigger), keymap::parse_action(action)) {
+                        (Some(t), Some(a)) => settings.keymap.bind(t, a),
+                        _ => err
+                            .values
+                            .push(format!("keybind 无法解析触发器或动作名: `{value}`")),
+                    }
+                } else {
+                    err.values.push(format!(
+                        "keybind 值应为 `<触发器> = <动作>` 或 clear,得 `{value}`"
+                    ));
+                }
+            }
             "palette" | "foreground" | "background" | "cursor-color" => {
                 if let Err(reason) = settings.palette.apply_pair(&key, &value) {
                     err.values.push(format!("{key}: {reason}"));
