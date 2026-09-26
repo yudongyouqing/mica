@@ -23,7 +23,9 @@ use mica_core::config::palette::Palette;
 use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
 use mica_core::input::{self, Key, Mods};
 use mica_core::pty::{PtyReader, PtySession, default_shell_command};
-use mica_core::surface::{Damage, ScreenSize, ScrollCommand, Surface};
+use mica_core::surface::{
+    Column, Damage, Line, Point, ScreenSize, ScrollCommand, SelectionType, Side, Surface,
+};
 use mica_render::font::dwrite::DwriteRouter;
 use mica_render::font::metrics::FontMetrics;
 use mica_render::frame::{RowInst, build_rows, repack};
@@ -34,15 +36,16 @@ use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_MENU,
-    VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
+    VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-    DispatchMessageW, GetClientRect, GetMessageW, LoadCursorW, MSG, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_SYSCHAR,
+    AdjustWindowRect, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
+    DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, LoadCursorW, MSG, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage,
+    WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_SYSCHAR,
     WM_SYSKEYDOWN, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK};
@@ -74,6 +77,11 @@ thread_local! {
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// 拖选中(WM_LBUTTONDOWN 起、WM_LBUTTONUP 止)
+    static MOUSE_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 上次双击的 (时刻, x, y):三击 = 同位置 450ms 内的第二次双击
+    static LAST_DBLCLK: std::cell::RefCell<Option<(std::time::Instant, i32, i32)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 struct Terminal {
@@ -110,7 +118,8 @@ pub fn run() {
         let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW,
+            // CS_DBLCLKS:双击翻译成 WM_LBUTTONDBLCLK(选择词/行语义的地基)
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             cbClsExtra: 0,
             cbWndExtra: 0,
@@ -711,6 +720,77 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 LRESULT(0)
             }
         }
+        WM_LBUTTONDOWN => {
+            let (px, py) = mouse_xy(lparam);
+            let mods = current_mods();
+            STATE.with(|cell| {
+                if let Some(t) = cell.borrow_mut().as_mut() {
+                    let offset = t.term.display_offset();
+                    let (point, side) = px_to_buffer_point(px, py, &t.metrics, offset);
+                    if mods.shift && t.term.selection_range().is_some() {
+                        t.term.selection_update(point, side);
+                    } else {
+                        t.term.selection_begin(SelectionType::Simple, point, side);
+                    }
+                    // 选区跨行覆盖且不入 term 脏区:全量兜底
+                    //(拖动 30 行重建成本低,行级选区追踪不值)
+                    t.force_full = true;
+                }
+            });
+            MOUSE_DOWN.with(|m| m.set(true));
+            let _ = SetCapture(hwnd);
+            draw_frame();
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if !MOUSE_DOWN.with(std::cell::Cell::get) {
+                return LRESULT(0);
+            }
+            let (px, py) = mouse_xy(lparam);
+            STATE.with(|cell| {
+                if let Some(t) = cell.borrow_mut().as_mut() {
+                    let offset = t.term.display_offset();
+                    let (point, side) = px_to_buffer_point(px, py, &t.metrics, offset);
+                    t.term.selection_update(point, side);
+                    t.force_full = true;
+                }
+            });
+            draw_frame();
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            MOUSE_DOWN.with(|m| m.set(false));
+            let _ = ReleaseCapture();
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            let (px, py) = mouse_xy(lparam);
+            // 三击 = 同位置 450ms 内的第二次双击,升格行选择
+            let ty = {
+                let last = LAST_DBLCLK.with_borrow_mut(|l| l.take());
+                let triple = last.as_ref().is_some_and(|(t, lx, ly)| {
+                    t.elapsed().as_millis() < 450 && *lx == px && *ly == py
+                });
+                LAST_DBLCLK.with_borrow_mut(|l| *l = last);
+                if triple {
+                    SelectionType::Lines
+                } else {
+                    SelectionType::Semantic
+                }
+            };
+            STATE.with(|cell| {
+                if let Some(t) = cell.borrow_mut().as_mut() {
+                    let offset = t.term.display_offset();
+                    let (point, side) = px_to_buffer_point(px, py, &t.metrics, offset);
+                    t.term.selection_begin(ty, point, side);
+                    t.force_full = true;
+                }
+            });
+            MOUSE_DOWN.with(|m| m.set(true));
+            let _ = SetCapture(hwnd);
+            draw_frame();
+            LRESULT(0)
+        }
         WM_MOUSEWHEEL => {
             // 高位有符号 delta,120/格;WT 惯例 3 行/格(=delta/40)。
             // delta 正 = 滚轮向上 = 看历史(上游 Scroll::Delta 正值增 offset)
@@ -826,6 +906,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// 客户区像素 → buffer 坐标点(视口行 + display_offset)与半格侧别。
+/// 拖出上/左边缘夹到 0(捕获期间 WM_MOUSEMOVE 仍投递,坐标可为负)。
+fn px_to_buffer_point(
+    px: i32,
+    py: i32,
+    metrics: &FontMetrics,
+    display_offset: usize,
+) -> (Point, Side) {
+    let col_f = (px.max(0) as f32 / metrics.cell_width).max(0.0);
+    let col = col_f as usize;
+    let side = if (col_f - col as f32) < 0.5 {
+        Side::Left
+    } else {
+        Side::Right
+    };
+    let view_line = (py.max(0) as f32 / metrics.line_height).max(0.0) as usize;
+    (
+        Point::new(Line(view_line as i32 + display_offset as i32), Column(col)),
+        side,
+    )
+}
+
+/// 鼠标消息 lparam 的有符号客户区坐标。
+fn mouse_xy(lparam: LPARAM) -> (i32, i32) {
+    (
+        (lparam.0 & 0xffff) as u16 as i16 as i32,
+        ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32,
+    )
 }
 
 fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {

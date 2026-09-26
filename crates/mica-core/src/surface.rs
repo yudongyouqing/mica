@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
-use alacritty_terminal::index::{Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
+use alacritty_terminal::selection::{Selection, SelectionRange};
 
 /// 滚动指令直通类型(重导出避免壳层直依赖 alacritty_terminal)。
 pub use alacritty_terminal::grid::Scroll as ScrollCommand;
+/// 选择相关直通类型(同上,app 只认 mica-core 的名字;pub use 亦供本模块内部使用)。
+pub use alacritty_terminal::index::{Column, Line, Point, Side};
+pub use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
