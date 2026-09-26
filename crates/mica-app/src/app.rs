@@ -37,7 +37,7 @@ use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
-    VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -71,6 +71,8 @@ struct ReloadHandle {
     watcher: notify::RecommendedWatcher,
     thread: std::thread::JoinHandle<()>,
 }
+
+mod clipboard;
 
 thread_local! {
     static STATE: RefCell<Option<Terminal>> = const { RefCell::new(None) };
@@ -665,6 +667,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_KEYDOWN => {
+            // 剪贴板组合(T5;T6 Keymap 落地后迁入 Action 表):
+            // Ctrl+C 有选区 → 复制并清选区,无选区 → 放行给 WM_CHAR 的
+            // (ETX 中断,WT 同款语义);Ctrl+V / Shift+Insert → 粘贴
+            let vk = wparam.0 as u32;
+            let mods = current_mods();
+            if mods.ctrl && !mods.alt && !mods.shift && vk == 'C' as u32 {
+                let mut copied = false;
+                STATE.with(|cell| {
+                    if let Some(t) = cell.borrow_mut().as_mut()
+                        && let Some(text) = t.term.selection_text()
+                    {
+                        clipboard::set_text(&text);
+                        t.term.selection_clear();
+                        t.force_full = true;
+                        copied = true;
+                    }
+                });
+                if copied {
+                    draw_frame();
+                    return LRESULT(0);
+                }
+            }
+            if (mods.ctrl && !mods.alt && !mods.shift && vk == 'V' as u32)
+                || (mods.shift && !mods.ctrl && vk == VK_INSERT.0 as u32)
+            {
+                if let Some(text) = clipboard::get_text() {
+                    let normalized = clipboard::normalize_paste(&text);
+                    STATE.with(|cell| {
+                        if let Some(t) = cell.borrow_mut().as_mut() {
+                            let _ = t.session.write(normalized.as_bytes());
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
             // 编码要读 term 的 DECCKM 模式,索性连同写回共用一次借用
             //(RefCell 内不嵌套第二借用,app_cursor_mode 只借走 &t.term)
             STATE.with(|cell| {
