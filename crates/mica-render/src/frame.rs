@@ -2,7 +2,8 @@
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::grid::Grid;
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::cell::Flags;
 
@@ -69,6 +70,7 @@ pub fn build_instances(
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    selection: Option<&SelectionRange>,
     display_offset: usize,
 ) -> Vec<CellInstance> {
     let grid = surface.grid();
@@ -83,11 +85,24 @@ pub fn build_instances(
     let mut glyphs = Vec::with_capacity(cols * rows);
     for line in 0..rows {
         for col in 0..cols {
-            let cell = &grid[Line(line as i32 - display_offset as i32)][Column(col)];
+            let buffer_line = line as i32 - display_offset as i32;
+            let cell = &grid[Line(buffer_line)][Column(col)];
             let mut fg = resolve(cell.fg, palette);
             let mut bg = resolve(cell.bg, palette);
-            // 先反色后光标(双交换抵消,光标在选区仍可辨——已裁定顺序)
-            if cell.flags.contains(Flags::INVERSE) {
+            // 选中优先于反色(选区是阅读层覆盖);光标交换保留,块光标在
+            // 选区内仍可辨——与 build_row 同序,黄金对拍锁定等价
+            if cell_selected(selection, cell, buffer_line, col) {
+                fg = [
+                    palette.selection_fg.r,
+                    palette.selection_fg.g,
+                    palette.selection_fg.b,
+                ];
+                bg = [
+                    palette.selection_bg.r,
+                    palette.selection_bg.g,
+                    palette.selection_bg.b,
+                ];
+            } else if cell.flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
             if display_offset == 0 && line == cursor_line && col == cursor_col {
@@ -133,11 +148,13 @@ pub struct RowInst {
 ///
 /// 结构守恒:`rows.len()` 必须等于视口行数;不符(resize 后、首建、调用方
 /// 维护失误)一律退化为全量重建——行数错位是结构性失配,增量修不回来。
+#[allow(clippy::too_many_arguments)] // 渲染热路径的参数组:打包 struct 反增噪音
 pub fn build_rows(
     surface: &Surface,
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    selection: Option<&SelectionRange>,
     display_offset: usize,
     damage: &Damage,
     rows: &mut Vec<RowInst>,
@@ -145,15 +162,39 @@ pub fn build_rows(
     let grid = surface.grid();
     let screen_lines = grid.screen_lines();
     if rows.len() != screen_lines {
-        rebuild_all(grid, router, metrics, palette, display_offset, rows);
+        rebuild_all(
+            grid,
+            router,
+            metrics,
+            palette,
+            selection,
+            display_offset,
+            rows,
+        );
         return;
     }
     match damage {
-        Damage::Full => rebuild_all(grid, router, metrics, palette, display_offset, rows),
+        Damage::Full => rebuild_all(
+            grid,
+            router,
+            metrics,
+            palette,
+            selection,
+            display_offset,
+            rows,
+        ),
         Damage::Lines(lines) => {
             for &line in lines {
                 if line < screen_lines {
-                    rows[line] = build_row(grid, line, router, metrics, palette, display_offset);
+                    rows[line] = build_row(
+                        grid,
+                        line,
+                        router,
+                        metrics,
+                        palette,
+                        selection,
+                        display_offset,
+                    );
                 }
             }
         }
@@ -166,6 +207,7 @@ fn rebuild_all(
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    selection: Option<&SelectionRange>,
     display_offset: usize,
     rows: &mut Vec<RowInst>,
 ) {
@@ -177,9 +219,27 @@ fn rebuild_all(
             router,
             metrics,
             palette,
+            selection,
             display_offset,
         ));
     }
+}
+
+/// 格是否在选区内(buffer 坐标)。宽字符前瞻一格:选到宽字尾部时
+/// 首格(字形承载格)也要高亮,否则半个字形高亮半个白。
+fn cell_selected(
+    selection: Option<&SelectionRange>,
+    cell: &Cell,
+    buffer_line: i32,
+    col: usize,
+) -> bool {
+    let Some(range) = selection else {
+        return false;
+    };
+    let point = Point::new(Line(buffer_line), Column(col));
+    range.contains(point)
+        || (cell.flags.contains(Flags::WIDE_CHAR)
+            && range.contains(Point::new(Line(buffer_line), Column(col + 1))))
 }
 
 /// 单行两段发射:bg 段(每格一整格 quad)先行,字形段随后。与
@@ -191,6 +251,7 @@ fn build_row(
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    selection: Option<&SelectionRange>,
     display_offset: usize,
 ) -> RowInst {
     let cols = grid.columns();
@@ -200,11 +261,24 @@ fn build_row(
     let mut row = RowInst::default();
     row.bg.reserve(cols);
     for col in 0..cols {
-        let cell = &grid[Line(line as i32 - display_offset as i32)][Column(col)];
+        let buffer_line = line as i32 - display_offset as i32;
+        let cell = &grid[Line(buffer_line)][Column(col)];
         let mut fg = resolve(cell.fg, palette);
         let mut bg = resolve(cell.bg, palette);
-        // 先反色后光标(双交换抵消,光标在反色上仍可辨——已裁定顺序)
-        if cell.flags.contains(Flags::INVERSE) {
+        // 选中优先于反色:选区是阅读层覆盖,选中的反色格不再交换
+        // (spec §5:选中格与光标相遇时光标交换仍执行,块光标在选区内可辨)
+        if cell_selected(selection, cell, buffer_line, col) {
+            fg = [
+                palette.selection_fg.r,
+                palette.selection_fg.g,
+                palette.selection_fg.b,
+            ];
+            bg = [
+                palette.selection_bg.r,
+                palette.selection_bg.g,
+                palette.selection_bg.b,
+            ];
+        } else if cell.flags.contains(Flags::INVERSE) {
             std::mem::swap(&mut fg, &mut bg);
         }
         if display_offset == 0 && line == cursor_line && col == cursor_col {
@@ -304,7 +378,7 @@ mod tests {
             wide: |_| false,
         };
         assert_eq!(
-            build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0).len(),
+            build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0).len(),
             8
         );
     }
@@ -320,7 +394,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| false,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0);
         // 两段式:bg 段 inst[0..4) 行优先每格一整格 quad,字形段随后
         assert_eq!(inst.len(), 5, "4 bg + 1 字形");
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -347,7 +421,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0);
         assert_eq!(inst.len(), 5, "4 bg + 1 宽字形(spacer 不出字形)");
         // bg 段:格 0 与 spacer 格(格 1)都是整格 blank
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -356,6 +430,54 @@ mod tests {
         assert_eq!(inst[1].size_uv, [8.0, 16.0, 0.0, 0.0]);
         // 字形段:宽字形在全部 bg 之后,横跨 2 格
         assert_eq!(inst[4].size_uv[0], 12.0, "宽字形横跨 2 格");
+    }
+
+    #[test]
+    fn selected_cells_use_palette_selection_colors() {
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::selection::SelectionRange;
+        let mut s = Surface::new(ScreenSize::new(4, 1));
+        s.feed(b"ABCD");
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 6.0,
+            glyph_h: 12.0,
+            wide: |_| false,
+        };
+        // 选中 (0,1)-(0,2) 两个格
+        let range = SelectionRange::new(
+            Point::new(Line(0), Column(1)),
+            Point::new(Line(0), Column(2)),
+            false,
+        );
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            Some(&range),
+            0,
+        );
+        // bg 段 4 格:1、2 格用 selection 对,0、3 格默认
+        let sel_bg = [
+            Palette::DEFAULT.selection_bg.r as f32 / 255.0,
+            Palette::DEFAULT.selection_bg.g as f32 / 255.0,
+            Palette::DEFAULT.selection_bg.b as f32 / 255.0,
+            0.0,
+        ];
+        let sel_fg = [
+            Palette::DEFAULT.selection_fg.r as f32 / 255.0,
+            Palette::DEFAULT.selection_fg.g as f32 / 255.0,
+            Palette::DEFAULT.selection_fg.b as f32 / 255.0,
+            0.0,
+        ];
+        let _ = &inst[0];
+        assert_eq!(inst[1].bg, sel_bg, "选中格 bg = selection_bg");
+        assert_eq!(inst[1].fg, sel_fg, "选中格 fg = selection_fg");
+        assert_eq!(inst[2].bg, sel_bg);
+        assert_ne!(inst[0].bg, sel_bg, "选区外格不受影响");
+        assert_ne!(inst[3].bg, sel_bg);
     }
 
     #[test]
@@ -387,7 +509,7 @@ mod tests {
                 wide: |_| false,
             },
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0);
         // 顺序:A@0(bold)、B@1(反色)、光标@2(空格)、空格@3
         // 两段式:bg 段 [0..4) = A、B、光标格、空格;字形段 [4..6) = A、B
         assert_eq!(inst.len(), 6, "4 bg + A、B 两个字形");
@@ -469,7 +591,7 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, 0);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0);
         // bg 段:全部 4 格在前,均整格 blank(uv 尺寸 0),行优先
         for (i, cell) in inst.iter().take(4).enumerate() {
             assert_eq!(
@@ -500,7 +622,7 @@ mod tests {
         let mut pal = Palette::DEFAULT;
         pal.apply_pair("palette", "1=#112233").unwrap();
         pal.apply_pair("background", "#abcdef").unwrap();
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &pal, 0);
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &pal, None, 0);
         // bg 段 inst[0]:A 的背景 = palette.bg(浅色),前景 = 槽 1
         assert_eq!(
             inst[0].bg,
@@ -593,12 +715,13 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            None,
             0,
             &damage,
             &mut rows,
         );
         let repacked = repack(&rows);
-        let golden = build_instances(&s, &mut router, &metrics_8x16(), &Palette::DEFAULT, 0);
+        let golden = build_instances(&s, &mut router, &metrics_8x16(), &Palette::DEFAULT, None, 0);
         assert_eq!(
             bytes(&repacked),
             bytes(&golden),
@@ -622,6 +745,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            None,
             0,
             &damage,
             &mut rows,
@@ -641,6 +765,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            None,
             0,
             &damage,
             &mut rows,
@@ -677,6 +802,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            None,
             0,
             &mica_core::surface::Damage::Full,
             &mut rows,
@@ -688,6 +814,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            None,
             0,
             &mica_core::surface::Damage::Lines(vec![]),
             &mut rows,
@@ -712,6 +839,7 @@ mod tests {
             &mut router,
             &metrics_8x16(),
             &Palette::DEFAULT,
+            None,
             0,
             &mica_core::surface::Damage::Full,
             &mut rows,

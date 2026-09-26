@@ -589,11 +589,13 @@ fn draw_frame() {
         };
         // 先 build(路由新字形、改图集)再比修订号:同帧新增字形同帧上传
         let display_offset = t.term.display_offset();
+        let selection = t.term.selection_range();
         build_rows(
             &t.term,
             &mut t.router,
             &t.metrics,
             &t.palette,
+            selection.as_ref(),
             display_offset,
             &damage,
             &mut t.row_insts,
