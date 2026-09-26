@@ -54,14 +54,14 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/plans/2026-09-26-m2a-tabs-selection.md` — M2a 计划(标签/键位/选择/剪贴板/滚轮/清账,8 任务;上游 scroll/selection API 已核实复用)。
 - 里程碑:M0 骨架(✅)→ M1 渲染补全(✅ 2026-09-26 发版进 main)→ M2 窗口体验(设计已确认,实施中)→ M3 系统集成 → M4 协议 → M5 1.0。
 
-## 当前边界(M1 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
+## 当前边界(M2a 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
 - 半纹素渗色(终审 I2,处方:insert 右/下 +1px 零填充 padding;冒烟未观察到明显症状,留观)
-- 快速拖动窗口有瞬态白块(DXGI 重建 backbuffer 的未初始化内容;M2 resize 体验一并处理)
-- 鼠标选择/复制(M2);WM_CHAR 无代理对之外的 IME 组合窗口(M3 系统级 IME)
-- Alt 编码已实现于 core;窗口路由(WM_SYSKEYDOWN/WM_SYSCHAR)未接,真机 Alt 组合当前整体不达(M2)
+- 分屏/连字(DWrite shaping,修订原 harfbuzz 决策 D16)/COLR 彩色 emoji(RGBA 图集 D19)/OSC 52/光标样式变体/自绘标题栏+Mica 材质——全部 M2b(spec 2026-09-26)
+- 标签溢出滚动为极简版(整条偏移);每标签独立字体/字号 M3 随 profile;标签 tear-off M3/M4 观望
+- 拖选接续滚轮扩展选区 M3;WM_CHAR 无代理对之外的 IME 组合窗口(M3 系统级 IME)
 - OSC 10/11/12 正确;OSC 4 索引 0-15 正确、16-255 答光标色(M4 修立方/灰阶)
-- 连字/COLR 彩色 emoji/光标样式变体(M2);bold-italic 复用 bold 面(M2);DPI 写死 96(spec §11)
+- bold-italic 复用 bold 面(M2b);DPI 写死 96(spec §11)
 
 ## 提交规范
 
