@@ -128,6 +128,99 @@ pub fn build_instances(
     out
 }
 
+/// tab strip 高度(T7):客户区顶部,终端区整体下移此值。
+pub const STRIP_H: f32 = 32.0;
+/// 单标签宽与 "+" 按钮宽(布局单源;app::strip_hit 依此命中)。
+pub const TAB_W: f32 = 140.0;
+pub const TAB_PLUS_W: f32 = 36.0;
+
+/// tab strip 的 UI 实例(T7,spec §3 同管线):底条 + 标签块(活跃高亮),
+/// 标题文字经 router 路由(与终端共享图集),尾部 "+" 按钮开新标签。
+/// 文字按等宽 cell 步进排版——strip 只有标题一行,粗排版与终端观感一致。
+pub fn strip_quads(
+    titles: &[(String, bool)],
+    router: &mut dyn GlyphRouter,
+    metrics: &FontMetrics,
+    palette: &Palette,
+) -> Vec<CellInstance> {
+    let mut out = Vec::new();
+    let total_w = titles.len() as f32 * TAB_W + TAB_PLUS_W;
+    let bg_of = |rgb: [u8; 3]| to_color(rgb);
+    // 底条(黑槽):宽度按需,不足以铺满也无妨(清屏色同源)
+    out.push(CellInstance {
+        pos_uv: [0.0, 0.0, 0.0, 0.0],
+        size_uv: [total_w, STRIP_H, 0.0, 0.0],
+        fg: bg_of([0, 0, 0]),
+        bg: bg_of([
+            palette.colors[0].r,
+            palette.colors[0].g,
+            palette.colors[0].b,
+        ]),
+    });
+    let text_y = (STRIP_H - metrics.line_height).max(0.0) / 2.0;
+    for (i, (title, active)) in titles.iter().enumerate() {
+        let x = i as f32 * TAB_W;
+        let block = if *active {
+            palette.bg
+        } else {
+            palette.colors[8]
+        };
+        let ink = if *active {
+            palette.fg
+        } else {
+            palette.colors[7]
+        };
+        out.push(CellInstance {
+            pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
+            size_uv: [TAB_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
+            fg: bg_of([ink.r, ink.g, ink.b]),
+            bg: bg_of([block.r, block.g, block.b]),
+        });
+        // 标题:8px 内边距,超宽截断(等宽步进)
+        let max_chars = (((TAB_W - 16.0) / metrics.cell_width) as usize).max(1);
+        for (ci, ch) in title.chars().take(max_chars).enumerate() {
+            let g = router.route(ch, GlyphStyle::PLAIN);
+            if g.size_px[0] <= 0.0 {
+                continue; // 空白/未路由字符跳过
+            }
+            out.push(CellInstance {
+                pos_uv: [
+                    x + 8.0 + ci as f32 * metrics.cell_width + g.offset_px[0],
+                    text_y + g.offset_px[1],
+                    g.uv[0],
+                    g.uv[1],
+                ],
+                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                fg: bg_of([ink.r, ink.g, ink.b]),
+                bg: bg_of([block.r, block.g, block.b]),
+            });
+        }
+    }
+    // "+" 按钮
+    let x = titles.len() as f32 * TAB_W;
+    let block = palette.colors[0];
+    let ink = palette.fg;
+    out.push(CellInstance {
+        pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
+        size_uv: [TAB_PLUS_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
+        fg: bg_of([ink.r, ink.g, ink.b]),
+        bg: bg_of([block.r, block.g, block.b]),
+    });
+    let g = router.route('+', GlyphStyle::PLAIN);
+    out.push(CellInstance {
+        pos_uv: [
+            x + (TAB_PLUS_W - g.size_px[0]) / 2.0,
+            (STRIP_H - g.size_px[1]) / 2.0,
+            g.uv[0],
+            g.uv[1],
+        ],
+        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+        fg: bg_of([ink.r, ink.g, ink.b]),
+        bg: bg_of([block.r, block.g, block.b]),
+    });
+    out
+}
+
 /// 一行的两段实例:bg 整格段(行内每格一实例)+ 字形段(仅非空白格)。
 /// 行主序持有;**全局**两遍发射契约(全部 bg 先于全部字形)由 [`repack`]
 /// 平铺时恢复——行内只保序,平铺才定序。
