@@ -50,7 +50,8 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-09-22-m1-render-config-design.md` — M1 设计(D8-D12 决策)。
 - `docs/superpowers/plans/2026-09-22-m1-fonts-cjk.md` — M1-A 计划(字体与中文,T1-T7 完成、2026-09-22 真机冒烟通过;文末终审附录含 C1-I3 处方与留观清单)。
 - `docs/superpowers/plans/2026-09-23-m1b-config-input-events.md` — M1-B 计划(配置/主题/OSC 4/12/DECCKM/事件化/脏区,T1-T9 完成、2026-09-25 真机冒烟通过——第 5 条 vim 因未安装跳过,DECCKM 以 core 表驱动测试为证)。
-- `docs/superpowers/specs/2026-09-26-m2-tabs-splits-design.md` — M2 设计(标签/分屏/选择/连字/COLR,D13-D20;M2a/M2b 两切片,计划待写)。
+- `docs/superpowers/specs/2026-09-26-m2-tabs-splits-design.md` — M2 设计(标签/分屏/选择/连字/COLR,D13-D20;M2a/M2b 两切片)。
+- `docs/superpowers/plans/2026-09-26-m2a-tabs-selection.md` — M2a 计划(标签/键位/选择/剪贴板/滚轮/清账,8 任务;上游 scroll/selection API 已核实复用)。
 - 里程碑:M0 骨架(✅)→ M1 渲染补全(✅ 2026-09-26 发版进 main)→ M2 窗口体验(设计已确认,实施中)→ M3 系统集成 → M4 协议 → M5 1.0。
 
 ## 当前边界(M1 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)

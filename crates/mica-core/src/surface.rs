@@ -5,7 +5,14 @@
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::{Dimensions, Grid};
+use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
+use alacritty_terminal::selection::{Selection, SelectionRange};
+
+/// 滚动指令直通类型(重导出避免壳层直依赖 alacritty_terminal)。
+pub use alacritty_terminal::grid::Scroll as ScrollCommand;
+/// 选择相关直通类型(同上,app 只认 mica-core 的名字;pub use 亦供本模块内部使用)。
+pub use alacritty_terminal::index::{Column, Line, Point, Side};
+pub use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
@@ -217,6 +224,49 @@ impl Surface {
     /// SS3 而非 CSI。
     pub fn app_cursor_mode(&self) -> bool {
         self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// 视口滚动(scrollback)。Delta(正) 向历史方向,Bottom 归零跟随。
+    pub fn scroll_display(&mut self, scroll: Scroll) {
+        self.term.scroll_display(scroll);
+    }
+
+    /// 当前滚动偏移(0 = 钉在屏幕底跟随输出)。
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    // ---- 选择(M2a/T3):状态与拼接全用上游成品,这里只做薄封装 ----
+
+    /// 开始一次选择(按下/双击/三击分别传 Simple/Semantic/Lines)。
+    /// point 为 buffer 坐标(视口行 + display_offset)。
+    pub fn selection_begin(&mut self, ty: SelectionType, point: Point, side: Side) {
+        self.term.selection = Some(Selection::new(ty, point, side));
+    }
+
+    /// 拖动更新选区末端。
+    pub fn selection_update(&mut self, point: Point, side: Side) {
+        if let Some(sel) = &mut self.term.selection {
+            sel.update(point, side);
+        }
+    }
+
+    /// 清空选区(点击空白/ESC/复制后)。
+    pub fn selection_clear(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// 选区规范化范围(起点 ≤ 终点),渲染高亮判定用。
+    pub fn selection_range(&self) -> Option<SelectionRange> {
+        self.term
+            .selection
+            .as_ref()
+            .and_then(|sel| sel.to_range(&self.term))
+    }
+
+    /// 选区文本(上游拼接,含 wrap 语义)。
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string()
     }
 
     pub fn size(&self) -> ScreenSize {
@@ -431,6 +481,30 @@ mod tests {
             Damage::Lines(vec![2]),
             "last_cursor 已同步到行 2:不得出现 (0,0) 假伤"
         );
+    }
+
+    #[test]
+    fn selection_spans_lines_and_clears() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        s.feed(b"hello\r\nworld");
+        use alacritty_terminal::index::{Column, Line};
+        // Side::Left = 从该格左缘起(含本格);Right 会跳到下一格右缘
+        s.selection_begin(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(2)),
+            Side::Left,
+        );
+        s.selection_update(Point::new(Line(1), Column(3)), Side::Left);
+        let text = s.selection_text().expect("选区应有文本");
+        assert!(text.contains("llo"), "首行尾部: {text:?}");
+        assert!(text.contains("wor"), "次行首部: {text:?}");
+        let range = s.selection_range().expect("选区应有 range");
+        assert!(range.start.line <= range.end.line, "to_range 已规范顺序");
+        assert!(range.contains(Point::new(Line(0), Column(4))));
+        assert!(!range.contains(Point::new(Line(0), Column(0))));
+        s.selection_clear();
+        assert!(s.selection_text().is_none());
+        assert!(s.selection_range().is_none());
     }
 
     #[test]
