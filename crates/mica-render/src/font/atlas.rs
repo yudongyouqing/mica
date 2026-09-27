@@ -1,12 +1,42 @@
-//! 字形图集:R8 纹素、shelf 行分配、放不下自动倍增高并重排。
+//! 字形图集:RGBA8 纹素(D19,M2b 起)、shelf 行分配、放不下自动倍增高并重排。
 //! 仅在主线程访问(渲染路径),无锁。
+//! 存储非预乘:灰度字形 RGB 恒白、A=coverage(染色交给 shader 的 fg 乘);
+//! 彩色字形(COLR)RGB=原色、A=不透明度,渲染时 fg 填白即得原色。
 
-/// 待排布的字形位图(R8,每像素 1 字节灰度)。
+/// 位图格式:Coverage = 灰度覆盖(进 A 通道);ColorRgba = 彩色原色。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlyphFormat {
+    Coverage,
+    ColorRgba,
+}
+
+/// 待排布的字形位图(RGBA8 非预乘,行主序,每像素 4 字节)。
 #[derive(Clone)]
 pub struct GlyphBitmap {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    pub format: GlyphFormat,
+}
+
+impl GlyphBitmap {
+    /// 灰度 coverage(R8 逐像素)→ RGBA:RGB 白、A=coverage。
+    pub fn from_coverage(width: u32, height: u32, coverage: Vec<u8>) -> Self {
+        assert_eq!(coverage.len(), (width * height) as usize);
+        let mut pixels = vec![0u8; coverage.len() * 4];
+        for (i, &v) in coverage.iter().enumerate() {
+            pixels[i * 4] = 255;
+            pixels[i * 4 + 1] = 255;
+            pixels[i * 4 + 2] = 255;
+            pixels[i * 4 + 3] = v;
+        }
+        Self {
+            width,
+            height,
+            pixels,
+            format: GlyphFormat::Coverage,
+        }
+    }
 }
 
 /// 图集内矩形(像素坐标,UV 换算由消费方做)。
@@ -45,7 +75,7 @@ impl GlyphAtlas {
         Self {
             width,
             height,
-            data: vec![0; (width * height) as usize],
+            data: vec![0; (width * height) as usize * 4], // RGBA8
             shelves: Vec::new(),
             entries: Vec::new(),
             version: 0,
@@ -127,7 +157,7 @@ impl GlyphAtlas {
         }
         // 高度倍增
         self.height = self.height.saturating_mul(2).max(1);
-        self.data = vec![0; (self.width * self.height) as usize];
+        self.data = vec![0; (self.width * self.height) as usize * 4]; // RGBA8
         self.shelves.clear();
         self.version += 1;
         self.revision += 1;
@@ -143,10 +173,10 @@ impl GlyphAtlas {
 
     fn blit(&mut self, bmp: &GlyphBitmap, r: Rect) {
         for y in 0..r.h {
-            let dst = ((r.v + y) * self.width + r.u) as usize;
-            let src = (y * bmp.width) as usize;
-            self.data[dst..dst + r.w as usize]
-                .copy_from_slice(&bmp.pixels[src..src + r.w as usize]);
+            let dst = (((r.v + y) * self.width + r.u) * 4) as usize;
+            let src = ((y * bmp.width) * 4) as usize;
+            let span = (r.w * 4) as usize;
+            self.data[dst..dst + span].copy_from_slice(&bmp.pixels[src..src + span]);
         }
     }
 }
@@ -155,12 +185,13 @@ impl GlyphAtlas {
 mod tests {
     use super::*;
 
+    /// 测试位图:A 通道 = tag,RGB 白(灰度字形真实形态)。
     fn bmp(w: u32, h: u32, tag: u8) -> GlyphBitmap {
-        GlyphBitmap {
-            width: w,
-            height: h,
-            pixels: vec![tag; (w * h) as usize],
-        }
+        GlyphBitmap::from_coverage(w, h, vec![tag; (w * h) as usize])
+    }
+
+    fn tex_alpha(a: &GlyphAtlas, x: u32, y: u32) -> u8 {
+        a.texture()[((y * a.width() + x) * 4 + 3) as usize]
     }
 
     #[test]
@@ -178,7 +209,11 @@ mod tests {
                 "{ra:?} overlaps {rb:?}"
             );
         }
-        assert_eq!(a.texture().len(), (a.width() * a.height()) as usize);
+        assert_eq!(
+            a.texture().len(),
+            (a.width() * a.height()) as usize * 4,
+            "RGBA8"
+        );
     }
 
     #[test]
@@ -187,7 +222,7 @@ mod tests {
         let r = a.insert(&bmp(3, 2, 7));
         for y in 0..r.h {
             for x in 0..r.w {
-                assert_eq!(a.texture()[((r.v + y) * a.width() + r.u + x) as usize], 7);
+                assert_eq!(tex_alpha(&a, r.u + x, r.v + y), 7, "coverage 落 A 通道");
             }
         }
     }
@@ -207,11 +242,7 @@ mod tests {
         for (r, tag) in [(r1, 9u8), (r2, 5u8)] {
             for y in 0..r.h {
                 for x in 0..r.w {
-                    assert_eq!(
-                        a.texture()[((r.v + y) * a.width() + r.u + x) as usize],
-                        tag,
-                        "{r:?} tag{tag}"
-                    );
+                    assert_eq!(tex_alpha(&a, r.u + x, r.v + y), tag, "{r:?} tag{tag}");
                 }
             }
         }
@@ -226,7 +257,7 @@ mod tests {
         // 内容落位
         for y in 0..r.h {
             for x in 0..r.w {
-                assert_eq!(a.texture()[((r.v + y) * a.width() + r.u + x) as usize], 3);
+                assert_eq!(tex_alpha(&a, r.u + x, r.v + y), 3);
             }
         }
         // 后续常规插入继续正常
@@ -252,7 +283,7 @@ mod tests {
         for i in 0..200u8 {
             rects.push(a.insert(&bmp((i % 7 + 2) as u32, (i % 5 + 2) as u32, i)));
         }
-        assert_eq!(a.texture().len(), (a.width() * a.height()) as usize);
+        assert_eq!(a.texture().len(), (a.width() * a.height()) as usize * 4);
         for (i, r) in rects.iter().enumerate() {
             assert!(
                 r.u + r.w <= a.width() && r.v + r.h <= a.height(),

@@ -1,4 +1,4 @@
-//! wgpu 30 pipeline: adapter/device setup, dynamic glyph atlas upload,
+//! wgpu 30 pipeline: adapter/device setup, dynamic RGBA glyph atlas upload,
 //! instanced cell pass. Pure GPU plumbing; instance building lives in frame.rs.
 
 use bytemuck::cast_slice;
@@ -238,7 +238,7 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format: wgpu::TextureFormat::Rgba8Unorm, // RGBA 图集(D19):灰度 RGB 白 A=coverage,彩色原色
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
@@ -248,18 +248,19 @@ impl Renderer {
         // next_power_of_two 都满足),故 width 本身即对齐行距,可零填充直传。
         // 若未来出现非 256 倍数的宽度,这里 debug 构建立即报错;修复路径是
         // padded 暂存上传(div_ceil(256)*256 逐行拷贝,参考旧 Atlas 上传)。
+        // RGBA8:每行 = width*4 字节;宽度恒为 256 的幂 → ×4 仍 256 对齐
         debug_assert_eq!(
-            atlas.width() % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+            (atlas.width() * 4) % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
             0,
-            "atlas width {} 不满足 bytes_per_row 的 256 对齐,需 padded 上传",
-            atlas.width()
+            "atlas width*4 {} 不满足 bytes_per_row 的 256 对齐",
+            atlas.width() * 4
         );
         self.queue.write_texture(
             texture.as_image_copy(),
             atlas.texture(),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(atlas.width()),
+                bytes_per_row: Some(atlas.width() * 4),
                 rows_per_image: Some(atlas.height()),
             },
             size,
@@ -457,11 +458,7 @@ mod tests {
         let mut renderer = Renderer::new(&ctx, TextureFormat::Bgra8Unorm);
         // 256 对齐宽度的图集:set_atlas 走完整纹理创建+直传路径
         let mut atlas = GlyphAtlas::new(256, 256);
-        let bmp = GlyphBitmap {
-            width: 8,
-            height: 12,
-            pixels: vec![255; 8 * 12],
-        };
+        let bmp = GlyphBitmap::from_coverage(8, 12, vec![255; (8 * 12) as usize]);
         let rect = atlas.insert(&bmp);
         assert!(rect.u + rect.w <= atlas.width());
         renderer.set_atlas(&atlas);
@@ -469,11 +466,7 @@ mod tests {
         renderer.set_atlas(&atlas);
         // C1 回归锁:普通插入(不触发 grow)version 不动但 revision 递增,
         // set_atlas 必须重传——旧门控只看 version 时这类插入会静默漏传
-        let plain = GlyphBitmap {
-            width: 6,
-            height: 9,
-            pixels: vec![200; 6 * 9],
-        };
+        let plain = GlyphBitmap::from_coverage(6, 9, vec![200; (6 * 9) as usize]);
         atlas.insert(&plain);
         assert_eq!(atlas.version(), 0, "此插入不应触发 grow");
         renderer.set_atlas(&atlas);
@@ -481,11 +474,7 @@ mod tests {
         assert_eq!(renderer.atlas_revision, atlas.revision());
         // 高 250 的字形在剩余空间放不下(12+250>256)→ grow 后 version 递增;
         // set_atlas 走"重建纹理+重传"路径(新尺寸 256×512)
-        let big = GlyphBitmap {
-            width: 8,
-            height: 250,
-            pixels: vec![128; 8 * 250],
-        };
+        let big = GlyphBitmap::from_coverage(8, 250, vec![128; (8 * 250) as usize]);
         atlas.insert(&big);
         assert!(atlas.version() > 0, "高度不足应触发 grow+版本递增");
         renderer.set_atlas(&atlas);

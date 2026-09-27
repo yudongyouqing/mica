@@ -263,12 +263,10 @@ impl DwriteRouter {
         };
         // 亚像素三通道即三份水平错位的 coverage:取 R 通道,单通道做墨量
         // 是亚像素纹理转灰度的标准做法(等价灰度 AA,合 R8 图集)
-        let pixels: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
-        let rect = self.atlas.insert(&GlyphBitmap {
-            width: w,
-            height: h,
-            pixels,
-        });
+        let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
+        let rect = self
+            .atlas
+            .insert(&GlyphBitmap::from_coverage(w, h, coverage));
         let (aw, ah) = (self.atlas.width() as f32, self.atlas.height() as f32);
         // 字形相对格左上:水平 = bounds.left;垂直 = ascent + bounds.top(top 为负 = 基线上方)
         Some(GlyphInfo {
