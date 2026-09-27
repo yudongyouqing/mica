@@ -9,6 +9,9 @@ pub struct GlyphInfo {
     pub uv: [f32; 4],
     pub size_px: [f32; 2],
     pub offset_px: [f32; 2],
+    /// 彩色字形(COLR,M2b/T3):位图带原色,渲染实例 fg 必须填白让原色
+    /// 直通(shader: mix(bg, tex.rgb * fg, tex.a))。灰度字形恒 false。
+    pub color: bool,
 }
 
 pub trait GlyphRouter {

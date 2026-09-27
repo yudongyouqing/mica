@@ -14,15 +14,17 @@ use std::mem::ManuallyDrop;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE,
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
-    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET,
-    DWRITE_GLYPH_RUN, DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
-    DWRITE_TEXTURE_CLEARTYPE_3x1, DWriteCreateFactory, IDWriteFactory, IDWriteFont,
-    IDWriteFontCollection, IDWriteFontFace,
+    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_IMAGE_FORMATS,
+    DWRITE_GLYPH_IMAGE_FORMATS_COLR, DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+    DWRITE_TEXTURE_CLEARTYPE_3x1, DWriteCreateFactory, IDWriteFactory, IDWriteFactory4,
+    IDWriteFont, IDWriteFontCollection, IDWriteFontFace,
 };
-use windows::core::{BOOL, HSTRING};
+use windows::core::{BOOL, HSTRING, Interface};
+use windows_numerics::Vector2;
 
 use super::GlyphStyle;
-use super::atlas::{GlyphAtlas, GlyphBitmap};
+use super::atlas::{GlyphAtlas, GlyphBitmap, GlyphFormat};
 use super::metrics::FontMetrics;
 use super::router::{GlyphInfo, GlyphRouter};
 
@@ -70,6 +72,7 @@ fn blank_glyph() -> GlyphInfo {
         uv: [0.0; 4],
         size_px: [0.0; 2],
         offset_px: [0.0; 2],
+        color: false,
     }
 }
 
@@ -203,6 +206,12 @@ impl DwriteRouter {
             None => face_with_glyph(&family.plain, ch)?,
         };
 
+        // 彩色路径(M2b/T3):COLR 字形走层合成;非彩色字形上游报错,
+        // 自然落回灰度路径——每字符仅首次路由时探测(缓存兜底)
+        if let Some(info) = self.rasterize_color(&face, glyph) {
+            return Some(info);
+        }
+
         let em = self.em_size_dip;
         let offset = DWRITE_GLYPH_OFFSET {
             advanceOffset: 0.0,
@@ -278,6 +287,152 @@ impl DwriteRouter {
             ],
             size_px: [w as f32, h as f32],
             offset_px: [bounds.left as f32, self.metrics.ascent + bounds.top as f32],
+            color: false,
+        })
+    }
+
+    /// COLR 彩色字形(M2b/T3):Factory4::TranslateColorGlyphRun 拿层
+    /// 枚举器(每层自带 glyphRun 子集 + runColor——调色板已被上游解析),
+    /// 逐层以灰度同款 analysis 光栅出 coverage mask,再 over 合成进
+    /// union 画布(非预乘存储,shader 侧 fg 白直通原色)。
+    /// 非彩色字形:TranslateColorGlyphRun 报错 → None → 回灰度。
+    fn rasterize_color(&mut self, face: &IDWriteFontFace, glyph: u16) -> Option<GlyphInfo> {
+        let factory4 = self.factory.cast::<IDWriteFactory4>().ok()?;
+        let glyphs = [glyph];
+        let advances = [self.em_size_dip];
+        let offsets = [DWRITE_GLYPH_OFFSET {
+            advanceOffset: 0.0,
+            ascenderOffset: 0.0,
+        }];
+        let mut run = DWRITE_GLYPH_RUN {
+            fontFace: ManuallyDrop::new(Some(face.clone())),
+            fontEmSize: self.em_size_dip,
+            glyphCount: 1,
+            glyphIndices: glyphs.as_ptr(),
+            glyphAdvances: advances.as_ptr(),
+            glyphOffsets: offsets.as_ptr(),
+            isSideways: BOOL::default(),
+            bidiLevel: 0,
+        };
+        let enumerator = unsafe {
+            factory4.TranslateColorGlyphRun(
+                Vector2 { X: 0.0, Y: 0.0 },
+                &run,
+                None,
+                DWRITE_GLYPH_IMAGE_FORMATS(DWRITE_GLYPH_IMAGE_FORMATS_COLR.0),
+                DWRITE_MEASURING_MODE_NATURAL,
+                None,
+                0,
+            )
+        };
+        drop(unsafe { ManuallyDrop::take(&mut run.fontFace) });
+        let enumerator = enumerator.ok()?;
+
+        // 逐层:coverage mask + 层色(层指针只在 MoveNext 前有效,即取即拷)
+        let mut layers: Vec<(windows::Win32::Foundation::RECT, Vec<u8>, [f32; 4])> = Vec::new();
+        loop {
+            let more = unsafe { enumerator.MoveNext().ok()? };
+            if !more.as_bool() {
+                break;
+            }
+            let run1_ptr = unsafe { enumerator.GetCurrentRun().ok()? };
+            // DWRITE_GLYPH_RUN 非 Copy(ManuallyDrop 字段):按引用借,不移出;
+            // runColor 是 4×f32 的 Copy 结构
+            let color = unsafe { (*run1_ptr).Base.runColor };
+            // SAFETY: 层 run 的指针参数在此块内有效(枚举器缓冲未动)
+            let analysis = unsafe {
+                self.factory.CreateGlyphRunAnalysis(
+                    &(*run1_ptr).Base.glyphRun,
+                    1.0,
+                    None,
+                    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                    0.0,
+                    0.0,
+                )
+            }
+            .ok()?;
+            let bounds = unsafe {
+                analysis
+                    .GetAlphaTextureBounds(DWRITE_TEXTURE_CLEARTYPE_3x1)
+                    .ok()?
+            };
+            let (bw, bh) = (
+                (bounds.right - bounds.left).max(0),
+                (bounds.bottom - bounds.top).max(0),
+            );
+            if bw == 0 || bh == 0 {
+                continue; // 空层跳过
+            }
+            let mut raw = vec![0u8; (bw * bh) as usize * 3];
+            unsafe {
+                analysis
+                    .CreateAlphaTexture(DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, &mut raw)
+                    .ok()?
+            };
+            let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
+            layers.push((bounds, coverage, [color.r, color.g, color.b, color.a]));
+        }
+        if layers.is_empty() {
+            return None;
+        }
+
+        // union 画布
+        let mut u = layers[0].0;
+        for (b, _, _) in &layers[1..] {
+            u.left = u.left.min(b.left);
+            u.top = u.top.min(b.top);
+            u.right = u.right.max(b.right);
+            u.bottom = u.bottom.max(b.bottom);
+        }
+        let (uw, uh) = ((u.right - u.left).max(1), (u.bottom - u.top).max(1));
+        let mut canvas = vec![0f32; (uw * uh) as usize * 4]; // 非预乘 RGBA f32
+        for (b, coverage, rgba) in layers {
+            let color = rgba.map(|c| c.clamp(0.0, 1.0));
+            for y in 0..(b.bottom - b.top).max(0) {
+                for x in 0..(b.right - b.left).max(0) {
+                    let cov = coverage[(y * (b.right - b.left) + x) as usize] as f32 / 255.0;
+                    if cov <= 0.0 {
+                        continue;
+                    }
+                    let sa = color[3] * cov; // 层有效 alpha
+                    let cx = (b.left - u.left + x) as usize;
+                    let cy = (b.top - u.top + y) as usize;
+                    let i = (cy * uw as usize + cx) * 4;
+                    let da = canvas[i + 3];
+                    canvas[i] = color[0] * sa + canvas[i] * (1.0 - sa);
+                    canvas[i + 1] = color[1] * sa + canvas[i + 1] * (1.0 - sa);
+                    canvas[i + 2] = color[2] * sa + canvas[i + 2] * (1.0 - sa);
+                    canvas[i + 3] = sa + da * (1.0 - sa);
+                }
+            }
+        }
+        let mut pixels = vec![0u8; canvas.len()];
+        let (packed, _) = pixels.as_chunks_mut::<4>();
+        let (floats, _) = canvas.as_chunks::<4>();
+        for (dst, src) in packed.iter_mut().zip(floats.iter()) {
+            for (d, v) in dst.iter_mut().zip(src.iter()) {
+                *d = (v * 255.0).round() as u8;
+            }
+        }
+        let bmp = GlyphBitmap {
+            width: uw as u32,
+            height: uh as u32,
+            pixels,
+            format: GlyphFormat::ColorRgba,
+        };
+        let rect = self.atlas.insert(&bmp);
+        let (aw, ah) = (self.atlas.width() as f32, self.atlas.height() as f32);
+        Some(GlyphInfo {
+            uv: [
+                rect.u as f32 / aw,
+                rect.v as f32 / ah,
+                rect.w as f32 / aw,
+                rect.h as f32 / ah,
+            ],
+            size_px: [uw as f32, uh as f32],
+            offset_px: [u.left as f32, self.metrics.ascent + u.top as f32],
+            color: true,
         })
     }
 }

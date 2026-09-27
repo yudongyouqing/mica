@@ -119,7 +119,12 @@ pub fn build_instances(
             glyphs.push(CellInstance {
                 pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
                 size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: to_color(fg),
+                // 彩色字形 fg 白:tex.rgb * 白 = 原色直通(灰度字形照常染色)
+                fg: if g.color {
+                    to_color([255, 255, 255])
+                } else {
+                    to_color(fg)
+                },
                 bg: to_color(bg),
             });
         }
@@ -387,7 +392,12 @@ fn build_row(
         row.glyphs.push(CellInstance {
             pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
             size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-            fg: to_color(fg),
+            // 彩色字形 fg 白:原色直通(与 build_instances 同序,对拍锁定)
+            fg: if g.color {
+                to_color([255, 255, 255])
+            } else {
+                to_color(fg)
+            },
             bg: to_color(bg),
         });
     }
@@ -447,6 +457,7 @@ mod tests {
                 uv: [0.25, 0.25, w / self.atlas_w, self.glyph_h / self.atlas_h],
                 size_px: [w, self.glyph_h],
                 offset_px: [1.0, 2.0],
+                color: false,
             }
         }
     }
