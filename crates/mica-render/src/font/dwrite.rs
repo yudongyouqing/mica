@@ -12,13 +12,15 @@ use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 
 use windows::Win32::Graphics::DirectWrite::{
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE,
-    DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_FEATURE, DWRITE_FONT_FEATURE_TAG_CONTEXTUAL_ALTERNATES,
+    DWRITE_FONT_FEATURE_TAG_STANDARD_LIGATURES, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL,
+    DWRITE_FONT_STYLE, DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
     DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_IMAGE_FORMATS,
     DWRITE_GLYPH_IMAGE_FORMATS_COLR, DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET, DWRITE_GLYPH_RUN,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
-    DWRITE_TEXTURE_CLEARTYPE_3x1, DWriteCreateFactory, IDWriteFactory, IDWriteFactory4,
-    IDWriteFont, IDWriteFontCollection, IDWriteFontFace,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, DWRITE_SCRIPT_ANALYSIS,
+    DWRITE_SCRIPT_SHAPES, DWRITE_SHAPING_GLYPH_PROPERTIES, DWRITE_SHAPING_TEXT_PROPERTIES,
+    DWRITE_TEXTURE_CLEARTYPE_3x1, DWRITE_TYPOGRAPHIC_FEATURES, DWriteCreateFactory, IDWriteFactory,
+    IDWriteFactory4, IDWriteFont, IDWriteFontCollection, IDWriteFontFace,
 };
 use windows::core::{BOOL, HSTRING, Interface};
 use windows_numerics::Vector2;
@@ -26,7 +28,7 @@ use windows_numerics::Vector2;
 use super::GlyphStyle;
 use super::atlas::{GlyphAtlas, GlyphBitmap, GlyphFormat};
 use super::metrics::FontMetrics;
-use super::router::{GlyphInfo, GlyphRouter};
+use super::router::{ClusterLayout, GlyphInfo, GlyphRouter};
 
 /// 一个家族的三个样式面(plain/bold/italic;bold-italic 复用 bold 面,M2 若需要再加)。
 struct FamilyFaces {
@@ -59,6 +61,11 @@ pub struct DwriteRouter {
     /// 图集版本哨兵:grow 会重排搬动全部条目,缓存里的 UV 是按当时尺寸归一的
     last_atlas_version: u64,
     cache: HashMap<(char, u8), GlyphInfo>,
+    /// 连字 shaping(M2b/T4):启动探测(主字体对 =>/>= 系列产合成字形)
+    /// 不通过则整条 route_run 走 None,行为与 M2a 完全一致
+    ligatures: bool,
+    /// 连字缓存:key = (字符段, 样式位);命中免 shaping
+    run_cache: HashMap<(Vec<char>, u8), Vec<ClusterLayout>>,
 }
 
 /// 缓存键的样式位:bold=bit0,italic=bit1。
@@ -155,14 +162,28 @@ impl DwriteRouter {
             em_size_dip,
             resolved[0].max_advance_du,
         );
+        // 连字探测(D16):主字体 shape 若干常见连字序列,全都不产合成
+        // 字形则关闭整条 shaping 路径(探测在构造期,零运行时成本)
+        let factory_probe = factory.clone();
+        // 探测全家族:链中任一支持连字即启用(承载段不支持时 cluster
+        // 自然 1:1 回退逐字,不会误渲染)
+        let ligature_family = resolved
+            .iter()
+            .find(|f| probe_ligatures(&factory_probe, &f.plain, em_size_dip));
+        let ligatures = ligature_family.is_some();
+        if let Some(f) = ligature_family {
+            eprintln!("ligatures: enabled for {}", f.name);
+        }
         Ok(Self {
             factory,
             families: resolved,
+            ligatures,
             em_size_dip,
             metrics,
             atlas: GlyphAtlas::new(256, 256),
             last_atlas_version: 0,
             cache: HashMap::new(),
+            run_cache: HashMap::new(),
         })
     }
 
@@ -289,6 +310,82 @@ impl DwriteRouter {
             offset_px: [bounds.left as f32, self.metrics.ascent + bounds.top as f32],
             color: false,
         })
+    }
+
+    /// 连字合成字形光栅化:单 glyph run(advance=总宽),灰度同款路径。
+    /// 失败兜底 blank(该连字不显示,好过崩)。
+    fn rasterize_ligature(&mut self, font: &IDWriteFont, glyph: u16, advance: f32) -> GlyphInfo {
+        // SAFETY: 与 rasterize 同款 run/analysis/bounds/texture 序
+        unsafe {
+            let face = match font.CreateFontFace() {
+                Ok(f) => f,
+                Err(_) => return blank_glyph(),
+            };
+            let glyphs = [glyph];
+            let advances = [advance];
+            let offsets = [DWRITE_GLYPH_OFFSET {
+                advanceOffset: 0.0,
+                ascenderOffset: 0.0,
+            }];
+            let mut run = DWRITE_GLYPH_RUN {
+                fontFace: ManuallyDrop::new(Some(face.clone())),
+                fontEmSize: self.em_size_dip,
+                glyphCount: 1,
+                glyphIndices: glyphs.as_ptr(),
+                glyphAdvances: advances.as_ptr(),
+                glyphOffsets: offsets.as_ptr(),
+                isSideways: BOOL::default(),
+                bidiLevel: 0,
+            };
+            let analysis = self.factory.CreateGlyphRunAnalysis(
+                &run,
+                1.0,
+                None,
+                DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+                DWRITE_MEASURING_MODE_NATURAL,
+                0.0,
+                0.0,
+            );
+            drop(ManuallyDrop::take(&mut run.fontFace));
+            let analysis = match analysis {
+                Ok(a) => a,
+                Err(_) => return blank_glyph(),
+            };
+            let bounds = match analysis.GetAlphaTextureBounds(DWRITE_TEXTURE_CLEARTYPE_3x1) {
+                Ok(b) => b,
+                Err(_) => return blank_glyph(),
+            };
+            let (w, h) = (
+                (bounds.right - bounds.left).max(0),
+                (bounds.bottom - bounds.top).max(0),
+            );
+            if w == 0 || h == 0 {
+                return blank_glyph();
+            }
+            let mut raw = vec![0u8; (w * h) as usize * 3];
+            if analysis
+                .CreateAlphaTexture(DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, &mut raw)
+                .is_err()
+            {
+                return blank_glyph();
+            }
+            let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
+            let rect = self
+                .atlas
+                .insert(&GlyphBitmap::from_coverage(w as u32, h as u32, coverage));
+            let (aw, ah) = (self.atlas.width() as f32, self.atlas.height() as f32);
+            GlyphInfo {
+                uv: [
+                    rect.u as f32 / aw,
+                    rect.v as f32 / ah,
+                    rect.w as f32 / aw,
+                    rect.h as f32 / ah,
+                ],
+                size_px: [w as f32, h as f32],
+                offset_px: [bounds.left as f32, self.metrics.ascent + bounds.top as f32],
+                color: false,
+            }
+        }
     }
 
     /// COLR 彩色字形(M2b/T3):Factory4::TranslateColorGlyphRun 拿层
@@ -438,6 +535,86 @@ impl DwriteRouter {
 }
 
 impl GlyphRouter for DwriteRouter {
+    /// 整段 shaping(连字,D16):cluster 布局逐格返回——单字符 cluster
+    /// 给 None(渲染侧走 route 缓存,零额外成本),连字 cluster 给合成
+    /// GlyphInfo(光栅化单 glyph 位图,宽 = cluster 总 advance)。
+    fn route_run(&mut self, chars: &[char], style: GlyphStyle) -> Option<Vec<ClusterLayout>> {
+        if !self.ligatures || chars.len() < 2 {
+            return None;
+        }
+        let key = (chars.to_vec(), style_bits(style));
+        if let Some(hit) = self.run_cache.get(&key) {
+            return Some(hit.clone());
+        }
+        // 段首字符选面(与 route 同语义:样式面缺字形回退 plain)
+        let font = {
+            let family = self.family_for(*chars.first()?)?;
+            match (style.bold, style.italic) {
+                (true, _) => family.bold.clone(),
+                (false, true) => family.italic.clone(),
+                _ => family.plain.clone(),
+            }
+        };
+        let shape = shape_run(&self.factory, &font, self.em_size_dip, chars)??;
+
+        // cluster 遍历:cluster_map 的值跳变处 = 新 cluster;cluster 的
+        // u16 起止换回 char 位数(chars 的 utf16 前缀长对照)
+        let mut u16_bounds = Vec::with_capacity(chars.len() + 1);
+        u16_bounds.push(0usize);
+        for &c in chars {
+            let last = *u16_bounds.last().unwrap();
+            u16_bounds.push(last + c.len_utf16());
+        }
+        // u16 位 → char 位 反查表
+        let mut char_at = vec![0usize; *u16_bounds.last().unwrap() + 1];
+        for (ci, &b) in u16_bounds.iter().enumerate() {
+            char_at[b] = ci;
+        }
+
+        let mut layouts: Vec<ClusterLayout> = Vec::new();
+        let mut u = 0usize; // 当前 u16 位
+        let cm = &shape.cluster_map;
+        let text_len = cm.len();
+        while u < text_len {
+            let start_glyph = cm[u] as usize;
+            // cluster 吞到 map 值跳变处(或结尾)
+            let mut v = u;
+            while v < text_len && cm[v] as usize == start_glyph {
+                v += 1;
+            }
+            // cluster 的 glyph 集:map 值 == start_glyph 的区间对应的 glyph
+            // 起始位是 start_glyph,终止位 = 下一 cluster 的起始 map 值
+            let next_glyph = if v < text_len {
+                cm[v] as usize
+            } else {
+                shape.glyph_indices.len()
+            };
+            let cluster_chars = char_at[v] - char_at[u];
+            if v - u >= 2 && cluster_chars >= 2 && next_glyph > start_glyph {
+                // 连字 cluster(多字符并成 ≥1 glyph):光栅化合成字形,
+                // 宽 = 该 cluster 所有 glyph advance 之和
+                let advance: f32 = shape.advances[start_glyph..next_glyph].iter().sum();
+                let glyph_id = shape.glyph_indices[start_glyph];
+                let info = self.rasterize_ligature(&font, glyph_id, advance);
+                layouts.push(ClusterLayout {
+                    len: cluster_chars,
+                    glyph: Some(info),
+                });
+            } else {
+                // 常规:逐字符 cluster(BMP 一 u16 一 char)
+                for _ in 0..cluster_chars {
+                    layouts.push(ClusterLayout {
+                        len: 1,
+                        glyph: None,
+                    });
+                }
+            }
+            u = v;
+        }
+        self.run_cache.insert(key, layouts.clone());
+        Some(layouts)
+    }
+
     fn route(&mut self, ch: char, style: GlyphStyle) -> GlyphInfo {
         // 图集 grow 重排后全部条目换了位置,旧缓存的 UV 按当时尺寸归一已失效——
         // 版本号一动即清缓存(本轮新插入本就按当前尺寸计算,不受影响)
@@ -454,6 +631,133 @@ impl GlyphRouter for DwriteRouter {
         self.cache.insert(key, info);
         info
     }
+}
+
+/// 启动连字探测:任一序列 shaping 后 glyph 数 < 字符数 ⇒ 字体支持连字。
+fn probe_ligatures(factory: &IDWriteFactory, font: &IDWriteFont, em: f32) -> bool {
+    for seq in ["=>", ">=", "!=", "->", "=="] {
+        let chars: Vec<char> = seq.chars().collect();
+        if let Some(Some(shape)) = shape_run(factory, font, em, &chars)
+            && shape.glyph_indices.len() < chars.len()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// shaping 结果:cluster map(每 u16 字符位 → glyph 起始索引)、
+/// glyph 索引与 advance。
+struct ShapeResult {
+    cluster_map: Vec<u16>,
+    glyph_indices: Vec<u16>,
+    advances: Vec<f32>,
+}
+
+/// shaping 核心。script analysis 用零值(拉丁近似):等宽编程连字全是
+/// ASCII,探针通过即视为可用;真出现错误只影响该段连字(回退逐字)。
+fn shape_run(
+    factory: &IDWriteFactory,
+    font: &IDWriteFont,
+    em: f32,
+    chars: &[char],
+) -> Option<Option<ShapeResult>> {
+    // SAFETY 门面:内部全 unsafe COM,失败归 None(外层 None = COM 失败)
+    fn inner(
+        factory: &IDWriteFactory,
+        font: &IDWriteFont,
+        em: f32,
+        chars: &[char],
+    ) -> Option<ShapeResult> {
+        unsafe {
+            let face = font.CreateFontFace().ok()?;
+            let analyzer = factory.CreateTextAnalyzer().ok()?;
+            let mut text = Vec::with_capacity(chars.len());
+            for &c in chars {
+                let mut buf = [0u16; 2];
+                text.extend_from_slice(c.encode_utf16(&mut buf));
+            }
+            let script = DWRITE_SCRIPT_ANALYSIS {
+                script: 0,
+                shapes: DWRITE_SCRIPT_SHAPES(0),
+            };
+            let mut cluster_map = vec![0u16; text.len()];
+            let mut text_props = vec![DWRITE_SHAPING_TEXT_PROPERTIES::default(); text.len()];
+            let mut glyph_indices = vec![0u16; text.len()];
+            let mut glyph_props = vec![DWRITE_SHAPING_GLYPH_PROPERTIES::default(); text.len()];
+            let mut actual: u32 = 0;
+            // 显式开 liga+calt:编程连字(=> 等)是上下文替换,DWrite 的
+            // 默认特性集不启用它——这是探测成败的关键参数
+            let mut features = [
+                DWRITE_FONT_FEATURE {
+                    nameTag: DWRITE_FONT_FEATURE_TAG_STANDARD_LIGATURES,
+                    parameter: 1,
+                },
+                DWRITE_FONT_FEATURE {
+                    nameTag: DWRITE_FONT_FEATURE_TAG_CONTEXTUAL_ALTERNATES,
+                    parameter: 1,
+                },
+            ];
+            let typo = [DWRITE_TYPOGRAPHIC_FEATURES {
+                features: features.as_mut_ptr(),
+                featureCount: features.len() as u32,
+            }];
+            let range_lens = [text.len() as u32];
+            let typo_ptr: *const DWRITE_TYPOGRAPHIC_FEATURES = &typo[0];
+            analyzer
+                .GetGlyphs(
+                    windows::core::PCWSTR(text.as_ptr()),
+                    text.len() as u32,
+                    &face,
+                    false,
+                    false,
+                    &script,
+                    None,
+                    None,
+                    Some(&typo_ptr),
+                    Some(range_lens.as_ptr()),
+                    1,
+                    text.len() as u32,
+                    cluster_map.as_mut_ptr(),
+                    text_props.as_mut_ptr(),
+                    glyph_indices.as_mut_ptr(),
+                    glyph_props.as_mut_ptr(),
+                    &mut actual,
+                )
+                .ok()?;
+            glyph_indices.truncate(actual as usize);
+            let mut advances = vec![0f32; actual as usize];
+            let mut offsets = vec![DWRITE_GLYPH_OFFSET::default(); actual as usize];
+            analyzer
+                .GetGlyphPlacements(
+                    windows::core::PCWSTR(text.as_ptr()),
+                    cluster_map.as_ptr(),
+                    text_props.as_mut_ptr(),
+                    text.len() as u32,
+                    glyph_indices.as_ptr(),
+                    glyph_props.as_ptr(),
+                    actual,
+                    &face,
+                    em,
+                    false,
+                    false,
+                    &script,
+                    None,
+                    Some(&typo_ptr),
+                    Some(range_lens.as_ptr()),
+                    1,
+                    advances.as_mut_ptr(),
+                    offsets.as_mut_ptr(),
+                )
+                .ok()?;
+            Some(ShapeResult {
+                cluster_map,
+                glyph_indices,
+                advances,
+            })
+        }
+    }
+    inner(factory, font, em, chars).map(Some)
 }
 
 #[cfg(test)]

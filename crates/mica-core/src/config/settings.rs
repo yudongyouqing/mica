@@ -93,10 +93,17 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
 /// 键集分派:font-family 追加、font-size 限幅、色键走 Palette;
 /// 未知键(含 selection-*/cursor-text,M2 接)静默跳过——Ghostty 同款容忍。
 fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut ConfigError) {
+    // 首个显式 font-family 重置默认链(Ghostty 配置语义:显式键覆盖默认值),
+    // 之后的声明追加
+    let mut family_declared = false;
     for (key, value) in pairs {
         match key.as_str() {
             "font-family" => {
                 if !value.is_empty() {
+                    if !family_declared {
+                        settings.font_families.clear();
+                        family_declared = true;
+                    }
                     settings.font_families.push(value);
                 }
             }
@@ -164,8 +171,12 @@ mod tests {
     #[test]
     fn font_family_appends_and_size_bounds() {
         let s = resolve("font-family = JetBrains Mono\nfont-size = 16\n").unwrap();
-        assert_eq!(s.font_families.len(), 5, "追加在默认链之后");
-        assert_eq!(s.font_families[4], "JetBrains Mono");
+        assert_eq!(
+            s.font_families,
+            vec!["JetBrains Mono"],
+            "首个显式声明替换默认链"
+        );
+
         assert_eq!(s.font_size_pt, 16.0);
 
         for bad in ["0", "144", "abc", "-3"] {

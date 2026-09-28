@@ -84,49 +84,68 @@ pub fn build_instances(
     // 字形段先攒后拼:保证全部 bg 先于全部字形(跨格画家序,见 doc)
     let mut glyphs = Vec::with_capacity(cols * rows);
     for line in 0..rows {
+        let buffer_line = line as i32 - display_offset as i32;
+        let y = line as f32 * metrics.line_height;
         for col in 0..cols {
-            let buffer_line = line as i32 - display_offset as i32;
             let cell = &grid[Line(buffer_line)][Column(col)];
-            let mut fg = resolve(cell.fg, palette);
-            let mut bg = resolve(cell.bg, palette);
-            // 选中优先于反色(选区是阅读层覆盖);光标交换保留,块光标在
-            // 选区内仍可辨——与 build_row 同序,黄金对拍锁定等价
-            if cell_selected(selection, cell, buffer_line, col) {
-                fg = [
-                    palette.selection_fg.r,
-                    palette.selection_fg.g,
-                    palette.selection_fg.b,
-                ];
-                bg = [
-                    palette.selection_bg.r,
-                    palette.selection_bg.g,
-                    palette.selection_bg.b,
-                ];
-            } else if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if display_offset == 0 && line == cursor_line && col == cursor_col {
-                std::mem::swap(&mut fg, &mut bg);
-            }
+            let cursor_here = display_offset == 0 && line == cursor_line && col == cursor_col;
+            let (fg, bg) = cell_colors(cell, selection, buffer_line, col, palette, cursor_here);
             let x = col as f32 * metrics.cell_width;
-            let y = line as f32 * metrics.line_height;
-            // bg 段:整格背景,不依赖字形 bbox 覆盖
             out.push(blank(x, y, metrics, fg, bg));
+        }
+        // 字形段:cluster 步进,与 build_row 逐字节同构(黄金对拍锁定)
+        let mut col = 0usize;
+        while col < cols {
+            let cell = &grid[Line(buffer_line)][Column(col)];
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.c == ' ' {
+                col += 1;
                 continue;
             }
-            let g = router.route(cell.c, GlyphStyle::from_flags(cell.flags));
-            glyphs.push(CellInstance {
-                pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
-                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                // 彩色字形 fg 白:tex.rgb * 白 = 原色直通(灰度字形照常染色)
-                fg: if g.color {
-                    to_color([255, 255, 255])
-                } else {
-                    to_color(fg)
-                },
-                bg: to_color(bg),
-            });
+            let style = GlyphStyle::from_flags(cell.flags);
+            let mut end = col + 1;
+            while end < cols {
+                let next = &grid[Line(buffer_line)][Column(end)];
+                if next.flags.contains(Flags::WIDE_CHAR_SPACER)
+                    || next.c == ' '
+                    || GlyphStyle::from_flags(next.flags) != style
+                {
+                    break;
+                }
+                end += 1;
+            }
+            let mut shaped = None;
+            if end - col >= 2 {
+                let chars: Vec<char> = (col..end)
+                    .map(|c| grid[Line(buffer_line)][Column(c)].c)
+                    .collect();
+                shaped = router.route_run(&chars, style);
+            }
+            let Some(clusters) = shaped else {
+                let cursor_here = display_offset == 0 && line == cursor_line && col == cursor_col;
+                let (fg, bg) = cell_colors(cell, selection, buffer_line, col, palette, cursor_here);
+                let x = col as f32 * metrics.cell_width;
+                let g = router.route(cell.c, style);
+                glyphs.push(glyph_instance(x, y, &g, fg, bg));
+                col += 1;
+                continue;
+            };
+            let mut pos = col;
+            for cluster in clusters {
+                let cell_c = &grid[Line(buffer_line)][Column(pos)];
+                let cursor_here = display_offset == 0 && line == cursor_line && pos == cursor_col;
+                let (fg, bg) =
+                    cell_colors(cell_c, selection, buffer_line, pos, palette, cursor_here);
+                let x = pos as f32 * metrics.cell_width;
+                match cluster.glyph {
+                    Some(g) => glyphs.push(glyph_instance(x, y, &g, fg, bg)),
+                    None => {
+                        let g = router.route(cell_c.c, style);
+                        glyphs.push(glyph_instance(x, y, &g, fg, bg));
+                    }
+                }
+                pos += cluster.len.max(1);
+            }
+            col = pos;
         }
     }
     out.extend(glyphs);
@@ -323,6 +342,58 @@ fn rebuild_all(
     }
 }
 
+/// 行内格子的前景/背景对(选中 > 反色 > 光标交换的裁定序,两处同构)。
+#[allow(clippy::too_many_arguments)]
+fn cell_colors(
+    cell: &Cell,
+    selection: Option<&SelectionRange>,
+    buffer_line: i32,
+    col: usize,
+    palette: &Palette,
+    cursor_here: bool,
+) -> ([u8; 3], [u8; 3]) {
+    let mut fg = resolve(cell.fg, palette);
+    let mut bg = resolve(cell.bg, palette);
+    if cell_selected(selection, cell, buffer_line, col) {
+        fg = [
+            palette.selection_fg.r,
+            palette.selection_fg.g,
+            palette.selection_fg.b,
+        ];
+        bg = [
+            palette.selection_bg.r,
+            palette.selection_bg.g,
+            palette.selection_bg.b,
+        ];
+    } else if cell.flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if cursor_here {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    (fg, bg)
+}
+
+/// 字形实例(连字/单字共用):彩色字形 fg 白原色直通。
+fn glyph_instance(
+    x: f32,
+    y: f32,
+    g: &crate::font::router::GlyphInfo,
+    fg: [u8; 3],
+    bg: [u8; 3],
+) -> CellInstance {
+    CellInstance {
+        pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
+        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+        fg: if g.color {
+            to_color([255, 255, 255])
+        } else {
+            to_color(fg)
+        },
+        bg: to_color(bg),
+    }
+}
+
 /// 格是否在选区内(buffer 坐标)。宽字符前瞻一格:选到宽字尾部时
 /// 首格(字形承载格)也要高亮,否则半个字形高亮半个白。
 fn cell_selected(
@@ -356,50 +427,71 @@ fn build_row(
     let cursor = grid.cursor.point;
     let cursor_line = usize::try_from(cursor.line.0).unwrap_or(usize::MAX);
     let cursor_col = cursor.column.0;
+    let buffer_line = line as i32 - display_offset as i32;
     let mut row = RowInst::default();
     row.bg.reserve(cols);
+    let y = line as f32 * metrics.line_height;
     for col in 0..cols {
-        let buffer_line = line as i32 - display_offset as i32;
         let cell = &grid[Line(buffer_line)][Column(col)];
-        let mut fg = resolve(cell.fg, palette);
-        let mut bg = resolve(cell.bg, palette);
-        // 选中优先于反色:选区是阅读层覆盖,选中的反色格不再交换
-        // (spec §5:选中格与光标相遇时光标交换仍执行,块光标在选区内可辨)
-        if cell_selected(selection, cell, buffer_line, col) {
-            fg = [
-                palette.selection_fg.r,
-                palette.selection_fg.g,
-                palette.selection_fg.b,
-            ];
-            bg = [
-                palette.selection_bg.r,
-                palette.selection_bg.g,
-                palette.selection_bg.b,
-            ];
-        } else if cell.flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if display_offset == 0 && line == cursor_line && col == cursor_col {
-            std::mem::swap(&mut fg, &mut bg);
-        }
+        let cursor_here = display_offset == 0 && line == cursor_line && col == cursor_col;
+        let (fg, bg) = cell_colors(cell, selection, buffer_line, col, palette, cursor_here);
         let x = col as f32 * metrics.cell_width;
-        let y = line as f32 * metrics.line_height;
         row.bg.push(blank(x, y, metrics, fg, bg));
+    }
+    // 字形段:同 style 连续段先试整段 shaping(连字),不成回退逐字
+    let mut col = 0usize;
+    while col < cols {
+        let cell = &grid[Line(buffer_line)][Column(col)];
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.c == ' ' {
+            col += 1;
             continue;
         }
-        let g = router.route(cell.c, GlyphStyle::from_flags(cell.flags));
-        row.glyphs.push(CellInstance {
-            pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
-            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-            // 彩色字形 fg 白:原色直通(与 build_instances 同序,对拍锁定)
-            fg: if g.color {
-                to_color([255, 255, 255])
-            } else {
-                to_color(fg)
-            },
-            bg: to_color(bg),
-        });
+        let style = GlyphStyle::from_flags(cell.flags);
+        let mut end = col + 1;
+        while end < cols {
+            let next = &grid[Line(buffer_line)][Column(end)];
+            if next.flags.contains(Flags::WIDE_CHAR_SPACER)
+                || next.c == ' '
+                || GlyphStyle::from_flags(next.flags) != style
+            {
+                break;
+            }
+            end += 1;
+        }
+        // 整段 shaping:cluster 步进——单字符 cluster 走逐字路由(缓存
+        // 路径零额外成本),连字 cluster 首格承载合成字形
+        let mut shaped = None;
+        if end - col >= 2 {
+            let chars: Vec<char> = (col..end)
+                .map(|c| grid[Line(buffer_line)][Column(c)].c)
+                .collect();
+            shaped = router.route_run(&chars, style);
+        }
+        let Some(clusters) = shaped else {
+            let cursor_here = display_offset == 0 && line == cursor_line && col == cursor_col;
+            let (fg, bg) = cell_colors(cell, selection, buffer_line, col, palette, cursor_here);
+            let x = col as f32 * metrics.cell_width;
+            let g = router.route(cell.c, style);
+            row.glyphs.push(glyph_instance(x, y, &g, fg, bg));
+            col += 1;
+            continue;
+        };
+        let mut pos = col;
+        for cluster in clusters {
+            let cell_c = &grid[Line(buffer_line)][Column(pos)];
+            let cursor_here = display_offset == 0 && line == cursor_line && pos == cursor_col;
+            let (fg, bg) = cell_colors(cell_c, selection, buffer_line, pos, palette, cursor_here);
+            let x = pos as f32 * metrics.cell_width;
+            match cluster.glyph {
+                Some(g) => row.glyphs.push(glyph_instance(x, y, &g, fg, bg)),
+                None => {
+                    let g = router.route(cell_c.c, style);
+                    row.glyphs.push(glyph_instance(x, y, &g, fg, bg));
+                }
+            }
+            pos += cluster.len.max(1);
+        }
+        col = pos;
     }
     row
 }
@@ -582,6 +674,71 @@ mod tests {
         assert_eq!(inst[2].bg, sel_bg);
         assert_ne!(inst[0].bg, sel_bg, "选区外格不受影响");
         assert_ne!(inst[3].bg, sel_bg);
+    }
+
+    /// 连字路由:仅对 "=>" 序列产合成字形(宽 2 格),其余 None 回退逐字。
+    struct LigatureRouter {
+        inner: FakeRouter,
+    }
+    impl GlyphRouter for LigatureRouter {
+        fn route(&mut self, ch: char, style: GlyphStyle) -> crate::font::router::GlyphInfo {
+            self.inner.route(ch, style)
+        }
+        fn route_run(
+            &mut self,
+            chars: &[char],
+            _style: GlyphStyle,
+        ) -> Option<Vec<crate::font::router::ClusterLayout>> {
+            use crate::font::router::ClusterLayout;
+            // "a=>b":a 单字、=> 连字、b 单字
+            if chars == ['a', '=', '>', 'b'] {
+                Some(vec![
+                    ClusterLayout {
+                        len: 1,
+                        glyph: None,
+                    },
+                    ClusterLayout {
+                        len: 2,
+                        glyph: Some(crate::font::router::GlyphInfo {
+                            uv: [0.5, 0.5, 0.2, 0.2],
+                            size_px: [16.0, 12.0],
+                            offset_px: [0.0, 2.0],
+                            color: false,
+                        }),
+                    },
+                    ClusterLayout {
+                        len: 1,
+                        glyph: None,
+                    },
+                ])
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn ligature_run_collapses_to_single_glyph() {
+        let mut s = Surface::new(ScreenSize::new(8, 1));
+        s.feed(b"a=>b");
+        let mut r = LigatureRouter {
+            inner: FakeRouter {
+                atlas_w: 64.0,
+                atlas_h: 64.0,
+                glyph_w: 6.0,
+                glyph_h: 12.0,
+                wide: |_| false,
+            },
+        };
+        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0);
+        // 8 bg + 字形段:a、=>(合成)、b = 3 个字形(逐字路径是 4 个)
+        assert_eq!(inst.len(), 8 + 3, "连字段收敛为单字形");
+        let lig = &inst[9]; // 字形段第 2 个
+        assert_eq!(lig.pos_uv[0], 8.0 + 0.0, "首格承载(a 占格 0)");
+        assert_eq!(lig.size_uv[0], 16.0, "合成字形宽 2 格");
+        // 隔离:相邻不同段不受影响,a 与 b 仍 6px
+        assert_eq!(inst[8].size_uv[0], 6.0);
+        assert_eq!(inst[10].pos_uv[0], 25.0, "b 在格 3(Fake offset+1)");
     }
 
     #[test]
