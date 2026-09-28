@@ -592,6 +592,11 @@ unsafe fn create_tab(hwnd: HWND) -> (TabState, PtyReader) {
     // 调色板接线:OSC 4/10/11/12 应答与渲染/清屏同源(窗口级 clear_color
     // 由 run/reload 维护,标签只管自己的应答与实例着色)
     term.set_palette(&palette);
+    // OSC 52 读向:终端请求剪贴板内容时经 provider 读系统剪贴板
+    // (主线程排空事件时调用,Win32 剪贴板无跨线程顾虑)
+    term.set_clipboard_provider(std::sync::Arc::new(|| {
+        clipboard::get_text().unwrap_or_default()
+    }));
     let (session, reader) =
         PtySession::spawn(default_shell_command(), cols, rows).expect("spawn shell");
     let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1111,6 +1116,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // 终端对查询的应答(DSR/OSC)必须写回 pty,否则 shell 会卡在等待
                 for reply in t.term.take_pty_writes() {
                     let _ = t.session.write(reply.as_bytes());
+                }
+                // OSC 52 写向(tmux 复制到本机):转交系统剪贴板
+                // (多条取最后一条——同一轮多次 set 是覆盖语义)
+                if let Some(text) = t.term.take_clipboard_out().pop() {
+                    clipboard::set_text(&text);
                 }
                 if let Some(title) = t.term.take_title() {
                     guard[idx].title = title.clone();
