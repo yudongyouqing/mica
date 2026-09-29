@@ -53,16 +53,18 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-09-26-m2-tabs-splits-design.md` — M2 设计(标签/分屏/选择/连字/COLR,D13-D20;M2a/M2b 两切片)。
 - `docs/superpowers/plans/2026-09-26-m2a-tabs-selection.md` — M2a 计划(标签/键位/选择/剪贴板/滚轮/清账,8 任务;上游 scroll/selection API 已核实复用)。
 - `docs/superpowers/plans/2026-09-27-m2b-splits-ligatures.md` — M2b 计划(分屏/连字/COLR/OSC52/光标/标题栏,9 任务;DWrite shaping/COLR/光标样式 API 已核实,探针先行原则标注)。
-- 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(a:标签/选择/键位 ✅ 2026-09-26;b:分屏/连字/COLR 实施中)→ M3 系统集成 → M4 协议 → M5 1.0。
+- 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(✅ 2026-09-30 真机冒烟通过)→ M3 系统集成 → M4 协议 → M5 1.0。
 
-## 当前边界(M2a 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
+## 当前边界(M2 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
 - 半纹素渗色(终审 I2,处方:insert 右/下 +1px 零填充 padding;冒烟未观察到明显症状,留观)
-- 分屏/连字(DWrite shaping,修订原 harfbuzz 决策 D16)/COLR 彩色 emoji(RGBA 图集 D19)/OSC 52/光标样式变体/自绘标题栏+Mica 材质——全部 M2b(spec 2026-09-26)
-- 标签溢出滚动为极简版(整条偏移);每标签独立字体/字号 M3 随 profile;标签 tear-off M3/M4 观望
-- 拖选接续滚轮扩展选区 M3;WM_CHAR 无代理对之外的 IME 组合窗口(M3 系统级 IME)
+- 连字:Cascadia 系需 TextLayout 级引擎(analyzer+liga/calt 不触发),管线已备,probe 阴性自动回退——换引擎留 M3
+- OSC 52:管线单测全过,真机经 ConPTY 疑被拦截——tmux 环境复验后定案(M3 或关账)
+- 系统按钮(— □ ×)hit-test 已通,视觉字形待打磨(M2 打磨票);标签溢出滚动为极简版
+- 每标签独立字体/字号 M3 随 profile;标签 tear-off M3/M4 观望;拖选接续滚轮扩展选区 M3
+- WM_CHAR 无代理对之外的 IME 组合窗口(M3 系统级 IME)
 - OSC 10/11/12 正确;OSC 4 索引 0-15 正确、16-255 答光标色(M4 修立方/灰阶)
-- bold-italic 复用 bold 面(M2b);DPI 写死 96(spec §11)
+- bold-italic 复用 bold 面(M2 打磨票);DPI 写死 96(spec §11)
 
 ## 提交规范
 
