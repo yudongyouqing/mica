@@ -43,17 +43,27 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-    DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, LoadCursorW, MSG, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE,
-    WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowTextW,
+    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE,
+    WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
-use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK};
+use windows::Win32::UI::WindowsAndMessaging::{
+    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
+    HTMINBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, MB_ICONWARNING, MB_OK, SC_MAXIMIZE,
+    SC_MINIMIZE,
+};
 use windows::core::{HSTRING, PCWSTR, w};
 
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
+
+/// 自绘顶栏(T8):右上三颗系统按钮各 46px 宽;resize 拖拽边宽
+const CAPTION_BTN_W: i32 = 46;
+const RESIZE_BORDER: i32 = 6;
 
 /// WM_APP 用户消息区(0x8000 起):
 /// +1 = WM_APP_RENDER(T7,pty 转发线程唤醒渲染);+2 = WM_APP_CONFIG(T5,热重载)
@@ -238,6 +248,14 @@ pub fn run() {
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             &dark as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        // Mica 材质(T8,Win11 22H2+;DWMSBT_MAINWINDOW=2):老系统静默降级
+        let backdrop: i32 = 2;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,
+            &backdrop as *const i32 as *const std::ffi::c_void,
             std::mem::size_of::<i32>() as u32,
         );
 
@@ -1469,6 +1487,105 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             });
             draw_frame();
             LRESULT(0)
+        }
+        WM_NCCALCSIZE => {
+            // 去系统标题栏(T8):整窗=客户区,顶栏由 strip 自绘。
+            // wparam=0 时是查询形态,交默认;=1 才是真正的尺寸计算
+            if wparam.0 == 1 {
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_NCHITTEST => {
+            // lparam = 屏幕坐标;转窗口本地坐标判区域
+            let px = (lparam.0 & 0xffff) as u16 as i16 as i32;
+            let py = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let (cx, cy) = (px - wr.left, py - wr.top);
+            let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+            let strip_h = mica_render::frame::STRIP_H as i32;
+            // 边缘 8 向 resize(优先于一切)
+            let (near_l, near_r) = (cx < RESIZE_BORDER, cx >= w - RESIZE_BORDER);
+            let (near_t, near_b) = (cy < RESIZE_BORDER, cy >= h - RESIZE_BORDER);
+            if near_t && near_l {
+                return LRESULT(HTTOPLEFT as isize);
+            }
+            if near_t && near_r {
+                return LRESULT(HTTOPRIGHT as isize);
+            }
+            if near_b && near_l {
+                return LRESULT(HTBOTTOMLEFT as isize);
+            }
+            if near_b && near_r {
+                return LRESULT(HTBOTTOMRIGHT as isize);
+            }
+            if near_l {
+                return LRESULT(HTLEFT as isize);
+            }
+            if near_r {
+                return LRESULT(HTRIGHT as isize);
+            }
+            if near_t {
+                return LRESULT(HTTOP as isize);
+            }
+            if near_b {
+                return LRESULT(HTBOTTOM as isize);
+            }
+            // 顶栏:右上按钮区优先,其余 = 拖拽区
+            if cy < strip_h {
+                let btn_left = w - CAPTION_BTN_W * 3;
+                if cx >= btn_left {
+                    if cx < btn_left + CAPTION_BTN_W {
+                        return LRESULT(HTMINBUTTON as isize);
+                    }
+                    if cx < btn_left + CAPTION_BTN_W * 2 {
+                        return LRESULT(HTMAXBUTTON as isize);
+                    }
+                    return LRESULT(HTCLOSE as isize);
+                }
+                return LRESULT(HTCAPTION as isize);
+            }
+            LRESULT(HTCLIENT as isize)
+        }
+        WM_NCLBUTTONDOWN => {
+            // 系统按钮(T8):SC 命令驱动最小化/最大化;关闭走销毁路径
+            match wparam.0 as u32 {
+                HTMINBUTTON => {
+                    let _ = SendMessageW(
+                        hwnd,
+                        WM_SYSCOMMAND,
+                        Some(WPARAM(SC_MINIMIZE as usize)),
+                        Some(LPARAM(0)),
+                    );
+                }
+                HTMAXBUTTON => {
+                    let _ = SendMessageW(
+                        hwnd,
+                        WM_SYSCOMMAND,
+                        Some(WPARAM(SC_MAXIMIZE as usize)),
+                        Some(LPARAM(0)),
+                    );
+                }
+                HTCLOSE => {
+                    let _ = PostMessageW(Some(hwnd), WM_DESTROY, WPARAM(0), LPARAM(0));
+                }
+                _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+            LRESULT(0)
+        }
+        WM_NCLBUTTONDBLCLK => {
+            // 双击顶栏 = 最大化/还原(WT 同款)
+            if wparam.0 as u32 == HTCAPTION {
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_SYSCOMMAND,
+                    Some(WPARAM(SC_MAXIMIZE as usize)),
+                    Some(LPARAM(0)),
+                );
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_PAINT => {
             // 绘制节奏由消息循环控制;这里只清掉无效区积压

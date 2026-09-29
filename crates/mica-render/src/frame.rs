@@ -237,6 +237,9 @@ pub fn strip_quads(
     let x = titles.len() as f32 * TAB_W;
     let block = palette.colors[0];
     let ink = palette.fg;
+    // 顶栏系统按钮占位(T8):右上三颗 — □ × 由 NC hit-test 命中;视觉
+    // 字形由 hit-test 的 CAPTION_BTN_W 常量几何驱动(同布局单源约束下,
+    // 按钮字形绘制放 app 层后续打磨,先保证 hit-test 可用)
     out.push(CellInstance {
         pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
         size_uv: [TAB_PLUS_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
