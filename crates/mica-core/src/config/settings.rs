@@ -29,6 +29,8 @@ pub struct Settings {
     pub theme_name: Option<String>,
     /// 键位表(D15):默认 WT 兼容,`keybind` 键覆盖。
     pub keymap: Keymap,
+    /// 光标闪烁(D20):默认不闪,`cursor-blink = true` 开 500ms 定时器。
+    pub cursor_blink: bool,
 }
 
 impl Default for Settings {
@@ -39,6 +41,7 @@ impl Default for Settings {
             palette: Palette::DEFAULT,
             theme_name: None,
             keymap: Keymap::wt_default(),
+            cursor_blink: false,
         }
     }
 }
@@ -114,6 +117,13 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                     .push(format!("font-size 应为 4-72 的数字,得 `{value}`")),
             },
             "theme" => settings.theme_name = Some(value),
+            "cursor-blink" => match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => settings.cursor_blink = true,
+                "false" | "0" | "no" => settings.cursor_blink = false,
+                _ => err
+                    .values
+                    .push(format!("cursor-blink 应为 true/false,得 `{value}`")),
+            },
             "keybind" => {
                 // 值形如 `ctrl+shift+t = new_tab`;`clear` 清默认表
                 let value = value.trim();

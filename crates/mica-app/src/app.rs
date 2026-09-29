@@ -47,7 +47,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassExW, SetWindowTextW, TranslateMessage,
     WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SIZE,
-    WM_SYSCHAR, WM_SYSKEYDOWN, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_SYSCHAR, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{MB_ICONWARNING, MB_OK};
 use windows::core::{HSTRING, PCWSTR, w};
@@ -93,6 +93,9 @@ thread_local! {
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// 窗口级键位表(Settings 合成;热重载时整表替换)
     static KEYMAP: RefCell<Keymap> = RefCell::new(Keymap::wt_default());
+    /// 光标闪烁相位(true = 亮);开关由配置驱动(settings.cursor_blink)
+    static BLINK_PHASE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static CURSOR_BLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 拖选中(WM_LBUTTONDOWN 起、WM_LBUTTONUP 止)
     static MOUSE_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 上次双击的 (时刻, x, y):三击 = 同位置 450ms 内的第二次双击
@@ -169,6 +172,8 @@ pub fn run() {
         let settings = load_settings();
         // 窗口级键位表与设置同源(用户 keybind 覆盖 WT 默认)
         KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
+        // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
+        CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         let router = {
             let families: Vec<&str> = if settings.font_families.is_empty() {
                 DEFAULT_FAMILIES.to_vec() // resolve 恒填默认链,此分支纯防御
@@ -214,6 +219,10 @@ pub fn run() {
             &dark as *const i32 as *const std::ffi::c_void,
             std::mem::size_of::<i32>() as u32,
         );
+
+        if CURSOR_BLINK.with(std::cell::Cell::get) {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 500, None);
+        }
 
         // T5/T7:后台线程共用的窗口哨兵,窗口创建后建立(两个线程都要投递)
         let hwnd_slot: SharedHwnd = Arc::new(Mutex::new(Some(hwnd.0 as isize)));
@@ -702,9 +711,16 @@ fn draw_frame() {
         } else {
             t.term.take_damage()
         };
-        // 先 build(路由新字形、改图集)再比修订号:同帧新增字形同帧上传
+        // 先 build(路由新字形、改图集)再比修订号:同帧新增字形同帧上传。
+        // 光标形状(D20):闪烁开启时按相位交替 Some(shape)/None
         let display_offset = t.term.display_offset();
         let selection = t.term.selection_range();
+        let cursor = t.term.cursor_shape();
+        let cursor = if !CURSOR_BLINK.with(std::cell::Cell::get) {
+            Some(cursor)
+        } else {
+            BLINK_PHASE.with(std::cell::Cell::get).then_some(cursor)
+        };
         build_rows(
             &t.term,
             &mut t.router,
@@ -712,6 +728,7 @@ fn draw_frame() {
             &t.palette,
             selection.as_ref(),
             display_offset,
+            cursor,
             &damage,
             &mut t.row_insts,
         );
@@ -1138,6 +1155,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if drew {
                 draw_frame();
             }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            // 光标闪烁(D20):翻相位,只重绘(光标行在 damage 里自然带出;
+            // 无输入时 term 脏区为空,force_full 兜底成本可接受——闪烁期
+            // 本来就是持续重绘)
+            BLINK_PHASE.with(|p| p.set(!p.get()));
+            TABS.with(|tabs| {
+                if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get()) {
+                    t.terminal.force_full = true;
+                }
+            });
+            draw_frame();
             LRESULT(0)
         }
         WM_PAINT => {

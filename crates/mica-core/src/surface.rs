@@ -15,6 +15,10 @@ pub use alacritty_terminal::index::{Column, Line, Point, Side};
 pub use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+/// 光标样式直通(DECSCUSR 承载;vte 枚举含 HollowBlock 等变体,
+/// 消费方按 Block/Underline/Beam 三类归一)。
+pub use alacritty_terminal::vte::ansi::CursorShape;
+pub use alacritty_terminal::vte::ansi::CursorStyle;
 use alacritty_terminal::vte::ansi::Processor;
 
 use crate::config::palette::Palette;
@@ -240,6 +244,20 @@ impl Surface {
     /// SS3 而非 CSI。
     pub fn app_cursor_mode(&self) -> bool {
         self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
+    /// 当前光标样式(DECSCUSR;未设走上游默认块状)。
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.term.cursor_style()
+    }
+
+    /// 光标形状三类归一(HollowBlock 等变体并入 Block)。
+    pub fn cursor_shape(&self) -> CursorShape {
+        match self.cursor_style().shape {
+            CursorShape::Underline => CursorShape::Underline,
+            CursorShape::Beam => CursorShape::Beam,
+            _ => CursorShape::Block,
+        }
     }
 
     /// 视口滚动(scrollback)。Delta(正) 向历史方向,Bottom 归零跟随。
@@ -570,6 +588,27 @@ mod tests {
         );
         s.feed(b"]52;c;aGk=\\");
         assert_eq!(s.take_clipboard_out(), vec!["hi".to_string()]);
+    }
+
+    /// DECSCUSR(xterm 语义):1|2=块、3|4=下划线、5|6=beam;0=重置默认。
+    #[test]
+    fn decscusr_changes_cursor_shape() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        s.feed(b"\x1b[2 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Block);
+        s.feed(b"\x1b[3 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Underline, "3=下划线");
+        s.feed(b"\x1b[4 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Underline, "4 仍是下划线");
+        s.feed(b"\x1b[5 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Beam, "5=beam");
+        s.feed(b"\x1b[6 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Beam);
+        // 样式含闪烁位(奇数=闪烁)——shape 归一后不可见,style 透出
+        s.feed(b"\x1b[3 q");
+        assert!(s.cursor_style().blinking, "3 = 下划线闪烁");
+        s.feed(b"\x1b[2 q");
+        assert!(!s.cursor_style().blinking, "2 = 块不闪烁");
     }
 
     #[test]
