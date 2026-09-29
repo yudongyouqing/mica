@@ -15,6 +15,10 @@ pub use alacritty_terminal::index::{Column, Line, Point, Side};
 pub use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+/// 光标样式直通(DECSCUSR 承载;vte 枚举含 HollowBlock 等变体,
+/// 消费方按 Block/Underline/Beam 三类归一)。
+pub use alacritty_terminal::vte::ansi::CursorShape;
+pub use alacritty_terminal::vte::ansi::CursorStyle;
 use alacritty_terminal::vte::ansi::Processor;
 
 use crate::config::palette::Palette;
@@ -69,6 +73,10 @@ struct ProxyState {
     cell: (u16, u16),
     /// OSC 4/10/11/12 应答与渲染同源(单一来源:config::palette)
     palette: Palette,
+    /// OSC 52 写向(tmux 远程复制到本机):app 排空时转交系统剪贴板
+    clipboard_out: Vec<String>,
+    /// OSC 52 读向(终端请求剪贴板内容):app 注册的系统剪贴板读取闭包
+    clipboard_provider: Arc<dyn Fn() -> String + Send + Sync>,
 }
 
 impl Default for ProxyState {
@@ -79,6 +87,8 @@ impl Default for ProxyState {
             size: None,
             cell: (8, 16),
             palette: Palette::DEFAULT,
+            clipboard_out: Vec::new(),
+            clipboard_provider: Arc::new(String::new),
         }
     }
 }
@@ -114,8 +124,18 @@ impl EventListener for EventProxy {
                 };
                 state.pty_writes.push(format(ws));
             }
-            // M0 ignores: clipboard, bell, blink, wakeup (window renders on its
-            // own cadence), child exit (Task 7 polls the pty child directly).
+            Event::ClipboardStore(_ty, text) => {
+                // 长度护栏(spec §9):OSC 52 可被恶意流塞爆,超限静默丢弃
+                if text.len() <= 100 * 1024 {
+                    state.clipboard_out.push(text);
+                }
+            }
+            Event::ClipboardLoad(_ty, fmt) => {
+                let text = (state.clipboard_provider)();
+                state.pty_writes.push(fmt(&text));
+            }
+            // M0 ignores: bell, blink, wakeup (window renders on its own
+            // cadence), child exit (Task 7 polls the pty child directly).
             _ => {}
         }
     }
@@ -226,6 +246,20 @@ impl Surface {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// 当前光标样式(DECSCUSR;未设走上游默认块状)。
+    pub fn cursor_style(&self) -> CursorStyle {
+        self.term.cursor_style()
+    }
+
+    /// 光标形状三类归一(HollowBlock 等变体并入 Block)。
+    pub fn cursor_shape(&self) -> CursorShape {
+        match self.cursor_style().shape {
+            CursorShape::Underline => CursorShape::Underline,
+            CursorShape::Beam => CursorShape::Beam,
+            _ => CursorShape::Block,
+        }
+    }
+
     /// 视口滚动(scrollback)。Delta(正) 向历史方向,Bottom 归零跟随。
     pub fn scroll_display(&mut self, scroll: Scroll) {
         self.term.scroll_display(scroll);
@@ -262,6 +296,16 @@ impl Surface {
             .selection
             .as_ref()
             .and_then(|sel| sel.to_range(&self.term))
+    }
+
+    /// 注册系统剪贴板读取闭包(OSC 52 读向):主线程排空事件时调用。
+    pub fn set_clipboard_provider(&mut self, f: Arc<dyn Fn() -> String + Send + Sync>) {
+        lock(&self.proxy.0).clipboard_provider = f;
+    }
+
+    /// 排空 OSC 52 的写向文本(app 转交系统剪贴板)。
+    pub fn take_clipboard_out(&mut self) -> Vec<String> {
+        std::mem::take(&mut lock(&self.proxy.0).clipboard_out)
     }
 
     /// 选区文本(上游拼接,含 wrap 语义)。
@@ -505,6 +549,66 @@ mod tests {
         s.selection_clear();
         assert!(s.selection_text().is_none());
         assert!(s.selection_range().is_none());
+    }
+
+    #[test]
+    fn osc52_store_and_load_roundtrip() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        use alacritty_terminal::term::ClipboardType;
+        // 写向:ClipboardStore → take_clipboard_out
+        s.proxy.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "remote-copy".into(),
+        ));
+        assert_eq!(s.take_clipboard_out(), vec!["remote-copy".to_string()]);
+        assert!(s.take_clipboard_out().is_empty(), "排空语义");
+        // 读向:provider 提供内容 → 应答进 pty_writes
+        s.set_clipboard_provider(Arc::new(|| "board-content".to_string()));
+        let fmt = Arc::new(|t: &str| format!("]52;{t}"));
+        s.proxy
+            .send_event(Event::ClipboardLoad(ClipboardType::Clipboard, fmt));
+        assert_eq!(s.take_pty_writes(), vec!["]52;board-content".to_string()]);
+        // 超限丢弃
+        let big = "x".repeat(101 * 1024);
+        s.proxy
+            .send_event(Event::ClipboardStore(ClipboardType::Clipboard, big));
+        assert!(s.take_clipboard_out().is_empty(), "超 100KB 静默丢弃");
+    }
+
+    /// 端到端(OSC 字节流 → 事件):不经过 ConPTY,验证 vte 段行为。
+    #[test]
+    fn osc52_sequence_feed_reaches_store() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        // ESC ] 52 ; c ; <base64("hi")> BEL
+        s.feed(b"]52;c;aGk=");
+        assert_eq!(
+            s.take_clipboard_out(),
+            vec!["hi".to_string()],
+            "ST 终止符形态也要过:"
+        );
+        s.feed(b"]52;c;aGk=\\");
+        assert_eq!(s.take_clipboard_out(), vec!["hi".to_string()]);
+    }
+
+    /// DECSCUSR(xterm 语义):1|2=块、3|4=下划线、5|6=beam;0=重置默认。
+    #[test]
+    fn decscusr_changes_cursor_shape() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        s.feed(b"\x1b[2 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Block);
+        s.feed(b"\x1b[3 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Underline, "3=下划线");
+        s.feed(b"\x1b[4 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Underline, "4 仍是下划线");
+        s.feed(b"\x1b[5 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Beam, "5=beam");
+        s.feed(b"\x1b[6 q");
+        assert_eq!(s.cursor_shape(), CursorShape::Beam);
+        // 样式含闪烁位(奇数=闪烁)——shape 归一后不可见,style 透出
+        s.feed(b"\x1b[3 q");
+        assert!(s.cursor_style().blinking, "3 = 下划线闪烁");
+        s.feed(b"\x1b[2 q");
+        assert!(!s.cursor_style().blinking, "2 = 块不闪烁");
     }
 
     #[test]

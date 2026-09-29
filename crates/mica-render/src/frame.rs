@@ -8,7 +8,7 @@ use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::cell::Flags;
 
 use mica_core::config::palette::Palette;
-use mica_core::surface::{Damage, Surface};
+use mica_core::surface::{CursorShape, Damage, Surface};
 
 use crate::color::resolve;
 use crate::font::GlyphStyle;
@@ -72,56 +72,93 @@ pub fn build_instances(
     palette: &Palette,
     selection: Option<&SelectionRange>,
     display_offset: usize,
+    cursor: Option<CursorShape>,
 ) -> Vec<CellInstance> {
     let grid = surface.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
-    let cursor = grid.cursor.point;
-    let cursor_line = usize::try_from(cursor.line.0).unwrap_or(usize::MAX);
-    let cursor_col = cursor.column.0;
+    let cursor_pos = grid.cursor.point;
+    let cursor_line = usize::try_from(cursor_pos.line.0).unwrap_or(usize::MAX);
+    let cursor_col = cursor_pos.column.0;
     // 上界 = 每格 2 实例(bg 段 + 字形段;空白格只有 bg)
     let mut out = Vec::with_capacity(cols * rows * 2);
     // 字形段先攒后拼:保证全部 bg 先于全部字形(跨格画家序,见 doc)
     let mut glyphs = Vec::with_capacity(cols * rows);
     for line in 0..rows {
+        let buffer_line = line as i32 - display_offset as i32;
+        let y = line as f32 * metrics.line_height;
+        let mut bar = None;
         for col in 0..cols {
-            let buffer_line = line as i32 - display_offset as i32;
             let cell = &grid[Line(buffer_line)][Column(col)];
-            let mut fg = resolve(cell.fg, palette);
-            let mut bg = resolve(cell.bg, palette);
-            // 选中优先于反色(选区是阅读层覆盖);光标交换保留,块光标在
-            // 选区内仍可辨——与 build_row 同序,黄金对拍锁定等价
-            if cell_selected(selection, cell, buffer_line, col) {
-                fg = [
-                    palette.selection_fg.r,
-                    palette.selection_fg.g,
-                    palette.selection_fg.b,
-                ];
-                bg = [
-                    palette.selection_bg.r,
-                    palette.selection_bg.g,
-                    palette.selection_bg.b,
-                ];
-            } else if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if display_offset == 0 && line == cursor_line && col == cursor_col {
-                std::mem::swap(&mut fg, &mut bg);
+            let cursor_here = display_offset == 0 && line == cursor_line && col == cursor_col;
+            let (mut fg, mut bg) = cell_colors(cell, selection, buffer_line, col, palette);
+            // 光标按形状:块=反色交换;条形=不交换、字可见,bar 单独发;
+            // None=闪烁关闭相位(不交换、无条)
+            if cursor_here {
+                match cursor {
+                    Some(CursorShape::Block) => std::mem::swap(&mut fg, &mut bg),
+                    Some(shape) => {
+                        bar = Some((shape, col as f32 * metrics.cell_width, y));
+                    }
+                    None => {}
+                }
             }
             let x = col as f32 * metrics.cell_width;
-            let y = line as f32 * metrics.line_height;
-            // bg 段:整格背景,不依赖字形 bbox 覆盖
             out.push(blank(x, y, metrics, fg, bg));
+        }
+        if let Some((shape, x, y)) = bar {
+            glyphs.insert(0, cursor_bar(shape, x, y, metrics, palette));
+        }
+        // 字形段:cluster 步进,与 build_row 逐字节同构(黄金对拍锁定)
+        let mut col = 0usize;
+        while col < cols {
+            let cell = &grid[Line(buffer_line)][Column(col)];
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.c == ' ' {
+                col += 1;
                 continue;
             }
-            let g = router.route(cell.c, GlyphStyle::from_flags(cell.flags));
-            glyphs.push(CellInstance {
-                pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
-                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: to_color(fg),
-                bg: to_color(bg),
-            });
+            let style = GlyphStyle::from_flags(cell.flags);
+            let mut end = col + 1;
+            while end < cols {
+                let next = &grid[Line(buffer_line)][Column(end)];
+                if next.flags.contains(Flags::WIDE_CHAR_SPACER)
+                    || next.c == ' '
+                    || GlyphStyle::from_flags(next.flags) != style
+                {
+                    break;
+                }
+                end += 1;
+            }
+            let mut shaped = None;
+            if end - col >= 2 {
+                let chars: Vec<char> = (col..end)
+                    .map(|c| grid[Line(buffer_line)][Column(c)].c)
+                    .collect();
+                shaped = router.route_run(&chars, style);
+            }
+            let Some(clusters) = shaped else {
+                let (fg, bg) = cell_colors(cell, selection, buffer_line, col, palette);
+                let x = col as f32 * metrics.cell_width;
+                let g = router.route(cell.c, style);
+                glyphs.push(glyph_instance(x, y, &g, fg, bg));
+                col += 1;
+                continue;
+            };
+            let mut pos = col;
+            for cluster in clusters {
+                let cell_c = &grid[Line(buffer_line)][Column(pos)];
+                let (fg, bg) = cell_colors(cell_c, selection, buffer_line, pos, palette);
+                let x = pos as f32 * metrics.cell_width;
+                match cluster.glyph {
+                    Some(g) => glyphs.push(glyph_instance(x, y, &g, fg, bg)),
+                    None => {
+                        let g = router.route(cell_c.c, style);
+                        glyphs.push(glyph_instance(x, y, &g, fg, bg));
+                    }
+                }
+                pos += cluster.len.max(1);
+            }
+            col = pos;
         }
     }
     out.extend(glyphs);
@@ -200,6 +237,9 @@ pub fn strip_quads(
     let x = titles.len() as f32 * TAB_W;
     let block = palette.colors[0];
     let ink = palette.fg;
+    // 顶栏系统按钮占位(T8):右上三颗 — □ × 由 NC hit-test 命中;视觉
+    // 字形由 hit-test 的 CAPTION_BTN_W 常量几何驱动(同布局单源约束下,
+    // 按钮字形绘制放 app 层后续打磨,先保证 hit-test 可用)
     out.push(CellInstance {
         pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
         size_uv: [TAB_PLUS_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
@@ -249,6 +289,7 @@ pub fn build_rows(
     palette: &Palette,
     selection: Option<&SelectionRange>,
     display_offset: usize,
+    cursor: Option<CursorShape>,
     damage: &Damage,
     rows: &mut Vec<RowInst>,
 ) {
@@ -262,6 +303,7 @@ pub fn build_rows(
             palette,
             selection,
             display_offset,
+            cursor,
             rows,
         );
         return;
@@ -274,6 +316,7 @@ pub fn build_rows(
             palette,
             selection,
             display_offset,
+            cursor,
             rows,
         ),
         Damage::Lines(lines) => {
@@ -287,6 +330,7 @@ pub fn build_rows(
                         palette,
                         selection,
                         display_offset,
+                        cursor,
                     );
                 }
             }
@@ -295,6 +339,7 @@ pub fn build_rows(
 }
 
 /// 全量重建 `rows` 为恰好视口行数(清尾,适配 resize 缩行)。
+#[allow(clippy::too_many_arguments)] // 同 build_rows:渲染参数组
 fn rebuild_all(
     grid: &Grid<Cell>,
     router: &mut dyn GlyphRouter,
@@ -302,6 +347,7 @@ fn rebuild_all(
     palette: &Palette,
     selection: Option<&SelectionRange>,
     display_offset: usize,
+    cursor: Option<CursorShape>,
     rows: &mut Vec<RowInst>,
 ) {
     rows.clear();
@@ -314,7 +360,81 @@ fn rebuild_all(
             palette,
             selection,
             display_offset,
+            cursor,
         ));
+    }
+}
+
+/// 行内格子的前景/背景对(选中 > 反色,光标由调用处按形状另行处理)。
+fn cell_colors(
+    cell: &Cell,
+    selection: Option<&SelectionRange>,
+    buffer_line: i32,
+    col: usize,
+    palette: &Palette,
+) -> ([u8; 3], [u8; 3]) {
+    let mut fg = resolve(cell.fg, palette);
+    let mut bg = resolve(cell.bg, palette);
+    if cell_selected(selection, cell, buffer_line, col) {
+        fg = [
+            palette.selection_fg.r,
+            palette.selection_fg.g,
+            palette.selection_fg.b,
+        ];
+        bg = [
+            palette.selection_bg.r,
+            palette.selection_bg.g,
+            palette.selection_bg.b,
+        ];
+    } else if cell.flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    (fg, bg)
+}
+
+/// 光标条实例(D20):Underline=底部 2px、Beam=左侧 1.2px;色 = palette.cursor。
+/// 放字形段头部(bg 之上、字之下;细条与字重叠小,不必顶层)。
+fn cursor_bar(
+    shape: CursorShape,
+    x: f32,
+    y: f32,
+    metrics: &FontMetrics,
+    palette: &Palette,
+) -> CellInstance {
+    let (w, h) = match shape {
+        CursorShape::Underline => (metrics.cell_width, 2.0),
+        _ => (1.2, metrics.line_height), // Beam(归一后仅三值)
+    };
+    let cy = match shape {
+        CursorShape::Underline => y + metrics.line_height - 2.0,
+        _ => y,
+    };
+    let ink = [palette.cursor.r, palette.cursor.g, palette.cursor.b];
+    CellInstance {
+        pos_uv: [x, cy, 0.0, 0.0],
+        size_uv: [w, h, 0.0, 0.0],
+        fg: to_color(ink),
+        bg: to_color(ink),
+    }
+}
+
+/// 字形实例(连字/单字共用):彩色字形 fg 白原色直通。
+fn glyph_instance(
+    x: f32,
+    y: f32,
+    g: &crate::font::router::GlyphInfo,
+    fg: [u8; 3],
+    bg: [u8; 3],
+) -> CellInstance {
+    CellInstance {
+        pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
+        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+        fg: if g.color {
+            to_color([255, 255, 255])
+        } else {
+            to_color(fg)
+        },
+        bg: to_color(bg),
     }
 }
 
@@ -338,6 +458,7 @@ fn cell_selected(
 /// 单行两段发射:bg 段(每格一整格 quad)先行,字形段随后。与
 /// [`build_instances`](全量黄金源)的行内逻辑逐格对齐——两处必须同步修改,
 /// 黄金对拍测试锁定等价。
+#[allow(clippy::too_many_arguments)] // 同 build_rows:渲染参数组
 fn build_row(
     grid: &Grid<Cell>,
     line: usize,
@@ -346,50 +467,91 @@ fn build_row(
     palette: &Palette,
     selection: Option<&SelectionRange>,
     display_offset: usize,
+    cursor: Option<CursorShape>,
 ) -> RowInst {
     let cols = grid.columns();
-    let cursor = grid.cursor.point;
-    let cursor_line = usize::try_from(cursor.line.0).unwrap_or(usize::MAX);
-    let cursor_col = cursor.column.0;
+    let cursor_pos = grid.cursor.point;
+    let cursor_line = usize::try_from(cursor_pos.line.0).unwrap_or(usize::MAX);
+    let cursor_col = cursor_pos.column.0;
+    let buffer_line = line as i32 - display_offset as i32;
     let mut row = RowInst::default();
     row.bg.reserve(cols);
+    let y = line as f32 * metrics.line_height;
+    let mut bar = None;
     for col in 0..cols {
-        let buffer_line = line as i32 - display_offset as i32;
         let cell = &grid[Line(buffer_line)][Column(col)];
-        let mut fg = resolve(cell.fg, palette);
-        let mut bg = resolve(cell.bg, palette);
-        // 选中优先于反色:选区是阅读层覆盖,选中的反色格不再交换
-        // (spec §5:选中格与光标相遇时光标交换仍执行,块光标在选区内可辨)
-        if cell_selected(selection, cell, buffer_line, col) {
-            fg = [
-                palette.selection_fg.r,
-                palette.selection_fg.g,
-                palette.selection_fg.b,
-            ];
-            bg = [
-                palette.selection_bg.r,
-                palette.selection_bg.g,
-                palette.selection_bg.b,
-            ];
-        } else if cell.flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if display_offset == 0 && line == cursor_line && col == cursor_col {
-            std::mem::swap(&mut fg, &mut bg);
+        let cursor_here = display_offset == 0 && line == cursor_line && col == cursor_col;
+        let (mut fg, mut bg) = cell_colors(cell, selection, buffer_line, col, palette);
+        // 光标按形状(D20):块=反色交换;条形=字可见,bar 单独发;
+        // None(闪烁关闭相位)=不画
+        if cursor_here {
+            match cursor {
+                Some(CursorShape::Block) => std::mem::swap(&mut fg, &mut bg),
+                Some(shape) => {
+                    bar = Some((shape, col as f32 * metrics.cell_width, y));
+                }
+                None => {}
+            }
         }
         let x = col as f32 * metrics.cell_width;
-        let y = line as f32 * metrics.line_height;
         row.bg.push(blank(x, y, metrics, fg, bg));
+    }
+    if let Some((shape, x, y)) = bar {
+        row.glyphs
+            .insert(0, cursor_bar(shape, x, y, metrics, palette));
+    }
+    // 字形段:同 style 连续段先试整段 shaping(连字),不成回退逐字
+    let mut col = 0usize;
+    while col < cols {
+        let cell = &grid[Line(buffer_line)][Column(col)];
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) || cell.c == ' ' {
+            col += 1;
             continue;
         }
-        let g = router.route(cell.c, GlyphStyle::from_flags(cell.flags));
-        row.glyphs.push(CellInstance {
-            pos_uv: [x + g.offset_px[0], y + g.offset_px[1], g.uv[0], g.uv[1]],
-            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-            fg: to_color(fg),
-            bg: to_color(bg),
-        });
+        let style = GlyphStyle::from_flags(cell.flags);
+        let mut end = col + 1;
+        while end < cols {
+            let next = &grid[Line(buffer_line)][Column(end)];
+            if next.flags.contains(Flags::WIDE_CHAR_SPACER)
+                || next.c == ' '
+                || GlyphStyle::from_flags(next.flags) != style
+            {
+                break;
+            }
+            end += 1;
+        }
+        // 整段 shaping:cluster 步进——单字符 cluster 走逐字路由(缓存
+        // 路径零额外成本),连字 cluster 首格承载合成字形
+        let mut shaped = None;
+        if end - col >= 2 {
+            let chars: Vec<char> = (col..end)
+                .map(|c| grid[Line(buffer_line)][Column(c)].c)
+                .collect();
+            shaped = router.route_run(&chars, style);
+        }
+        let Some(clusters) = shaped else {
+            let (fg, bg) = cell_colors(cell, selection, buffer_line, col, palette);
+            let x = col as f32 * metrics.cell_width;
+            let g = router.route(cell.c, style);
+            row.glyphs.push(glyph_instance(x, y, &g, fg, bg));
+            col += 1;
+            continue;
+        };
+        let mut pos = col;
+        for cluster in clusters {
+            let cell_c = &grid[Line(buffer_line)][Column(pos)];
+            let (fg, bg) = cell_colors(cell_c, selection, buffer_line, pos, palette);
+            let x = pos as f32 * metrics.cell_width;
+            match cluster.glyph {
+                Some(g) => row.glyphs.push(glyph_instance(x, y, &g, fg, bg)),
+                None => {
+                    let g = router.route(cell_c.c, style);
+                    row.glyphs.push(glyph_instance(x, y, &g, fg, bg));
+                }
+            }
+            pos += cluster.len.max(1);
+        }
+        col = pos;
     }
     row
 }
@@ -447,6 +609,7 @@ mod tests {
                 uv: [0.25, 0.25, w / self.atlas_w, self.glyph_h / self.atlas_h],
                 size_px: [w, self.glyph_h],
                 offset_px: [1.0, 2.0],
+                color: false,
             }
         }
     }
@@ -471,7 +634,16 @@ mod tests {
             wide: |_| false,
         };
         assert_eq!(
-            build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0).len(),
+            build_instances(
+                &s,
+                &mut r,
+                &metrics_8x16(),
+                &Palette::DEFAULT,
+                None,
+                0,
+                Some(CursorShape::Block)
+            )
+            .len(),
             8
         );
     }
@@ -487,7 +659,15 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| false,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0);
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            Some(CursorShape::Block),
+        );
         // 两段式:bg 段 inst[0..4) 行优先每格一整格 quad,字形段随后
         assert_eq!(inst.len(), 5, "4 bg + 1 字形");
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -514,7 +694,15 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0);
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            Some(CursorShape::Block),
+        );
         assert_eq!(inst.len(), 5, "4 bg + 1 宽字形(spacer 不出字形)");
         // bg 段:格 0 与 spacer 格(格 1)都是整格 blank
         assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
@@ -551,6 +739,7 @@ mod tests {
             &Palette::DEFAULT,
             Some(&range),
             0,
+            Some(CursorShape::Block),
         );
         // bg 段 4 格:1、2 格用 selection 对,0、3 格默认
         let sel_bg = [
@@ -571,6 +760,152 @@ mod tests {
         assert_eq!(inst[2].bg, sel_bg);
         assert_ne!(inst[0].bg, sel_bg, "选区外格不受影响");
         assert_ne!(inst[3].bg, sel_bg);
+    }
+
+    /// 连字路由:仅对 "=>" 序列产合成字形(宽 2 格),其余 None 回退逐字。
+    struct LigatureRouter {
+        inner: FakeRouter,
+    }
+    impl GlyphRouter for LigatureRouter {
+        fn route(&mut self, ch: char, style: GlyphStyle) -> crate::font::router::GlyphInfo {
+            self.inner.route(ch, style)
+        }
+        fn route_run(
+            &mut self,
+            chars: &[char],
+            _style: GlyphStyle,
+        ) -> Option<Vec<crate::font::router::ClusterLayout>> {
+            use crate::font::router::ClusterLayout;
+            // "a=>b":a 单字、=> 连字、b 单字
+            if chars == ['a', '=', '>', 'b'] {
+                Some(vec![
+                    ClusterLayout {
+                        len: 1,
+                        glyph: None,
+                    },
+                    ClusterLayout {
+                        len: 2,
+                        glyph: Some(crate::font::router::GlyphInfo {
+                            uv: [0.5, 0.5, 0.2, 0.2],
+                            size_px: [16.0, 12.0],
+                            offset_px: [0.0, 2.0],
+                            color: false,
+                        }),
+                    },
+                    ClusterLayout {
+                        len: 1,
+                        glyph: None,
+                    },
+                ])
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn ligature_run_collapses_to_single_glyph() {
+        let mut s = Surface::new(ScreenSize::new(8, 1));
+        s.feed(b"a=>b");
+        let mut r = LigatureRouter {
+            inner: FakeRouter {
+                atlas_w: 64.0,
+                atlas_h: 64.0,
+                glyph_w: 6.0,
+                glyph_h: 12.0,
+                wide: |_| false,
+            },
+        };
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            Some(CursorShape::Block),
+        );
+        // 8 bg + 字形段:a、=>(合成)、b = 3 个字形(逐字路径是 4 个)
+        assert_eq!(inst.len(), 8 + 3, "连字段收敛为单字形");
+        let lig = &inst[9]; // 字形段第 2 个
+        assert_eq!(lig.pos_uv[0], 8.0 + 0.0, "首格承载(a 占格 0)");
+        assert_eq!(lig.size_uv[0], 16.0, "合成字形宽 2 格");
+        // 隔离:相邻不同段不受影响,a 与 b 仍 6px
+        assert_eq!(inst[8].size_uv[0], 6.0);
+        assert_eq!(inst[10].pos_uv[0], 25.0, "b 在格 3(Fake offset+1)");
+    }
+
+    #[test]
+    fn cursor_shapes_render_block_swap_and_bars() {
+        let mut s = Surface::new(ScreenSize::new(4, 1));
+        s.feed(b"A");
+        let m = metrics_8x16();
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 6.0,
+            glyph_h: 12.0,
+            wide: |_| false,
+        };
+        // 块:光标格(0,0)交换(白底暗字)
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &m,
+            &Palette::DEFAULT,
+            None,
+            0,
+            Some(CursorShape::Block),
+        );
+        assert_eq!(
+            inst[1].bg,
+            [1.0, 1.0, 1.0, 0.0],
+            "块=交换白底(光标格 feed 后在 (0,1))"
+        );
+        // beam:不交换 + 字形段头一条 1.2px 竖条(cursor 色)
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &m,
+            &Palette::DEFAULT,
+            None,
+            0,
+            Some(CursorShape::Beam),
+        );
+        assert_ne!(inst[1].bg, [1.0, 1.0, 1.0, 0.0], "条形不交换");
+        let bar = inst
+            .iter()
+            .find(|i| i.size_uv[1] == m.line_height && i.size_uv[0] == 1.2)
+            .expect("beam 竖条");
+        assert_eq!(bar.pos_uv[0], 8.0, "条在光标格(0,1)左侧");
+        assert_eq!(
+            bar.fg,
+            to_color([255, 255, 255]),
+            "条色=palette.cursor(默认白)"
+        );
+        // underline:底部 2px 横条
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &m,
+            &Palette::DEFAULT,
+            None,
+            0,
+            Some(CursorShape::Underline),
+        );
+        let bar = inst
+            .iter()
+            .find(|i| i.size_uv[0] == m.cell_width && i.size_uv[1] == 2.0)
+            .expect("underline 横条");
+        assert_eq!(bar.pos_uv[1], m.line_height - 2.0, "条贴行底");
+        // None(闪烁关闭):既不交换也无条
+        let inst = build_instances(&s, &mut r, &m, &Palette::DEFAULT, None, 0, None);
+        assert_ne!(inst[1].bg, [1.0, 1.0, 1.0, 0.0], "关相位完全不画");
+        assert!(
+            !inst
+                .iter()
+                .any(|i| i.size_uv[1] == 2.0 && i.size_uv[0] == m.cell_width)
+        );
     }
 
     #[test]
@@ -602,7 +937,15 @@ mod tests {
                 wide: |_| false,
             },
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0);
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            Some(CursorShape::Block),
+        );
         // 顺序:A@0(bold)、B@1(反色)、光标@2(空格)、空格@3
         // 两段式:bg 段 [0..4) = A、B、光标格、空格;字形段 [4..6) = A、B
         assert_eq!(inst.len(), 6, "4 bg + A、B 两个字形");
@@ -684,7 +1027,15 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| true,
         };
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &Palette::DEFAULT, None, 0);
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            Some(CursorShape::Block),
+        );
         // bg 段:全部 4 格在前,均整格 blank(uv 尺寸 0),行优先
         for (i, cell) in inst.iter().take(4).enumerate() {
             assert_eq!(
@@ -715,7 +1066,15 @@ mod tests {
         let mut pal = Palette::DEFAULT;
         pal.apply_pair("palette", "1=#112233").unwrap();
         pal.apply_pair("background", "#abcdef").unwrap();
-        let inst = build_instances(&s, &mut r, &metrics_8x16(), &pal, None, 0);
+        let inst = build_instances(
+            &s,
+            &mut r,
+            &metrics_8x16(),
+            &pal,
+            None,
+            0,
+            Some(CursorShape::Block),
+        );
         // bg 段 inst[0]:A 的背景 = palette.bg(浅色),前景 = 槽 1
         assert_eq!(
             inst[0].bg,
@@ -810,11 +1169,20 @@ mod tests {
             &Palette::DEFAULT,
             None,
             0,
+            Some(CursorShape::Block),
             &damage,
             &mut rows,
         );
         let repacked = repack(&rows);
-        let golden = build_instances(&s, &mut router, &metrics_8x16(), &Palette::DEFAULT, None, 0);
+        let golden = build_instances(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            Some(CursorShape::Block),
+        );
         assert_eq!(
             bytes(&repacked),
             bytes(&golden),
@@ -840,6 +1208,7 @@ mod tests {
             &Palette::DEFAULT,
             None,
             0,
+            Some(CursorShape::Block),
             &damage,
             &mut rows,
         );
@@ -860,6 +1229,7 @@ mod tests {
             &Palette::DEFAULT,
             None,
             0,
+            Some(CursorShape::Block),
             &damage,
             &mut rows,
         );
@@ -897,6 +1267,7 @@ mod tests {
             &Palette::DEFAULT,
             None,
             0,
+            Some(CursorShape::Block),
             &mica_core::surface::Damage::Full,
             &mut rows,
         );
@@ -909,6 +1280,7 @@ mod tests {
             &Palette::DEFAULT,
             None,
             0,
+            Some(CursorShape::Block),
             &mica_core::surface::Damage::Lines(vec![]),
             &mut rows,
         );
@@ -934,6 +1306,7 @@ mod tests {
             &Palette::DEFAULT,
             None,
             0,
+            Some(CursorShape::Block),
             &mica_core::surface::Damage::Full,
             &mut rows,
         );

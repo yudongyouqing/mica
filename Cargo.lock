@@ -638,6 +638,7 @@ dependencies = [
  "unicode-width",
  "wgpu",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]

@@ -43,8 +43,12 @@ fn vs(
     return out;
 }
 
+// RGBA 图集(D19):灰度字形 texel = (白, coverage) → rgb*fg 染色、a 做 ink,
+// 与 M1 的 R8 单通道行为逐位等价;彩色字形 texel = (原色, 不透明度),渲染
+// 实例对彩色字形 fg 填白即得原色——一条公式覆盖两种格式。
 @fragment
 fn fs(inp: VsOut) -> @location(0) vec4f {
-    let ink = textureSample(glyphs, glyph_sampler, inp.uv).r * inp.ink_mask;
-    return vec4f(mix(inp.bg, inp.fg, ink), 1.0);
+    let tex = textureSample(glyphs, glyph_sampler, inp.uv);
+    let ink = tex.a * inp.ink_mask;
+    return vec4f(mix(inp.bg, tex.rgb * inp.fg, ink), 1.0);
 }

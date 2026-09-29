@@ -29,6 +29,8 @@ pub struct Settings {
     pub theme_name: Option<String>,
     /// 键位表(D15):默认 WT 兼容,`keybind` 键覆盖。
     pub keymap: Keymap,
+    /// 光标闪烁(D20):默认不闪,`cursor-blink = true` 开 500ms 定时器。
+    pub cursor_blink: bool,
 }
 
 impl Default for Settings {
@@ -39,6 +41,7 @@ impl Default for Settings {
             palette: Palette::DEFAULT,
             theme_name: None,
             keymap: Keymap::wt_default(),
+            cursor_blink: false,
         }
     }
 }
@@ -93,10 +96,17 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
 /// 键集分派:font-family 追加、font-size 限幅、色键走 Palette;
 /// 未知键(含 selection-*/cursor-text,M2 接)静默跳过——Ghostty 同款容忍。
 fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut ConfigError) {
+    // 首个显式 font-family 重置默认链(Ghostty 配置语义:显式键覆盖默认值),
+    // 之后的声明追加
+    let mut family_declared = false;
     for (key, value) in pairs {
         match key.as_str() {
             "font-family" => {
                 if !value.is_empty() {
+                    if !family_declared {
+                        settings.font_families.clear();
+                        family_declared = true;
+                    }
                     settings.font_families.push(value);
                 }
             }
@@ -107,6 +117,13 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                     .push(format!("font-size 应为 4-72 的数字,得 `{value}`")),
             },
             "theme" => settings.theme_name = Some(value),
+            "cursor-blink" => match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => settings.cursor_blink = true,
+                "false" | "0" | "no" => settings.cursor_blink = false,
+                _ => err
+                    .values
+                    .push(format!("cursor-blink 应为 true/false,得 `{value}`")),
+            },
             "keybind" => {
                 // 值形如 `ctrl+shift+t = new_tab`;`clear` 清默认表
                 let value = value.trim();
@@ -164,8 +181,12 @@ mod tests {
     #[test]
     fn font_family_appends_and_size_bounds() {
         let s = resolve("font-family = JetBrains Mono\nfont-size = 16\n").unwrap();
-        assert_eq!(s.font_families.len(), 5, "追加在默认链之后");
-        assert_eq!(s.font_families[4], "JetBrains Mono");
+        assert_eq!(
+            s.font_families,
+            vec!["JetBrains Mono"],
+            "首个显式声明替换默认链"
+        );
+
         assert_eq!(s.font_size_pt, 16.0);
 
         for bad in ["0", "144", "abc", "-3"] {
