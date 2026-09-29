@@ -44,6 +44,8 @@ pub enum Action {
     SplitRight,
     SplitDown,
     ClosePane,
+    /// 焦点跳邻 pane(方向)。Alt+方向(D15)。
+    FocusNeighbor(Key),
 }
 
 /// 键位表:用户条目在前(优先),默认表垫底。
@@ -66,10 +68,11 @@ impl Keymap {
             TriggerKey::Letter('T'),
             Action::NewTab,
         );
+        // WT 语义:Ctrl+Shift+W 关焦点 pane,最后一个 pane 时升级关标签
         push(
             m(true, true, false),
             TriggerKey::Letter('W'),
-            Action::CloseTab,
+            Action::ClosePane,
         );
         push(
             m(true, false, false),
@@ -93,6 +96,27 @@ impl Keymap {
         push(m(true, true, false), TriggerKey::Letter('V'), Action::Paste);
         push(m(true, false, false), TriggerKey::Insert, Action::Copy);
         push(m(false, true, false), TriggerKey::Insert, Action::Paste);
+        // 分屏:Alt+方向 焦点跳邻(几何最近邻)
+        push(
+            m(true, false, true),
+            TriggerKey::Key(Key::Left),
+            Action::FocusNeighbor(Key::Left),
+        );
+        push(
+            m(true, false, true),
+            TriggerKey::Key(Key::Right),
+            Action::FocusNeighbor(Key::Right),
+        );
+        push(
+            m(true, false, true),
+            TriggerKey::Key(Key::Up),
+            Action::FocusNeighbor(Key::Up),
+        );
+        push(
+            m(true, false, true),
+            TriggerKey::Key(Key::Down),
+            Action::FocusNeighbor(Key::Down),
+        );
         // 滚动:正方向 = 历史
         push(
             m(false, true, false),
@@ -218,6 +242,10 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "split_right" => Some(Action::SplitRight),
         "split_down" => Some(Action::SplitDown),
         "close_pane" => Some(Action::ClosePane),
+        "focus_left" => Some(Action::FocusNeighbor(Key::Left)),
+        "focus_right" => Some(Action::FocusNeighbor(Key::Right)),
+        "focus_up" => Some(Action::FocusNeighbor(Key::Up)),
+        "focus_down" => Some(Action::FocusNeighbor(Key::Down)),
         _ => {
             // goto_tab_1 ..= goto_tab_9
             let n = name.strip_prefix("goto_tab_")?;
