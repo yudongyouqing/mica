@@ -5,7 +5,7 @@
 //! written to the pty verbatim by the shell; this module only owns keys that
 //! need *sequence* encoding.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Mods {
     pub shift: bool,
     pub alt: bool,
@@ -25,7 +25,7 @@ impl Mods {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     Enter,
     Backspace,
