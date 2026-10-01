@@ -22,8 +22,9 @@ use notify::{Event, RecursiveMode, Watcher};
 use mica_core::config::palette::Palette;
 use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
 use mica_core::input::{self, Key, Mods};
+use mica_core::ipc::IpcMessage;
 use mica_core::keymap::{Action, Keymap, TriggerKey};
-use mica_core::pty::{PtyReader, PtySession, default_shell_command};
+use mica_core::pty::{PtyReader, PtySession};
 use mica_core::surface::{
     Column, Damage, Line, Point, ScreenSize, ScrollCommand, SelectionType, Side, Surface,
 };
@@ -69,6 +70,9 @@ const RESIZE_BORDER: i32 = 6;
 /// +1 = WM_APP_RENDER(T7,pty 转发线程唤醒渲染);+2 = WM_APP_CONFIG(T5,热重载)
 const WM_APP_RENDER: u32 = 0x8000 + 1;
 const WM_APP_CONFIG: u32 = 0x8000 + 2;
+const WM_APP_IPC: u32 = 0x8000 + 3;
+/// WM_APP 基值(quickterm 转发线程投递用裸 WM_APP)
+const WM_APP_MSG: u32 = 0x8000;
 
 /// watch/转发线程共持的窗口句柄哨兵,唯一语义是"窗口是否存活":退出序第一
 /// 步统一落 None,两个后台线程自此不再向窗口投递消息;Post 到死句柄本就无害,
@@ -84,6 +88,9 @@ struct ReloadHandle {
 }
 
 mod clipboard;
+pub(crate) mod ipc;
+mod jumplist;
+pub(crate) mod quickterm;
 
 thread_local! {
     static GPU: RefCell<Option<WindowGpu>> = const { RefCell::new(None) };
@@ -103,6 +110,8 @@ thread_local! {
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// 窗口级键位表(Settings 合成;热重载时整表替换)
     static KEYMAP: RefCell<Keymap> = RefCell::new(Keymap::wt_default());
+    /// IPC 服务端消息队列(主线程 WM_APP_IPC 时 try_recv)
+    static IPC_RX: RefCell<Option<std::sync::mpsc::Receiver<IpcMessage>>> = const { RefCell::new(None) };
     /// 光标闪烁相位(true = 亮);开关由配置驱动(settings.cursor_blink)
     static BLINK_PHASE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static CURSOR_BLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -275,9 +284,32 @@ pub fn run() {
         // T5:热重载 watcher 在窗口创建后启动(投递 WM_APP_CONFIG 需要 hwnd);
         // config 文件缺失(全默认启动)则不监听——首次创建配置需重启生效
         let reload = spawn_config_watcher(Arc::clone(&hwnd_slot));
+        // M3a:单实例 IPC 服务(管道被占说明已有实例——main 侧已分流,这里
+        // 只可能首实例到达;失败降级单开不致命)
+        match ipc::serve(Arc::clone(&hwnd_slot)) {
+            Ok(rx) => IPC_RX.with(|slot| *slot.borrow_mut() = Some(rx)),
+            Err(false) => {} // 建管道失败:已在 ipc::serve 记日志
+            Err(true) => unreachable!("main 已分流,GUI 路径不会撞已占管道"),
+        }
+        // M3a:AUMID + jump list(profile 任务直达)
+        jumplist::set_appuser_model_id();
+        let profiles: Vec<(String, String)> = mica_core::profile::scan_all()
+            .into_iter()
+            .map(|p| (p.name, p.command))
+            .collect();
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        jumplist::install(&exe, &profiles);
         // T7:首个标签与 GPU 就位(forwarder 由 start_tab 内部起;
-        // handle 不 join——退出序由杀 pty 断源自然收尾,detach 可接受)
-        start_tab(hwnd);
+        // handle 不 join——退出序由杀 pty 断源自然收尾,detach 可接受)。
+        // M3a:CLI/IPC 自启动路径经 MICA_START_PROFILE 指定首标签 profile
+        // SAFETY: run() 本就在 unsafe 块内;remove_var 在窗口/线程起前
+        let start_profile = std::env::var("MICA_START_PROFILE").ok();
+        if start_profile.is_some() {
+            std::env::remove_var("MICA_START_PROFILE");
+        }
+        start_tab_with_profile(hwnd, start_profile.as_deref());
         // GPU 建后补一次 clear_color(默认 palette;create_tab 不碰窗口资源)
         GPU.with(|g| {
             if let Some(gpu) = g.borrow_mut().as_mut() {
@@ -288,6 +320,8 @@ pub fn run() {
         // 首帧显式化:旧轮询循环里第一帧混在首轮 drain 中,事件化后没有输出
         // 就没人画——进循环前先铺一帧(底色+空网格),不等第一条 pty 输出
         draw_frame();
+        // M3b:Quick Terminal(热键 + 下拉窗;失败只记日志)
+        let _ = quickterm::init(hwnd);
         message_loop(reload, hwnd_slot);
     }
 }
@@ -744,7 +778,7 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
         let Some(target) = tab.active_pane_id() else {
             return;
         };
-        let (pane, reader) = create_pane(hwnd);
+        let (pane, reader) = create_pane(hwnd, "powershell.exe -NoLogo");
         let pane_id = pane.id;
         let pty_buf = Arc::clone(&pane.terminal.pty_buf);
         tab.layout.split(target, dir, pane_id);
@@ -757,7 +791,7 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
     });
 }
 
-unsafe fn create_pane(hwnd: HWND) -> (PaneState, PtyReader) {
+unsafe fn create_pane(hwnd: HWND, shell_command: &str) -> (PaneState, PtyReader) {
     let (families, size_pt) = TAB_SEED.with(|s| s.borrow().clone());
     let families: Vec<&str> = if families.is_empty() {
         DEFAULT_FAMILIES.to_vec()
@@ -793,7 +827,8 @@ unsafe fn create_pane(hwnd: HWND) -> (PaneState, PtyReader) {
         clipboard::get_text().unwrap_or_default()
     }));
     let (session, reader) =
-        PtySession::spawn(default_shell_command(), cols, rows).expect("spawn shell");
+        PtySession::spawn(mica_core::pty::command_from_str(shell_command), cols, rows)
+            .expect("spawn shell");
     let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
     let terminal = Terminal {
@@ -822,10 +857,35 @@ unsafe fn create_pane(hwnd: HWND) -> (PaneState, PtyReader) {
 /// 建标签并接入渲染链(T7):create_pane 包成 Tab → 入池 → forwarder
 /// (WPARAM=pane id)→ 置为活跃。NewTab 动作与启动路径共用。
 unsafe fn start_tab(hwnd: HWND) {
-    let (pane, reader) = create_pane(hwnd);
+    start_tab_with_profile(hwnd, None);
+}
+
+/// 带 profile 的建标签(M3a):IPC new-tab / CLI 注入。名字在 scan_all
+/// 里查(大小写不敏感);查不到回落默认并记日志。
+unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>) {
+    let profiles = mica_core::profile::scan_all();
+    let picked = profile.and_then(|name| {
+        let p = profiles
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .cloned();
+        if p.is_none() {
+            eprintln!("ipc/CLI: 未知 profile `{name}`,回落 PowerShell");
+        }
+        p
+    });
+    let shell = picked
+        .as_ref()
+        .map(|p| p.command.clone())
+        .unwrap_or_else(|| "powershell.exe -NoLogo".to_string());
+    let title = picked
+        .as_ref()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| "PowerShell".to_string());
+    let (pane, reader) = create_pane(hwnd, &shell);
     let pane_id = pane.id;
     let tab = TabState {
-        title: "PowerShell".into(),
+        title,
         dirty: false,
         panes: vec![pane],
         layout: mica_core::layout::Layout::leaf(pane_id),
@@ -843,6 +903,50 @@ unsafe fn start_tab(hwnd: HWND) {
 /// 主循环:GetMessageW 阻塞等消息,零轮询(T7)。返回 0 = 取到 WM_QUIT,
 /// -1 = 错误,其余为有消息——不能按真值判(-1 也非零),先精确判 -1 再判 0。
 /// 渲染唤醒(WM_APP_RENDER)、输入、尺寸、热重载全在 wndproc 侧处理。
+///
+/// Quick Terminal 接线辅助(pub(crate) 供 quickterm 模块)
+pub(crate) fn tab_seed() -> (Vec<String>, f32) {
+    TAB_SEED.with(|s| s.borrow().clone())
+}
+pub(crate) fn current_palette() -> Palette {
+    CURRENT_PALETTE.with(|p| *p.borrow())
+}
+pub(crate) fn shared_hwnd_for_quickterm() -> Option<SharedHwnd> {
+    SHARED_HWND.with(|s| s.borrow().clone())
+}
+/// QT 转发线程:与主 forwarder 同款,但 WM_APP(非 WM_APP_RENDER)投给
+/// QT 窗口(独立消息域;WPARAM=0xFF00 哨兵)。
+pub(crate) fn spawn_qt_forwarder(
+    reader: mica_core::pty::PtyReader,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    hwnd_slot: SharedHwnd,
+) {
+    std::thread::Builder::new()
+        .name("qt-forwarder".into())
+        .spawn(move || {
+            loop {
+                match reader.recv_block() {
+                    Some(chunk) => {
+                        {
+                            let mut pending = buffer.lock().expect("qt buf poisoned");
+                            pending.extend_from_slice(&chunk);
+                        }
+                        let hwnd = *hwnd_slot.lock().expect("hwnd slot poisoned");
+                        if let Some(raw) = hwnd {
+                            let hwnd = HWND(raw as *mut std::ffi::c_void);
+                            // SAFETY: Post 到死句柄无害
+                            let _ = unsafe {
+                                PostMessageW(Some(hwnd), WM_APP_MSG, WPARAM(0xFF00), LPARAM(0))
+                            };
+                        }
+                    }
+                    None => return,
+                }
+            }
+        })
+        .expect("spawn qt forwarder");
+}
+
 unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     let mut msg = MSG::default();
     loop {
@@ -1587,6 +1691,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_APP_IPC => {
+            // IPC 客户端请求(M3a):主线程排空消息队列——new-tab 起 profile
+            // 标签,activate 仅前置窗口
+            while let Some(msg) =
+                IPC_RX.with(|slot| slot.borrow_mut().as_mut().and_then(|rx| rx.try_recv().ok()))
+            {
+                if msg.op == "new-tab" {
+                    let profile = msg.profile.as_deref();
+                    start_tab_with_profile(hwnd, profile);
+                }
+            }
+            // activate 语义(两条消息共用):前置既有窗口
+            let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd) };
+            draw_frame();
+            LRESULT(0)
+        }
         WM_PAINT => {
             // 绘制节奏由消息循环控制;这里只清掉无效区积压
             let _ = ValidateRect(Some(hwnd), None);
@@ -1846,6 +1966,7 @@ fn current_mods() -> Mods {
             shift: down(VK_SHIFT),
             alt: down(VK_MENU),
             ctrl: down(VK_CONTROL),
+            win: false,
         }
     }
 }

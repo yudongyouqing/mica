@@ -22,14 +22,14 @@ Mica is a **Windows-native** terminal emulator aiming to bring the three pillars
 
 ## 状态 / Status
 
-**M2(窗口体验)完成** — 多标签、分屏布局树、鼠标选择/剪贴板、滚轮 scrollback、WT 键位、COLR 彩色 emoji、光标样式、自绘标题栏 + Mica 材质,真机验收通过(2026-09-30),双平台 CI 全绿。下一个里程碑:M3 系统集成(默认终端注册、WSL、安装包)。
+**M3(系统集成)完成** — WSL/Profile 体系、单实例 named pipe IPC(`mica new-tab` / `mica wsl` / `mica list-profiles`)、任务栏 jump list、Quick Terminal(Win+` 下拉·失焦收起)、WiX MSI(CI artifact)、默认终端 RRVA 注册,真机验收通过(2026-10-02)。下一个里程碑:M4 协议补全(kitty keyboard、OSC 8/133)。
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M0 骨架 | 三 crate 架构 + 核心层 + 渲染管线 + Win32 壳 + CI | ✅ |
 | M1 渲染补全 | DirectWrite 字形、CJK 宽字符、配置与主题 | ✅ |
 | M2 窗口体验 | 多标签、分屏、快捷键体系 | ✅ |
-| M3 系统集成 | 默认终端注册、WSL、Quick Terminal、安装包 | |
+| M3 系统集成 | 默认终端注册、WSL、Quick Terminal、安装包 | ✅ |
 | M4 协议补全 | kitty keyboard、OSC 8/133、图形协议预研 | |
 | M5 1.0 | 无障碍、公开跑分、正式发布 | |
 

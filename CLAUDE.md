@@ -53,15 +53,19 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-09-26-m2-tabs-splits-design.md` — M2 设计(标签/分屏/选择/连字/COLR,D13-D20;M2a/M2b 两切片)。
 - `docs/superpowers/plans/2026-09-26-m2a-tabs-selection.md` — M2a 计划(标签/键位/选择/剪贴板/滚轮/清账,8 任务;上游 scroll/selection API 已核实复用)。
 - `docs/superpowers/plans/2026-09-27-m2b-splits-ligatures.md` — M2b 计划(分屏/连字/COLR/OSC52/光标/标题栏,9 任务;DWrite shaping/COLR/光标样式 API 已核实,探针先行原则标注)。
-- 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(✅ 2026-09-30 真机冒烟通过)→ M3 系统集成 → M4 协议 → M5 1.0。
+- `docs/superpowers/specs/2026-10-01-m3-integration-design.md` — M3 设计(Profile/IPC/QuickTerm/安装/defterm,D21-D26;M3a/M3b/M3c 三切片)。
+- `docs/superpowers/plans/2026-10-01-m3a-profiles-ipc.md` — M3a 计划(profile 扫描/WSL 解析/named pipe IPC/CLI/jumplist,6 任务;管道与 Shell COM API 已核实)。
+- 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(✅)→ M3 系统集成(✅ 2026-10-02:profiles/IPC/CLI/jumplist/QuickTerm/MSI artifact/defterm RRVA)→ M4 协议 → M5 1.0。
 
-## 当前边界(M2 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
+## 当前边界(M3 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
 - 半纹素渗色(终审 I2,处方:insert 右/下 +1px 零填充 padding;冒烟未观察到明显症状,留观)
 - 连字:Cascadia 系需 TextLayout 级引擎(analyzer+liga/calt 不触发),管线已备,probe 阴性自动回退——换引擎留 M3
 - OSC 52:管线单测全过,真机经 ConPTY 疑被拦截——tmux 环境复验后定案(M3 或关账)
 - 系统按钮(— □ ×)hit-test 已通,视觉字形待打磨(M2 打磨票);标签溢出滚动为极简版
-- 每标签独立字体/字号 M3 随 profile;标签 tear-off M3/M4 观望;拖选接续滚轮扩展选区 M3
+- 每标签独立字体/字号 M4 随 profile;标签 tear-off M4 观望;拖选接续滚轮扩展选区 M4
+- defterm 二级(ITerminalHandoff COM 完整接管):RRVA 一级已上线(设置列表可见),COM 手绑 M4 探针;winget 清单首提待做
+- Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M4;QT 输入无修饰键编码(打磨票)
 - WM_CHAR 无代理对之外的 IME 组合窗口(M3 系统级 IME)
 - OSC 10/11/12 正确;OSC 4 索引 0-15 正确、16-255 答光标色(M4 修立方/灰阶)
 - bold-italic 复用 bold 面(M2 打磨票);DPI 写死 96(spec §11)

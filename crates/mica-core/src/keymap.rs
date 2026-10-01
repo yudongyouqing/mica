@@ -57,7 +57,12 @@ pub struct Keymap {
 impl Keymap {
     /// WT 兼容默认表(D15):目标用户是 WT 迁移者,肌肉记忆零成本。
     pub fn wt_default() -> Self {
-        let m = |ctrl: bool, shift: bool, alt: bool| Mods { shift, alt, ctrl };
+        let m = |ctrl: bool, shift: bool, alt: bool| Mods {
+            shift,
+            alt,
+            ctrl,
+            win: false,
+        };
         let mut binds = Vec::new();
         let mut push = |mods: Mods, key: TriggerKey, action: Action| {
             binds.push((Trigger::new(mods, key), action))
@@ -184,6 +189,7 @@ pub fn parse_trigger(s: &str) -> Option<Trigger> {
             "ctrl" => mods.ctrl = true,
             "shift" => mods.shift = true,
             "alt" => mods.alt = true,
+            "win" => mods.win = true,
             _ => return None,
         }
     }
@@ -202,6 +208,8 @@ pub fn parse_trigger(s: &str) -> Option<Trigger> {
         "pageup" => TriggerKey::Key(Key::PageUp),
         "pagedown" => TriggerKey::Key(Key::PageDown),
         "insert" => TriggerKey::Insert,
+        // ` 键(美式键盘反引号;Quick Terminal 默认热键)
+        "oem_3" | "grave" | "backquote" => TriggerKey::Key(Key::Grave),
         d if d.len() == 1 && d.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
             let digit = key_name.parse::<u8>().ok()?;
             // 0 不是合法数字触发键(与 9 上限一致)
@@ -266,6 +274,7 @@ mod tests {
             shift: s,
             alt: a,
             ctrl: c,
+            win: false,
         };
         assert_eq!(
             km.lookup(m(true, true, false), TriggerKey::Letter('T')),
@@ -299,7 +308,8 @@ mod tests {
                 Mods {
                     ctrl: true,
                     shift: true,
-                    alt: false
+                    alt: false,
+                    win: false
                 },
                 t.key
             ),
@@ -315,7 +325,8 @@ mod tests {
                 Mods {
                     ctrl: true,
                     shift: true,
-                    alt: false
+                    alt: false,
+                    win: false
                 },
                 TriggerKey::Letter('T')
             ))
@@ -326,7 +337,8 @@ mod tests {
                 Mods {
                     ctrl: false,
                     shift: true,
-                    alt: false
+                    alt: false,
+                    win: false,
                 },
                 TriggerKey::Key(Key::PageUp)
             ))

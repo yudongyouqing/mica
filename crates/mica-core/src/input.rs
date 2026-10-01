@@ -10,6 +10,9 @@ pub struct Mods {
     pub shift: bool,
     pub alt: bool,
     pub ctrl: bool,
+    /// Win 键修饰(M3b 全局热键用;xterm 编码不含——终端转义序列
+    /// 没有 Win 修饰位,encode 侧忽略它)
+    pub win: bool,
 }
 
 impl Mods {
@@ -17,6 +20,7 @@ impl Mods {
         shift: false,
         alt: false,
         ctrl: false,
+        win: false,
     };
 
     /// xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4).
@@ -40,6 +44,8 @@ pub enum Key {
     Delete,
     PageUp,
     PageDown,
+    /// ` 键(反引号;全局热键/Quick Terminal 用,不进 xterm 编码)。
+    Grave,
 }
 
 /// Encode a key press into the byte sequence the pty expects.
@@ -72,6 +78,10 @@ pub fn encode(key: Key, mods: Mods, app_cursor: bool) -> Vec<u8> {
             format!("\x1b[1;{p}{letter}").into_bytes()
         }
     };
+    // ` 有 WM_CHAR 文本路径(普通字符),键盘路径不消费(空串即无输出)
+    if matches!(key, Key::Grave) {
+        return Vec::new();
+    }
     let seq = match key {
         Key::Enter => b"\r".to_vec(),
         Key::Backspace => b"\x7f".to_vec(),
@@ -93,6 +103,7 @@ pub fn encode(key: Key, mods: Mods, app_cursor: bool) -> Vec<u8> {
         Key::Delete => tilde(3),
         Key::PageUp => tilde(5),
         Key::PageDown => tilde(6),
+        Key::Grave => unreachable!("Grave 已在函数头早退"),
     };
     if mods.alt {
         let mut out = Vec::with_capacity(seq.len() + 1);
