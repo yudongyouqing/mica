@@ -28,6 +28,8 @@ windows = { workspace = true, features = [
     "Win32_System_Pipes",
     "Win32_Storage_FileSystem",
     "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_UI_Shell_Common",
     "Win32_System_Memory",
 ] }
 pollster = { workspace = true }

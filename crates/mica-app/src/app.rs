@@ -87,6 +87,7 @@ struct ReloadHandle {
 
 mod clipboard;
 pub(crate) mod ipc;
+mod jumplist;
 
 thread_local! {
     static GPU: RefCell<Option<WindowGpu>> = const { RefCell::new(None) };
@@ -287,6 +288,16 @@ pub fn run() {
             Err(false) => {} // 建管道失败:已在 ipc::serve 记日志
             Err(true) => unreachable!("main 已分流,GUI 路径不会撞已占管道"),
         }
+        // M3a:AUMID + jump list(profile 任务直达)
+        jumplist::set_appuser_model_id();
+        let profiles: Vec<(String, String)> = mica_core::profile::scan_all()
+            .into_iter()
+            .map(|p| (p.name, p.command))
+            .collect();
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        jumplist::install(&exe, &profiles);
         // T7:首个标签与 GPU 就位(forwarder 由 start_tab 内部起;
         // handle 不 join——退出序由杀 pty 断源自然收尾,detach 可接受)。
         // M3a:CLI/IPC 自启动路径经 MICA_START_PROFILE 指定首标签 profile
