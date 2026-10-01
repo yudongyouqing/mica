@@ -53,7 +53,8 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-09-26-m2-tabs-splits-design.md` — M2 设计(标签/分屏/选择/连字/COLR,D13-D20;M2a/M2b 两切片)。
 - `docs/superpowers/plans/2026-09-26-m2a-tabs-selection.md` — M2a 计划(标签/键位/选择/剪贴板/滚轮/清账,8 任务;上游 scroll/selection API 已核实复用)。
 - `docs/superpowers/plans/2026-09-27-m2b-splits-ligatures.md` — M2b 计划(分屏/连字/COLR/OSC52/光标/标题栏,9 任务;DWrite shaping/COLR/光标样式 API 已核实,探针先行原则标注)。
-- `docs/superpowers/specs/2026-10-01-m3-integration-design.md` — M3 设计(Profile/IPC/QuickTerm/安装/defterm,D21-D26;M3a/M3b/M3c 三切片,计划待写)。
+- `docs/superpowers/specs/2026-10-01-m3-integration-design.md` — M3 设计(Profile/IPC/QuickTerm/安装/defterm,D21-D26;M3a/M3b/M3c 三切片)。
+- `docs/superpowers/plans/2026-10-01-m3a-profiles-ipc.md` — M3a 计划(profile 扫描/WSL 解析/named pipe IPC/CLI/jumplist,6 任务;管道与 Shell COM API 已核实)。
 - 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(✅)→ M3 系统集成(设计已确认,实施中)→ M4 协议 → M5 1.0。
 
 ## 当前边界(M2 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)

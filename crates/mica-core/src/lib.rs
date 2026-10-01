@@ -3,7 +3,9 @@
 
 pub mod config;
 pub mod input;
+pub mod ipc;
 pub mod keymap;
 pub mod layout;
+pub mod profile;
 pub mod pty;
 pub mod surface;

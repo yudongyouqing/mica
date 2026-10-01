@@ -46,6 +46,20 @@ pub struct PtySession {
     child: Box<dyn Child + Send + Sync>,
 }
 
+/// 命令行字符串(exe + 空格分隔参数)→ CommandBuilder(M3a profile 用;
+/// 引号语义不支持——profile 命令都是受控生成,不含带空格路径)。
+pub fn command_from_str(cmd: &str) -> CommandBuilder {
+    let mut parts = cmd.split_whitespace();
+    let Some(exe) = parts.next() else {
+        return default_shell_command();
+    };
+    let mut builder = CommandBuilder::new(exe);
+    for arg in parts {
+        builder.arg(arg);
+    }
+    builder
+}
+
 /// The shell a new tab gets: PowerShell on Windows (spec M0), sh elsewhere
 /// (so core tests run on the macOS dev box).
 pub fn default_shell_command() -> CommandBuilder {
