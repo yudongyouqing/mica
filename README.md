@@ -22,7 +22,7 @@ Mica is a **Windows-native** terminal emulator aiming to bring the three pillars
 
 ## 状态 / Status
 
-**M3(系统集成)完成** — WSL/Profile 体系、单实例 named pipe IPC(//)、任务栏 jump list、Quick Terminal(Win+` 下拉·失焦收起)、WiX MSI(CI artifact)、默认终端 RRVA 注册,真机验收通过(2026-10-02)。下一个里程碑:M4 协议补全(kitty keyboard、OSC 8/133)。
+**M3(系统集成)完成** — WSL/Profile 体系、单实例 named pipe IPC(`mica new-tab` / `mica wsl` / `mica list-profiles`)、任务栏 jump list、Quick Terminal(Win+` 下拉·失焦收起)、WiX MSI(CI artifact)、默认终端 RRVA 注册,真机验收通过(2026-10-02)。下一个里程碑:M4 协议补全(kitty keyboard、OSC 8/133)。
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
