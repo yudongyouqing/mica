@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Windows shell: Win32 window, input routing, terminal wiring"
+authors.workspace = true
 
 [dependencies]
 mica-core = { path = "../mica-core" }

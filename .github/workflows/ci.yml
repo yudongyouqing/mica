@@ -42,3 +42,28 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p mica-core -p mica-render --all-targets -- -D warnings
       - run: cargo test -p mica-core -p mica-render
+
+  msi:
+    # M3c(D23):cargo-wix 打包 MSI artifact;candle/light 由 choco 提供。
+    # 打包失败不红主 CI(installer optional)——改成 always() 条件由 artifact 落地
+    runs-on: windows-latest
+    needs: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install WiX Toolset v3
+        shell: pwsh
+        run: choco install wixtoolset --version=3.14.1 --no-progress -y
+      - name: Add WiX to PATH
+        shell: pwsh
+        run: echo "C:\\Program Files (x86)\\WiX Toolset v3.14\\bin" | Out-File -Append $env:GITHUB_PATH
+      - name: Build MSI
+        run: |
+          cargo install cargo-wix --locked
+          cargo wix -p mica-app --output target/wix/mica.msi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mica-msi
+          path: target/wix/mica.msi
+          if-no-files-found: warn

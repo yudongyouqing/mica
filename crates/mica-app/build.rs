@@ -33,44 +33,12 @@ fn main() {
 /// 格式:ICONDIR + 每尺寸 ICONDIRENTRY + BITMAPINFOHEADER(高×2,含 AND 掩码)+ 像素。
 fn write_placeholder_ico(path: &std::path::Path) {
     const SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
-    let mut dir: Vec<u8> = vec![0, 0, 1, 0, SIZES.len() as u8, 0]; // reserved, type=1(icon), count
-    let mut images: Vec<Vec<u8>> = Vec::new();
-    for (i, &sz) in SIZES.iter().enumerate() {
-        let bmp = bmp_entry(sz);
-        // ICONDIRENTRY: w,h,colorcount=0,reserved,planes=1,bpp=32,size,offset(稍后回填)
-        let off = 6 + SIZES.len() * 16 + images.iter().map(|v: &Vec<u8>| v.len()).sum::<usize>();
-        let b = sz.min(255) as u8; // 256 存 0
-        dir.extend([
-            b,
-            b,
-            0,
-            0,
-            1,
-            0,
-            32,
-            0,
-            (bmp.len() & 0xff) as u8,
-            ((bmp.len() >> 8) & 0xff) as u8,
-            ((bmp.len() >> 16) & 0xff) as u8,
-            ((bmp.len() >> 24) & 0xff) as u8,
-            (off & 0xff) as u8,
-            ((off >> 8) & 08) as u8,
-            ((off >> 16) & 0xff) as u8,
-            ((off >> 24) & 0xff) as u8,
-        ]);
-        let _ = i;
-        images.push(bmp);
-    }
-    // 修正:上面 entry 里 offset 高位错位(0x08 笔误),重写一遍干净实现
+    // ICONDIR:reserved=0, type=1(icon), count;entry 含各尺寸的像素偏移
     let mut dir: Vec<u8> = vec![0, 0, 1, 0, SIZES.len() as u8, 0];
-    let mut total = 6 + SIZES.len() * 16;
-    for &sz in &SIZES {
-        total += bmp_entry(sz).len();
-    }
+    let sizes: Vec<Vec<u8>> = SIZES.iter().map(|&sz| bmp_entry(sz)).collect();
     let mut cur = 6 + SIZES.len() * 16;
-    for &sz in &SIZES {
-        let bmp = bmp_entry(sz);
-        let b = sz.min(255) as u8;
+    for (&sz, bmp) in SIZES.iter().zip(&sizes) {
+        let b = sz.min(255) as u8; // 256 按格式存 0
         dir.extend([
             b,
             b,
@@ -91,7 +59,6 @@ fn write_placeholder_ico(path: &std::path::Path) {
         ]);
         cur += bmp.len();
     }
-    let _ = total;
     let mut ico = dir;
     for sz in SIZES {
         ico.extend(bmp_entry(sz));
@@ -103,9 +70,9 @@ fn write_placeholder_ico(path: &std::path::Path) {
 /// + BGRA 像素(BMP 自底向上)+ 全零 AND 掩码(alpha 通道已承载透明)。
 fn bmp_entry(sz: u32) -> Vec<u8> {
     let n = sz as usize;
-    let row = (n * 4).max(((n + 31) / 32) * 4 * 1); // BGRA 行已 4 对齐;AND 每像素 1 bit
-    let and_row = ((n + 31) / 32) * 4;
-    let mut out = Vec::with_capacity(40 + row * n + and_row * n);
+    // BGRA 行天然 4 字节对齐;AND 掩码每像素 1 bit,按 32bit 打包行对齐
+    let and_row = n.div_ceil(32) * 4;
+    let mut out = Vec::with_capacity(40 + n * 4 * n + and_row * n);
     out.extend_from_slice(&40u32.to_le_bytes()); // biSize
     out.extend_from_slice(&sz.to_le_bytes()); // biWidth
     out.extend_from_slice(&(sz * 2).to_le_bytes()); // biHeight(双倍)
@@ -149,6 +116,6 @@ fn bmp_entry(sz: u32) -> Vec<u8> {
         }
     }
     // AND 掩码全零(alpha 负责)
-    out.extend(std::iter::repeat(0u8).take(and_row * n));
+    out.extend(std::iter::repeat_n(0u8, and_row * n));
     out
 }
