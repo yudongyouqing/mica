@@ -71,6 +71,8 @@ const RESIZE_BORDER: i32 = 6;
 const WM_APP_RENDER: u32 = 0x8000 + 1;
 const WM_APP_CONFIG: u32 = 0x8000 + 2;
 const WM_APP_IPC: u32 = 0x8000 + 3;
+/// WM_APP 基值(quickterm 转发线程投递用裸 WM_APP)
+const WM_APP_MSG: u32 = 0x8000;
 
 /// watch/转发线程共持的窗口句柄哨兵,唯一语义是"窗口是否存活":退出序第一
 /// 步统一落 None,两个后台线程自此不再向窗口投递消息;Post 到死句柄本就无害,
@@ -88,6 +90,7 @@ struct ReloadHandle {
 mod clipboard;
 pub(crate) mod ipc;
 mod jumplist;
+pub(crate) mod quickterm;
 
 thread_local! {
     static GPU: RefCell<Option<WindowGpu>> = const { RefCell::new(None) };
@@ -317,6 +320,8 @@ pub fn run() {
         // 首帧显式化:旧轮询循环里第一帧混在首轮 drain 中,事件化后没有输出
         // 就没人画——进循环前先铺一帧(底色+空网格),不等第一条 pty 输出
         draw_frame();
+        // M3b:Quick Terminal(热键 + 下拉窗;失败只记日志)
+        let _ = quickterm::init(hwnd);
         message_loop(reload, hwnd_slot);
     }
 }
@@ -898,6 +903,50 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>) {
 /// 主循环:GetMessageW 阻塞等消息,零轮询(T7)。返回 0 = 取到 WM_QUIT,
 /// -1 = 错误,其余为有消息——不能按真值判(-1 也非零),先精确判 -1 再判 0。
 /// 渲染唤醒(WM_APP_RENDER)、输入、尺寸、热重载全在 wndproc 侧处理。
+///
+/// Quick Terminal 接线辅助(pub(crate) 供 quickterm 模块)
+pub(crate) fn tab_seed() -> (Vec<String>, f32) {
+    TAB_SEED.with(|s| s.borrow().clone())
+}
+pub(crate) fn current_palette() -> Palette {
+    CURRENT_PALETTE.with(|p| *p.borrow())
+}
+pub(crate) fn shared_hwnd_for_quickterm() -> Option<SharedHwnd> {
+    SHARED_HWND.with(|s| s.borrow().clone())
+}
+/// QT 转发线程:与主 forwarder 同款,但 WM_APP(非 WM_APP_RENDER)投给
+/// QT 窗口(独立消息域;WPARAM=0xFF00 哨兵)。
+pub(crate) fn spawn_qt_forwarder(
+    reader: mica_core::pty::PtyReader,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    hwnd_slot: SharedHwnd,
+) {
+    std::thread::Builder::new()
+        .name("qt-forwarder".into())
+        .spawn(move || {
+            loop {
+                match reader.recv_block() {
+                    Some(chunk) => {
+                        {
+                            let mut pending = buffer.lock().expect("qt buf poisoned");
+                            pending.extend_from_slice(&chunk);
+                        }
+                        let hwnd = *hwnd_slot.lock().expect("hwnd slot poisoned");
+                        if let Some(raw) = hwnd {
+                            let hwnd = HWND(raw as *mut std::ffi::c_void);
+                            // SAFETY: Post 到死句柄无害
+                            let _ = unsafe {
+                                PostMessageW(Some(hwnd), WM_APP_MSG, WPARAM(0xFF00), LPARAM(0))
+                            };
+                        }
+                    }
+                    None => return,
+                }
+            }
+        })
+        .expect("spawn qt forwarder");
+}
+
 unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     let mut msg = MSG::default();
     loop {
@@ -1917,6 +1966,7 @@ fn current_mods() -> Mods {
             shift: down(VK_SHIFT),
             alt: down(VK_MENU),
             ctrl: down(VK_CONTROL),
+            win: false,
         }
     }
 }

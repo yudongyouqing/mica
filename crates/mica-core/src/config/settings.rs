@@ -31,6 +31,8 @@ pub struct Settings {
     pub keymap: Keymap,
     /// 光标闪烁(D20):默认不闪,`cursor-blink = true` 开 500ms 定时器。
     pub cursor_blink: bool,
+    /// Quick Terminal 全局热键(M3b,默认 Win+`;禁用写 `none`)。
+    pub quick_terminal_key: Option<String>,
 }
 
 impl Default for Settings {
@@ -42,6 +44,7 @@ impl Default for Settings {
             theme_name: None,
             keymap: Keymap::wt_default(),
             cursor_blink: false,
+            quick_terminal_key: Some("win+oem_3".into()),
         }
     }
 }
@@ -117,6 +120,17 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                     .push(format!("font-size 应为 4-72 的数字,得 `{value}`")),
             },
             "theme" => settings.theme_name = Some(value),
+            "quick-terminal-key" => {
+                if value.eq_ignore_ascii_case("none") {
+                    settings.quick_terminal_key = None;
+                } else if crate::keymap::parse_trigger(value.trim()).is_some() {
+                    settings.quick_terminal_key = Some(value.to_lowercase());
+                } else {
+                    err.values.push(format!(
+                        "quick-terminal-key 应为 <触发器>(如 win+oem_3)或 none,得 `{value}`"
+                    ));
+                }
+            }
             "cursor-blink" => match value.to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" => settings.cursor_blink = true,
                 "false" | "0" | "no" => settings.cursor_blink = false,
