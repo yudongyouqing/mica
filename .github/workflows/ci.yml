@@ -42,3 +42,21 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p mica-core -p mica-render --all-targets -- -D warnings
       - run: cargo test -p mica-core -p mica-render
+
+  msi:
+    # M3c(D23):cargo-wix 打包 MSI artifact;candle/light 预装在 windows runner。
+    runs-on: windows-latest
+    needs: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build MSI
+        run: |
+          cargo install cargo-wix --locked
+          cargo wix -p mica-app --output target/wix/mica.msi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mica-msi
+          path: target/wix/mica.msi
+          if-no-files-found: warn

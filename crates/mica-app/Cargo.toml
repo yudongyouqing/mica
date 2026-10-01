@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 description = "Windows shell: Win32 window, input routing, terminal wiring"
+authors.workspace = true
 
 [dependencies]
 mica-core = { path = "../mica-core" }
@@ -14,6 +15,9 @@ anyhow = { workspace = true }
 [[bin]]
 name = "mica"
 path = "src/main.rs"
+
+[build-dependencies]
+winres = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
