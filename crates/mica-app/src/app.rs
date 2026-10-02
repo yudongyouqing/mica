@@ -321,6 +321,7 @@ pub fn run() {
         // 就没人画——进循环前先铺一帧(底色+空网格),不等第一条 pty 输出
         draw_frame();
         // M3b:Quick Terminal(热键 + 下拉窗;失败只记日志)
+        // QT 失败已内部记日志;Err = QT 禁用(主窗照常,增强件不炸主流程)
         let _ = quickterm::init(hwnd);
         message_loop(reload, hwnd_slot);
     }

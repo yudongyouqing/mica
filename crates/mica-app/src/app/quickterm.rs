@@ -48,7 +48,7 @@ thread_local! {
 
 /// 创建 Quick Terminal(主窗 run() 尾调用;失败仅记日志——QT 是增强件)。
 /// 返回热键 id(0 = 未注册)。
-pub unsafe fn init(hwnd_main: HWND) -> u32 {
+pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     let class_name: HSTRING = "mica_quickterm_class".into();
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -106,28 +106,33 @@ pub unsafe fn init(hwnd_main: HWND) -> u32 {
     let fam_ref: Vec<&str> = families.iter().map(String::as_str).collect();
     let Ok(router) = DwriteRouter::new(size_pt, &fam_ref) else {
         eprintln!("quickterm: 字体链失败,QT 禁用");
-        return 0;
+        return Err(());
     };
     let metrics = router.metrics();
     let palette = crate::app::current_palette();
 
-    // wgpu surface + renderer(独立于主窗)
+    // wgpu surface + renderer(独立于主窗;display handle 与主窗同款——
+    // wgpu 30 在 DX12 后端要求显式 display handle,None 会 MissingDisplayHandle)
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let wgpu_surface: wgpu::Surface<'static> = instance
         .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: None,
+            raw_display_handle: Some(raw_window_handle::RawDisplayHandle::Windows(
+                raw_window_handle::WindowsDisplayHandle::new(),
+            )),
             raw_window_handle: raw_window_handle::RawWindowHandle::Win32(
                 raw_window_handle::Win32WindowHandle::new(
                     std::num::NonZeroIsize::new(hwnd_qt.0 as isize).expect("hwnd"),
                 ),
             ),
         })
-        .expect("QT surface");
-    let ctx =
-        pollster::block_on(create_context(&instance, Some(&wgpu_surface))).expect("QT GPU context");
+        .inspect_err(|e| eprintln!("quickterm: surface 失败 {e:?},QT 禁用"))
+        .map_err(|_| ())?;
+    let ctx = pollster::block_on(create_context(&instance, Some(&wgpu_surface)))
+        .inspect_err(|e| eprintln!("quickterm: GPU 上下文失败 {e:?},QT 禁用"))
+        .map_err(|_| ())?;
     let mut config = wgpu_surface
         .get_default_config(&ctx.adapter, w_px as u32, h_px as u32)
-        .expect("QT config");
+        .ok_or(())?; // Option:get_default_config 失败仅记日志走降级
     if config.format.is_srgb() {
         let caps = wgpu_surface.get_capabilities(&ctx.adapter);
         config.format = caps
@@ -155,7 +160,8 @@ pub unsafe fn init(hwnd_main: HWND) -> u32 {
         cols,
         rows,
     )
-    .expect("QT pty");
+    .inspect_err(|e| eprintln!("quickterm: pty 失败 {e:?},QT 禁用"))
+    .map_err(|_| ())?;
     let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     term.set_clipboard_provider(Arc::new(|| {
         crate::app::clipboard::get_text().unwrap_or_default()
@@ -189,7 +195,7 @@ pub unsafe fn init(hwnd_main: HWND) -> u32 {
         crate::app::spawn_qt_forwarder(reader, pty_buf, slot);
     }
     let _ = class_name; // 注册已用 w! 字面量
-    1
+    Ok(())
 }
 
 /// 切换:可见→隐藏;隐藏→显示+置顶激活。
