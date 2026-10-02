@@ -3,3 +3,4 @@
 //! 由上游 TermMode 承载,消费方经 Surface 读取。
 
 pub mod kitty;
+pub mod sidecar;
