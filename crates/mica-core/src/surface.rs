@@ -157,6 +157,9 @@ impl Surface {
         let proxy = EventProxy::default();
         let config = Config {
             scrolling_history: 10_000,
+            // kitty keyboard(M4a/D27):激活上游状态机(mode 栈/查询应答);
+            // 输入编码器在 protocol::kitty,app 按 kitty_flags() 分流
+            kitty_keyboard: true,
             ..Default::default()
         };
         let term = Term::new(config, &size, proxy.clone());
@@ -238,6 +241,35 @@ impl Surface {
 
     pub fn grid(&self) -> &Grid<Cell> {
         self.term.grid()
+    }
+
+    /// 当前 kitty keyboard flags(M4a):四渐进位的并集;全零走 legacy。
+    pub fn kitty_flags(&self) -> crate::protocol::kitty::KittyFlags {
+        let mode = self.term.mode();
+        let mut bits = 0u32;
+        // 位值与上游 TermMode(1<<18..22)锁死;不能直接读私有位,经 mode
+        // contains 判定后重组
+        use alacritty_terminal::term::TermMode;
+        const KITTY_BITS: [(u32, u32); 4] = [
+            (1 << 18, 1 << 18),
+            (1 << 19, 1 << 19),
+            (1 << 21, 1 << 21),
+            (1 << 22, 1 << 22),
+        ];
+        for (mode_bit, out_bit) in KITTY_BITS {
+            if mode.contains(TermMode::from_bits_truncate(mode_bit)) {
+                bits |= out_bit;
+            }
+        }
+        crate::protocol::kitty::KittyFlags(bits)
+    }
+
+    /// bracketed paste(DECSET 2004)是否激活——粘贴路径据此包裹。
+    pub fn bracketed_paste_active(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term
+            .mode()
+            .contains(TermMode::from_bits_truncate(1 << 4))
     }
 
     /// DECCKM(DECSET 1)application cursor keys:编码器据此把导航键发成
@@ -588,6 +620,42 @@ mod tests {
         );
         s.feed(b"]52;c;aGk=\\");
         assert_eq!(s.take_clipboard_out(), vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn kitty_flags_follow_mode_set_and_push() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        use crate::protocol::kitty::KittyFlags;
+        assert_eq!(s.kitty_flags(), KittyFlags::NONE, "初始无 kitty 位");
+        // set-or 全量替换:CSI = flags u(1 = disambiguate)
+        s.feed(b"\x1b[=1u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        // 再叠加 event types(全量替换语义:只留 bit19)
+        s.feed(b"\x1b[=2u");
+        assert_eq!(
+            s.kitty_flags(),
+            KittyFlags::REPORT_EVENT_TYPES,
+            "set-or 全量替换"
+        );
+        // push/pop:push 置栈顶为该 mode,pop 恢复栈底(set 不入栈,栈空即 NO_MODE)
+        s.feed(b"\x1b[>1u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        s.feed(b"\x1b[<1u");
+        assert_eq!(
+            s.kitty_flags(),
+            KittyFlags::NONE,
+            "栈空回 NO_MODE(set 不入栈)"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_mode_toggles() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert!(!s.bracketed_paste_active());
+        s.feed(b"\x1b[?2004h");
+        assert!(s.bracketed_paste_active());
+        s.feed(b"\x1b[?2004l");
+        assert!(!s.bracketed_paste_active());
     }
 
     /// DECSCUSR(xterm 语义):1|2=块、3|4=下划线、5|6=beam;0=重置默认。

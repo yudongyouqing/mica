@@ -7,5 +7,6 @@ pub mod ipc;
 pub mod keymap;
 pub mod layout;
 pub mod profile;
+pub mod protocol;
 pub mod pty;
 pub mod surface;
