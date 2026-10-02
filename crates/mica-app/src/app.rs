@@ -112,6 +112,9 @@ thread_local! {
     static KEYMAP: RefCell<Keymap> = RefCell::new(Keymap::wt_default());
     /// IPC 服务端消息队列(主线程 WM_APP_IPC 时 try_recv)
     static IPC_RX: RefCell<Option<std::sync::mpsc::Receiver<IpcMessage>>> = const { RefCell::new(None) };
+    /// 2026 同步持帧(D29):h 起置 true,l 或 150ms 超时放帧。
+    /// 持帧只跳 draw(数据照 drain+feed,不丢)
+    static SYNC_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 光标闪烁相位(true = 亮);开关由配置驱动(settings.cursor_blink)
     static BLINK_PHASE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static CURSOR_BLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1625,17 +1628,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(text) = t.term.take_clipboard_out().pop() {
                     clipboard::set_text(&text);
                 }
-                if let Some(title) = t.term.take_title() {
+                // 2026 同步输出(D29):持帧只跳 draw,数据已照 feed,不丢。
+                // 先取状态到局部再写 guard,避开 t(&mut 借用)与 guard 交叉
+                // 全部 t 状态先取局部(t 是 guard 的 &mut,不再交叉借用 guard
+                let title_opt: Option<String> = t.term.take_title();
+                let sync_open = t.term.sync_output_active();
+                let mut flush = sync_open; // 放帧时刻需要全量重绘
+                let was_held = SYNC_HELD.replace(false);
+                if sync_open {
+                    t.force_full = true;
+                }
+                if let Some(title) = title_opt {
                     guard[tab_idx].title = title.clone();
                     if is_active {
                         let _ = SetWindowTextW(hwnd, &HSTRING::from(title));
                     }
                 }
                 if is_active {
-                    drew = true;
+                    if sync_open {
+                        // 起安全阀(D29):150ms 内 2026-l 不来即强制放帧
+                        SYNC_HELD.with(|f| f.set(true));
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                            Some(hwnd),
+                            2,
+                            150,
+                            None,
+                        );
+                    } else if was_held {
+                        // 窗口刚关(2026-l 到达):放一帧全量
+                        windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2).ok();
+                        flush = true;
+                        drew = true; // l 即刻放帧
+                    } else {
+                        drew = true;
+                    }
                 } else {
                     guard[tab_idx].dirty = true;
                 }
+                let _ = flush;
             });
             // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
             if drew {
@@ -1644,18 +1674,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TIMER => {
-            // 光标闪烁(D20):翻相位,只重绘(光标行在 damage 里自然带出;
-            // 无输入时 term 脏区为空,force_full 兜底成本可接受——闪烁期
-            // 本来就是持续重绘)
-            BLINK_PHASE.with(|p| p.set(!p.get()));
-            TABS.with(|tabs| {
-                if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get())
-                    && let Some(p) = t.active_pane()
-                {
-                    p.force_full = true;
+            // id 分流:2 = 2026 同步安全阀(D29);1 = 光标闪烁(D20)
+            match wparam.0 {
+                2 => {
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2).ok();
+                    if SYNC_HELD.with(std::cell::Cell::take) {
+                        SYNC_HELD.with(|f| f.set(false));
+                        TABS.with(|tabs| {
+                            if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get())
+                                && let Some(p) = t.active_pane()
+                            {
+                                p.term.mark_sync_flushed();
+                                p.force_full = true;
+                            }
+                        });
+                        draw_frame();
+                    }
                 }
-            });
-            draw_frame();
+                _ => {
+                    // 光标闪烁(D20):翻相位,只重绘(光标行在 damage 里自然带出;
+                    // 无输入时 term 脏区为空,force_full 兜底成本可接受——闪烁期
+                    // 本来就是持续重绘)
+                    BLINK_PHASE.with(|p| p.set(!p.get()));
+                    TABS.with(|tabs| {
+                        if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get())
+                            && let Some(p) = t.active_pane()
+                        {
+                            p.force_full = true;
+                        }
+                    });
+                    draw_frame();
+                }
+            }
             LRESULT(0)
         }
         WM_NCCALCSIZE => {
