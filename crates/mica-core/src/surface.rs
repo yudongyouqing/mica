@@ -150,6 +150,12 @@ pub struct Surface {
     /// take_damage 首帧哨兵:TermDamageState 构造即 full=true,本应自然
     /// Full,但那是上游实现细节——本层显式保证"第一次消费必是 Full"。
     has_drawn: bool,
+    /// 协议旁路(M4b):与主 parser 同源喂入,只认 2026/OSC 133。
+    sidecar: crate::protocol::sidecar::SidecarParser,
+    /// 最近一次 feed 是否处于同步输出窗口(2026h..2026l),app 据此持帧。
+    sync_output: bool,
+    /// 最近一次 feed 到达的 OSC 133 标记(取走即清;行号由消费方结合光标记录,M5 消费)。
+    pending_marks: Vec<crate::protocol::sidecar::ShellMark>,
 }
 
 impl Surface {
@@ -170,12 +176,43 @@ impl Surface {
             proxy,
             size,
             has_drawn: false,
+            sidecar: crate::protocol::sidecar::SidecarParser::new(),
+            sync_output: false,
+            pending_marks: Vec::new(),
         }
     }
 
     /// Feed raw pty output into the terminal state machine.
+    /// 同段字节也过 sidecar(M4b):2026/OSC 133 旁路监听。
     pub fn feed(&mut self, bytes: &[u8]) {
+        let events = self.sidecar.scan(bytes);
+        if events.sync_begin > 0 {
+            self.sync_output = true;
+        }
+        if events.sync_end > 0 {
+            // 幂等:end 在超时后到(HELD 已 false)只画不重置(D29 竞态缓解)。
+            self.sync_output = false;
+        }
+        self.pending_marks.extend(events.marks);
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// 当前是否处于同步输出窗口(2026h 起 2026l/超时止)。app 的
+    /// WM_APP_RENDER 据此跳过 draw(数据照 drain+feed,不丢)。读取侧判断后应配对调用
+    /// `mark_sync_flushed` 以便超时释放。简化契约:`sync_output` 只反映最近 feed 的
+    /// 状态——超时强制放帧由 app 持有,超时时 app 调 `mark_sync_flushed`。
+    pub fn sync_output_active(&self) -> bool {
+        self.sync_output
+    }
+
+    /// app 侧超时放帧后调用(app 150ms 安全阀)——把状态清掉,后续 feed 正常画。
+    pub fn mark_sync_flushed(&mut self) {
+        self.sync_output = false;
+    }
+
+    /// 取走上次 feed 后到达的 OSC 133 标记(D30:解析+存储,M5 消费)。
+    pub fn take_shell_marks(&mut self) -> Vec<crate::protocol::sidecar::ShellMark> {
+        std::mem::take(&mut self.pending_marks)
     }
 
     pub fn resize(&mut self, size: ScreenSize) {
@@ -656,6 +693,26 @@ mod tests {
         assert!(s.bracketed_paste_active());
         s.feed(b"\x1b[?2004l");
         assert!(!s.bracketed_paste_active());
+    }
+
+    #[test]
+    fn sync_output_and_marks_flow_through_surface() {
+        use crate::protocol::sidecar::ShellMark;
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert!(!s.sync_output_active());
+        assert!(s.take_shell_marks().is_empty());
+        // 2026h + 133;A 同流到达
+        s.feed(b"\x1b[?2026h chunk1 \x1b]133;A\x1b\\ prompt");
+        assert!(s.sync_output_active(), "2026h 后进入同步窗口");
+        assert_eq!(s.take_shell_marks(), vec![ShellMark::PromptStart]);
+        // 2026l 结束窗口
+        s.feed(b"tail \x1b[?2026l");
+        assert!(!s.sync_output_active());
+        // 超时安全阀路径
+        s.feed(b"\x1b[?2026h more");
+        assert!(s.sync_output_active());
+        s.mark_sync_flushed();
+        assert!(!s.sync_output_active(), "超时强制放帧后窗口关闭");
     }
 
     /// DECSCUSR(xterm 语义):1|2=块、3|4=下划线、5|6=beam;0=重置默认。
