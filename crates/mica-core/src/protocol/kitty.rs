@@ -83,12 +83,8 @@ pub fn kitty_encode(key: Key, mods: Mods, kind: EventKind, flags: KittyFlags) ->
     if !flags.contains(KittyFlags::REPORT_EVENT_TYPES) && !matches!(kind, EventKind::Press) {
         return None;
     }
-    let code = match functional_keysym(key) {
-        Some(c) => c,
-        // Key 枚举目前全是功能键(可打印字符走 WM_CHAR 文本路径,不进 Key)。
-        // 将来若枚举扩展可打印键,这里按 all-keys 判定(见 doc)。
-        None => return None,
-    };
+    // None(可打印字符如 Grave)走 WM_CHAR 文本路径,不在此编码
+    let code = functional_keysym(key)?;
     // 功能键在 disambiguate 任一形态开启时编码;全关时功能键本来就不歧义
     // (legacy CSI 序列已覆盖),回 None。
     if !flags.disambiguate() {
