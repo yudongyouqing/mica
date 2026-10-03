@@ -137,6 +137,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// device lost 标志(M5b/T2):静态而非 TLS——wgpu 的 lost callback 可能
+/// 从内部线程触发,主线程在 draw_frame 入口轮询消费。
+static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 窗口级 GPU 资源(T7 标签架构):surface/renderer 全标签共享,
 /// 切标签只换绑"喂给渲染器的数据",不动 GPU。
 struct WindowGpu {
@@ -654,6 +658,15 @@ unsafe fn init_window_gpu(hwnd: HWND) -> WindowGpu {
             .expect("no non-srgb surface format");
     }
     wgpu_surface.configure(&ctx.device, &config);
+    // device lost 双钩子(M5b/T2):丢失置静态标志(回调可能在 wgpu 内部
+    // 线程),draw_frame 入口重建;未捕获错误记档(验证层报错有日志可查)
+    ctx.device.set_device_lost_callback(|reason, msg| {
+        GPU_LOST.store(true, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("[gpu] device lost: {reason:?} {msg}");
+    });
+    let err_handler: std::sync::Arc<dyn wgpu::UncapturedErrorHandler> =
+        std::sync::Arc::new(|e: wgpu::Error| eprintln!("[wgpu] uncaptured error: {e}"));
+    ctx.device.on_uncaptured_error(err_handler);
     // T4:Globals 不再携带 cell/shader v2 纯矩形化,Renderer::new 退掉 cell 参
     let renderer = Renderer::new(&ctx, config.format);
     WindowGpu {
@@ -662,6 +675,32 @@ unsafe fn init_window_gpu(hwnd: HWND) -> WindowGpu {
         wgpu_surface,
         config,
     }
+}
+
+/// device lost 后整套重建 GPU 资源(M5b/T2)。旧 WindowGpu 先 drop(旧
+/// surface 归旧设备);新链按当前客户区尺寸重配。tab 侧不动——图集重传
+/// 由 renderer_atlas_revision 重置驱动(与热重载同机制)。
+fn rebuild_gpu_after_loss() {
+    eprintln!("[gpu] device lost —— 重建渲染链");
+    let Some(hwnd_raw) = SHARED_HWND.with(|s| s.borrow().clone()) else {
+        return;
+    };
+    let Some(raw) = hwnd_raw.lock().ok().and_then(|g| *g) else {
+        return;
+    };
+    // SAFETY: 哨兵非空即窗口存活(run() 退出序先置 None)
+    unsafe {
+        let gpu = init_window_gpu(HWND(raw as _));
+        GPU.with(|g| *g.borrow_mut() = Some(gpu));
+    }
+    TABS.with(|tabs| {
+        for tab in tabs.borrow_mut().iter_mut() {
+            for pane in tab.panes.iter_mut() {
+                pane.terminal.renderer_atlas_revision = u64::MAX;
+                pane.terminal.force_full = true;
+            }
+        }
+    });
 }
 
 /// 建一个新标签(T7):router 按当前 TAB_SEED(启动设置或最近热重载),
@@ -1019,6 +1058,11 @@ unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
 }
 
 fn draw_frame() {
+    // device lost 重建(M5b/T2):下一帧发现丢失即整套重造(实例、适配
+    // 器、surface、renderer),全部 tab 图集修订重置强制重传 + force_full。
+    if GPU_LOST.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        rebuild_gpu_after_loss();
+    }
     TABS.with(|tabs| {
         let mut guard = tabs.borrow_mut();
         // titles 先行收集(不可变借用),再取活跃标签可变借用
