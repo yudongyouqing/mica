@@ -2,7 +2,7 @@
 //! empty because the windowing APIs do not exist there.
 
 #[cfg(windows)]
-mod app;
+pub mod app; // tests 直入(UIA 集成测试要真窗口走真 WM_GETOBJECT)
 
 /// GUI 入口(main 无参数 / IPC 连不上时的自启动路径)。
 #[cfg(windows)]

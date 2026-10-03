@@ -1696,3 +1696,92 @@ mod tests {
         }
     }
 }
+
+/// M5c/T3(D34):渲染吞吐基准——build_rows 全管线路径(feed→damage→
+/// 重建),无 GPU 依赖,CI 可跑。80×24×500 行回放,cells/s。
+/// `#ignored` + `--release`:`cargo test -p mica-render bench -- --ignored --nocapture`。
+/// 输出可被 CI 的 perf job 抓取:`BENCH cells_per_sec=<f64> frame_us=<f64>`。
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::font::router::{GlyphInfo, GlyphRouter};
+    use mica_core::config::palette::Palette;
+    use mica_core::surface::{Damage, ScreenSize, Surface};
+
+    struct BenchRouter;
+    impl GlyphRouter for BenchRouter {
+        fn route(&mut self, ch: char, _style: crate::font::GlyphStyle) -> GlyphInfo {
+            GlyphInfo {
+                // 4×8 定形:uv/尺寸稳定,图集无关(不测上传,测 CPU 组装)
+                uv: [0.25, 0.25, 4.0 / 256.0, 8.0 / 256.0],
+                size_px: [4.0, 8.0],
+                offset_px: [1.0, 2.0],
+                color: ch as u32 & 0xff == 1, // 极少彩色
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_rows_throughput() {
+        let mut s = Surface::new(ScreenSize::new(80, 24));
+        // 混合负载:SGR/文本/CJK 交替,代表真实色彩输出
+        let line = b"\x1b[32mhello world 0123456789 \x1b[m plain text here\r\n";
+        let mut router = BenchRouter;
+        let metrics = crate::font::metrics::FontMetrics {
+            cell_width: 9.0,
+            line_height: 19.0,
+            ascent: 15.0,
+            descent: 4.0,
+        };
+        let palette = Palette::DEFAULT;
+        // 预喂 500 行(全量 damage 状态)
+        for _ in 0..500 {
+            s.feed(line);
+        }
+        let mut rows = Vec::new();
+        let t0 = std::time::Instant::now();
+        let mut total_cells = 0usize;
+        for round in 0..3 {
+            let damage = if round == 0 {
+                Damage::Full
+            } else {
+                Damage::Lines(vec![round % 24])
+            };
+            rows.clear();
+            build_rows(
+                &s,
+                &mut router,
+                &metrics,
+                &palette,
+                None,
+                0,
+                None,
+                &damage,
+                &mut rows,
+            );
+            total_cells += rows
+                .iter()
+                .map(|r| r.bg.len() + r.glyphs.len())
+                .sum::<usize>();
+        }
+        let elapsed = t0.elapsed();
+        // 单帧(全量)基准
+        let t1 = std::time::Instant::now();
+        rows.clear();
+        build_rows(
+            &s,
+            &mut router,
+            &metrics,
+            &palette,
+            None,
+            0,
+            None,
+            &Damage::Full,
+            &mut rows,
+        );
+        let frame_us = t1.elapsed().as_secs_f64() * 1e6;
+        let cells_per_sec = total_cells as f64 / elapsed.as_secs_f64();
+        println!("BENCH cells_per_sec={cells_per_sec:.0} frame_us={frame_us:.0}");
+    }
+}

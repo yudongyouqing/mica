@@ -51,10 +51,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG,
     MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowTextW,
     TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE, WM_SYSCHAR,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE,
+    WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
@@ -95,7 +96,9 @@ mod clipboard;
 pub(crate) mod crash;
 pub(crate) mod ipc;
 mod jumplist;
+pub(crate) mod orphan;
 pub(crate) mod quickterm;
+pub mod uia;
 
 thread_local! {
     static GPU: RefCell<Option<WindowGpu>> = const { RefCell::new(None) };
@@ -332,6 +335,12 @@ pub fn run() {
             Err(false) => {} // 建管道失败:已在 ipc::serve 记日志
             Err(true) => unreachable!("main 已分流,GUI 路径不会撞已占管道"),
         }
+        // 孤儿 ConPTY 清理(M5c/T1):趁自身还没 spawn pty,零误杀窗口
+        let orphans = orphan::sweep_orphaned_conhost(true);
+        if orphans > 0 {
+            eprintln!("[orphan] 清杀 {orphans} 个父进程已死的 ConPTY 宿主");
+        }
+
         // M3a:AUMID + jump list(profile 任务直达)
         jumplist::set_appuser_model_id();
         let profiles: Vec<(String, String)> = mica_core::profile::scan_all()
@@ -1280,6 +1289,14 @@ fn draw_frame() {
             return;
         };
         active.dirty = false;
+        // UIA Name 快照(M5c/T2):每帧刷新,Narrator 随时可读
+        if let Ok(mut name) = uia::UIA_NAME.lock() {
+            let summary = titles
+                .get(ACTIVE.get())
+                .map(|(t, _)| t.as_str())
+                .unwrap_or("");
+            *name = format!("Mica,{} 个标签,{}", titles.len(), summary);
+        }
 
         // ---- T7 分屏渲染:客户区(减 strip)按布局树切给各 pane,逐 pane
         // build(各自己的 damage/router/光标)+ 实例偏移 pane 矩形;焦点
@@ -1459,6 +1476,11 @@ fn draw_frame() {
 /// WM_CHAR;方向/编辑键没有字符事件,走 WM_KEYDOWN 的 VK 映射。
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_GETOBJECT => {
+            // 最小 UIA(M5c/T2):OBJID_CLIENT 走自定义 provider,其余默认
+            uia::handle_getobject(hwnd, wparam, lparam)
+                .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
+        }
         WM_IME_SETCONTEXT | WM_IME_STARTCOMPOSITION => {
             // IME 跟随(M5b/T5):激活/开始组合前把组合窗与候选窗定到终端
             // 光标格下缘;默认链(DefWindowProc)负责上下文与结果字符——
