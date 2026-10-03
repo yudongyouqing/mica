@@ -1,0 +1,10 @@
+C:\Project folder\项目\mica\target-t\release\deps\notify_types-90485c1925d66fc2.d: C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\lib.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\debouncer_full.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\debouncer_mini.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\event.rs
+
+C:\Project folder\项目\mica\target-t\release\deps\libnotify_types-90485c1925d66fc2.rlib: C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\lib.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\debouncer_full.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\debouncer_mini.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\event.rs
+
+C:\Project folder\项目\mica\target-t\release\deps\libnotify_types-90485c1925d66fc2.rmeta: C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\lib.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\debouncer_full.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\debouncer_mini.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\event.rs
+
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\lib.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\debouncer_full.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\debouncer_mini.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\notify-types-2.1.0\src\event.rs:

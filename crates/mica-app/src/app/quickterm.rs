@@ -200,6 +200,15 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     Ok(())
 }
 
+/// 退出序取走 QT 状态(调用方 mem::forget——故意泄漏换可靠退出,见
+/// message_loop 退出序注释;teardown drop 在坏驱动栈上会陷内核卡死)。
+pub fn forget_state() {
+    // 取到的 QtState 原地 forget——类型私有,泄漏细节留在模块内
+    if let Some(st) = QT.with(|q| q.borrow_mut().take()) {
+        std::mem::forget(st);
+    }
+}
+
 /// 切换:可见→隐藏;隐藏→显示+置顶激活。
 pub unsafe fn toggle() {
     let raw = QT_HWND.with(|c| c.get());

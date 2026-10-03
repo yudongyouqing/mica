@@ -1017,7 +1017,7 @@ fn close_pane_action() {
             return;
         }
         if let Some(pos) = tab.panes.iter().position(|p| p.id == pid) {
-            tab.panes.remove(pos); // Drop 杀 pty(既有契约)
+            std::mem::forget(tab.panes.remove(pos)); // 脏退出(同 close_tab 注释)
         }
         tab.focused = tab.focused.min(tab.panes.len() - 1);
         for p in tab.panes.iter_mut() {
@@ -1255,15 +1255,23 @@ unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     // 计划原文把 join 排在杀 pty 之前,前提是"转发线程至多阻塞在 PostMessageW
     // 上(异步不阻塞,join 安全)";本实现它泊在 recv_block,pty 不断开就
     // 不醒,先杀后 join 才不悬挂(偏差已记 task 报告)。
+    eprintln!("[exit] step1: sentinel None");
     *hwnd_slot.lock().expect("hwnd slot poisoned") = None;
+    eprintln!("[exit] step2: watcher drop + join");
     if let Some(reload) = reload {
         drop(reload.watcher);
         let _ = reload.thread.join();
     }
-    // 标签池与 GPU 显式拆:Terminal Drop 杀各自 pty → 读线程 EOF →
-    // 转发线程 recv None 退场(detach,不悬挂——哨兵已 None 不再 Post)
-    TABS.with(|tabs| tabs.borrow_mut().clear());
-    GPU.with(|g| g.borrow_mut().take());
+    // 退出序终招(1.0.2):GPU/QT/Terminal 资源 mem::forget,不 drop——
+    // 实证:虚拟显卡驱动栈不稳的机器上,wgpu teardown 陷内核不可中断
+    // 调用,进程杀不死(僵尸占管道连锁害死后续实例,用户实报"关窗未
+    // 响应")。故意泄漏换可靠退出(Alacritty/WezTerm 同款哲学):进程
+    // 一死 OS 全额回收,泄漏上限 = 进程生命期。
+    eprintln!("[exit] step5: leak GPU/QT/terminals (deliberate)");
+    std::mem::forget(TABS.with(|tabs| std::mem::take(&mut *tabs.borrow_mut())));
+    std::mem::forget(GPU.with(|g| g.borrow_mut().take()));
+    crate::app::quickterm::forget_state();
+    eprintln!("[exit] step6: done");
 }
 
 fn draw_frame() {
@@ -2354,7 +2362,11 @@ fn close_tab(idx: usize) {
         if idx >= guard.len() {
             return;
         }
-        guard.remove(idx);
+        // 脏退出(1.0.2):Terminal drop 会 join pty 读线程——OpenConsole
+        // 半死(坏驱动栈常见)时 ReadFile 卡内核,join 挂死 wndproc(用户
+        // 实报"关窗未响应"的主挂点)。forget 换即时关窗;pty 子进程成孤儿
+        // 由启动期孤儿清杀闭环(M5c/T1)兜底。
+        std::mem::forget(guard.remove(idx));
         let len = guard.len();
         if len == 0 {
             quit = true;
