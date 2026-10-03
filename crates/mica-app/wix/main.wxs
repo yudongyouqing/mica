@@ -120,6 +120,9 @@
                             <RegistryValue Root='HKCU' Key='Software\Classes\CLSID\{C6C4E9E1-1D2B-4F3A-8E5D-9A7B6C5D4E3F}' Name='ExeId' Type='string' Value='yudongyouqing.Mica'/>
                         </Component>
                         <Component Id='Path' Guid='54F4D0E4-7F3E-4D1D-A973-78CB76F27CAA' KeyPath='yes'>
+                            <!-- System='no'(用户级 HKCU PATH):InstallScope='perUser' 无提权安装
+                                 写不了机器级(HKLM)PATH——1.0.0 实证静默失败,'mica' 不被
+                                 识别;用户级随 perUser 语义走,卸载同清 -->
                             <Environment
                                 Id='PATH'
                                 Name='PATH'
@@ -127,7 +130,7 @@
                                 Permanent='no'
                                 Part='last'
                                 Action='set'
-                                System='yes'/>
+                                System='no'/>
                         </Component>
                         <Component Id='binary0' Guid='*'>
                             <File
