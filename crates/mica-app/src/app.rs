@@ -2426,6 +2426,7 @@ fn tab_follow_active() {
 /// 标签类动作待 T7 标签池落地(TODO 占位消费,防误发 pty 序列)。
 fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut need_draw = false;
+    let mut restart = false; // 延迟执行(块内自借 TABS 会 panic——冒烟实证)
     let mut new_tab = false;
     let mut close_idx: Option<usize> = None;
     let mut next_idx: Option<usize> = None;
@@ -2459,11 +2460,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                     t.force_full = true;
                     need_draw = true;
                 }
-                Action::RestartPane => {
-                    if restart_active_pane() {
-                        need_draw = true;
-                    }
-                }
+                Action::RestartPane => restart = true, // 延迟:with 块内再借 TABS 会双借 panic
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
                     if t.term.jump_prompt(matches!(action, Action::JumpNextPrompt)) {
                         t.force_full = true;
@@ -2511,6 +2508,9 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
         draw_frame();
     }
     // 标签操作段外执行:TABS 借用已还,switch/close/start 可自由再借
+    if restart {
+        restart_active_pane();
+    }
     if new_tab {
         unsafe { start_tab(hwnd) };
         draw_frame();
