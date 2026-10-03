@@ -1607,6 +1607,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .and_then(|tab| tab.active_pane())
                 {
                     t.term.scroll_display(ScrollCommand::Delta(delta / 40));
+                    // 拖选接续滚轮(T6):按住拖选中滚轮,选区端点跟视口边缘走
+                    if MOUSE_DOWN.with(std::cell::Cell::get) {
+                        t.term.selection_extend_edge(delta > 0);
+                    }
                     // 视口几何变了(视口行 → buffer 行的映射整体位移):
                     // 行缓存的"行 i"语义失效,显式全量(与 resize 同性质)
                     t.force_full = true;

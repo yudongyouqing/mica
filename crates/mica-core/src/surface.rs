@@ -158,6 +158,9 @@ pub struct Surface {
     marks: Vec<MarkRecord>,
     /// jump 锚(D37):上次 jump_prompt 的目标(行 + epoch);手动滚动即重置。
     jump_ref: Option<(i32, usize)>,
+    /// 活动选区的端点(begin/update 时记录;extend_edge 用其列——上游
+    /// region 私有且 to_range 给的是排序 span,分不出端点在哪侧)。
+    sel_end: Point,
 }
 
 /// OSC 133 标记 + 记录时的光标行(视口行,0=顶,与 `Damage::Lines` 同一
@@ -204,6 +207,7 @@ impl Surface {
             sync_output: false,
             marks: Vec::new(),
             jump_ref: None,
+            sel_end: Point::new(Line(0), Column(0)),
         }
     }
 
@@ -453,14 +457,37 @@ impl Surface {
     /// 开始一次选择(按下/双击/三击分别传 Simple/Semantic/Lines)。
     /// point 为 buffer 坐标(视口行 + display_offset)。
     pub fn selection_begin(&mut self, ty: SelectionType, point: Point, side: Side) {
+        self.sel_end = point;
         self.term.selection = Some(Selection::new(ty, point, side));
     }
 
     /// 拖动更新选区末端。
     pub fn selection_update(&mut self, point: Point, side: Side) {
+        self.sel_end = point;
         if let Some(sel) = &mut self.term.selection {
             sel.update(point, side);
         }
+    }
+
+    /// 拖选接续滚轮(M5a/T6):活动选区端点扩到视口顶/底行,列保持端点
+    /// 原值。返回是否变化。方向语义:滚轮向上 = 端点跟到视口顶,向下 =
+    /// 跟到底——与选区几何无关(anchor 与被推端点间的区域即增长方向)。
+    pub fn selection_extend_edge(&mut self, to_top: bool) -> bool {
+        if self.term.selection.is_none() {
+            return false;
+        }
+        let rows = self.size.screen_lines() as i32;
+        let offset = self.term.grid().display_offset() as i32;
+        let line = if to_top { -offset } else { rows - 1 - offset };
+        if self.sel_end.line == Line(line) {
+            return false; // 已在边缘,幂等
+        }
+        let point = Point::new(Line(line), self.sel_end.column);
+        self.sel_end = point;
+        if let Some(sel) = &mut self.term.selection {
+            sel.update(point, Side::Left);
+        }
+        true
     }
 
     /// 清空选区(点击空白/ESC/复制后)。
@@ -882,6 +909,33 @@ mod tests {
         assert_eq!(s.last_exit_code(), Some(Some(127)), "C 不影响");
         s.feed(b"\x1b]133;D;err=x\x07");
         assert_eq!(s.last_exit_code(), Some(None), "灰(参数不可解析)");
+    }
+
+    #[test]
+    fn selection_extends_to_viewport_edge() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        s.feed(b"aaa\r\nbbb\r\nccc\r\nddd\r\neee\r\n");
+        // 选中行 1 的 0..3 列,滚轮向上 → 端点应跟到视口顶行(列保持)
+        s.selection_begin(
+            SelectionType::Simple,
+            Point::new(Line(1), Column(0)),
+            Side::Left,
+        );
+        s.selection_update(Point::new(Line(1), Column(3)), Side::Right);
+        assert!(s.selection_extend_edge(true));
+        let range = s.selection_range().expect("选区仍在");
+        // 排序 span:端点 (0,3) < anchor (1,0),故 start 即新端点
+        assert_eq!(range.start.line, Line(0), "端点扩到视口顶行");
+        assert_eq!(range.start.column, Column(3), "列保持端点原值");
+        // 幂等:已在边缘
+        assert!(!s.selection_extend_edge(true));
+        // 向下跟到底行
+        assert!(s.selection_extend_edge(false));
+        let range = s.selection_range().expect("选区仍在");
+        assert_eq!(range.end.line, Line(2), "端点跟到视口底行");
+        // 无选区时 no-op
+        s.selection_clear();
+        assert!(!s.selection_extend_edge(true));
     }
 
     #[test]
