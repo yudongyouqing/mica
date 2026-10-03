@@ -179,6 +179,8 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         renderer_atlas_revision: u64::MAX,
         row_insts: Vec::new(),
         force_full: true,
+        shell: "powershell.exe -NoLogo".into(),
+        exited: None,
     };
     QT.with(|q| {
         *q.borrow_mut() = Some(QtState {

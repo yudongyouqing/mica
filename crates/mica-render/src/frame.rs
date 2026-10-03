@@ -198,6 +198,19 @@ pub struct StripLayout {
     pub avail_w: f32,
 }
 
+/// strip 杂项参数打包(M5b/T3 起参数超限):状态点/pane 退出态/caption 区。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StripExtras {
+    /// D37 OSC 133 exit 状态点
+    pub exit_dot: Option<ExitDot>,
+    /// T8 系统按钮区起点(客户区坐标)
+    pub caption_x: Option<f32>,
+    /// T8 溢出滚动布局
+    pub layout: StripLayout,
+    /// M5b/T3 pane 退出码(活跃 pane 已退出时显示 [exit N])
+    pub pane_exit: Option<u32>,
+}
+
 /// tab strip 的 UI 实例(T7,spec §3 同管线):底条 + 标签块(活跃高亮),
 /// 标题文字经 router 路由(与终端共享图集),尾部 "+" 按钮开新标签。
 /// 文字按等宽 cell 步进排版——strip 只有标题一行,粗排版与终端观感一致。
@@ -211,10 +224,14 @@ pub fn strip_quads(
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
-    exit_dot: Option<ExitDot>,
-    caption_x: Option<f32>,
-    layout: StripLayout,
+    extras: StripExtras,
 ) -> Vec<CellInstance> {
+    let StripExtras {
+        exit_dot,
+        caption_x,
+        layout,
+        pane_exit,
+    } = extras;
     let mut out = Vec::new();
     let total_w = titles.len() as f32 * TAB_W + TAB_PLUS_W;
     let shift = layout.tab_scroll as f32 * TAB_W;
@@ -298,6 +315,41 @@ pub fn strip_quads(
             fg: bg_of([ink.r, ink.g, ink.b]),
             bg: bg_of([block.r, block.g, block.b]),
         });
+    }
+    // pane 退出态(M5b/T3):dot 槽左侧文本(标题后缀会被截断吃掉——
+    // 长 cwd 标题实测);0 绿/非 0 红。OSC133 点在 caption_x-14,
+    // 文本止于 caption_x-24,无重叠
+    if let Some(code) = pane_exit {
+        let label = format!("[exit {code}]");
+        let slot = if code == 0 {
+            palette.colors[2]
+        } else {
+            palette.colors[1]
+        };
+        let text_y = (STRIP_H - metrics.line_height).max(0.0) / 2.0;
+        let end_x = caption_x.map(|cx| cx - 24.0).unwrap_or(total_w);
+        let start = end_x - label.chars().count() as f32 * metrics.cell_width;
+        for (ci, ch) in label.chars().enumerate() {
+            let g = router.route(ch, GlyphStyle::PLAIN);
+            if g.size_px[0] <= 0.0 {
+                continue;
+            }
+            out.push(CellInstance {
+                pos_uv: [
+                    start + ci as f32 * metrics.cell_width + g.offset_px[0],
+                    text_y + g.offset_px[1],
+                    g.uv[0],
+                    g.uv[1],
+                ],
+                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                fg: bg_of([slot.r, slot.g, slot.b]),
+                bg: bg_of([
+                    palette.colors[0].r,
+                    palette.colors[0].g,
+                    palette.colors[0].b,
+                ]),
+            });
+        }
     }
     // D37 exit 状态点:caption 区左邻(固定锚;无 caption 时 "+" 右侧),
     // 6px 八边形(3 rect 逼近,quad 管线零扩展)
@@ -821,8 +873,6 @@ mod tests {
             &mut r,
             &metrics_8x16(),
             &palette,
-            None,
-            None,
             Default::default(),
         )
         .len();
@@ -831,9 +881,10 @@ mod tests {
             &mut r,
             &metrics_8x16(),
             &palette,
-            Some(ExitDot::Green),
-            None,
-            Default::default(),
+            StripExtras {
+                exit_dot: Some(ExitDot::Green),
+                ..Default::default()
+            },
         );
         // 八边形 = 3 个 rect;None 不画
         assert_eq!(dot.len() - none_len, 3);
