@@ -105,14 +105,19 @@ impl GlyphAtlas {
     }
 
     pub fn insert(&mut self, bmp: &GlyphBitmap) -> Rect {
+        // I2 处方(M5a/T8):右/下各 +1px 零填充——半纹素采样越界时读到
+        // 零墨而非邻居字形边缘,渗色消除。矩形保持真实尺寸,UV 不变;
+        // 预留位靠 data 零初始化 + 布局推进保持零(重排路径同样 +1)
         loop {
-            if let Some(rect) = self.try_place(bmp.width, bmp.height) {
+            if let Some(mut rect) = self.try_place(bmp.width + 1, bmp.height + 1) {
+                rect.w = bmp.width;
+                rect.h = bmp.height;
                 self.blit(bmp, rect);
                 self.entries.push((bmp.clone(), rect));
                 self.revision += 1;
                 return rect;
             }
-            self.grow(bmp.width);
+            self.grow(bmp.width + 1);
         }
     }
 
@@ -163,9 +168,12 @@ impl GlyphAtlas {
         self.revision += 1;
         let entries = std::mem::take(&mut self.entries);
         for (bmp, _) in entries {
-            let rect = self
-                .try_place(bmp.width, bmp.height)
+            // 重排同款 +1 零填充(I2):预留位随搬移重建,保持零墨
+            let mut rect = self
+                .try_place(bmp.width + 1, bmp.height + 1)
                 .expect("doubled atlas must fit prior entries");
+            rect.w = bmp.width;
+            rect.h = bmp.height;
             self.blit(&bmp, rect);
             self.entries.push((bmp, rect));
         }
@@ -209,6 +217,30 @@ mod tests {
                 "{ra:?} overlaps {rb:?}"
             );
         }
+    }
+
+    /// I2 零填充(M5a/T8):右/下 1px 恒零墨,后续字形从 +1 处起。
+    #[test]
+    fn insert_pads_zero_border_right_bottom() {
+        let mut a = GlyphAtlas::new(64, 64);
+        let r1 = a.insert(&bmp(10, 10, 0xff));
+        let r2 = a.insert(&bmp(10, 10, 0xff));
+        assert_eq!(r2.u, r1.u + 11, "同 shelf 布局推进 = w+1(含填充)");
+        assert_eq!(tex_alpha(&a, r1.u + 10, r1.v), 0, "右侧 padding 零墨");
+        assert_eq!(tex_alpha(&a, r1.u, r1.v + 10), 0, "下侧 padding 零墨");
+        // 重排(grow)后填充保持
+        let big = bmp(200, 10, 0xff); // 触发 grow 加宽
+        let r3 = a.insert(&big);
+        assert_eq!(
+            tex_alpha(&a, r3.u + r3.w, r3.v),
+            0,
+            "grow 重排后右 padding 仍零"
+        );
+        assert_eq!(
+            tex_alpha(&a, r1.u + 10, r1.v),
+            0,
+            "旧条目重排后右 padding 仍零"
+        );
         assert_eq!(
             a.texture().len(),
             (a.width() * a.height()) as usize * 4,

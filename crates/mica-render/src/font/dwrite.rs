@@ -30,7 +30,7 @@ use super::atlas::{GlyphAtlas, GlyphBitmap, GlyphFormat};
 use super::metrics::FontMetrics;
 use super::router::{ClusterLayout, GlyphInfo, GlyphRouter};
 
-/// 一个家族的三个样式面(plain/bold/italic;bold-italic 复用 bold 面,M2 若需要再加)。
+/// 一个家族的四个样式面(plain/bold/italic/bold_italic;T7 起四态齐备)。
 struct FamilyFaces {
     name: String,
     plain: IDWriteFont,
