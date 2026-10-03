@@ -86,6 +86,8 @@
         <Property Id='DiskPrompt' Value='Mica Installation'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='ProgramMenuFolder' Name='Programs'/>
+            <Directory Id='DesktopFolder' Name='Desktop'/>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
                 <Directory Id='APPLICATIONFOLDER' Name='Mica'>
                     
@@ -133,6 +135,20 @@
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\mica.exe'
                                 KeyPath='yes'/>
+                            <!-- 开始菜单 + 桌面快捷方式(1.0.2):GUI app 无
+                                 快捷方式 = 装完"只能终端启动"(用户实报) -->
+                            <Shortcut
+                                Id='StartMenuShortcut'
+                                Directory='ProgramMenuFolder'
+                                Name='Mica'
+                                Target='[Bin]mica.exe'
+                                WorkingDirectory='Bin'/>
+                            <Shortcut
+                                Id='DesktopShortcut'
+                                Directory='DesktopFolder'
+                                Name='Mica'
+                                Target='[Bin]mica.exe'
+                                WorkingDirectory='Bin'/>
                         </Component>
                     </Directory>
                 </Directory>
