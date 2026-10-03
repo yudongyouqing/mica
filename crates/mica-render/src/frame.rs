@@ -108,6 +108,9 @@ pub fn build_instances(
                 // OSC 8 链接下划线(D28):置于段首(画在全部 bg 之上、字形之下)
                 glyphs.insert(0, link_underline(x, y, metrics, fg));
             }
+            // SGR 下划线族(T5):同层(bg 上、字下);本循环先于字形段填 glyphs,
+            // 天然序正确
+            glyphs.extend(underline_quads(cell.flags, x, y, metrics, fg));
             out.push(blank(x, y, metrics, fg, bg));
         }
         if let Some((shape, x, y)) = bar {
@@ -501,6 +504,54 @@ fn link_underline(x: f32, y: f32, metrics: &FontMetrics, fg: [u8; 3]) -> CellIns
     }
 }
 
+/// SGR 下划线族(M5a/T5):UNDERLINE 直线、DOUBLE 双线、UNDERCURL 波浪、
+/// DOTTED/DASHED 点/虚线(近似形态)。1px 高,底部对齐;波浪 = 2px 段在
+/// bottom-1/bottom-3 交替。色 = fg(SGR 58 专属下划线色未接,边界记录)。
+fn underline_quads(
+    flags: Flags,
+    x: f32,
+    y: f32,
+    metrics: &FontMetrics,
+    fg: [u8; 3],
+) -> Vec<CellInstance> {
+    let mut out = Vec::new();
+    let w = metrics.cell_width;
+    let bottom = y + metrics.line_height;
+    let q = |qx: f32, qy: f32, qw: f32| CellInstance {
+        pos_uv: [qx, qy, 0.0, 0.0],
+        size_uv: [qw, 1.0, 0.0, 0.0],
+        fg: to_color(fg),
+        bg: to_color(fg),
+    };
+    if flags.contains(Flags::UNDERCURL) {
+        let mut sx = x;
+        let mut hi = false;
+        while sx < x + w - 0.5 {
+            let seg = 2.0f32.min(x + w - sx);
+            out.push(q(sx, if hi { bottom - 3.0 } else { bottom - 1.0 }, seg));
+            hi = !hi;
+            sx += seg;
+        }
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        out.push(q(x, bottom - 1.0, w));
+        out.push(q(x, bottom - 3.0, w));
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        let mut sx = x;
+        while sx < x + w - 0.5 {
+            out.push(q(sx, bottom - 1.0, 1.0));
+            sx += 2.0;
+        }
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        out.push(q(x, bottom - 1.0, w.min(4.0)));
+        if w > 6.0 {
+            out.push(q(x + 6.0, bottom - 1.0, (w - 6.0).min(2.0)));
+        }
+    } else if flags.contains(Flags::UNDERLINE) {
+        out.push(q(x, bottom - 1.0, w));
+    }
+    out
+}
+
 /// 光标条实例(D20):Underline=底部 2px、Beam=左侧 1.2px;色 = palette.cursor。
 /// 放字形段头部(bg 之上、字之下;细条与字重叠小,不必顶层)。
 fn cursor_bar(
@@ -607,6 +658,9 @@ fn build_row(
             // OSC 8 链接下划线(D28),与 build_instances 同序同构
             row.glyphs.insert(0, link_underline(x, y, metrics, fg));
         }
+        // SGR 下划线族(T5):与 build_instances 同序同构
+        row.glyphs
+            .extend(underline_quads(cell.flags, x, y, metrics, fg));
         row.bg.push(blank(x, y, metrics, fg, bg));
     }
     if let Some((shape, x, y)) = bar {
@@ -1336,6 +1390,53 @@ mod tests {
             bytes(&repacked),
             bytes(&golden),
             "repack(build_rows(Full)) 必须与 build_instances 逐字节一致"
+        );
+    }
+
+    /// SGR 下划线族(T5):直线/双线/波浪三态渲染 + 两构建器对拍。
+    #[test]
+    fn sgr_underline_family_in_both_builders() {
+        // 直线(4)/双线(4:2)/波浪(4:3)三态同屏,对拍两构建器逐字节一致
+        let mut s = Surface::new(ScreenSize::new(6, 1));
+        s.feed(b"\x1b[4ma\x1b[4:2mb\x1b[4:3mc");
+        let calls = std::cell::Cell::new(0);
+        let fresh = std::cell::Cell::new(0);
+        let mut router = counting_router(&calls, &fresh);
+        let damage = s.take_damage();
+        let mut rows = Vec::new();
+        build_rows(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            None,
+            &damage,
+            &mut rows,
+        );
+        let repacked = repack(&rows);
+        let golden = build_instances(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(bytes(&repacked), bytes(&golden), "对拍(下划线族)");
+        // 下划线段 = 1px 高、uv 尺寸 0 横条:直线 1 + 双线 2 + 波浪 4
+        // (cell_width 8 / 2px 段)
+        let u: Vec<&CellInstance> = golden
+            .iter()
+            .filter(|q| q.size_uv[1] == 1.0 && q.size_uv[2] == 0.0)
+            .collect();
+        assert_eq!(u.len(), 7, "直线1 + 双线2 + 波浪4");
+        let ys: Vec<f32> = u[3..].iter().map(|q| q.pos_uv[1]).collect();
+        assert!(
+            ys.contains(&15.0) && ys.contains(&13.0),
+            "波浪两档 bottom-1/bottom-3,实际 {ys:?}"
         );
     }
 
