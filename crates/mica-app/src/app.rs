@@ -41,12 +41,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
     VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::HICON;
+/// ShellExecuteW show cmd(打开链接用)
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
     DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG,
     MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowTextW,
-    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE,
     WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
@@ -112,6 +115,9 @@ thread_local! {
     static KEYMAP: RefCell<Keymap> = RefCell::new(Keymap::wt_default());
     /// IPC 服务端消息队列(主线程 WM_APP_IPC 时 try_recv)
     static IPC_RX: RefCell<Option<std::sync::mpsc::Receiver<IpcMessage>>> = const { RefCell::new(None) };
+    /// 2026 同步持帧(D29):h 起置 true,l 或 150ms 超时放帧。
+    /// 持帧只跳 draw(数据照 drain+feed,不丢)
+    static SYNC_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 光标闪烁相位(true = 亮);开关由配置驱动(settings.cursor_blink)
     static BLINK_PHASE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static CURSOR_BLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -321,6 +327,7 @@ pub fn run() {
         // 就没人画——进循环前先铺一帧(底色+空网格),不等第一条 pty 输出
         draw_frame();
         // M3b:Quick Terminal(热键 + 下拉窗;失败只记日志)
+        // QT 失败已内部记日志;Err = QT 禁用(主窗照常,增强件不炸主流程)
         let _ = quickterm::init(hwnd);
         message_loop(reload, hwnd_slot);
     }
@@ -1171,6 +1178,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
             };
+            // kitty 模式下 C0 控制字符已由 WM_KEYDOWN 侧编码成 CSI-u,这里
+            // 再发就是双发(Ctrl+字母/退格 0x08/Tab);可打印文本照旧走此处。
+            // 代理对(上文已归并的 ch ≥ 0x10000)不受影响
+            {
+                let kitty = TABS.with(|tabs| {
+                    tabs.borrow_mut()
+                        .get_mut(ACTIVE.get())
+                        .and_then(|tab| tab.active_pane())
+                        .is_some_and(|t| t.term.kitty_flags().any())
+                });
+                if kitty && (ch as u32) < 0x20 {
+                    return LRESULT(0);
+                }
+            }
             // Windows 把退格发成 0x08,终端世界统一 DEL(0x7f)
             let bytes: Vec<u8> = if ch == '\u{8}' {
                 vec![0x7f]
@@ -1232,23 +1253,74 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             .get_mut(ACTIVE.get())
                             .and_then(|tab| tab.active_pane())
                         {
-                            let _ = t.session.write(normalized.as_bytes());
+                            // bracketed paste(M4a):应用开了 DECSET 2004 就包
+                            // ESC[200~/201~ 边界——shell 把多行粘贴当一块处理,
+                            // 立即执行。包裹在 CRLF 归一之后(边界不可被改写)
+                            let bytes = if t.term.bracketed_paste_active() {
+                                let mut wrapped = b"[200~".to_vec();
+                                wrapped.extend_from_slice(normalized.as_bytes());
+                                wrapped.extend_from_slice(b"[201~");
+                                wrapped
+                            } else {
+                                normalized.into_bytes()
+                            };
+                            let _ = t.session.write(&bytes);
                         }
                     });
                 }
                 return LRESULT(0);
             }
-            // 编码要读 term 的 DECCKM 模式,索性连同写回共用一次借用
-            //(RefCell 内不嵌套第二借用,app_cursor_mode 只借走 &t.term)
+            // kitty 分流(M4a/D27):flags 非零时功能键走 CSI-u 编码,
+            // None(全关/可打印键)回 legacy;repeat = lparam bit30
             TABS.with(|tabs| {
                 if let Some(t) = tabs
                     .borrow_mut()
                     .get_mut(ACTIVE.get())
                     .and_then(|tab| tab.active_pane())
-                    && let Some(bytes) =
-                        vkey_bytes(wparam.0 as u32, current_mods(), t.term.app_cursor_mode())
                 {
-                    let _ = t.session.write(&bytes);
+                    let flags = t.term.kitty_flags();
+                    if flags.any() {
+                        let kind = if lparam.0 & (1 << 30) != 0 {
+                            mica_core::protocol::kitty::EventKind::Repeat
+                        } else {
+                            mica_core::protocol::kitty::EventKind::Press
+                        };
+                        if let Some(key) = vk_to_key(vk)
+                            && let Some(bytes) =
+                                mica_core::protocol::kitty::kitty_encode(key, mods, kind, flags)
+                        {
+                            let _ = t.session.write(&bytes);
+                            return;
+                        }
+                    }
+                    if let Some(bytes) = vkey_bytes(vk, mods, t.term.app_cursor_mode()) {
+                        let _ = t.session.write(&bytes);
+                    }
+                }
+            });
+            LRESULT(0)
+        }
+        WM_KEYUP => {
+            // kitty release 事件(M4a):仅 REPORT_EVENT_TYPES 开启时上报,
+            // 其余静默(legacy 无 release 语义)
+            TABS.with(|tabs| {
+                if let Some(t) = tabs
+                    .borrow_mut()
+                    .get_mut(ACTIVE.get())
+                    .and_then(|tab| tab.active_pane())
+                {
+                    let flags = t.term.kitty_flags();
+                    if flags.contains(mica_core::protocol::kitty::KittyFlags::REPORT_EVENT_TYPES)
+                        && let Some(key) = vk_to_key(wparam.0 as u32)
+                        && let Some(bytes) = mica_core::protocol::kitty::kitty_encode(
+                            key,
+                            current_mods(),
+                            mica_core::protocol::kitty::EventKind::Release,
+                            flags,
+                        )
+                    {
+                        let _ = t.session.write(&bytes);
+                    }
                 }
             });
             LRESULT(0)
@@ -1318,6 +1390,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return LRESULT(0);
                 }
                 None => {}
+            }
+            // OSC 8 Ctrl+Click(D28):按住 Ctrl 不走选择;命中带链接格直接打开浏览器
+            if current_mods().ctrl {
+                let rects = active_pane_rects().into_iter().find(|(_, r)| {
+                    (px as f32) >= r.x
+                        && (px as f32) < r.x + r.w
+                        && (py as f32) >= r.y
+                        && (py as f32) < r.y + r.h
+                });
+                if let Some((_, r)) = rects {
+                    let (cx, cy) = (px as f32 - r.x, py as f32 - r.y);
+                    TABS.with(|tabs| {
+                        let mut guard = tabs.borrow_mut();
+                        let Some(tab) = guard.get_mut(ACTIVE.get()) else {
+                            return;
+                        };
+                        let Some(t) = tab.active_pane() else { return };
+                        let m = &t.metrics;
+                        let line = (cy / m.line_height) as i32 + t.term.display_offset() as i32;
+                        let col = (cx / m.cell_width) as usize;
+                        let link = t.term.grid()[Line(line)][Column(col)].hyperlink();
+                        if let Some(link) = link {
+                            let uri = windows::core::HSTRING::from(link.uri().to_string());
+                            // SAFETY: OS open;失败静默(scheme 异常不弹窗)
+                            unsafe {
+                                ShellExecuteW(
+                                    None,
+                                    windows::core::w!("open"),
+                                    windows::core::PCWSTR(uri.as_ptr()),
+                                    None,
+                                    None,
+                                    SW_SHOWNORMAL,
+                                );
+                            }
+                        }
+                    });
+                }
+                return LRESULT(0);
             }
             let mods = current_mods();
             // pane 命中(T7):点中的 pane 聚焦,坐标换算到该 pane 原点
@@ -1559,17 +1669,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(text) = t.term.take_clipboard_out().pop() {
                     clipboard::set_text(&text);
                 }
-                if let Some(title) = t.term.take_title() {
+                // 2026 同步输出(D29):持帧只跳 draw,数据已照 feed,不丢。
+                // 先取状态到局部再写 guard,避开 t(&mut 借用)与 guard 交叉
+                // 全部 t 状态先取局部(t 是 guard 的 &mut,不再交叉借用 guard
+                let title_opt: Option<String> = t.term.take_title();
+                // OSC 133 标记(D30):M4 到存储为止,app 侧在此排空防积压;
+                // M5 消费(jump/状态行)时在此接入
+                let _ = t.term.take_shell_marks();
+                let sync_open = t.term.sync_output_active();
+                let mut flush = sync_open; // 放帧时刻需要全量重绘
+                let was_held = SYNC_HELD.replace(false);
+                if sync_open {
+                    t.force_full = true;
+                }
+                if let Some(title) = title_opt {
                     guard[tab_idx].title = title.clone();
                     if is_active {
                         let _ = SetWindowTextW(hwnd, &HSTRING::from(title));
                     }
                 }
                 if is_active {
-                    drew = true;
+                    if sync_open {
+                        // 起安全阀(D29):150ms 内 2026-l 不来即强制放帧
+                        SYNC_HELD.with(|f| f.set(true));
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                            Some(hwnd),
+                            2,
+                            150,
+                            None,
+                        );
+                    } else if was_held {
+                        // 窗口刚关(2026-l 到达):放一帧全量
+                        windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2).ok();
+                        flush = true;
+                        drew = true; // l 即刻放帧
+                    } else {
+                        drew = true;
+                    }
                 } else {
                     guard[tab_idx].dirty = true;
                 }
+                let _ = flush;
             });
             // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
             if drew {
@@ -1578,18 +1718,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TIMER => {
-            // 光标闪烁(D20):翻相位,只重绘(光标行在 damage 里自然带出;
-            // 无输入时 term 脏区为空,force_full 兜底成本可接受——闪烁期
-            // 本来就是持续重绘)
-            BLINK_PHASE.with(|p| p.set(!p.get()));
-            TABS.with(|tabs| {
-                if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get())
-                    && let Some(p) = t.active_pane()
-                {
-                    p.force_full = true;
+            // id 分流:2 = 2026 同步安全阀(D29);1 = 光标闪烁(D20)
+            match wparam.0 {
+                2 => {
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2).ok();
+                    if SYNC_HELD.with(std::cell::Cell::take) {
+                        SYNC_HELD.with(|f| f.set(false));
+                        TABS.with(|tabs| {
+                            if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get())
+                                && let Some(p) = t.active_pane()
+                            {
+                                p.term.mark_sync_flushed();
+                                p.force_full = true;
+                            }
+                        });
+                        draw_frame();
+                    }
                 }
-            });
-            draw_frame();
+                _ => {
+                    // 光标闪烁(D20):翻相位,只重绘(光标行在 damage 里自然带出;
+                    // 无输入时 term 脏区为空,force_full 兜底成本可接受——闪烁期
+                    // 本来就是持续重绘)
+                    BLINK_PHASE.with(|p| p.set(!p.get()));
+                    TABS.with(|tabs| {
+                        if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get())
+                            && let Some(p) = t.active_pane()
+                        {
+                            p.force_full = true;
+                        }
+                    });
+                    draw_frame();
+                }
+            }
             LRESULT(0)
         }
         WM_NCCALCSIZE => {
@@ -1726,6 +1886,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 /// VK → Keymap 触发键(字母/数字/Insert/导航;其余键无终端外语义)。
+/// VK → 终端键(kitty 编码用;与 vk_to_trigger 同表源,不经 Keymap)。
+/// match 模式不能用 VK 常量表达式(pattern 限制),数值注释留来源。
+fn vk_to_key(vk: u32) -> Option<mica_core::input::Key> {
+    Some(match vk {
+        0x0D => mica_core::input::Key::Enter,
+        0x08 => mica_core::input::Key::Backspace,
+        0x09 => mica_core::input::Key::Tab,
+        0x1B => mica_core::input::Key::Escape,
+        0x26 => mica_core::input::Key::Up,       // VK_UP
+        0x28 => mica_core::input::Key::Down,     // VK_DOWN
+        0x25 => mica_core::input::Key::Left,     // VK_LEFT
+        0x27 => mica_core::input::Key::Right,    // VK_RIGHT
+        0x24 => mica_core::input::Key::Home,     // VK_HOME
+        0x23 => mica_core::input::Key::End,      // VK_END
+        0x2E => mica_core::input::Key::Delete,   // VK_DELETE
+        0x21 => mica_core::input::Key::PageUp,   // VK_PRIOR
+        0x22 => mica_core::input::Key::PageDown, // VK_NEXT
+        _ => return None,
+    })
+}
+
 fn vk_to_trigger(vk: u32) -> Option<TriggerKey> {
     match vk {
         // VK 常量是关联 const,进不了 pattern——守卫链对齐 vkey_bytes

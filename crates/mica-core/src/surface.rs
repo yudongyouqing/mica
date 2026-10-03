@@ -150,6 +150,20 @@ pub struct Surface {
     /// take_damage 首帧哨兵:TermDamageState 构造即 full=true,本应自然
     /// Full,但那是上游实现细节——本层显式保证"第一次消费必是 Full"。
     has_drawn: bool,
+    /// 协议旁路(M4b):与主 parser 同源喂入,只认 2026/OSC 133。
+    sidecar: crate::protocol::sidecar::SidecarParser,
+    /// 最近一次 feed 是否处于同步输出窗口(2026h..2026l),app 据此持帧。
+    sync_output: bool,
+    /// 最近一次 feed 到达的 OSC 133 标记(取走即清)。
+    pending_marks: Vec<RowMark>,
+}
+
+/// OSC 133 标记 + 记录时的光标行(视口行,0=顶,与 `Damage::Lines` 同一
+/// 坐标系;上游光标坐标恒在活动屏内,与 display_offset 无关)。M5 消费。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowMark {
+    pub mark: crate::protocol::sidecar::ShellMark,
+    pub line: i32,
 }
 
 impl Surface {
@@ -157,6 +171,9 @@ impl Surface {
         let proxy = EventProxy::default();
         let config = Config {
             scrolling_history: 10_000,
+            // kitty keyboard(M4a/D27):激活上游状态机(mode 栈/查询应答);
+            // 输入编码器在 protocol::kitty,app 按 kitty_flags() 分流
+            kitty_keyboard: true,
             ..Default::default()
         };
         let term = Term::new(config, &size, proxy.clone());
@@ -167,12 +184,51 @@ impl Surface {
             proxy,
             size,
             has_drawn: false,
+            sidecar: crate::protocol::sidecar::SidecarParser::new(),
+            sync_output: false,
+            pending_marks: Vec::new(),
         }
     }
 
     /// Feed raw pty output into the terminal state machine.
+    /// 同段字节也过 sidecar(M4b):2026/OSC 133 旁路监听。
     pub fn feed(&mut self, bytes: &[u8]) {
+        let events = self.sidecar.scan(bytes);
+        if events.sync_begin > 0 {
+            self.sync_output = true;
+        }
+        if events.sync_end > 0 {
+            // 幂等:end 在超时后到(HELD 已 false)只画不重置(D29 竞态缓解)。
+            self.sync_output = false;
+        }
+        if !events.marks.is_empty() {
+            // 行号 = 本块开始时的光标行(视口坐标,0=顶,与 Damage 同系)。
+            // sidecar 不产字节偏移,块内多个标记共用同一行——块粒度近似,
+            // 典型 shell 集成每个标记独立 write,实践偏差为零。
+            let line = self.term.grid().cursor.point.line.0;
+            self.pending_marks
+                .extend(events.marks.into_iter().map(|mark| RowMark { mark, line }));
+        }
         self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// 当前是否处于同步输出窗口(2026h 起 2026l/超时止)。app 的
+    /// WM_APP_RENDER 据此跳过 draw(数据照 drain+feed,不丢)。读取侧判断后应配对调用
+    /// `mark_sync_flushed` 以便超时释放。简化契约:`sync_output` 只反映最近 feed 的
+    /// 状态——超时强制放帧由 app 持有,超时时 app 调 `mark_sync_flushed`。
+    pub fn sync_output_active(&self) -> bool {
+        self.sync_output
+    }
+
+    /// app 侧超时放帧后调用(app 150ms 安全阀)——把状态清掉,后续 feed 正常画。
+    pub fn mark_sync_flushed(&mut self) {
+        self.sync_output = false;
+    }
+
+    /// 取走上次 feed 后到达的 OSC 133 标记(D30:解析+存储,M5 消费)。line 为
+    /// 标记所在块开始时的光标行(视口坐标,0=顶,与 damage 同一坐标系)。
+    pub fn take_shell_marks(&mut self) -> Vec<RowMark> {
+        std::mem::take(&mut self.pending_marks)
     }
 
     pub fn resize(&mut self, size: ScreenSize) {
@@ -238,6 +294,35 @@ impl Surface {
 
     pub fn grid(&self) -> &Grid<Cell> {
         self.term.grid()
+    }
+
+    /// 当前 kitty keyboard flags(M4a):四渐进位的并集;全零走 legacy。
+    pub fn kitty_flags(&self) -> crate::protocol::kitty::KittyFlags {
+        let mode = self.term.mode();
+        let mut bits = 0u32;
+        // 位值与上游 TermMode(1<<18..22)锁死;不能直接读私有位,经 mode
+        // contains 判定后重组
+        use alacritty_terminal::term::TermMode;
+        const KITTY_BITS: [(u32, u32); 4] = [
+            (1 << 18, 1 << 18),
+            (1 << 19, 1 << 19),
+            (1 << 21, 1 << 21),
+            (1 << 22, 1 << 22),
+        ];
+        for (mode_bit, out_bit) in KITTY_BITS {
+            if mode.contains(TermMode::from_bits_truncate(mode_bit)) {
+                bits |= out_bit;
+            }
+        }
+        crate::protocol::kitty::KittyFlags(bits)
+    }
+
+    /// bracketed paste(DECSET 2004)是否激活——粘贴路径据此包裹。
+    pub fn bracketed_paste_active(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term
+            .mode()
+            .contains(TermMode::from_bits_truncate(1 << 4))
     }
 
     /// DECCKM(DECSET 1)application cursor keys:编码器据此把导航键发成
@@ -588,6 +673,133 @@ mod tests {
         );
         s.feed(b"]52;c;aGk=\\");
         assert_eq!(s.take_clipboard_out(), vec!["hi".to_string()]);
+    }
+
+    #[test]
+    fn kitty_flags_follow_mode_set_and_push() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        use crate::protocol::kitty::KittyFlags;
+        assert_eq!(s.kitty_flags(), KittyFlags::NONE, "初始无 kitty 位");
+        // set-or 全量替换:CSI = flags u(1 = disambiguate)
+        s.feed(b"\x1b[=1u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        // 再叠加 event types(全量替换语义:只留 bit19)
+        s.feed(b"\x1b[=2u");
+        assert_eq!(
+            s.kitty_flags(),
+            KittyFlags::REPORT_EVENT_TYPES,
+            "set-or 全量替换"
+        );
+        // push/pop:push 置栈顶为该 mode,pop 恢复栈底(set 不入栈,栈空即 NO_MODE)
+        s.feed(b"\x1b[>1u");
+        assert_eq!(s.kitty_flags(), KittyFlags::DISAMBIGUATE);
+        s.feed(b"\x1b[<1u");
+        assert_eq!(
+            s.kitty_flags(),
+            KittyFlags::NONE,
+            "栈空回 NO_MODE(set 不入栈)"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_mode_toggles() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert!(!s.bracketed_paste_active());
+        s.feed(b"\x1b[?2004h");
+        assert!(s.bracketed_paste_active());
+        s.feed(b"\x1b[?2004l");
+        assert!(!s.bracketed_paste_active());
+    }
+
+    #[test]
+    fn sync_output_and_marks_flow_through_surface() {
+        use crate::protocol::sidecar::ShellMark;
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert!(!s.sync_output_active());
+        assert!(s.take_shell_marks().is_empty());
+        // 2026h + 133;A 同流到达
+        s.feed(b"\x1b[?2026h chunk1 \x1b]133;A\x1b\\ prompt");
+        assert!(s.sync_output_active(), "2026h 后进入同步窗口");
+        assert_eq!(
+            s.take_shell_marks(),
+            vec![RowMark {
+                mark: ShellMark::PromptStart,
+                line: 0
+            }],
+            "行号按块开始时的光标行记录(新屏光标在顶行)"
+        );
+        // 2026l 结束窗口
+        s.feed(b"tail \x1b[?2026l");
+        assert!(!s.sync_output_active());
+        // 超时安全阀路径
+        s.feed(b"\x1b[?2026h more");
+        assert!(s.sync_output_active());
+        s.mark_sync_flushed();
+        assert!(!s.sync_output_active(), "超时强制放帧后窗口关闭");
+    }
+
+    #[test]
+    fn marks_record_cursor_line_at_chunk_start() {
+        use crate::protocol::sidecar::ShellMark;
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        // 前一块把光标推到第 2 行;随后独立到达的 133;C 记录该行号
+        s.feed(b"one\r\ntwo\r\n");
+        s.feed(b"\x1b]133;C\x07out");
+        assert_eq!(
+            s.take_shell_marks(),
+            vec![RowMark {
+                mark: ShellMark::OutputStart,
+                line: 2
+            }]
+        );
+        // 取走即清
+        assert!(s.take_shell_marks().is_empty());
+    }
+
+    /// D29 吞吐预算:sidecar 双解析的回归。10MB 混合负载(SGR 文本行),
+    /// A = `Surface::feed`(含 sidecar),B = 直调主 `Processor::advance`
+    /// (单解析基线,同 Term 配置)。回归 >5% 则按 spec 换字节前缀快筛。
+    /// 秒级耗时,默认 ignore:`cargo test -p mica-core sidecar_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn sidecar_throughput_budget() {
+        let line =
+            b"\x1b[32mhello world 0123456789 abcdefghijklmnopqrstuvwxyz \x1b[0m tail text\r\n";
+        let target = 10 * 1024 * 1024;
+        let mut data = Vec::with_capacity(target + line.len());
+        while data.len() < target {
+            data.extend_from_slice(line);
+        }
+        // 4KB 块:pty 读线程的真实粒度
+        let chunks: Vec<&[u8]> = data.chunks(4096).collect();
+
+        let mut a = Surface::new(ScreenSize::new(80, 24));
+        let mut dur_a = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            for c in &chunks {
+                a.feed(c);
+            }
+            dur_a = dur_a.min(t0.elapsed());
+        }
+
+        let mut b = Surface::new(ScreenSize::new(80, 24));
+        let mut dur_b = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            for c in &chunks {
+                b.parser.advance(&mut b.term, c);
+            }
+            dur_b = dur_b.min(t0.elapsed());
+        }
+
+        let regression = (dur_a.as_secs_f64() / dur_b.as_secs_f64() - 1.0) * 100.0;
+        println!("A feed+sidecar = {dur_a:?}   B main-only = {dur_b:?}   回归 = {regression:.1}%");
+        // 预算判定只在 release 成立:debug 下门控的字节扫描无优化,比例
+        // 失真(实测 debug ~9% vs release ~2%),断言会误报
+        if !cfg!(debug_assertions) {
+            assert!(regression < 5.0, "D29 吞吐预算超支:{regression:.1}% > 5%");
+        }
     }
 
     /// DECSCUSR(xterm 语义):1|2=块、3|4=下划线、5|6=beam;0=重置默认。
