@@ -135,8 +135,13 @@
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\mica.exe'
                                 KeyPath='yes'/>
-                            <!-- 开始菜单 + 桌面快捷方式(1.0.2):GUI app 无
-                                 快捷方式 = 装完"只能终端启动"(用户实报) -->
+                        </Component>
+                        <!-- 快捷方式独立组件(1.0.2):perUser 安装下 File 不能
+                             与 Shortcut 同组件(File KeyPath 触发 ICE 验证红,
+                             light 退出码 204 CI 实证)——HKCU 注册表值作
+                             KeyPath 是 perUser 的规范写法 -->
+                        <Component Id='Shortcuts' Guid='6E1F6D2C-8A4B-4C3E-9F5A-1D2B3C4D5E6F'>
+                            <RegistryValue Root='HKCU' Key='Software\yudongyouqing\Mica' Name='installed' Type='integer' Value='1' KeyPath='yes'/>
                             <Shortcut
                                 Id='StartMenuShortcut'
                                 Directory='ProgramMenuFolder'
@@ -172,6 +177,7 @@
             <!--<ComponentRef Id='License'/>-->
 
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='Shortcuts'/>
 
             <Feature
                 Id='Environment'
