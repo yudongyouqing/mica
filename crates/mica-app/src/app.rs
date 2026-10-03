@@ -38,8 +38,9 @@ use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
-    VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, TME_HOVER, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_INSERT,
+    VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::HICON;
@@ -123,6 +124,11 @@ thread_local! {
     static CURSOR_BLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 拖选中(WM_LBUTTONDOWN 起、WM_LBUTTONUP 止)
     static MOUSE_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// hover 追踪已武装(TrackMouseEvent 每 hover 会话只需请求一次)
+    static HOVER_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// D28 hover 气泡:URL + 绘制锚(客户区坐标)。None = 不画
+    static HOVER_URL: RefCell<Option<(String, f32, f32)>> =
+        const { RefCell::new(None) };
     /// 上次双击的 (时刻, x, y):三击 = 同位置 450ms 内的第二次双击
     static LAST_DBLCLK: std::cell::RefCell<Option<(std::time::Instant, i32, i32)>> =
         const { std::cell::RefCell::new(None) };
@@ -184,6 +190,10 @@ impl TabState {
     /// 活跃 pane 的 Terminal(全部输入/渲染路径经此)。
     fn active_pane(&mut self) -> Option<&mut Terminal> {
         self.panes.get_mut(self.focused).map(|p| &mut p.terminal)
+    }
+    /// 同 [`Self::active_pane`] 的共享版(查询类路径:链接查找等)。
+    fn active_pane_ref(&self) -> Option<&Terminal> {
+        self.panes.get(self.focused).map(|p| &p.terminal)
     }
     fn active_pane_id(&self) -> Option<u64> {
         self.panes.get(self.focused).map(|p| p.id)
@@ -1141,6 +1151,17 @@ fn draw_frame() {
             &t.palette,
             exit_dot,
         );
+        // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
+        if let Some((url, hx, hy)) = HOVER_URL.with(|h| h.borrow().clone()) {
+            strip.extend(mica_render::frame::tooltip_quads(
+                &url,
+                hx,
+                hy,
+                &mut t.router,
+                &t.metrics,
+                &t.palette,
+            ));
+        }
         let revision = t.router.atlas_revision();
         let atlas = t.router.atlas();
         strip.append(&mut all_instances);
@@ -1404,39 +1425,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             // OSC 8 Ctrl+Click(D28):按住 Ctrl 不走选择;命中带链接格直接打开浏览器
             if current_mods().ctrl {
-                let rects = active_pane_rects().into_iter().find(|(_, r)| {
-                    (px as f32) >= r.x
-                        && (px as f32) < r.x + r.w
-                        && (py as f32) >= r.y
-                        && (py as f32) < r.y + r.h
-                });
-                if let Some((_, r)) = rects {
-                    let (cx, cy) = (px as f32 - r.x, py as f32 - r.y);
-                    TABS.with(|tabs| {
-                        let mut guard = tabs.borrow_mut();
-                        let Some(tab) = guard.get_mut(ACTIVE.get()) else {
-                            return;
-                        };
-                        let Some(t) = tab.active_pane() else { return };
-                        let m = &t.metrics;
-                        let line = (cy / m.line_height) as i32 + t.term.display_offset() as i32;
-                        let col = (cx / m.cell_width) as usize;
-                        let link = t.term.grid()[Line(line)][Column(col)].hyperlink();
-                        if let Some(link) = link {
-                            let uri = windows::core::HSTRING::from(link.uri().to_string());
-                            // SAFETY: OS open;失败静默(scheme 异常不弹窗)
-                            unsafe {
-                                ShellExecuteW(
-                                    None,
-                                    windows::core::w!("open"),
-                                    windows::core::PCWSTR(uri.as_ptr()),
-                                    None,
-                                    None,
-                                    SW_SHOWNORMAL,
-                                );
-                            }
-                        }
-                    });
+                if let Some(uri) = link_at(px, py) {
+                    let uri = windows::core::HSTRING::from(uri);
+                    // SAFETY: OS open;失败静默(scheme 异常不弹窗)
+                    unsafe {
+                        ShellExecuteW(
+                            None,
+                            windows::core::w!("open"),
+                            windows::core::PCWSTR(uri.as_ptr()),
+                            None,
+                            None,
+                            SW_SHOWNORMAL,
+                        );
+                    }
                 }
                 return LRESULT(0);
             }
@@ -1487,6 +1488,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_MOUSEMOVE => {
             if !MOUSE_DOWN.with(std::cell::Cell::get) {
+                // D28 hover:非拖选时武装悬停追踪(每会话一次,HOVER/LEAVE 都会重置)
+                if !HOVER_ARMED.with(|a| a.replace(true)) {
+                    arm_hover(hwnd);
+                }
                 return LRESULT(0);
             }
             let (px, py) = mouse_xy(lparam);
@@ -1511,6 +1516,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             });
             draw_frame();
+            LRESULT(0)
+        }
+        WM_MOUSEHOVER => {
+            // D28:持续 hover 事件流(重武装);悬停格带链接则显气泡
+            HOVER_ARMED.with(|a| a.set(false));
+            arm_hover(hwnd);
+            let (px, py) = mouse_xy(lparam);
+            let url = link_at(px, py);
+            let changed = HOVER_URL.with(|h| {
+                let mut h = h.borrow_mut();
+                let same = match (&*h, &url) {
+                    (Some((u, _, _)), Some(v)) => u == v,
+                    (None, None) => true,
+                    _ => false,
+                };
+                if !same {
+                    *h = url.map(|u| (u, px as f32 + 14.0, py as f32 + 22.0));
+                }
+                !same
+            });
+            if changed {
+                draw_frame();
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            // TrackMouseEvent TME_LEAVE 投递(675,本地声明——windows-rs 未收录)
+            HOVER_ARMED.with(|a| a.set(false));
+            let had = HOVER_URL.with(|h| h.borrow_mut().take().is_some());
+            if had {
+                draw_frame();
+            }
             LRESULT(0)
         }
         WM_MBUTTONDOWN => {
@@ -2138,6 +2175,47 @@ fn mouse_xy(lparam: LPARAM) -> (i32, i32) {
         (lparam.0 & 0xffff) as u16 as i16 as i32,
         ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32,
     )
+}
+
+/// Win32:TrackMouseEvent 投递的 hover/leave(0x2A2/0x2A3;windows-rs 0.62
+/// 只收在未启用的 Win32_UI_Controls feature,本地声明免开整包)。
+const WM_MOUSEHOVER: u32 = 673;
+const WM_MOUSELEAVE: u32 = 675;
+
+/// 武装 hover/leave 追踪(WM_MOUSEMOVE 非拖选路径与 WM_MOUSEHOVER 重武装共用)。
+/// dwell 300ms:观感上"停一下才出提示",误触率与响应速度的折中。
+fn arm_hover(hwnd: HWND) {
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_HOVER | TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 300,
+    };
+    // SAFETY: OS 追踪注册;失败(罕见)只是收不到 hover,无碍
+    unsafe {
+        let _ = TrackMouseEvent(&mut tme);
+    }
+    HOVER_ARMED.with(|a| a.set(true));
+}
+
+/// 客户区坐标处的 OSC 8 URI(Ctrl+Click 与 hover 气泡共用;None = 无链接)。
+fn link_at(px: i32, py: i32) -> Option<String> {
+    let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
+        (px as f32) >= r.x
+            && (px as f32) < r.x + r.w
+            && (py as f32) >= r.y
+            && (py as f32) < r.y + r.h
+    })?;
+    TABS.with(|tabs| {
+        let guard = tabs.borrow();
+        let t = guard.get(ACTIVE.get())?.active_pane_ref()?;
+        let line =
+            ((py as f32 - r.y) / t.metrics.line_height) as i32 + t.term.display_offset() as i32;
+        let col = ((px as f32 - r.x) / t.metrics.cell_width) as usize;
+        t.term.grid()[Line(line)][Column(col)]
+            .hyperlink()
+            .map(|l| l.uri().to_string())
+    })
 }
 
 fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {

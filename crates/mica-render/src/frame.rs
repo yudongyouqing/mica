@@ -311,6 +311,64 @@ pub struct RowInst {
     pub glyphs: Vec<CellInstance>,
 }
 
+/// D28 hover URI 气泡:主窗 overlay(spec 的 WS_POPUP 简化——零新窗口零
+/// 新管线,同功能;越窗裁剪 v1 接受)。bg + 1px 边框 + 等宽文字(截断
+/// 40 字符),锚点为鼠标位 + 偏移(app 侧传入)。
+pub fn tooltip_quads(
+    url: &str,
+    x: f32,
+    y: f32,
+    router: &mut dyn GlyphRouter,
+    metrics: &FontMetrics,
+    palette: &Palette,
+) -> Vec<CellInstance> {
+    let bg_of = |rgb: [u8; 3]| to_color(rgb);
+    let chars: Vec<char> = url.chars().take(40).collect();
+    let text_w = chars.len() as f32 * metrics.cell_width;
+    let pad = 6.0;
+    let w = text_w + pad * 2.0;
+    let h = metrics.line_height + pad;
+    let mut out = Vec::with_capacity(2 + 4 + chars.len());
+    // bg(底色槽 0)+ fg 边框
+    out.push(CellInstance {
+        pos_uv: [x, y, 0.0, 0.0],
+        size_uv: [w, h, 0.0, 0.0],
+        fg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+        bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+    });
+    let border = |bx: f32, by: f32, bw: f32, bh: f32| CellInstance {
+        pos_uv: [bx, by, 0.0, 0.0],
+        size_uv: [bw, bh, 0.0, 0.0],
+        fg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
+        bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+    };
+    out.extend([
+        border(x, y, w, 1.0),
+        border(x, y + h - 1.0, w, 1.0),
+        border(x, y, 1.0, h),
+        border(x + w - 1.0, y, 1.0, h),
+    ]);
+    let text_y = (h - metrics.line_height) / 2.0;
+    for (ci, ch) in chars.iter().enumerate() {
+        let g = router.route(*ch, GlyphStyle::PLAIN);
+        if g.size_px[0] <= 0.0 {
+            continue;
+        }
+        out.push(CellInstance {
+            pos_uv: [
+                x + pad + ci as f32 * metrics.cell_width + g.offset_px[0],
+                y + text_y + g.offset_px[1],
+                g.uv[0],
+                g.uv[1],
+            ],
+            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+            fg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
+            bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+        });
+    }
+    out
+}
+
 /// 行级重建入口(Task 8),按 `damage` 分路:
 ///
 /// - `Full`:全部行重建(与 [`build_instances`] 全量黄金源逐字节等价,
