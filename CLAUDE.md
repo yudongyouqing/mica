@@ -58,6 +58,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-10-02-m4-protocol-design.md` — M4 设计(kitty keyboard/2026/OSC 8/133/graphics 预研,D27-D31;M4a/M4b/M4c 三切片,计划待写)。
 - `docs/superpowers/plans/2026-10-02-m4a-kitty-keyboard.md` — M4a 计划(kitty 编码器/bracketed paste/app 路由,5 任务;上游状态机 API 与协议键码表已核实)。
 - `docs/superpowers/research/2026-10-03-kitty-graphics.md` — M4c 预研(D31:协议结构/内存模型/图集融合点/工作量;两项本机实证——vte 0.15 无 apc_dispatch、ConPTY 剥离 APC 致 Windows 主路径不可达,金丝雀测试守边界)。
+- `docs/superpowers/specs/2026-10-03-m5-1.0-design.md` — M5 1.0 设计(打磨/健壮/发布三切片,D32-D37;砍单 tear-off/defterm 二级/官网/连字引擎/签名;验收=winget 可装+崩溃有档+IME 跟随+1.0 tag)。
 - 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(✅)→ M3 系统集成(✅)→ M4 协议补全(✅:M4a/M4b 合入 dev,M4c 预研落档;kitty graphics 因 ConPTY 边界不实现,M5 再议)→ M5 1.0。
 
 ## 当前边界(M3 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
