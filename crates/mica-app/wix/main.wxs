@@ -110,15 +110,9 @@
                     -->
 
                     <Directory Id='Bin' Name='bin'>
-                        <!-- defterm 一级(D24):RRVA 键把 Mica 送进 Windows "默认终端"选择列表;
-                             卸载仅当值仍指向本 GUID 才清(别覆盖用户后来选的其他终端) -->
-                        <Component Id='DefTerm' Guid='5A9F4E2B-3D1C-4F0E-9B8A-7C6D5E4F3A21'>
-                            <RegistryValue Root='HKCU' Key='Software\Microsoft\Windows\CurrentVersion\Console' Name='DelegationConsole' Type='string' Value='{C6C4E9E1-1D2B-4F3A-8E5D-9A7B6C5D4E3F}' KeyPath='yes'/>
-                            <RegistryValue Root='HKCU' Key='Software\Microsoft\Windows\CurrentVersion\Console' Name='DelegationTerminal' Type='string' Value='{C6C4E9E1-1D2B-4F3A-8E5D-9A7B6C5D4E3F}'/>
-                            <!-- 显示名注册(WT 同款结构;ConsoleDelegation 的 CLSID 键) -->
-                            <RegistryValue Root='HKCU' Key='Software\Classes\CLSID\{C6C4E9E1-1D2B-4F3A-8E5D-9A7B6C5D4E3F}' Name='(Default)' Type='string' Value='Mica'/>
-                            <RegistryValue Root='HKCU' Key='Software\Classes\CLSID\{C6C4E9E1-1D2B-4F3A-8E5D-9A7B6C5D4E3F}' Name='ExeId' Type='string' Value='yudongyouqing.Mica'/>
-                        </Component>
+                        <!-- defterm 注册撤下(1.0.2):无 ITerminalHandoff COM 实现的 defterm 是陷阱——
+                         装完即劫持默认终端且接管失败(console 程序 0xc0000142,1.0.0/1.0.1 实证)。
+                         连设置列表注册一并撤:半吊子上列表=用户选了必炸。真实现后(M5+/M4 探针)整块恢复 -->
                         <Component Id='Path' Guid='54F4D0E4-7F3E-4D1D-A973-78CB76F27CAA' KeyPath='yes'>
                             <!-- System='no'(用户级 HKCU PATH):InstallScope='perUser' 无提权安装
                                  写不了机器级(HKLM)PATH——1.0.0 实证静默失败,'mica' 不被
@@ -162,7 +156,6 @@
             <!--<ComponentRef Id='License'/>-->
 
             <ComponentRef Id='binary0'/>
-            <ComponentRef Id='DefTerm'/>
 
             <Feature
                 Id='Environment'
