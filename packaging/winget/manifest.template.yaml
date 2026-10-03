@@ -1,0 +1,22 @@
+# winget 清单模板(M5c/T6):InstallerUrl 指向 release asset。
+# 提交方式:fork microsoft/winget-pkgs → 按规范路径放入 → PR。
+# 占位符 <URL> 替换为实际资产直链后使用。
+# yaml-package: yudongyouqing.mica
+PackageIdentifier: yudongyouqing.mica
+PackageVersion: 1.0.0
+PackageName: Mica
+Publisher: yudongyouqing
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/yudongyouqing/mica/blob/main/LICENSE-MIT
+ShortDescription: Windows-native terminal emulator built in Rust.
+PackageUrl: https://github.com/yudongyouqing/mica
+Installers:
+  - Architecture: x64
+    InstallerUrl: <URL>
+    InstallerType: wix
+    InstallerSha256: 7f7e86b71024949c6d821c968186108e542df47d51e4f8f6533323bf1b80b5fe
+    InstallerSwitches:
+      Silent: /qn
+      SilentWithProgress: /qb
+ManifestType: singleton
+ManifestVersion: 1.4.0
