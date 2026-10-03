@@ -3,7 +3,7 @@
 # 占位符 <URL> 替换为实际资产直链后使用。
 # yaml-package: yudongyouqing.mica
 PackageIdentifier: yudongyouqing.mica
-PackageVersion: 1.0.0
+PackageVersion: 1.0.1
 PackageName: Mica
 Publisher: yudongyouqing
 License: MIT OR Apache-2.0
@@ -14,7 +14,7 @@ Installers:
   - Architecture: x64
     InstallerUrl: <URL>
     InstallerType: wix
-    InstallerSha256: 7f7e86b71024949c6d821c968186108e542df47d51e4f8f6533323bf1b80b5fe
+    InstallerSha256: 578e757b022e3d93468e83e89c9c5d207b37a38af2a1cb4b272392b06780f378
     InstallerSwitches:
       Silent: /qn
       SilentWithProgress: /qb
