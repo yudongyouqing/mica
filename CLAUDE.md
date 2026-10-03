@@ -68,6 +68,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - OSC 52:管线单测全过,真机经 ConPTY 疑被拦截——tmux 环境复验后定案(M3 或关账)
 - DECSET 2026:sidecar 检测→帧持有管线单测全绿,但 ConPTY 不透传 2026(2026-10-03 真机探针实证 feed 零命中;同路径 OSC 8 可透传,唯 2026 被消费——ConPTY 自带同步缓冲)——直连 pty 场景生效,ConPTY 场景由其自身机制兜底
 - sidecar 快筛(M4b/D29 备胎,已启用):候选前缀深跑 + carry/open_seq 跨块续命;基准测试 `sidecar_throughput_budget`(#ignored,release 跑)预算 5%
+- 启动清理孤儿 ConPTY 宿主(M5c):强杀终端必留 OpenConsole 孤儿,管道断裂后 busy-loop——2026-10-03 冒烟事故实证 13 个孤儿各烧满 1 核;启动时按"父进程已死"清杀(真开着的 WT 父进程活着不受影响),与 minidump 崩溃恢复成对
 - kitty graphics:ConPTY 剥离 APC(M4c 字节级实证,与 2026/OSC 52 同类)——Windows 主路径不可达,不实现;金丝雀测试 `conpty_strips_apc_today_canary` 变红 = 边界移动,重估(预研文档含 M5 立项建议)
 - OSC 133 UI(jump/exit 状态点,M5a):数据层/渲染全绿,但 ConPTY 毁引导符(ESC]→ESC\,载荷文本泄漏、BEL 被吃;OSC 8 是唯一透传例外)——经 ConPTY 不可达,金丝雀 `conpty_strips_osc133_today_canary` 守边界;直连 pty 场景即生效
 - 标签溢出滚动:滚轮+活跃自动跟随已落,箭头命中区暂缓(计划偏差注记)
