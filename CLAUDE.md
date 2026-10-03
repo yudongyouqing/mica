@@ -59,7 +59,8 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/plans/2026-10-02-m4a-kitty-keyboard.md` — M4a 计划(kitty 编码器/bracketed paste/app 路由,5 任务;上游状态机 API 与协议键码表已核实)。
 - `docs/superpowers/research/2026-10-03-kitty-graphics.md` — M4c 预研(D31:协议结构/内存模型/图集融合点/工作量;两项本机实证——vte 0.15 无 apc_dispatch、ConPTY 剥离 APC 致 Windows 主路径不可达,金丝雀测试守边界)。
 - `docs/superpowers/specs/2026-10-03-m5-1.0-design.md` — M5 1.0 设计(打磨/健壮/发布三切片,D32-D37;砍单 tear-off/defterm 二级/官网/连字引擎/签名;验收=winget 可装+崩溃有档+IME 跟随+1.0 tag)。
-- 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(✅)→ M3 系统集成(✅)→ M4 协议补全(✅)→ M5 1.0(M5a 打磨完成待 PR;OSC 133 UI 撞 ConPTY 边界)→ M5b/c。
+- `docs/superpowers/plans/2026-10-03-m5b-robustness.md` — M5b 计划(健壮五件;wgpu lost 双钩子/DbgHelp/try_wait/Ime/winres-manifest API 全核实;冒烟抓到 restart 双借真 bug——T1 崩溃档案首秀定位)。
+- 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(✅)→ M3 系统集成(✅)→ M4 协议补全(✅)→ M5 1.0(M5a 已合入 dev;M5b 健壮五件完成:crash 档案/device lost/退出态+重开/PMv2 DPI/IME 跟随)→ M5c 发布。
 
 ## 当前边界(M3 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
@@ -72,10 +73,10 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - 标签溢出滚动:滚轮+活跃自动跟随已落,箭头命中区暂缓(计划偏差注记)
 - 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段);标签 tear-off 砍单(D32)
 - defterm 二级(ITerminalHandoff COM 完整接管):RRVA 一级已上线(设置列表可见),COM 手绑 M4 探针;winget 清单首提待做
-- Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M5b;QT 输入已对齐主窗契约(M5a 修双发)
+- Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M5c 观察;QT 输入已对齐主窗契约(M5a 修双发)
 - WM_CHAR 无代理对之外的 IME 组合窗口(M3 系统级 IME)
 - OSC 4 全域正确(16-231 立方/232-255 灰阶,M5a 落);SGR 下划线族已渲染(M5a,此前从未画)
-- DPI 写死 96(spec §11;per-monitor DPI M5b)
+- DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始窗口物理尺寸在高 DPI 屏偏小(创建尺寸未乘 scale,打磨票)
 
 ## 提交规范
 
