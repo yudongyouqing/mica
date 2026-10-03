@@ -95,6 +95,7 @@ mod clipboard;
 pub(crate) mod crash;
 pub(crate) mod ipc;
 mod jumplist;
+pub(crate) mod orphan;
 pub(crate) mod quickterm;
 
 thread_local! {
@@ -332,6 +333,12 @@ pub fn run() {
             Err(false) => {} // 建管道失败:已在 ipc::serve 记日志
             Err(true) => unreachable!("main 已分流,GUI 路径不会撞已占管道"),
         }
+        // 孤儿 ConPTY 清理(M5c/T1):趁自身还没 spawn pty,零误杀窗口
+        let orphans = orphan::sweep_orphaned_conhost(true);
+        if orphans > 0 {
+            eprintln!("[orphan] 清杀 {orphans} 个父进程已死的 ConPTY 宿主");
+        }
+
         // M3a:AUMID + jump list(profile 任务直达)
         jumplist::set_appuser_model_id();
         let profiles: Vec<(String, String)> = mica_core::profile::scan_all()
