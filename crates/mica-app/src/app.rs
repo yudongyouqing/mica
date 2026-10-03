@@ -41,7 +41,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
     VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::HICON;
+/// ShellExecuteW show cmd(打开链接用)
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
     DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG,
@@ -112,6 +115,9 @@ thread_local! {
     static KEYMAP: RefCell<Keymap> = RefCell::new(Keymap::wt_default());
     /// IPC 服务端消息队列(主线程 WM_APP_IPC 时 try_recv)
     static IPC_RX: RefCell<Option<std::sync::mpsc::Receiver<IpcMessage>>> = const { RefCell::new(None) };
+    /// 2026 同步持帧(D29):h 起置 true,l 或 150ms 超时放帧。
+    /// 持帧只跳 draw(数据照 drain+feed,不丢)
+    static SYNC_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 光标闪烁相位(true = 亮);开关由配置驱动(settings.cursor_blink)
     static BLINK_PHASE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static CURSOR_BLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1385,6 +1391,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 None => {}
             }
+            // OSC 8 Ctrl+Click(D28):按住 Ctrl 不走选择;命中带链接格直接打开浏览器
+            if current_mods().ctrl {
+                let rects = active_pane_rects().into_iter().find(|(_, r)| {
+                    (px as f32) >= r.x
+                        && (px as f32) < r.x + r.w
+                        && (py as f32) >= r.y
+                        && (py as f32) < r.y + r.h
+                });
+                if let Some((_, r)) = rects {
+                    let (cx, cy) = (px as f32 - r.x, py as f32 - r.y);
+                    TABS.with(|tabs| {
+                        let mut guard = tabs.borrow_mut();
+                        let Some(tab) = guard.get_mut(ACTIVE.get()) else {
+                            return;
+                        };
+                        let Some(t) = tab.active_pane() else { return };
+                        let m = &t.metrics;
+                        let line = (cy / m.line_height) as i32 + t.term.display_offset() as i32;
+                        let col = (cx / m.cell_width) as usize;
+                        let link = t.term.grid()[Line(line)][Column(col)].hyperlink();
+                        if let Some(link) = link {
+                            let uri = windows::core::HSTRING::from(link.uri().to_string());
+                            // SAFETY: OS open;失败静默(scheme 异常不弹窗)
+                            unsafe {
+                                ShellExecuteW(
+                                    None,
+                                    windows::core::w!("open"),
+                                    windows::core::PCWSTR(uri.as_ptr()),
+                                    None,
+                                    None,
+                                    SW_SHOWNORMAL,
+                                );
+                            }
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
             let mods = current_mods();
             // pane 命中(T7):点中的 pane 聚焦,坐标换算到该 pane 原点
             let rects = active_pane_rects();
@@ -1625,17 +1669,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(text) = t.term.take_clipboard_out().pop() {
                     clipboard::set_text(&text);
                 }
-                if let Some(title) = t.term.take_title() {
+                // 2026 同步输出(D29):持帧只跳 draw,数据已照 feed,不丢。
+                // 先取状态到局部再写 guard,避开 t(&mut 借用)与 guard 交叉
+                // 全部 t 状态先取局部(t 是 guard 的 &mut,不再交叉借用 guard
+                let title_opt: Option<String> = t.term.take_title();
+                // OSC 133 标记(D30):M4 到存储为止,app 侧在此排空防积压;
+                // M5 消费(jump/状态行)时在此接入
+                let _ = t.term.take_shell_marks();
+                let sync_open = t.term.sync_output_active();
+                let mut flush = sync_open; // 放帧时刻需要全量重绘
+                let was_held = SYNC_HELD.replace(false);
+                if sync_open {
+                    t.force_full = true;
+                }
+                if let Some(title) = title_opt {
                     guard[tab_idx].title = title.clone();
                     if is_active {
                         let _ = SetWindowTextW(hwnd, &HSTRING::from(title));
                     }
                 }
                 if is_active {
-                    drew = true;
+                    if sync_open {
+                        // 起安全阀(D29):150ms 内 2026-l 不来即强制放帧
+                        SYNC_HELD.with(|f| f.set(true));
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                            Some(hwnd),
+                            2,
+                            150,
+                            None,
+                        );
+                    } else if was_held {
+                        // 窗口刚关(2026-l 到达):放一帧全量
+                        windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2).ok();
+                        flush = true;
+                        drew = true; // l 即刻放帧
+                    } else {
+                        drew = true;
+                    }
                 } else {
                     guard[tab_idx].dirty = true;
                 }
+                let _ = flush;
             });
             // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
             if drew {
@@ -1644,18 +1718,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TIMER => {
-            // 光标闪烁(D20):翻相位,只重绘(光标行在 damage 里自然带出;
-            // 无输入时 term 脏区为空,force_full 兜底成本可接受——闪烁期
-            // 本来就是持续重绘)
-            BLINK_PHASE.with(|p| p.set(!p.get()));
-            TABS.with(|tabs| {
-                if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get())
-                    && let Some(p) = t.active_pane()
-                {
-                    p.force_full = true;
+            // id 分流:2 = 2026 同步安全阀(D29);1 = 光标闪烁(D20)
+            match wparam.0 {
+                2 => {
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2).ok();
+                    if SYNC_HELD.with(std::cell::Cell::take) {
+                        SYNC_HELD.with(|f| f.set(false));
+                        TABS.with(|tabs| {
+                            if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get())
+                                && let Some(p) = t.active_pane()
+                            {
+                                p.term.mark_sync_flushed();
+                                p.force_full = true;
+                            }
+                        });
+                        draw_frame();
+                    }
                 }
-            });
-            draw_frame();
+                _ => {
+                    // 光标闪烁(D20):翻相位,只重绘(光标行在 damage 里自然带出;
+                    // 无输入时 term 脏区为空,force_full 兜底成本可接受——闪烁期
+                    // 本来就是持续重绘)
+                    BLINK_PHASE.with(|p| p.set(!p.get()));
+                    TABS.with(|tabs| {
+                        if let Some(t) = tabs.borrow_mut().get_mut(ACTIVE.get())
+                            && let Some(p) = t.active_pane()
+                        {
+                            p.force_full = true;
+                        }
+                    });
+                    draw_frame();
+                }
+            }
             LRESULT(0)
         }
         WM_NCCALCSIZE => {

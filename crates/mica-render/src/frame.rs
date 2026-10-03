@@ -104,6 +104,10 @@ pub fn build_instances(
                 }
             }
             let x = col as f32 * metrics.cell_width;
+            if cell.hyperlink().is_some() {
+                // OSC 8 链接下划线(D28):置于段首(画在全部 bg 之上、字形之下)
+                glyphs.insert(0, link_underline(x, y, metrics, fg));
+            }
             out.push(blank(x, y, metrics, fg, bg));
         }
         if let Some((shape, x, y)) = bar {
@@ -392,6 +396,16 @@ fn cell_colors(
     (fg, bg)
 }
 
+/// OSC 8 链接下划线(D28):底部 1px,色 = fg(fg 即 cell fg,随选区反色自然反)
+fn link_underline(x: f32, y: f32, metrics: &FontMetrics, fg: [u8; 3]) -> CellInstance {
+    CellInstance {
+        pos_uv: [x, y + metrics.line_height - 1.0, 0.0, 0.0],
+        size_uv: [metrics.cell_width, 1.0, 0.0, 0.0],
+        fg: to_color(fg),
+        bg: to_color(fg),
+    }
+}
+
 /// 光标条实例(D20):Underline=底部 2px、Beam=左侧 1.2px;色 = palette.cursor。
 /// 放字形段头部(bg 之上、字之下;细条与字重叠小,不必顶层)。
 fn cursor_bar(
@@ -494,6 +508,10 @@ fn build_row(
             }
         }
         let x = col as f32 * metrics.cell_width;
+        if cell.hyperlink().is_some() {
+            // OSC 8 链接下划线(D28),与 build_instances 同序同构
+            row.glyphs.insert(0, link_underline(x, y, metrics, fg));
+        }
         row.bg.push(blank(x, y, metrics, fg, bg));
     }
     if let Some((shape, x, y)) = bar {
