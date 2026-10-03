@@ -175,14 +175,25 @@ pub const STRIP_H: f32 = 32.0;
 pub const TAB_W: f32 = 140.0;
 pub const TAB_PLUS_W: f32 = 36.0;
 
+/// D37 exit 状态点形态:绿(0)/红(非 0)/灰(D 参数不可解析)。
+/// 色取调色板语义槽(green=2 / red=1 / bright black=8),主题同源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitDot {
+    Green,
+    Red,
+    Gray,
+}
+
 /// tab strip 的 UI 实例(T7,spec §3 同管线):底条 + 标签块(活跃高亮),
 /// 标题文字经 router 路由(与终端共享图集),尾部 "+" 按钮开新标签。
 /// 文字按等宽 cell 步进排版——strip 只有标题一行,粗排版与终端观感一致。
+/// exit_dot(D37):活跃标签的命令状态点,画在 "+" 右侧(标题栏右)。
 pub fn strip_quads(
     titles: &[(String, bool)],
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    exit_dot: Option<ExitDot>,
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
     let total_w = titles.len() as f32 * TAB_W + TAB_PLUS_W;
@@ -262,6 +273,32 @@ pub fn strip_quads(
         fg: bg_of([ink.r, ink.g, ink.b]),
         bg: bg_of([block.r, block.g, block.b]),
     });
+    // D37 exit 状态点:"+" 右侧,6px 八边形(3 rect 逼近,quad 管线零扩展)
+    if let Some(dot) = exit_dot {
+        let slot = match dot {
+            ExitDot::Green => palette.colors[2],
+            ExitDot::Red => palette.colors[1],
+            ExitDot::Gray => palette.colors[8],
+        };
+        let dx = total_w + 10.0;
+        let cy = STRIP_H / 2.0;
+        for [rx, ry, rw, rh] in [
+            [dx + 1.0, cy - 3.0, 4.0, 1.0],
+            [dx, cy - 2.0, 6.0, 4.0],
+            [dx + 1.0, cy + 2.0, 4.0, 1.0],
+        ] {
+            out.push(CellInstance {
+                pos_uv: [rx, ry, 0.0, 0.0],
+                size_uv: [rw, rh, 0.0, 0.0],
+                fg: bg_of([slot.r, slot.g, slot.b]),
+                bg: bg_of([
+                    palette.colors[0].r,
+                    palette.colors[0].g,
+                    palette.colors[0].b,
+                ]),
+            });
+        }
+    }
     out
 }
 
@@ -602,6 +639,42 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CellInstance, size_uv), 16);
         assert_eq!(std::mem::offset_of!(CellInstance, fg), 32);
         assert_eq!(std::mem::offset_of!(CellInstance, bg), 48);
+    }
+
+    #[test]
+    fn strip_exit_dot_octagon_and_colors() {
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let titles = vec![("t".to_string(), true)];
+        let palette = Palette::DEFAULT;
+        let none_len = strip_quads(&titles, &mut r, &metrics_8x16(), &palette, None).len();
+        let dot = strip_quads(
+            &titles,
+            &mut r,
+            &metrics_8x16(),
+            &palette,
+            Some(ExitDot::Green),
+        );
+        // 八边形 = 3 个 rect;None 不画
+        assert_eq!(dot.len() - none_len, 3);
+        let to_u8 = |c: f32| (c * 255.0 + 0.5) as u8;
+        for q in &dot[none_len..] {
+            assert_eq!(
+                ([to_u8(q.fg[0]), to_u8(q.fg[1]), to_u8(q.fg[2])]),
+                [
+                    palette.colors[2].r,
+                    palette.colors[2].g,
+                    palette.colors[2].b
+                ],
+                "绿点取调色板 slot 2"
+            );
+            assert_eq!(q.size_uv[2], 0.0, "实心 quad,uv 尺寸 0");
+        }
     }
 
     /// 可编程假路由:每个字符回固定字形,便于断言几何。

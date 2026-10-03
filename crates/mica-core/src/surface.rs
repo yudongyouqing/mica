@@ -265,6 +265,20 @@ impl Surface {
             .collect()
     }
 
+    /// D37 状态点:最近一个 D 的 exit code;其后的 B(命令开始)清除。
+    /// 外层 None = 无点;内层 None = D 带不可解析参数(灰点)。
+    /// A/C 不影响状态(继续向前找)。
+    pub fn last_exit_code(&self) -> Option<Option<i32>> {
+        for m in self.marks.iter().rev() {
+            match m.mark {
+                crate::protocol::sidecar::ShellMark::CommandEnd { exit } => return Some(exit),
+                crate::protocol::sidecar::ShellMark::CommandStart => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
     pub fn resize(&mut self, size: ScreenSize) {
         self.size = size;
         self.term.resize(size);
@@ -852,6 +866,22 @@ mod tests {
         // 3 行屏:6 行文本+尾换行,前 3 行填屏后滚出 4 行 → history 4,
         // 原 0 行 → 0 - 4 = -4(滚进历史区,负 Line 语义)
         assert_eq!(marks[0].line, -4);
+    }
+
+    #[test]
+    fn exit_code_state_from_marks() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert_eq!(s.last_exit_code(), None, "无标记无点");
+        s.feed(b"\x1b]133;D;err=0\x07");
+        assert_eq!(s.last_exit_code(), Some(Some(0)), "绿(0)");
+        s.feed(b"\x1b]133;B\x07");
+        assert_eq!(s.last_exit_code(), None, "B 清除");
+        s.feed(b"\x1b]133;D;127\x07");
+        assert_eq!(s.last_exit_code(), Some(Some(127)), "红(裸数字形态)");
+        s.feed(b"\x1b]133;C\x07tail");
+        assert_eq!(s.last_exit_code(), Some(Some(127)), "C 不影响");
+        s.feed(b"\x1b]133;D;err=x\x07");
+        assert_eq!(s.last_exit_code(), Some(None), "灰(参数不可解析)");
     }
 
     #[test]

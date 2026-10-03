@@ -1128,8 +1128,19 @@ fn draw_frame() {
         let Some(t) = active.active_pane() else {
             return;
         };
-        let mut strip =
-            mica_render::frame::strip_quads(&titles, &mut t.router, &t.metrics, &t.palette);
+        // D37 状态点:活跃标签最近命令的 exit(B 清除/D 无参灰)
+        let exit_dot = t.term.last_exit_code().map(|code| match code {
+            Some(0) => mica_render::frame::ExitDot::Green,
+            Some(_) => mica_render::frame::ExitDot::Red,
+            None => mica_render::frame::ExitDot::Gray,
+        });
+        let mut strip = mica_render::frame::strip_quads(
+            &titles,
+            &mut t.router,
+            &t.metrics,
+            &t.palette,
+            exit_dot,
+        );
         let revision = t.router.atlas_revision();
         let atlas = t.router.atlas();
         strip.append(&mut all_instances);
