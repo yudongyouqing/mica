@@ -1269,14 +1269,13 @@ fn draw_frame() {
         let titles: Vec<(String, bool)> = guard
             .iter()
             .enumerate()
-            .map(|(i, tab)| {
-                let mut title = tab.title.clone();
-                if let Some(code) = tab.active_pane_ref().and_then(|t| t.exited) {
-                    title.push_str(&format!(" [exit {code}]"));
-                }
-                (title, i == ACTIVE.get())
-            })
+            .map(|(i, tab)| (tab.title.clone(), i == ACTIVE.get()))
             .collect();
+        // pane 退出态(M5b/T3):strip 右侧标签(标题后缀会被长标题截断吃掉)
+        let pane_exit = guard
+            .get(ACTIVE.get())
+            .and_then(|tab| tab.active_pane_ref())
+            .and_then(|t| t.exited);
         let Some(active) = guard.get_mut(ACTIVE.get()) else {
             return;
         };
@@ -1416,12 +1415,15 @@ fn draw_frame() {
             &mut t.router,
             &t.metrics,
             &t.palette,
-            exit_dot,
-            // 系统按钮区(T8):NCHITTEST 的 CAPTION_BTN_W 同几何
-            Some(area_w - 3.0 * CAPTION_BTN_W as f32),
-            mica_render::frame::StripLayout {
-                tab_scroll: TAB_SCROLL.with(std::cell::Cell::get),
-                avail_w: (area_w - 3.0 * CAPTION_BTN_W as f32).max(0.0),
+            mica_render::frame::StripExtras {
+                exit_dot,
+                // 系统按钮区(T8):NCHITTEST 的 CAPTION_BTN_W 同几何
+                caption_x: Some(area_w - 3.0 * CAPTION_BTN_W as f32),
+                layout: mica_render::frame::StripLayout {
+                    tab_scroll: TAB_SCROLL.with(std::cell::Cell::get),
+                    avail_w: (area_w - 3.0 * CAPTION_BTN_W as f32).max(0.0),
+                },
+                pane_exit,
             },
         );
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
