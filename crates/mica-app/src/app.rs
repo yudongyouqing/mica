@@ -2027,6 +2027,12 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                     t.force_full = true;
                     need_draw = true;
                 }
+                Action::JumpPrevPrompt | Action::JumpNextPrompt => {
+                    if t.term.jump_prompt(matches!(action, Action::JumpNextPrompt)) {
+                        t.force_full = true;
+                        need_draw = true;
+                    }
+                }
                 Action::ScrollPage(n) => {
                     let rows = t.rows as i32;
                     t.term.scroll_display(ScrollCommand::Delta(n * rows));

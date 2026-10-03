@@ -156,6 +156,8 @@ pub struct Surface {
     sync_output: bool,
     /// OSC 133 行属性表(D37):持久累积,超 `MAX_MARKS` 淘汰最旧。
     marks: Vec<MarkRecord>,
+    /// jump 锚(D37):上次 jump_prompt 的目标(行 + epoch);手动滚动即重置。
+    jump_ref: Option<(i32, usize)>,
 }
 
 /// OSC 133 标记 + 记录时的光标行(视口行,0=顶,与 `Damage::Lines` 同一
@@ -201,6 +203,7 @@ impl Surface {
             sidecar: crate::protocol::sidecar::SidecarParser::new(),
             sync_output: false,
             marks: Vec::new(),
+            jump_ref: None,
         }
     }
 
@@ -377,8 +380,53 @@ impl Surface {
     }
 
     /// 视口滚动(scrollback)。Delta(正) 向历史方向,Bottom 归零跟随。
+    /// 手动滚动重置 jump 锚(D37:锚只在连续 jump 链中保持)。
     pub fn scroll_display(&mut self, scroll: Scroll) {
+        self.jump_ref = None;
         self.term.scroll_display(scroll);
+    }
+
+    /// OSC 133 prompt 间跳转(D37)。锚 = 上次跳转目标(经 epoch 换算),
+    /// 无锚时取当前视口顶行;目标 prompt 行置于视口顶(负 Line = 历史区,
+    /// 活动屏内的目标只能归底跟随——无法滚出负偏移,天然限制)。
+    /// next 越过最新 prompt = 回底部跟随。返回是否发生滚动(需重绘)。
+    pub fn jump_prompt(&mut self, forward: bool) -> bool {
+        let hist = self.term.grid().history_size() as i32;
+        let ref_line = match self.jump_ref {
+            Some((l, e)) => l - (hist - e as i32),
+            None => -(self.term.grid().display_offset() as i32),
+        };
+        let prompts: Vec<i32> = self
+            .marks
+            .iter()
+            .filter(|m| matches!(m.mark, crate::protocol::sidecar::ShellMark::PromptStart))
+            .map(|m| m.line - (hist - m.epoch as i32))
+            .collect();
+        let target = if forward {
+            prompts.into_iter().filter(|&l| l > ref_line).min()
+        } else {
+            prompts.into_iter().filter(|&l| l < ref_line).max()
+        };
+        match target {
+            Some(l) => {
+                let want = (-l).max(0) as usize;
+                let delta = want as i32 - self.term.grid().display_offset() as i32;
+                if delta != 0 {
+                    self.term.scroll_display(Scroll::Delta(delta));
+                }
+                self.jump_ref = Some((l, hist as usize));
+                delta != 0
+            }
+            None => {
+                if forward && self.term.grid().display_offset() > 0 {
+                    self.term.scroll_display(Scroll::Bottom);
+                    self.jump_ref = None;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     /// 当前滚动偏移(0 = 钉在屏幕底跟随输出)。
@@ -804,6 +852,53 @@ mod tests {
         // 3 行屏:6 行文本+尾换行,前 3 行填屏后滚出 4 行 → history 4,
         // 原 0 行 → 0 - 4 = -4(滚进历史区,负 Line 语义)
         assert_eq!(marks[0].line, -4);
+    }
+
+    #[test]
+    fn jump_prompt_steps_through_prompts() {
+        let mut s = Surface::new(ScreenSize::new(10, 4));
+        s.feed(b"\x1b]133;A\x07p1\r\n");
+        s.feed(b"\x1b]133;A\x07p2\r\n");
+        s.feed(b"\x1b]133;A\x07p3\r\nout\r\n");
+        // hist=1;prompt 当前行:p1=-1(历史)、p2=0、p3=1(活动屏)
+        assert!(s.jump_prompt(false), "prev:唯一历史 prompt 命中");
+        assert_eq!(s.display_offset(), 1, "目标行置于视口顶");
+        assert!(!s.jump_prompt(false), "再往上没有 prompt");
+        assert!(s.jump_prompt(true), "next:回到 p2");
+        assert_eq!(s.display_offset(), 0);
+        assert!(!s.jump_prompt(true), "p3 在活动屏内,无需滚动即命中");
+        assert!(!s.jump_prompt(true), "越过最新且已在底:无变化");
+    }
+
+    #[test]
+    fn jump_prompt_next_past_all_snaps_to_bottom() {
+        let mut s = Surface::new(ScreenSize::new(10, 2));
+        s.feed(b"\x1b]133;A\x07p1\r\n");
+        s.feed(b"\x1b]133;A\x07p2\r\n");
+        s.feed(b"x\r\ny\r\nz\r\n");
+        // hist=4,p1=-4、p2=-3;滚到顶(offset 4,ref=-4)
+        s.scroll_display(ScrollCommand::Top);
+        assert_eq!(s.display_offset(), 4);
+        assert!(s.jump_prompt(true));
+        assert_eq!(s.display_offset(), 3, "跳到 p2");
+        // ref=-3,无更靠下的 prompt → 回底跟随
+        assert!(s.jump_prompt(true));
+        assert_eq!(s.display_offset(), 0, "越过全部 prompt = 回底");
+    }
+
+    #[test]
+    fn manual_scroll_resets_jump_anchor() {
+        let mut s = Surface::new(ScreenSize::new(10, 4));
+        s.feed(b"\x1b]133;A\x07p1\r\n");
+        s.feed(b"\x1b]133;A\x07p2\r\n");
+        s.feed(b"\x1b]133;A\x07p3\r\nout\r\n");
+        assert!(s.jump_prompt(false));
+        assert_eq!(s.display_offset(), 1);
+        // 手动滚回底:锚清除,next 的参照回到视口顶(0)而非锚(-1)
+        s.scroll_display(ScrollCommand::Bottom);
+        assert_eq!(s.display_offset(), 0);
+        assert!(s.jump_prompt(false), "锚已重置,ref=0 再次命中 p1(-1)");
+        assert_eq!(s.display_offset(), 1);
     }
 
     /// D29 吞吐预算:sidecar 双解析的回归。10MB 混合负载(SGR 文本行),
