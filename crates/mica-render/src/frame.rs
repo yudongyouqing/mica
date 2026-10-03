@@ -190,12 +190,22 @@ pub enum ExitDot {
 /// 系统按钮单宽(T8 视觉字形;hit-test 的 CAPTION_BTN_W 同值,布局单源)。
 pub const CAPTION_BTN: f32 = 46.0;
 
+/// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数;
+/// avail_w = 标签+加号区可用宽(客户区宽 - caption 区,0 = 不裁)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StripLayout {
+    pub tab_scroll: i32,
+    pub avail_w: f32,
+}
+
 /// tab strip 的 UI 实例(T7,spec §3 同管线):底条 + 标签块(活跃高亮),
 /// 标题文字经 router 路由(与终端共享图集),尾部 "+" 按钮开新标签。
 /// 文字按等宽 cell 步进排版——strip 只有标题一行,粗排版与终端观感一致。
-/// exit_dot(D37):活跃标签的命令状态点,画在 "+" 右侧(标题栏右)。
+/// exit_dot(D37):活跃标签的命令状态点,画在 caption 区左邻(固定锚)。
 /// caption_x(T8):系统按钮区起点(客户区坐标);Some 时画 — □ × 字形
 /// (路由字符,hit-test 已在;hover 态留后续)。
+/// layout(T8):溢出滚动——越界标签不发射(右缘由 caption bg 自然覆盖),
+/// 滚轮驱动滚动,箭头命中区暂缓(滚轮覆盖主痛点)。
 pub fn strip_quads(
     titles: &[(String, bool)],
     router: &mut dyn GlyphRouter,
@@ -203,9 +213,11 @@ pub fn strip_quads(
     palette: &Palette,
     exit_dot: Option<ExitDot>,
     caption_x: Option<f32>,
+    layout: StripLayout,
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
     let total_w = titles.len() as f32 * TAB_W + TAB_PLUS_W;
+    let shift = layout.tab_scroll as f32 * TAB_W;
     let bg_of = |rgb: [u8; 3]| to_color(rgb);
     // 底条(黑槽):宽度按需,不足以铺满也无妨(清屏色同源)
     out.push(CellInstance {
@@ -220,7 +232,10 @@ pub fn strip_quads(
     });
     let text_y = (STRIP_H - metrics.line_height).max(0.0) / 2.0;
     for (i, (title, active)) in titles.iter().enumerate() {
-        let x = i as f32 * TAB_W;
+        let x = i as f32 * TAB_W - shift;
+        if x + TAB_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w) {
+            continue; // 滚出可视区的标签不发射
+        }
         let block = if *active {
             palette.bg
         } else {
@@ -257,39 +272,42 @@ pub fn strip_quads(
             });
         }
     }
-    // "+" 按钮
-    let x = titles.len() as f32 * TAB_W;
-    let block = palette.colors[0];
-    let ink = palette.fg;
-    // 顶栏系统按钮占位(T8):右上三颗 — □ × 由 NC hit-test 命中;视觉
-    // 字形由 hit-test 的 CAPTION_BTN_W 常量几何驱动(同布局单源约束下,
-    // 按钮字形绘制放 app 层后续打磨,先保证 hit-test 可用)
-    out.push(CellInstance {
-        pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
-        size_uv: [TAB_PLUS_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
-        fg: bg_of([ink.r, ink.g, ink.b]),
-        bg: bg_of([block.r, block.g, block.b]),
-    });
-    let g = router.route('+', GlyphStyle::PLAIN);
-    out.push(CellInstance {
-        pos_uv: [
-            x + (TAB_PLUS_W - g.size_px[0]) / 2.0,
-            (STRIP_H - g.size_px[1]) / 2.0,
-            g.uv[0],
-            g.uv[1],
-        ],
-        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-        fg: bg_of([ink.r, ink.g, ink.b]),
-        bg: bg_of([block.r, block.g, block.b]),
-    });
-    // D37 exit 状态点:"+" 右侧,6px 八边形(3 rect 逼近,quad 管线零扩展)
+    // "+" 按钮(随滚动平移,同裁剪)
+    let x = titles.len() as f32 * TAB_W - shift;
+    if !(x + TAB_PLUS_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
+        let block = palette.colors[0];
+        let ink = palette.fg;
+        // 顶栏系统按钮占位(T8):右上三颗 — □ × 由 NC hit-test 命中;视觉
+        // 字形由 hit-test 的 CAPTION_BTN_W 常量几何驱动(同布局单源约束下,
+        // 按钮字形绘制放 app 层后续打磨,先保证 hit-test 可用)
+        out.push(CellInstance {
+            pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
+            size_uv: [TAB_PLUS_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
+            fg: bg_of([ink.r, ink.g, ink.b]),
+            bg: bg_of([block.r, block.g, block.b]),
+        });
+        let g = router.route('+', GlyphStyle::PLAIN);
+        out.push(CellInstance {
+            pos_uv: [
+                x + (TAB_PLUS_W - g.size_px[0]) / 2.0,
+                (STRIP_H - g.size_px[1]) / 2.0,
+                g.uv[0],
+                g.uv[1],
+            ],
+            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+            fg: bg_of([ink.r, ink.g, ink.b]),
+            bg: bg_of([block.r, block.g, block.b]),
+        });
+    }
+    // D37 exit 状态点:caption 区左邻(固定锚;无 caption 时 "+" 右侧),
+    // 6px 八边形(3 rect 逼近,quad 管线零扩展)
     if let Some(dot) = exit_dot {
         let slot = match dot {
             ExitDot::Green => palette.colors[2],
             ExitDot::Red => palette.colors[1],
             ExitDot::Gray => palette.colors[8],
         };
-        let dx = total_w + 10.0;
+        let dx = caption_x.map(|cx| cx - 14.0).unwrap_or(total_w + 10.0);
         let cy = STRIP_H / 2.0;
         for [rx, ry, rw, rh] in [
             [dx + 1.0, cy - 3.0, 4.0, 1.0],
@@ -799,7 +817,16 @@ mod tests {
         };
         let titles = vec![("t".to_string(), true)];
         let palette = Palette::DEFAULT;
-        let none_len = strip_quads(&titles, &mut r, &metrics_8x16(), &palette, None, None).len();
+        let none_len = strip_quads(
+            &titles,
+            &mut r,
+            &metrics_8x16(),
+            &palette,
+            None,
+            None,
+            Default::default(),
+        )
+        .len();
         let dot = strip_quads(
             &titles,
             &mut r,
@@ -807,6 +834,7 @@ mod tests {
             &palette,
             Some(ExitDot::Green),
             None,
+            Default::default(),
         );
         // 八边形 = 3 个 rect;None 不画
         assert_eq!(dot.len() - none_len, 3);

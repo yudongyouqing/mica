@@ -126,6 +126,8 @@ thread_local! {
     static MOUSE_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// hover 追踪已武装(TrackMouseEvent 每 hover 会话只需请求一次)
     static HOVER_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 标签溢出滚动(T8):向左滚过的标签数
+    static TAB_SCROLL: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     /// D28 hover 气泡:URL + 绘制锚(客户区坐标)。None = 不画
     static HOVER_URL: RefCell<Option<(String, f32, f32)>> =
         const { RefCell::new(None) };
@@ -912,6 +914,7 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>) {
     let pty_buf = Arc::clone(&tab.panes[0].terminal.pty_buf);
     TABS.with(|tabs| tabs.borrow_mut().push(tab));
     ACTIVE.with(|a| a.set(TABS.with(|tabs| tabs.borrow().len() - 1)));
+    tab_follow_active(); // T8:新标签滚入可视区(溢出时)
     if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
         spawn_render_forwarder(reader, pty_buf, slot, id);
     }
@@ -1152,6 +1155,10 @@ fn draw_frame() {
             exit_dot,
             // 系统按钮区(T8):NCHITTEST 的 CAPTION_BTN_W 同几何
             Some(area_w - 3.0 * CAPTION_BTN_W as f32),
+            mica_render::frame::StripLayout {
+                tab_scroll: TAB_SCROLL.with(std::cell::Cell::get),
+                avail_w: (area_w - 3.0 * CAPTION_BTN_W as f32).max(0.0),
+            },
         );
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
         if let Some((url, hx, hy)) = HOVER_URL.with(|h| h.borrow().clone()) {
@@ -1601,6 +1608,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 高位有符号 delta,120/格;WT 惯例 3 行/格(=delta/40)。
             // delta 正 = 滚轮向上 = 看历史(上游 Scroll::Delta 正值增 offset)
             let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+            // strip 上的滚轮 = 标签列表滚动(T8 溢出);lparam 是屏幕坐标
+            {
+                let mut pt = windows::Win32::Foundation::POINT {
+                    x: (lparam.0 & 0xffff) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+                };
+                // SAFETY: 坐标换算,输出写回本侧 POINT;失败仅停留在屏幕系
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+                }
+                if pt.y >= 0 && (pt.y as f32) < mica_render::frame::STRIP_H {
+                    // 滚轮向上 = 看左侧标签
+                    if tab_scroll_adjust(if delta > 0 { 1 } else { -1 }) {
+                        draw_frame();
+                    }
+                    return LRESULT(0);
+                }
+            }
             let mut scrolled = false;
             TABS.with(|tabs| {
                 if let Some(t) = tabs
@@ -1993,6 +2018,7 @@ fn switch_tab(idx: usize) {
             }
         }
     });
+    tab_follow_active(); // T8:溢出时活跃标签滚入可视区
     draw_frame();
 }
 
@@ -2032,7 +2058,8 @@ fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
     if py < 0 || py as f32 >= mica_render::frame::STRIP_H {
         return None; // 不在 strip 区
     }
-    let x = px.max(0) as f32;
+    let x =
+        px.max(0) as f32 + TAB_SCROLL.with(std::cell::Cell::get) as f32 * mica_render::frame::TAB_W;
     let n = TABS.with(|tabs| tabs.borrow().len());
     let idx = (x / mica_render::frame::TAB_W) as usize;
     if idx < n {
@@ -2041,6 +2068,58 @@ fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
         Some(None) // + 按钮
     } else {
         None
+    }
+}
+
+/// 标签溢出滚动调整(T8):步进 1 个标签宽,clamp 到 [0, max];返回是否变化。
+fn tab_scroll_adjust(delta: i32) -> bool {
+    let area_w = GPU
+        .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
+        .unwrap_or(0.0);
+    let avail = (area_w - 3.0 * CAPTION_BTN_W as f32).max(0.0);
+    let n = TABS.with(|tabs| tabs.borrow().len());
+    let need = mica_render::frame::TAB_W * n as f32 + mica_render::frame::TAB_PLUS_W;
+    let max = if avail <= 0.0 || need <= avail {
+        0
+    } else {
+        ((need - avail) / mica_render::frame::TAB_W).ceil() as i32
+    };
+    let old = TAB_SCROLL.with(std::cell::Cell::get);
+    let new = (old + delta).clamp(0, max);
+    if new != old {
+        TAB_SCROLL.with(|s| s.set(new));
+        true
+    } else {
+        false
+    }
+}
+
+/// 活跃标签滚入可视区(T8 自动跟随):切换/新建标签时调用。
+fn tab_follow_active() {
+    let area_w = GPU
+        .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
+        .unwrap_or(0.0);
+    let avail = (area_w - 3.0 * CAPTION_BTN_W as f32).max(0.0);
+    let n = TABS.with(|tabs| tabs.borrow().len()) as i32;
+    let visible = if avail <= 0.0 {
+        i32::MAX
+    } else {
+        (((avail - mica_render::frame::TAB_PLUS_W) / mica_render::frame::TAB_W).floor() as i32)
+            .max(1)
+    };
+    let active = ACTIVE.get() as i32;
+    let cur = TAB_SCROLL.with(std::cell::Cell::get);
+    let want = if active < cur + 1 {
+        (active - 1).max(0) // 左侧滚出:活跃前留一标签
+    } else if active > cur + visible.saturating_sub(1) {
+        active - visible + 1 // 右侧滚出
+    } else {
+        cur
+    };
+    let _ = n; // clamp 在 tab_scroll_adjust 内做
+    if want != cur {
+        TAB_SCROLL.with(|s| s.set(want));
+        let _ = tab_scroll_adjust(0); // clamp
     }
 }
 
