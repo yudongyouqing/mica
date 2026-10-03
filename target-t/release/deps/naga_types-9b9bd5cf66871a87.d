@@ -1,0 +1,11 @@
+C:\Project folder\项目\mica\target-t\release\deps\naga_types-9b9bd5cf66871a87.d: C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\lib.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\glsl.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\hlsl.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\msl.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\spv.rs
+
+C:\Project folder\项目\mica\target-t\release\deps\libnaga_types-9b9bd5cf66871a87.rlib: C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\lib.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\glsl.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\hlsl.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\msl.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\spv.rs
+
+C:\Project folder\项目\mica\target-t\release\deps\libnaga_types-9b9bd5cf66871a87.rmeta: C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\lib.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\glsl.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\hlsl.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\msl.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\spv.rs
+
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\lib.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\glsl.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\hlsl.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\msl.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\naga-types-30.0.1\src\spv.rs:

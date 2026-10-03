@@ -1,0 +1,14 @@
+C:\Project folder\项目\mica\target-t\release\deps\serde-e68283ba83808119.d: C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs C:\Project\ folder\项目\mica\target-t\release\build\serde-1f4725e0c5a1989b\out/private.rs
+
+C:\Project folder\项目\mica\target-t\release\deps\libserde-e68283ba83808119.rlib: C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs C:\Project\ folder\项目\mica\target-t\release\build\serde-1f4725e0c5a1989b\out/private.rs
+
+C:\Project folder\项目\mica\target-t\release\deps\libserde-e68283ba83808119.rmeta: C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs C:\Project\ folder\项目\mica\target-t\release\build\serde-1f4725e0c5a1989b\out/private.rs
+
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\lib.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\integer128.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\mod.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\de.rs:
+C:\Users\yudongyouqing\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.229\src\private\ser.rs:
+C:\Project\ folder\项目\mica\target-t\release\build\serde-1f4725e0c5a1989b\out/private.rs:
+
+# env-dep:OUT_DIR=C:\\Project folder\\项目\\mica\\target-t\\release\\build\\serde-1f4725e0c5a1989b\\out
