@@ -169,6 +169,10 @@ struct Terminal {
     /// 行级实例缓存(Task 8):draw_frame 按 damage 增量重建,容量恒等于
     /// 视口行数(结构守恒在 frame::build_rows 内兜底)
     row_insts: Vec<RowInst>,
+    /// 重开用(M5b/T3):pane 的 shell 命令串(profile 出处不存,重启等价)
+    shell: String,
+    /// 子进程退出码(M5b/T3):Some = 已退出,冻结尾帧 + strip 提示 + 重开
+    exited: Option<u32>,
     /// 结构性失配(resize、热重载换字体/主题)置位:下一帧无视 term 脏区
     /// 强制全量重建。Term::resize 自身会标 full,但那属于上游实现细节,
     /// 几何失配必须显式钉死在本层
@@ -293,6 +297,8 @@ pub fn run() {
 
         if CURSOR_BLINK.with(std::cell::Cell::get) {
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 500, None);
+            // 子进程退出轮询(M5b/T3):1s 粒度足够(退出不是高频事件)
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 3, 1000, None);
         }
 
         // T5/T7:后台线程共用的窗口哨兵,窗口创建后建立(两个线程都要投递)
@@ -703,6 +709,78 @@ fn rebuild_gpu_after_loss() {
     });
 }
 
+/// 轮询各 pane 子进程退出(M5b/T3):首次探得退出记 code。返回是否有新
+/// 退出(调用方触发重绘)。EOF 后读线程自然静默,1s 轮询补上"退出"事实。
+fn poll_exits() -> bool {
+    let mut changed = false;
+    TABS.with(|tabs| {
+        for tab in tabs.borrow_mut().iter_mut() {
+            for pane in tab.panes.iter_mut() {
+                let t = &mut pane.terminal;
+                if t.exited.is_none()
+                    && let Ok(Some(st)) = t.session.try_wait()
+                {
+                    t.exited = Some(st.exit_code());
+                    changed = true;
+                }
+            }
+        }
+    });
+    changed
+}
+
+/// 重开活跃 pane(M5b/T3):同 shell 新 pty,复用 pane 槽/id/图集/网格;
+/// surface 换新(旧画面属旧会话,重开即干净起步),退出态清零。
+fn restart_active_pane() -> bool {
+    let Some((shell, cols, rows)) = TABS.with(|tabs| {
+        tabs.borrow_mut()
+            .get_mut(ACTIVE.get())
+            .and_then(|tab| tab.active_pane())
+            .map(|t| (t.shell.clone(), t.cols, t.rows))
+    }) else {
+        return false;
+    };
+    TABS.with(|tabs| {
+        let mut guard = tabs.borrow_mut();
+        let Some(tab) = guard.get_mut(ACTIVE.get()) else {
+            return;
+        };
+        let Some(pid) = tab.active_pane_id() else {
+            return;
+        };
+        let Some(pane) = tab.pane_by_id(pid) else {
+            return;
+        };
+        let t = &mut pane.terminal;
+        let Ok((session, reader)) =
+            PtySession::spawn(mica_core::pty::command_from_str(&shell), cols, rows)
+        else {
+            eprintln!("[restart] spawn 失败: {shell}");
+            return;
+        };
+        t.session = session; // 旧 session drop(子已死,kill 无副作用)
+        t.exited = None;
+        // 干净起步:新 Surface 重置网格(度量/调色板/剪贴板 provider 同建)
+        let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
+        term.set_cell_metrics(
+            t.metrics.cell_width.round() as u16,
+            t.metrics.line_height.round() as u16,
+        );
+        term.set_palette(&t.palette);
+        term.set_clipboard_provider(Arc::new(|| clipboard::get_text().unwrap_or_default()));
+        t.term = term;
+        t.row_insts.clear();
+        t.force_full = true;
+        t.pty_buf.lock().expect("pty buffer poisoned").clear();
+        // 重挂转发线程(同 pane id:WM_APP_RENDER 寻址不变)
+        let pty_buf = Arc::clone(&t.pty_buf);
+        if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
+            spawn_render_forwarder(reader, pty_buf, slot, pid);
+        }
+    });
+    true
+}
+
 /// 建一个新标签(T7):router 按当前 TAB_SEED(启动设置或最近热重载),
 /// 网格按客户区减 strip 高换算。返回 (TabState, reader, pty_buf)。
 /// 活跃标签的 pane 矩形表(鼠标路由与 draw_frame 同源几何)。
@@ -914,6 +992,8 @@ unsafe fn create_pane_with_size(
         renderer_atlas_revision: u64::MAX,
         row_insts: Vec::new(), // 首建即空:build_rows 的长度守恒兜底 → 首帧全量
         force_full: true,      // 首帧显式全量,不依赖哨兵的先后
+        shell: shell_command.to_string(),
+        exited: None,
     };
     let pane_id = NEXT_TAB_ID.with(|n| n.replace(n.get() + 1));
     (
@@ -1069,7 +1149,13 @@ fn draw_frame() {
         let titles: Vec<(String, bool)> = guard
             .iter()
             .enumerate()
-            .map(|(i, tab)| (tab.title.clone(), i == ACTIVE.get()))
+            .map(|(i, tab)| {
+                let mut title = tab.title.clone();
+                if let Some(code) = tab.active_pane_ref().and_then(|t| t.exited) {
+                    title.push_str(&format!(" [exit {code}]"));
+                }
+                (title, i == ACTIVE.get())
+            })
             .collect();
         let Some(active) = guard.get_mut(ACTIVE.get()) else {
             return;
@@ -1854,7 +1940,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_TIMER => {
-            // id 分流:2 = 2026 同步安全阀(D29);1 = 光标闪烁(D20)
+            // id 分流:2 = 2026 同步安全阀(D29);1 = 光标闪烁(D20);
+            // 3 = 子进程退出轮询(M5b/T3)
+            if wparam.0 == 3 && poll_exits() {
+                draw_frame();
+                return LRESULT(0);
+            }
             match wparam.0 {
                 2 => {
                     windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2).ok();
@@ -2217,6 +2308,11 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                     t.term.scroll_display(ScrollCommand::Delta(n));
                     t.force_full = true;
                     need_draw = true;
+                }
+                Action::RestartPane => {
+                    if restart_active_pane() {
+                        need_draw = true;
+                    }
                 }
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
                     if t.term.jump_prompt(matches!(action, Action::JumpNextPrompt)) {
