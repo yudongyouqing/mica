@@ -23,6 +23,7 @@ serde_json = "1"
 windows-numerics = "0.3.1"
 notify = "8.2"
 windows = "0.62"
+windows-core = "0.62"
 
 [profile.dev]
 # 终端是吞吐敏感负载,opt 1 让本地开发不用忍 10x 慢的 debug 渲染

@@ -620,6 +620,7 @@ dependencies = [
  "raw-window-handle",
  "wgpu",
  "windows",
+ "windows-core",
  "winres",
 ]
 
