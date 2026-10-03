@@ -51,10 +51,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG,
     MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowTextW,
     TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-    WM_PAINT, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE, WM_SYSCHAR,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
@@ -846,6 +846,61 @@ unsafe fn reload_dpi(hwnd: HWND, dpi: u32) {
     });
 }
 
+/// IME 组合窗/候选窗定位(M5b/T5):跟随焦点 pane 的终端光标格。
+/// 坐标链:pane 原点 + 光标格(客户区)→ ClientToScreen → ImmSet*。
+fn position_ime(hwnd: HWND) {
+    let Some((cx, cy)) = TABS.with(|tabs| {
+        let guard = tabs.borrow();
+        let tab = guard.get(ACTIVE.get())?;
+        let pid = tab.active_pane_id()?;
+        let t = tab.active_pane_ref()?;
+        let rect = active_pane_rects()
+            .into_iter()
+            .find(|(id, _)| *id == pid)
+            .map(|(_, r)| r)?;
+        let grid = t.term.grid();
+        let col = grid.cursor.point.column.0 as f32;
+        let line = grid.cursor.point.line.0.max(0) as f32;
+        Some((
+            rect.x + (col + 0.5) * t.metrics.cell_width,
+            rect.y + (line + 1.0) * t.metrics.line_height, // 候选框排在光标行下缘
+        ))
+    }) else {
+        return;
+    };
+    // SAFETY: 坐标换算与 IMM 上下文,输出/句柄本侧承接
+    unsafe {
+        let mut pt = windows::Win32::Foundation::POINT {
+            x: cx as i32,
+            y: cy as i32,
+        };
+        let _ = windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut pt);
+        let himc = windows::Win32::UI::Input::Ime::ImmGetContext(hwnd);
+        if himc.is_invalid() {
+            return;
+        }
+        let comp = windows::Win32::UI::Input::Ime::COMPOSITIONFORM {
+            dwStyle: windows::Win32::UI::Input::Ime::CFS_POINT,
+            ptCurrentPos: pt,
+            rcArea: RECT::default(),
+        };
+        let _ = windows::Win32::UI::Input::Ime::ImmSetCompositionWindow(himc, &comp);
+        let cand = windows::Win32::UI::Input::Ime::CANDIDATEFORM {
+            dwIndex: 0,
+            dwStyle: windows::Win32::UI::Input::Ime::CFS_EXCLUDE,
+            ptCurrentPos: pt,
+            rcArea: RECT {
+                left: pt.x,
+                top: pt.y,
+                right: pt.x,
+                bottom: pt.y,
+            },
+        };
+        let _ = windows::Win32::UI::Input::Ime::ImmSetCandidateWindow(himc, &cand);
+        let _ = windows::Win32::UI::Input::Ime::ImmReleaseContext(hwnd, himc);
+    }
+}
+
 /// 建一个新标签(T7):router 按当前 TAB_SEED(启动设置或最近热重载),
 /// 网格按客户区减 strip 高换算。返回 (TabState, reader, pty_buf)。
 /// 活跃标签的 pane 矩形表(鼠标路由与 draw_frame 同源几何)。
@@ -1402,6 +1457,13 @@ fn draw_frame() {
 /// WM_CHAR;方向/编辑键没有字符事件,走 WM_KEYDOWN 的 VK 映射。
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        WM_IME_SETCONTEXT | WM_IME_STARTCOMPOSITION => {
+            // IME 跟随(M5b/T5):激活/开始组合前把组合窗与候选窗定到终端
+            // 光标格下缘;默认链(DefWindowProc)负责上下文与结果字符——
+            // 提交文本经 WM_IME_CHAR→WM_CHAR 到达,既有 WM_CHAR 路径接管
+            position_ime(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_CHAR => {
             // 代理对重组:Rust 的 char 不含代理码位,不重组的话 emoji
             // 两个 WM_CHAR 都在 from_u32 处变 None 被丢弃,永远发不出去
