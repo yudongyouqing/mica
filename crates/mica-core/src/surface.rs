@@ -756,6 +756,52 @@ mod tests {
         assert!(s.take_shell_marks().is_empty());
     }
 
+    /// D29 吞吐预算:sidecar 双解析的回归。10MB 混合负载(SGR 文本行),
+    /// A = `Surface::feed`(含 sidecar),B = 直调主 `Processor::advance`
+    /// (单解析基线,同 Term 配置)。回归 >5% 则按 spec 换字节前缀快筛。
+    /// 秒级耗时,默认 ignore:`cargo test -p mica-core sidecar_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn sidecar_throughput_budget() {
+        let line =
+            b"\x1b[32mhello world 0123456789 abcdefghijklmnopqrstuvwxyz \x1b[0m tail text\r\n";
+        let target = 10 * 1024 * 1024;
+        let mut data = Vec::with_capacity(target + line.len());
+        while data.len() < target {
+            data.extend_from_slice(line);
+        }
+        // 4KB 块:pty 读线程的真实粒度
+        let chunks: Vec<&[u8]> = data.chunks(4096).collect();
+
+        let mut a = Surface::new(ScreenSize::new(80, 24));
+        let mut dur_a = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            for c in &chunks {
+                a.feed(c);
+            }
+            dur_a = dur_a.min(t0.elapsed());
+        }
+
+        let mut b = Surface::new(ScreenSize::new(80, 24));
+        let mut dur_b = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            for c in &chunks {
+                b.parser.advance(&mut b.term, c);
+            }
+            dur_b = dur_b.min(t0.elapsed());
+        }
+
+        let regression = (dur_a.as_secs_f64() / dur_b.as_secs_f64() - 1.0) * 100.0;
+        println!("A feed+sidecar = {dur_a:?}   B main-only = {dur_b:?}   回归 = {regression:.1}%");
+        // 预算判定只在 release 成立:debug 下门控的字节扫描无优化,比例
+        // 失真(实测 debug ~9% vs release ~2%),断言会误报
+        if !cfg!(debug_assertions) {
+            assert!(regression < 5.0, "D29 吞吐预算超支:{regression:.1}% > 5%");
+        }
+    }
+
     /// DECSCUSR(xterm 语义):1|2=块、3|4=下划线、5|6=beam;0=重置默认。
     #[test]
     fn decscusr_changes_cursor_shape() {
