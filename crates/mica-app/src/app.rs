@@ -327,7 +327,7 @@ pub fn run() {
         if start_profile.is_some() {
             std::env::remove_var("MICA_START_PROFILE");
         }
-        start_tab_with_profile(hwnd, start_profile.as_deref());
+        start_tab_with_profile(hwnd, start_profile.as_deref(), None);
         // GPU 建后补一次 clear_color(默认 palette;create_tab 不碰窗口资源)
         GPU.with(|g| {
             if let Some(gpu) = g.borrow_mut().as_mut() {
@@ -811,7 +811,19 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
 }
 
 unsafe fn create_pane(hwnd: HWND, shell_command: &str) -> (PaneState, PtyReader) {
+    create_pane_with_size(hwnd, shell_command, None)
+}
+
+/// T9:font_size 覆盖 seed 字号(Some 时),其余同 [`create_pane`]。
+unsafe fn create_pane_with_size(
+    hwnd: HWND,
+    shell_command: &str,
+    font_size: Option<f32>,
+) -> (PaneState, PtyReader) {
     let (families, size_pt) = TAB_SEED.with(|s| s.borrow().clone());
+    let size_pt = font_size
+        .filter(|s| (6.0..=72.0).contains(s))
+        .unwrap_or(size_pt);
     let families: Vec<&str> = if families.is_empty() {
         DEFAULT_FAMILIES.to_vec()
     } else {
@@ -876,12 +888,13 @@ unsafe fn create_pane(hwnd: HWND, shell_command: &str) -> (PaneState, PtyReader)
 /// 建标签并接入渲染链(T7):create_pane 包成 Tab → 入池 → forwarder
 /// (WPARAM=pane id)→ 置为活跃。NewTab 动作与启动路径共用。
 unsafe fn start_tab(hwnd: HWND) {
-    start_tab_with_profile(hwnd, None);
+    start_tab_with_profile(hwnd, None, None);
 }
 
 /// 带 profile 的建标签(M3a):IPC new-tab / CLI 注入。名字在 scan_all
-/// 里查(大小写不敏感);查不到回落默认并记日志。
-unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>) {
+/// 里查(大小写不敏感);查不到回落默认并记日志。font_size(T9)覆盖
+/// 启动字号(pt),None 跟随全局 seed——每标签字号的 IPC 通路。
+unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>, font_size: Option<f32>) {
     let profiles = mica_core::profile::scan_all();
     let picked = profile.and_then(|name| {
         let p = profiles
@@ -901,7 +914,7 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>) {
         .as_ref()
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "PowerShell".to_string());
-    let (pane, reader) = create_pane(hwnd, &shell);
+    let (pane, reader) = create_pane_with_size(hwnd, &shell, font_size);
     let pane_id = pane.id;
     let tab = TabState {
         title,
@@ -1937,7 +1950,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             {
                 if msg.op == "new-tab" {
                     let profile = msg.profile.as_deref();
-                    start_tab_with_profile(hwnd, profile);
+                    start_tab_with_profile(hwnd, profile, msg.font_size);
                 }
             }
             // activate 语义(两条消息共用):前置既有窗口
