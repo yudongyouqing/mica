@@ -154,8 +154,16 @@ pub struct Surface {
     sidecar: crate::protocol::sidecar::SidecarParser,
     /// 最近一次 feed 是否处于同步输出窗口(2026h..2026l),app 据此持帧。
     sync_output: bool,
-    /// 最近一次 feed 到达的 OSC 133 标记(取走即清;行号由消费方结合光标记录,M5 消费)。
-    pending_marks: Vec<crate::protocol::sidecar::ShellMark>,
+    /// 最近一次 feed 到达的 OSC 133 标记(取走即清)。
+    pending_marks: Vec<RowMark>,
+}
+
+/// OSC 133 标记 + 记录时的光标行(视口行,0=顶,与 `Damage::Lines` 同一
+/// 坐标系;上游光标坐标恒在活动屏内,与 display_offset 无关)。M5 消费。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowMark {
+    pub mark: crate::protocol::sidecar::ShellMark,
+    pub line: i32,
 }
 
 impl Surface {
@@ -193,7 +201,14 @@ impl Surface {
             // 幂等:end 在超时后到(HELD 已 false)只画不重置(D29 竞态缓解)。
             self.sync_output = false;
         }
-        self.pending_marks.extend(events.marks);
+        if !events.marks.is_empty() {
+            // 行号 = 本块开始时的光标行(视口坐标,0=顶,与 Damage 同系)。
+            // sidecar 不产字节偏移,块内多个标记共用同一行——块粒度近似,
+            // 典型 shell 集成每个标记独立 write,实践偏差为零。
+            let line = self.term.grid().cursor.point.line.0;
+            self.pending_marks
+                .extend(events.marks.into_iter().map(|mark| RowMark { mark, line }));
+        }
         self.parser.advance(&mut self.term, bytes);
     }
 
@@ -210,8 +225,9 @@ impl Surface {
         self.sync_output = false;
     }
 
-    /// 取走上次 feed 后到达的 OSC 133 标记(D30:解析+存储,M5 消费)。
-    pub fn take_shell_marks(&mut self) -> Vec<crate::protocol::sidecar::ShellMark> {
+    /// 取走上次 feed 后到达的 OSC 133 标记(D30:解析+存储,M5 消费)。line 为
+    /// 标记所在块开始时的光标行(视口坐标,0=顶,与 damage 同一坐标系)。
+    pub fn take_shell_marks(&mut self) -> Vec<RowMark> {
         std::mem::take(&mut self.pending_marks)
     }
 
@@ -704,7 +720,14 @@ mod tests {
         // 2026h + 133;A 同流到达
         s.feed(b"\x1b[?2026h chunk1 \x1b]133;A\x1b\\ prompt");
         assert!(s.sync_output_active(), "2026h 后进入同步窗口");
-        assert_eq!(s.take_shell_marks(), vec![ShellMark::PromptStart]);
+        assert_eq!(
+            s.take_shell_marks(),
+            vec![RowMark {
+                mark: ShellMark::PromptStart,
+                line: 0
+            }],
+            "行号按块开始时的光标行记录(新屏光标在顶行)"
+        );
         // 2026l 结束窗口
         s.feed(b"tail \x1b[?2026l");
         assert!(!s.sync_output_active());
@@ -713,6 +736,24 @@ mod tests {
         assert!(s.sync_output_active());
         s.mark_sync_flushed();
         assert!(!s.sync_output_active(), "超时强制放帧后窗口关闭");
+    }
+
+    #[test]
+    fn marks_record_cursor_line_at_chunk_start() {
+        use crate::protocol::sidecar::ShellMark;
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        // 前一块把光标推到第 2 行;随后独立到达的 133;C 记录该行号
+        s.feed(b"one\r\ntwo\r\n");
+        s.feed(b"\x1b]133;C\x07out");
+        assert_eq!(
+            s.take_shell_marks(),
+            vec![RowMark {
+                mark: ShellMark::OutputStart,
+                line: 2
+            }]
+        );
+        // 取走即清
+        assert!(s.take_shell_marks().is_empty());
     }
 
     /// DECSCUSR(xterm 语义):1|2=块、3|4=下划线、5|6=beam;0=重置默认。
