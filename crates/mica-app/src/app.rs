@@ -1268,7 +1268,7 @@ unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     // 响应")。故意泄漏换可靠退出(Alacritty/WezTerm 同款哲学):进程
     // 一死 OS 全额回收,泄漏上限 = 进程生命期。
     eprintln!("[exit] step5: leak GPU/QT/terminals (deliberate)");
-    std::mem::forget(TABS.with(|tabs| tabs.borrow_mut().clear()));
+    std::mem::forget(TABS.with(|tabs| std::mem::take(&mut *tabs.borrow_mut())));
     std::mem::forget(GPU.with(|g| g.borrow_mut().take()));
     crate::app::quickterm::forget_state();
     eprintln!("[exit] step6: done");
