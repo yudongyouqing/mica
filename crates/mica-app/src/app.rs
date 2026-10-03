@@ -1150,6 +1150,8 @@ fn draw_frame() {
             &t.metrics,
             &t.palette,
             exit_dot,
+            // 系统按钮区(T8):NCHITTEST 的 CAPTION_BTN_W 同几何
+            Some(area_w - 3.0 * CAPTION_BTN_W as f32),
         );
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
         if let Some((url, hx, hy)) = HOVER_URL.with(|h| h.borrow().clone()) {

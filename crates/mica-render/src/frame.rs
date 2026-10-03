@@ -187,16 +187,22 @@ pub enum ExitDot {
     Gray,
 }
 
+/// 系统按钮单宽(T8 视觉字形;hit-test 的 CAPTION_BTN_W 同值,布局单源)。
+pub const CAPTION_BTN: f32 = 46.0;
+
 /// tab strip 的 UI 实例(T7,spec §3 同管线):底条 + 标签块(活跃高亮),
 /// 标题文字经 router 路由(与终端共享图集),尾部 "+" 按钮开新标签。
 /// 文字按等宽 cell 步进排版——strip 只有标题一行,粗排版与终端观感一致。
 /// exit_dot(D37):活跃标签的命令状态点,画在 "+" 右侧(标题栏右)。
+/// caption_x(T8):系统按钮区起点(客户区坐标);Some 时画 — □ × 字形
+/// (路由字符,hit-test 已在;hover 态留后续)。
 pub fn strip_quads(
     titles: &[(String, bool)],
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
     exit_dot: Option<ExitDot>,
+    caption_x: Option<f32>,
 ) -> Vec<CellInstance> {
     let mut out = Vec::new();
     let total_w = titles.len() as f32 * TAB_W + TAB_PLUS_W;
@@ -300,6 +306,35 @@ pub fn strip_quads(
                     palette.colors[0].b,
                 ]),
             });
+        }
+    }
+    // 系统按钮区(T8):— □ ×,路由字符(hit-test 已在 NCHITTEST,同几何
+    // 单源:每颗 CAPTION_BTN 宽,起点 caption_x = 客户区右缘 - 3×宽)
+    if let Some(cx) = caption_x {
+        let ink = palette.fg;
+        let block = palette.colors[0];
+        for (i, glyph) in ['\u{2500}', '\u{25a1}', '\u{00d7}'].iter().enumerate() {
+            let bx = cx + i as f32 * CAPTION_BTN;
+            out.push(CellInstance {
+                pos_uv: [bx + 1.0, 1.0, 0.0, 0.0],
+                size_uv: [CAPTION_BTN - 2.0, STRIP_H - 2.0, 0.0, 0.0],
+                fg: bg_of([ink.r, ink.g, ink.b]),
+                bg: bg_of([block.r, block.g, block.b]),
+            });
+            let g = router.route(*glyph, GlyphStyle::PLAIN);
+            if g.size_px[0] > 0.0 {
+                out.push(CellInstance {
+                    pos_uv: [
+                        bx + (CAPTION_BTN - g.size_px[0]) / 2.0 + g.offset_px[0],
+                        (STRIP_H - g.size_px[1]) / 2.0 + g.offset_px[1],
+                        g.uv[0],
+                        g.uv[1],
+                    ],
+                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                    fg: bg_of([ink.r, ink.g, ink.b]),
+                    bg: bg_of([block.r, block.g, block.b]),
+                });
+            }
         }
     }
     out
@@ -764,13 +799,14 @@ mod tests {
         };
         let titles = vec![("t".to_string(), true)];
         let palette = Palette::DEFAULT;
-        let none_len = strip_quads(&titles, &mut r, &metrics_8x16(), &palette, None).len();
+        let none_len = strip_quads(&titles, &mut r, &metrics_8x16(), &palette, None, None).len();
         let dot = strip_quads(
             &titles,
             &mut r,
             &metrics_8x16(),
             &palette,
             Some(ExitDot::Green),
+            None,
         );
         // 八边形 = 3 个 rect;None 不画
         assert_eq!(dot.len() - none_len, 3);
