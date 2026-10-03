@@ -1673,9 +1673,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // 先取状态到局部再写 guard,避开 t(&mut 借用)与 guard 交叉
                 // 全部 t 状态先取局部(t 是 guard 的 &mut,不再交叉借用 guard
                 let title_opt: Option<String> = t.term.take_title();
-                // OSC 133 标记(D30):M4 到存储为止,app 侧在此排空防积压;
-                // M5 消费(jump/状态行)时在此接入
-                let _ = t.term.take_shell_marks();
+                // OSC 133 行属性表(D37):core 持久累积(上限内),app 不再
+                // 排空;jump(T2)与 exit 状态点(T3)经 shell_marks() 消费
                 let sync_open = t.term.sync_output_active();
                 let mut flush = sync_open; // 放帧时刻需要全量重绘
                 let was_held = SYNC_HELD.replace(false);

@@ -154,17 +154,31 @@ pub struct Surface {
     sidecar: crate::protocol::sidecar::SidecarParser,
     /// 最近一次 feed 是否处于同步输出窗口(2026h..2026l),app 据此持帧。
     sync_output: bool,
-    /// 最近一次 feed 到达的 OSC 133 标记(取走即清)。
-    pending_marks: Vec<RowMark>,
+    /// OSC 133 行属性表(D37):持久累积,超 `MAX_MARKS` 淘汰最旧。
+    marks: Vec<MarkRecord>,
 }
 
 /// OSC 133 标记 + 记录时的光标行(视口行,0=顶,与 `Damage::Lines` 同一
-/// 坐标系;上游光标坐标恒在活动屏内,与 display_offset 无关)。M5 消费。
+/// 坐标系;上游光标坐标恒在活动屏内,与 display_offset 无关)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowMark {
     pub mark: crate::protocol::sidecar::ShellMark,
     pub line: i32,
 }
+
+/// 行属性表的内部记录:行号 + 记录瞬间的 history 深度(epoch)。
+/// 消费时换算:`current = line - (hist_now - epoch)`——内容上滚 = 行号
+/// 减小 = history 同步增长的恒等式。resize 重排会破恒等式(近似,v1 接受,
+/// M5a 冒烟把关);alt screen 的标记视同废弃。
+#[derive(Debug, Clone, Copy)]
+struct MarkRecord {
+    mark: crate::protocol::sidecar::ShellMark,
+    line: i32,
+    epoch: usize,
+}
+
+/// 行属性表上限:长会话千级 prompt 足够,jump 只关心最近的。
+const MAX_MARKS: usize = 4096;
 
 impl Surface {
     pub fn new(size: ScreenSize) -> Self {
@@ -186,7 +200,7 @@ impl Surface {
             has_drawn: false,
             sidecar: crate::protocol::sidecar::SidecarParser::new(),
             sync_output: false,
-            pending_marks: Vec::new(),
+            marks: Vec::new(),
         }
     }
 
@@ -206,8 +220,18 @@ impl Surface {
             // sidecar 不产字节偏移,块内多个标记共用同一行——块粒度近似,
             // 典型 shell 集成每个标记独立 write,实践偏差为零。
             let line = self.term.grid().cursor.point.line.0;
-            self.pending_marks
-                .extend(events.marks.into_iter().map(|mark| RowMark { mark, line }));
+            let epoch = self.term.grid().history_size();
+            self.marks
+                .extend(
+                    events
+                        .marks
+                        .into_iter()
+                        .map(|mark| MarkRecord { mark, line, epoch }),
+                );
+            let overflow = self.marks.len().saturating_sub(MAX_MARKS);
+            if overflow > 0 {
+                self.marks.drain(..overflow);
+            }
         }
         self.parser.advance(&mut self.term, bytes);
     }
@@ -225,10 +249,17 @@ impl Surface {
         self.sync_output = false;
     }
 
-    /// 取走上次 feed 后到达的 OSC 133 标记(D30:解析+存储,M5 消费)。line 为
-    /// 标记所在块开始时的光标行(视口坐标,0=顶,与 damage 同一坐标系)。
-    pub fn take_shell_marks(&mut self) -> Vec<RowMark> {
-        std::mem::take(&mut self.pending_marks)
+    /// OSC 133 行属性表(D37):换算到当前视口坐标的标记行,幂等读。
+    /// 持久累积(上限 MAX_MARKS);换算恒等式见 `MarkRecord`。
+    pub fn shell_marks(&self) -> Vec<RowMark> {
+        let now = self.term.grid().history_size() as i32;
+        self.marks
+            .iter()
+            .map(|r| RowMark {
+                mark: r.mark,
+                line: r.line - (now - r.epoch as i32),
+            })
+            .collect()
     }
 
     pub fn resize(&mut self, size: ScreenSize) {
@@ -716,12 +747,12 @@ mod tests {
         use crate::protocol::sidecar::ShellMark;
         let mut s = Surface::new(ScreenSize::new(10, 3));
         assert!(!s.sync_output_active());
-        assert!(s.take_shell_marks().is_empty());
+        assert!(s.shell_marks().is_empty());
         // 2026h + 133;A 同流到达
         s.feed(b"\x1b[?2026h chunk1 \x1b]133;A\x1b\\ prompt");
         assert!(s.sync_output_active(), "2026h 后进入同步窗口");
         assert_eq!(
-            s.take_shell_marks(),
+            s.shell_marks(),
             vec![RowMark {
                 mark: ShellMark::PromptStart,
                 line: 0
@@ -746,14 +777,33 @@ mod tests {
         s.feed(b"one\r\ntwo\r\n");
         s.feed(b"\x1b]133;C\x07out");
         assert_eq!(
-            s.take_shell_marks(),
+            s.shell_marks(),
             vec![RowMark {
                 mark: ShellMark::OutputStart,
                 line: 2
             }]
         );
-        // 取走即清
-        assert!(s.take_shell_marks().is_empty());
+        // 幂等读:重复调用不消耗
+        assert_eq!(s.shell_marks().len(), 1);
+    }
+
+    #[test]
+    fn marks_shift_with_scrollback() {
+        use crate::protocol::sidecar::ShellMark;
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        // prompt 标记落在第 0 行(epoch 0),随后输出把屏幕滚 3 行
+        s.feed(b"\x1b]133;A\x07PS> ");
+        s.feed(b"l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\n");
+        let marks = s.shell_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(
+            marks[0].mark,
+            ShellMark::PromptStart,
+            "标记类型保持;行号换算到当前视口系"
+        );
+        // 3 行屏:6 行文本+尾换行,前 3 行填屏后滚出 4 行 → history 4,
+        // 原 0 行 → 0 - 4 = -4(滚进历史区,负 Line 语义)
+        assert_eq!(marks[0].line, -4);
     }
 
     /// D29 吞吐预算:sidecar 双解析的回归。10MB 混合负载(SGR 文本行),
