@@ -165,10 +165,27 @@ impl Palette {
         Ok(())
     }
 
-    /// OSC 查询应答口径(ColorRequest 索引):16 色槽 + 256/257/258。
+    /// OSC 查询应答口径(ColorRequest 索引):16 色槽 + 256/257/258;
+    /// 16-231 = 256 色立方(6³,标准 xterm 公式),232-255 = 灰阶
+    /// (8+10n)。M5a/T7:此前 16-255 误答光标色。
     pub fn query(&self, index: usize) -> Rgb {
         match index {
             0..=15 => self.colors[index],
+            16..=231 => {
+                // 立方坐标 c = index - 16;r=c/36、g=c/6%6、b=c%6;
+                // 每级 × 51(0,51,…,255)
+                let c = index - 16;
+                let lv = |axis: u32| ((c / 6usize.pow(axis)) % 6 * 51) as u8;
+                Rgb {
+                    r: lv(2),
+                    g: lv(1),
+                    b: lv(0),
+                }
+            }
+            232..=255 => {
+                let v = (8 + 10 * (index - 232)) as u8;
+                Rgb { r: v, g: v, b: v }
+            }
             256 => self.fg,
             257 => self.bg,
             _ => self.cursor,
@@ -299,5 +316,36 @@ mod tests {
         assert_eq!(p.query(256), p.fg);
         assert_eq!(p.query(257), p.bg);
         assert_eq!(p.query(258), p.cursor);
+    }
+
+    /// 256 色立方与灰阶公式(T7):锚点值锁 xterm 标准口径。
+    #[test]
+    fn query_cube_and_grayscale_anchors() {
+        let p = Palette::DEFAULT;
+        // 立方角:16=(0,0,0)黑、17=(0,0,1)蓝 51、21=(0,0,5)蓝 255、
+        // 231=(5,5,5)白、196=(5,0,0)红 255
+        assert_eq!(p.query(16), Rgb { r: 0, g: 0, b: 0 });
+        assert_eq!(p.query(17), Rgb { r: 0, g: 0, b: 51 });
+        assert_eq!(p.query(21), Rgb { r: 0, g: 0, b: 255 });
+        assert_eq!(
+            p.query(231),
+            Rgb {
+                r: 255,
+                g: 255,
+                b: 255
+            }
+        );
+        assert_eq!(p.query(196), Rgb { r: 255, g: 0, b: 0 });
+        assert_eq!(p.query(46), Rgb { r: 0, g: 255, b: 0 }, "46=(0,5,0)");
+        // 灰阶:232=8、255=238
+        assert_eq!(p.query(232), Rgb { r: 8, g: 8, b: 8 });
+        assert_eq!(
+            p.query(255),
+            Rgb {
+                r: 238,
+                g: 238,
+                b: 238
+            }
+        );
     }
 }
