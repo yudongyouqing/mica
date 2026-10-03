@@ -50,11 +50,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
     DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG,
     MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowTextW,
-    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE,
-    WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
+    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    WM_PAINT, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
@@ -129,6 +129,9 @@ thread_local! {
     static HOVER_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 标签溢出滚动(T8):向左滚过的标签数
     static TAB_SCROLL: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// per-monitor DPI 缩放(M5b/T4):当前窗口 DPI/96;字号在建 router 时
+    /// 乘它(度量数学层零改动),配置里的 pt 值不受污染(换屏可逆)
+    static DPI_SCALE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
     /// D28 hover 气泡:URL + 绘制锚(客户区坐标)。None = 不画
     static HOVER_URL: RefCell<Option<(String, f32, f32)>> =
         const { RefCell::new(None) };
@@ -296,6 +299,15 @@ pub fn run() {
         );
 
         if CURSOR_BLINK.with(std::cell::Cell::get) {
+            // 首屏 DPI 播种(M5b/T4):窗口落在高 DPI 屏时,首建即正确字号
+            let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
+            if dpi != 96 {
+                eprintln!(
+                    "[dpi] 启动于 {dpi} DPI 屏(初始即按 x{:.2} 缩放)",
+                    dpi as f32 / 96.0
+                );
+                DPI_SCALE.with(|d| d.set(dpi as f32 / 96.0));
+            }
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 500, None);
             // 子进程退出轮询(M5b/T3):1s 粒度足够(退出不是高频事件)
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 3, 1000, None);
@@ -779,6 +791,59 @@ fn restart_active_pane() -> bool {
         }
     });
     true
+}
+
+/// DPI 变更(M5b/T4):更新缩放系数,全部 pane 按新有效字号重建
+/// router/度量/网格(热重载同机制);配置 pt 不动(可逆)。
+/// restart 的 shell 会话不受影响——字号是渲染层语义。
+unsafe fn reload_dpi(hwnd: HWND, dpi: u32) {
+    let scale = dpi as f32 / 96.0;
+    if (DPI_SCALE.with(std::cell::Cell::get) - scale).abs() < f32::EPSILON {
+        return;
+    }
+    DPI_SCALE.with(|d| d.set(scale));
+    let (families, base_pt) = TAB_SEED.with(|s| s.borrow().clone());
+    let families: Vec<&str> = if families.is_empty() {
+        DEFAULT_FAMILIES.to_vec()
+    } else {
+        families.iter().map(String::as_str).collect()
+    };
+    let size_pt = (base_pt * scale).clamp(6.0, 72.0);
+    let Ok(head) = DwriteRouter::new(size_pt, &families) else {
+        eprintln!("[dpi] 字体链重建失败,保持旧缩放观感");
+        return;
+    };
+    let metrics = head.metrics();
+    let mut rect = RECT::default();
+    GetClientRect(hwnd, &mut rect).expect("GetClientRect");
+    let width = rect.right.max(1) as u32;
+    let term_h = (rect.bottom.max(1) as u32)
+        .saturating_sub(mica_render::frame::STRIP_H as u32)
+        .max(1);
+    eprintln!("[dpi] {dpi} (x{scale:.2}) → pt {base_pt}→{size_pt}");
+    TABS.with(|tabs| {
+        for tab in tabs.borrow_mut().iter_mut() {
+            for pane in tab.panes.iter_mut() {
+                let t = &mut pane.terminal;
+                let Ok(router) = DwriteRouter::new(size_pt, &families) else {
+                    return;
+                };
+                let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
+                let rows = ((term_h as f32 / metrics.line_height).max(1.0)) as u16;
+                t.router = router;
+                t.metrics = metrics;
+                t.renderer_atlas_revision = u64::MAX;
+                t.cols = cols;
+                t.rows = rows;
+                t.term.resize(ScreenSize::new(cols as usize, rows as usize));
+                t.term.set_cell_metrics(
+                    metrics.cell_width.round() as u16,
+                    metrics.line_height.round() as u16,
+                );
+                t.force_full = true;
+            }
+        }
+    });
 }
 
 /// 建一个新标签(T7):router 按当前 TAB_SEED(启动设置或最近热重载),
@@ -1797,6 +1862,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 客户区全由 wgpu 清屏:阻止系统擦背景——resize 时旧内容闪白
             // 的来源就是这擦除(D3D 未准备好前的一帧系统底色)
             LRESULT(1)
+        }
+        WM_DPICHANGED => {
+            // 跨屏拖动/系统缩放变更(M5b/T4):wparam 高 16 位 = 新 DPI;
+            // lparam = 建议矩形指针(按新 DPI 的同逻辑尺寸,系统惯例采纳)
+            let dpi = ((wparam.0 >> 16) & 0xffff) as u32;
+            // SAFETY: lparam 指向系统栈上的 RECT,本消息期间有效
+            let suggested: &RECT = unsafe { &*(lparam.0 as *const RECT) };
+            // SAFETY: 按建议矩形重定尺寸(无激活无置顶)
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                );
+            }
+            reload_dpi(hwnd, dpi);
+            draw_frame();
+            LRESULT(0)
         }
         WM_SIZE => {
             // lparam 低位 = 客户区宽,高位 = 客户区高(像素)

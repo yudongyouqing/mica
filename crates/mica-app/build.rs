@@ -17,6 +17,19 @@ fn main() {
         .unwrap_or(false)
     {
         let mut res = winres::WindowsResource::new();
+        // per-monitor DPI v2(M5b/T4):manifest 声明前 WM_DPICHANGED 根本
+        // 不投递(进程 DPI-unaware 时被系统虚拟化,DPI 恒 96)
+        res.set_manifest(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>"#,
+        );
         res.set_icon(ico_path.to_str().expect("path utf8"));
         res.set("FileDescription", "Mica — Windows-native terminal");
         res.set("ProductName", "Mica");
