@@ -16,8 +16,14 @@ pub fn run() {
 #[cfg(windows)]
 pub fn handle_cli() -> i32 {
     use mica_core::ipc::IpcMessage;
+    // 崩溃档案(M5b/T1):任何后续 panic 都有 dmp——先于一切安装
+    app::crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        // 隐藏自检:集成测试 spawn 断言 dmp 落盘(crash.rs 测试用)
+        Some("--panic-test") => {
+            panic!("--panic-test 自检");
+        }
         Some("list-profiles") => {
             for p in mica_core::profile::scan_all() {
                 println!("{}", p.name);

@@ -92,6 +92,7 @@ struct ReloadHandle {
 }
 
 mod clipboard;
+pub(crate) mod crash;
 pub(crate) mod ipc;
 mod jumplist;
 pub(crate) mod quickterm;
