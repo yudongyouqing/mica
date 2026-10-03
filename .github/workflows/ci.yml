@@ -60,3 +60,28 @@ jobs:
           name: mica-msi
           path: target/wix/mica.msi
           if-no-files-found: warn
+
+  perf:
+    # M5c/T3(D34):渲染吞吐防退化。spec 写 5% 预算,但 GitHub 共享
+    # runner 机器方差实测 >5%——CI 阈值放宽到 25%(结果页与本地跑仍按
+    # 5% 口径人工复核),数字进 summary 供纵向对比。
+    runs-on: windows-latest
+    needs: []
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run throughput bench
+        run: cargo test --release -p mica-render bench -- --ignored --nocapture 2>&1 | tee bench.log
+      - name: Gate against baseline
+        shell: pwsh
+        run: |
+          $line = (Select-String -Path bench.log -Pattern 'BENCH cells_per_sec=(\d+)').Matches[0].Groups[1].Value
+          $cells = [double]$line
+          $baseline = [double](Get-Content docs/benchmarks/baseline.txt | Where-Object { $_ -match 'cells_per_sec=(\d+)' } | ForEach-Object { $Matches[1] })
+          $frameUs = [double]((Select-String -Path bench.log -Pattern 'frame_us=(\d+)').Matches[0].Groups[1].Value)
+          $frameBase = [double](Get-Content docs/benchmarks/baseline.txt | Where-Object { $_ -match 'frame_us=(\d+)' } | ForEach-Object { $Matches[1] })
+          "cells_per_sec=$cells (baseline $baseline)" >> $GITHUB_STEP_SUMMARY
+          "frame_us=$frameUs (baseline $frameBase)" >> $GITHUB_STEP_SUMMARY
+          if ($cells -lt $baseline * 0.75) { Write-Error "throughput regression: $cells < 75% of $baseline"; exit 1 }
+          if ($frameUs -gt $frameBase * 4.0) { Write-Error "frame time regression: ${frameUs}us > 400% of ${frameBase}us"; exit 1 }
