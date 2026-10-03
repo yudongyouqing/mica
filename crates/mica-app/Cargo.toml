@@ -35,7 +35,16 @@ windows = { workspace = true, features = [
     "Win32_System_Com",
     "Win32_UI_Shell_Common",
     "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_Ime",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Accessibility",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
 ] }
+windows-core = { workspace = true }
 pollster = { workspace = true }
 raw-window-handle = { workspace = true }
 notify = { workspace = true }

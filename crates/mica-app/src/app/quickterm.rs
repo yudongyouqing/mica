@@ -179,6 +179,8 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         renderer_atlas_revision: u64::MAX,
         row_insts: Vec::new(),
         force_full: true,
+        shell: "powershell.exe -NoLogo".into(),
+        exited: None,
     };
     QT.with(|q| {
         *q.borrow_mut() = Some(QtState {
@@ -292,6 +294,12 @@ unsafe extern "system" fn qt_wndproc(
                     }
                     _ => char::from_u32(code).unwrap_or('\u{FFFD}'),
                 };
+                // kitty 模式下 C0 已由 WM_KEYDOWN 侧编码成 CSI-u,这里再发
+                // 就是双发(主窗同款契约);可打印文本照旧走此处
+                if st.terminal.term.kitty_flags().any() && (ch as u32) < 0x20 {
+                    return;
+                }
+                // Windows 把退格发成 0x08,终端世界统一 DEL(0x7f)
                 let bytes: Vec<u8> = if ch == '\u{8}' {
                     vec![0x7f]
                 } else {
@@ -302,30 +310,33 @@ unsafe extern "system" fn qt_wndproc(
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            use mica_core::input::{self, Key, Mods};
-            // QT 无 keymap 拦截需求(单 pane);直接 pty 编码
+            // M5a/T8(M3b 打磨票清账):对齐主窗输入契约——Enter/Tab/Esc/
+            // Backspace/可打印走 WM_CHAR(修双发:旧代码两臂都写);kitty 时
+            // 功能键 CSI-u;legacy 时方向/编辑键经 vkey_bytes(补修饰键,
+            // 修 Ctrl+方向跳词/Shift+翻页等)。QT 无 keymap 拦截(单 pane)
             let vk = wparam.0 as u32;
-            let mods = Mods::NONE; // 修饰读取省略:M3b 打磨票(vk->xterm 主键位已够用)
-            let key = match vk {
-                0x26 => Key::Up,
-                0x28 => Key::Down,
-                0x25 => Key::Left,
-                0x27 => Key::Right,
-                0x24 => Key::Home,
-                0x23 => Key::End,
-                0x2E => Key::Delete,
-                0x21 => Key::PageUp,
-                0x22 => Key::PageDown,
-                0x0D => Key::Enter,
-                0x08 => Key::Backspace,
-                0x09 => Key::Tab,
-                _ => {
-                    return LRESULT(0); // 可打印字符走 WM_CHAR
-                }
-            };
-            let bytes = input::encode(key, mods, false);
+            let mods = super::current_mods();
             QT.with(|q| {
-                if let Some(st) = q.borrow_mut().as_mut() {
+                let mut guard = q.borrow_mut();
+                let Some(st) = guard.as_mut() else {
+                    return;
+                };
+                let flags = st.terminal.term.kitty_flags();
+                let kind = if lparam.0 & (1 << 30) != 0 {
+                    mica_core::protocol::kitty::EventKind::Repeat
+                } else {
+                    mica_core::protocol::kitty::EventKind::Press
+                };
+                if flags.any()
+                    && let Some(key) = super::vk_to_key(vk)
+                    && let Some(bytes) =
+                        mica_core::protocol::kitty::kitty_encode(key, mods, kind, flags)
+                {
+                    let _ = st.terminal.session.write(&bytes);
+                    return;
+                }
+                if let Some(bytes) = super::vkey_bytes(vk, mods, st.terminal.term.app_cursor_mode())
+                {
                     let _ = st.terminal.session.write(&bytes);
                 }
             });

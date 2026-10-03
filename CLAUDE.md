@@ -58,23 +58,26 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-10-02-m4-protocol-design.md` — M4 设计(kitty keyboard/2026/OSC 8/133/graphics 预研,D27-D31;M4a/M4b/M4c 三切片,计划待写)。
 - `docs/superpowers/plans/2026-10-02-m4a-kitty-keyboard.md` — M4a 计划(kitty 编码器/bracketed paste/app 路由,5 任务;上游状态机 API 与协议键码表已核实)。
 - `docs/superpowers/research/2026-10-03-kitty-graphics.md` — M4c 预研(D31:协议结构/内存模型/图集融合点/工作量;两项本机实证——vte 0.15 无 apc_dispatch、ConPTY 剥离 APC 致 Windows 主路径不可达,金丝雀测试守边界)。
-- 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(✅)→ M3 系统集成(✅)→ M4 协议补全(✅:M4a/M4b 合入 dev,M4c 预研落档;kitty graphics 因 ConPTY 边界不实现,M5 再议)→ M5 1.0。
+- `docs/superpowers/specs/2026-10-03-m5-1.0-design.md` — M5 1.0 设计(打磨/健壮/发布三切片,D32-D37;砍单 tear-off/defterm 二级/官网/连字引擎/签名;验收=winget 可装+崩溃有档+IME 跟随+1.0 tag)。
+- `docs/superpowers/plans/2026-10-03-m5b-robustness.md` — M5b 计划(健壮五件;wgpu lost 双钩子/DbgHelp/try_wait/Ime/winres-manifest API 全核实;冒烟抓到 restart 双借真 bug——T1 崩溃档案首秀定位)。
+- 里程碑:M0 骨架(✅)→ M1 渲染补全(✅)→ M2 窗口体验(✅)→ M3 系统集成(✅)→ M4 协议补全(✅)→ M5 1.0(M5a 已合入 dev;M5b 健壮五件完成:crash 档案/device lost/退出态+重开/PMv2 DPI/IME 跟随)→ M5c 发布。
 
 ## 当前边界(M3 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
-- 半纹素渗色(终审 I2,处方:insert 右/下 +1px 零填充 padding;冒烟未观察到明显症状,留观)
 - 连字:Cascadia 系需 TextLayout 级引擎(analyzer+liga/calt 不触发),管线已备,probe 阴性自动回退——换引擎留 M3
 - OSC 52:管线单测全过,真机经 ConPTY 疑被拦截——tmux 环境复验后定案(M3 或关账)
 - DECSET 2026:sidecar 检测→帧持有管线单测全绿,但 ConPTY 不透传 2026(2026-10-03 真机探针实证 feed 零命中;同路径 OSC 8 可透传,唯 2026 被消费——ConPTY 自带同步缓冲)——直连 pty 场景生效,ConPTY 场景由其自身机制兜底
 - sidecar 快筛(M4b/D29 备胎,已启用):候选前缀深跑 + carry/open_seq 跨块续命;基准测试 `sidecar_throughput_budget`(#ignored,release 跑)预算 5%
+- 启动清理孤儿 ConPTY 宿主(M5c):强杀终端必留 OpenConsole 孤儿,管道断裂后 busy-loop——2026-10-03 冒烟事故实证 13 个孤儿各烧满 1 核;启动时按"父进程已死"清杀(真开着的 WT 父进程活着不受影响),与 minidump 崩溃恢复成对
 - kitty graphics:ConPTY 剥离 APC(M4c 字节级实证,与 2026/OSC 52 同类)——Windows 主路径不可达,不实现;金丝雀测试 `conpty_strips_apc_today_canary` 变红 = 边界移动,重估(预研文档含 M5 立项建议)
-- 系统按钮(— □ ×)hit-test 已通,视觉字形待打磨(M2 打磨票);标签溢出滚动为极简版
-- 每标签独立字体/字号 M4 随 profile;标签 tear-off M4 观望;拖选接续滚轮扩展选区 M4
+- OSC 133 UI(jump/exit 状态点,M5a):数据层/渲染全绿,但 ConPTY 毁引导符(ESC]→ESC\,载荷文本泄漏、BEL 被吃;OSC 8 是唯一透传例外)——经 ConPTY 不可达,金丝雀 `conpty_strips_osc133_today_canary` 守边界;直连 pty 场景即生效
+- 标签溢出滚动:滚轮+活跃自动跟随已落,箭头命中区暂缓(计划偏差注记)
+- 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段);标签 tear-off 砍单(D32)
 - defterm 二级(ITerminalHandoff COM 完整接管):RRVA 一级已上线(设置列表可见),COM 手绑 M4 探针;winget 清单首提待做
-- Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M4;QT 输入无修饰键编码(打磨票)
+- Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M5c 观察;QT 输入已对齐主窗契约(M5a 修双发)
 - WM_CHAR 无代理对之外的 IME 组合窗口(M3 系统级 IME)
-- OSC 10/11/12 正确;OSC 4 索引 0-15 正确、16-255 答光标色(M4 修立方/灰阶)
-- bold-italic 复用 bold 面(M2 打磨票);DPI 写死 96(spec §11)
+- OSC 4 全域正确(16-231 立方/232-255 灰阶,M5a 落);SGR 下划线族已渲染(M5a,此前从未画)
+- DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始窗口物理尺寸在高 DPI 屏偏小(创建尺寸未乘 scale,打磨票)
 
 ## 提交规范
 

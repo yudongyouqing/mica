@@ -46,6 +46,12 @@ pub enum Action {
     ClosePane,
     /// 焦点跳邻 pane(方向)。Alt+方向(D15)。
     FocusNeighbor(Key),
+    /// 重开 pane(M5b/T3):同 shell 新会话,退出态清零。
+    RestartPane,
+    /// OSC 133 jump(D37):跳上一个 prompt 行。
+    JumpPrevPrompt,
+    /// OSC 133 jump(D37):跳下一个 prompt 行;越过最新 = 回底部跟随。
+    JumpNextPrompt,
 }
 
 /// 键位表:用户条目在前(优先),默认表垫底。
@@ -127,6 +133,22 @@ impl Keymap {
             m(false, true, false),
             TriggerKey::Key(Key::PageUp),
             Action::ScrollPage(1),
+        );
+        // OSC 133 prompt 间跳转(D37,WezTerm 同款肌肉记忆)
+        push(
+            m(true, true, false),
+            TriggerKey::Letter('R'),
+            Action::RestartPane,
+        );
+        push(
+            m(true, true, false),
+            TriggerKey::Key(Key::Up),
+            Action::JumpPrevPrompt,
+        );
+        push(
+            m(true, true, false),
+            TriggerKey::Key(Key::Down),
+            Action::JumpNextPrompt,
         );
         push(
             m(false, true, false),
@@ -250,6 +272,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "split_right" => Some(Action::SplitRight),
         "split_down" => Some(Action::SplitDown),
         "close_pane" => Some(Action::ClosePane),
+        "restart_pane" => Some(Action::RestartPane),
         "focus_left" => Some(Action::FocusNeighbor(Key::Left)),
         "focus_right" => Some(Action::FocusNeighbor(Key::Right)),
         "focus_up" => Some(Action::FocusNeighbor(Key::Up)),

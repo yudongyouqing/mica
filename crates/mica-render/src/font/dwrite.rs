@@ -30,12 +30,14 @@ use super::atlas::{GlyphAtlas, GlyphBitmap, GlyphFormat};
 use super::metrics::FontMetrics;
 use super::router::{ClusterLayout, GlyphInfo, GlyphRouter};
 
-/// 一个家族的三个样式面(plain/bold/italic;bold-italic 复用 bold 面,M2 若需要再加)。
+/// 一个家族的四个样式面(plain/bold/italic/bold_italic;T7 起四态齐备)。
 struct FamilyFaces {
     name: String,
     plain: IDWriteFont,
     bold: IDWriteFont,
     italic: IDWriteFont,
+    /// M5a/T7:bold+italic 面(此前 (true,_) 吞 italic,italic 只在非粗体下生效)
+    bold_italic: IDWriteFont,
     /// 'M' 的 advance(design units)——等宽字体即 cell 宽
     max_advance_du: u32,
 }
@@ -130,6 +132,7 @@ impl DwriteRouter {
             let plain = pick(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL)?;
             let bold = pick(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL)?;
             let italic = pick(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_ITALIC)?;
+            let bold_italic = pick(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_ITALIC)?;
             // SAFETY: IDWriteFont::CreateFontFace 无额外前提
             let face = unsafe { plain.CreateFontFace()? };
             let mut dm = DWRITE_FONT_METRICS::default();
@@ -147,6 +150,7 @@ impl DwriteRouter {
                 plain,
                 bold,
                 italic,
+                bold_italic,
                 max_advance_du,
             });
         }
@@ -215,14 +219,24 @@ impl DwriteRouter {
             return Some(blank_glyph());
         }
         let family = self.family_for(ch)?;
-        let styled_font = match (style.bold, style.italic) {
-            (true, _) => Some(&family.bold),
-            (false, true) => Some(&family.italic),
-            _ => None,
+        // 样式面候选级联(T7):bold+italic 先专面,miss 降级保样式优先级
+        // italic > bold(斜体信息比粗细更难从字形回推);再 miss 回退 plain
+        let candidates: &[&IDWriteFont] = match (style.bold, style.italic) {
+            (true, true) => &[&family.bold_italic, &family.italic, &family.bold],
+            (true, false) => &[&family.bold],
+            (false, true) => &[&family.italic],
+            _ => &[],
         };
-        // 样式面缺字形(如斜体面缺 CJK)→ 回退家族 plain 面;
+        let mut hit = None;
+        for f in candidates {
+            if let Some(pair) = face_with_glyph(f, ch) {
+                hit = Some(pair);
+                break;
+            }
+        }
+        // 全部样式面 miss(如斜体面缺 CJK)→ 回退家族 plain 面;
         // plain 也 miss(None)即全链空白,交 route 兜底
-        let (face, glyph) = match styled_font.and_then(|f| face_with_glyph(f, ch)) {
+        let (face, glyph) = match hit {
             Some(pair) => pair,
             None => face_with_glyph(&family.plain, ch)?,
         };
@@ -804,6 +818,46 @@ mod tests {
         assert!(
             plain.uv != bold.uv || plain.size_px != bold.size_px,
             "bold 与 plain 字形位图相同:.bold 面未生效(GetFirstMatchingFont 回落?)"
+        );
+    }
+
+    /// T7:bold+italic 三态互异——(true,_) 吞 italic 的回归锁。
+    /// 注意主链 Cascadia Mono 无斜体轴?有( italic 由系统合成或家族自带),
+    /// 断言按位图差异;Cascadia 系四态位图实际互异。
+    #[test]
+    fn bold_italic_face_distinct_from_single_styles() {
+        let mut r = DwriteRouter::new(12.0, crate::font::DEFAULT_FAMILIES).expect("router");
+        let bi = r.route(
+            'B',
+            GlyphStyle {
+                bold: true,
+                italic: true,
+            },
+        );
+        let bold = r.route(
+            'B',
+            GlyphStyle {
+                bold: true,
+                italic: false,
+            },
+        );
+        let italic = r.route(
+            'B',
+            GlyphStyle {
+                bold: false,
+                italic: true,
+            },
+        );
+        let differs = |a: crate::font::router::GlyphInfo, b: crate::font::router::GlyphInfo| {
+            a.uv != b.uv || a.size_px != b.size_px
+        };
+        assert!(
+            differs(bi, bold),
+            "bold_italic 与 bold 位图相同:专面未生效(加载或级联失效)"
+        );
+        assert!(
+            differs(bi, italic),
+            "bold_italic 与 italic 位图相同:粗体维度丢失"
         );
     }
 

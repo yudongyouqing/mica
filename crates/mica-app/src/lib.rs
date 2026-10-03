@@ -2,7 +2,7 @@
 //! empty because the windowing APIs do not exist there.
 
 #[cfg(windows)]
-mod app;
+pub mod app; // tests 直入(UIA 集成测试要真窗口走真 WM_GETOBJECT)
 
 /// GUI 入口(main 无参数 / IPC 连不上时的自启动路径)。
 #[cfg(windows)]
@@ -16,8 +16,14 @@ pub fn run() {
 #[cfg(windows)]
 pub fn handle_cli() -> i32 {
     use mica_core::ipc::IpcMessage;
+    // 崩溃档案(M5b/T1):任何后续 panic 都有 dmp——先于一切安装
+    app::crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        // 隐藏自检:集成测试 spawn 断言 dmp 落盘(crash.rs 测试用)
+        Some("--panic-test") => {
+            panic!("--panic-test 自检");
+        }
         Some("list-profiles") => {
             for p in mica_core::profile::scan_all() {
                 println!("{}", p.name);
@@ -44,10 +50,29 @@ pub fn handle_cli() -> i32 {
                 }
             }
         }
-        Some("new-tab") => dispatch_ipc(
-            IpcMessage::new_tab(args.get(1).cloned()),
-            "powershell.exe -NoLogo".into(),
-        ),
+        Some("new-tab") => {
+            // mica new-tab [profile] [--font-size N](T9 每标签字号)
+            let mut profile = None;
+            let mut font_size = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--font-size" | "-f" => {
+                        if let Some(v) = args.get(i + 1).and_then(|a| a.parse::<f32>().ok()) {
+                            font_size = Some(v);
+                            i += 1;
+                        }
+                    }
+                    _ if profile.is_none() => profile = args.get(i).cloned(),
+                    _ => {}
+                }
+                i += 1;
+            }
+            dispatch_ipc(
+                IpcMessage::new_tab_with(profile, font_size),
+                "powershell.exe -NoLogo".into(),
+            )
+        }
         Some(other) => {
             eprintln!(
                 "mica [new-tab [profile] | wsl [distro] | list-profiles]

@@ -108,6 +108,9 @@ pub fn build_instances(
                 // OSC 8 链接下划线(D28):置于段首(画在全部 bg 之上、字形之下)
                 glyphs.insert(0, link_underline(x, y, metrics, fg));
             }
+            // SGR 下划线族(T5):同层(bg 上、字下);本循环先于字形段填 glyphs,
+            // 天然序正确
+            glyphs.extend(underline_quads(cell.flags, x, y, metrics, fg));
             out.push(blank(x, y, metrics, fg, bg));
         }
         if let Some((shape, x, y)) = bar {
@@ -175,17 +178,63 @@ pub const STRIP_H: f32 = 32.0;
 pub const TAB_W: f32 = 140.0;
 pub const TAB_PLUS_W: f32 = 36.0;
 
+/// D37 exit 状态点形态:绿(0)/红(非 0)/灰(D 参数不可解析)。
+/// 色取调色板语义槽(green=2 / red=1 / bright black=8),主题同源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitDot {
+    Green,
+    Red,
+    Gray,
+}
+
+/// 系统按钮单宽(T8 视觉字形;hit-test 的 CAPTION_BTN_W 同值,布局单源)。
+pub const CAPTION_BTN: f32 = 46.0;
+
+/// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数;
+/// avail_w = 标签+加号区可用宽(客户区宽 - caption 区,0 = 不裁)。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StripLayout {
+    pub tab_scroll: i32,
+    pub avail_w: f32,
+}
+
+/// strip 杂项参数打包(M5b/T3 起参数超限):状态点/pane 退出态/caption 区。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StripExtras {
+    /// D37 OSC 133 exit 状态点
+    pub exit_dot: Option<ExitDot>,
+    /// T8 系统按钮区起点(客户区坐标)
+    pub caption_x: Option<f32>,
+    /// T8 溢出滚动布局
+    pub layout: StripLayout,
+    /// M5b/T3 pane 退出码(活跃 pane 已退出时显示 [exit N])
+    pub pane_exit: Option<u32>,
+}
+
 /// tab strip 的 UI 实例(T7,spec §3 同管线):底条 + 标签块(活跃高亮),
 /// 标题文字经 router 路由(与终端共享图集),尾部 "+" 按钮开新标签。
 /// 文字按等宽 cell 步进排版——strip 只有标题一行,粗排版与终端观感一致。
+/// exit_dot(D37):活跃标签的命令状态点,画在 caption 区左邻(固定锚)。
+/// caption_x(T8):系统按钮区起点(客户区坐标);Some 时画 — □ × 字形
+/// (路由字符,hit-test 已在;hover 态留后续)。
+/// layout(T8):溢出滚动——越界标签不发射(右缘由 caption bg 自然覆盖),
+/// 滚轮驱动滚动,箭头命中区暂缓(滚轮覆盖主痛点)。
 pub fn strip_quads(
     titles: &[(String, bool)],
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    extras: StripExtras,
 ) -> Vec<CellInstance> {
+    let StripExtras {
+        exit_dot,
+        caption_x,
+        layout,
+        pane_exit,
+    } = extras;
     let mut out = Vec::new();
     let total_w = titles.len() as f32 * TAB_W + TAB_PLUS_W;
+    let shift = layout.tab_scroll as f32 * TAB_W;
     let bg_of = |rgb: [u8; 3]| to_color(rgb);
     // 底条(黑槽):宽度按需,不足以铺满也无妨(清屏色同源)
     out.push(CellInstance {
@@ -200,7 +249,10 @@ pub fn strip_quads(
     });
     let text_y = (STRIP_H - metrics.line_height).max(0.0) / 2.0;
     for (i, (title, active)) in titles.iter().enumerate() {
-        let x = i as f32 * TAB_W;
+        let x = i as f32 * TAB_W - shift;
+        if x + TAB_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w) {
+            continue; // 滚出可视区的标签不发射
+        }
         let block = if *active {
             palette.bg
         } else {
@@ -237,31 +289,122 @@ pub fn strip_quads(
             });
         }
     }
-    // "+" 按钮
-    let x = titles.len() as f32 * TAB_W;
-    let block = palette.colors[0];
-    let ink = palette.fg;
-    // 顶栏系统按钮占位(T8):右上三颗 — □ × 由 NC hit-test 命中;视觉
-    // 字形由 hit-test 的 CAPTION_BTN_W 常量几何驱动(同布局单源约束下,
-    // 按钮字形绘制放 app 层后续打磨,先保证 hit-test 可用)
-    out.push(CellInstance {
-        pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
-        size_uv: [TAB_PLUS_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
-        fg: bg_of([ink.r, ink.g, ink.b]),
-        bg: bg_of([block.r, block.g, block.b]),
-    });
-    let g = router.route('+', GlyphStyle::PLAIN);
-    out.push(CellInstance {
-        pos_uv: [
-            x + (TAB_PLUS_W - g.size_px[0]) / 2.0,
-            (STRIP_H - g.size_px[1]) / 2.0,
-            g.uv[0],
-            g.uv[1],
-        ],
-        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-        fg: bg_of([ink.r, ink.g, ink.b]),
-        bg: bg_of([block.r, block.g, block.b]),
-    });
+    // "+" 按钮(随滚动平移,同裁剪)
+    let x = titles.len() as f32 * TAB_W - shift;
+    if !(x + TAB_PLUS_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
+        let block = palette.colors[0];
+        let ink = palette.fg;
+        // 顶栏系统按钮占位(T8):右上三颗 — □ × 由 NC hit-test 命中;视觉
+        // 字形由 hit-test 的 CAPTION_BTN_W 常量几何驱动(同布局单源约束下,
+        // 按钮字形绘制放 app 层后续打磨,先保证 hit-test 可用)
+        out.push(CellInstance {
+            pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
+            size_uv: [TAB_PLUS_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
+            fg: bg_of([ink.r, ink.g, ink.b]),
+            bg: bg_of([block.r, block.g, block.b]),
+        });
+        let g = router.route('+', GlyphStyle::PLAIN);
+        out.push(CellInstance {
+            pos_uv: [
+                x + (TAB_PLUS_W - g.size_px[0]) / 2.0,
+                (STRIP_H - g.size_px[1]) / 2.0,
+                g.uv[0],
+                g.uv[1],
+            ],
+            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+            fg: bg_of([ink.r, ink.g, ink.b]),
+            bg: bg_of([block.r, block.g, block.b]),
+        });
+    }
+    // pane 退出态(M5b/T3):dot 槽左侧文本(标题后缀会被截断吃掉——
+    // 长 cwd 标题实测);0 绿/非 0 红。OSC133 点在 caption_x-14,
+    // 文本止于 caption_x-24,无重叠
+    if let Some(code) = pane_exit {
+        let label = format!("[exit {code}]");
+        let slot = if code == 0 {
+            palette.colors[2]
+        } else {
+            palette.colors[1]
+        };
+        let text_y = (STRIP_H - metrics.line_height).max(0.0) / 2.0;
+        let end_x = caption_x.map(|cx| cx - 24.0).unwrap_or(total_w);
+        let start = end_x - label.chars().count() as f32 * metrics.cell_width;
+        for (ci, ch) in label.chars().enumerate() {
+            let g = router.route(ch, GlyphStyle::PLAIN);
+            if g.size_px[0] <= 0.0 {
+                continue;
+            }
+            out.push(CellInstance {
+                pos_uv: [
+                    start + ci as f32 * metrics.cell_width + g.offset_px[0],
+                    text_y + g.offset_px[1],
+                    g.uv[0],
+                    g.uv[1],
+                ],
+                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                fg: bg_of([slot.r, slot.g, slot.b]),
+                bg: bg_of([
+                    palette.colors[0].r,
+                    palette.colors[0].g,
+                    palette.colors[0].b,
+                ]),
+            });
+        }
+    }
+    // D37 exit 状态点:caption 区左邻(固定锚;无 caption 时 "+" 右侧),
+    // 6px 八边形(3 rect 逼近,quad 管线零扩展)
+    if let Some(dot) = exit_dot {
+        let slot = match dot {
+            ExitDot::Green => palette.colors[2],
+            ExitDot::Red => palette.colors[1],
+            ExitDot::Gray => palette.colors[8],
+        };
+        let dx = caption_x.map(|cx| cx - 14.0).unwrap_or(total_w + 10.0);
+        let cy = STRIP_H / 2.0;
+        for [rx, ry, rw, rh] in [
+            [dx + 1.0, cy - 3.0, 4.0, 1.0],
+            [dx, cy - 2.0, 6.0, 4.0],
+            [dx + 1.0, cy + 2.0, 4.0, 1.0],
+        ] {
+            out.push(CellInstance {
+                pos_uv: [rx, ry, 0.0, 0.0],
+                size_uv: [rw, rh, 0.0, 0.0],
+                // blank 形(uv 0)shader 只画 bg、墨恒 0——实心色必须进 bg 槽
+                // (link_underline 同款约定;fg 字段同色冗余存档)
+                fg: bg_of([slot.r, slot.g, slot.b]),
+                bg: bg_of([slot.r, slot.g, slot.b]),
+            });
+        }
+    }
+    // 系统按钮区(T8):— □ ×,路由字符(hit-test 已在 NCHITTEST,同几何
+    // 单源:每颗 CAPTION_BTN 宽,起点 caption_x = 客户区右缘 - 3×宽)
+    if let Some(cx) = caption_x {
+        let ink = palette.fg;
+        let block = palette.colors[0];
+        for (i, glyph) in ['\u{2500}', '\u{25a1}', '\u{00d7}'].iter().enumerate() {
+            let bx = cx + i as f32 * CAPTION_BTN;
+            out.push(CellInstance {
+                pos_uv: [bx + 1.0, 1.0, 0.0, 0.0],
+                size_uv: [CAPTION_BTN - 2.0, STRIP_H - 2.0, 0.0, 0.0],
+                fg: bg_of([ink.r, ink.g, ink.b]),
+                bg: bg_of([block.r, block.g, block.b]),
+            });
+            let g = router.route(*glyph, GlyphStyle::PLAIN);
+            if g.size_px[0] > 0.0 {
+                out.push(CellInstance {
+                    pos_uv: [
+                        bx + (CAPTION_BTN - g.size_px[0]) / 2.0 + g.offset_px[0],
+                        (STRIP_H - g.size_px[1]) / 2.0 + g.offset_px[1],
+                        g.uv[0],
+                        g.uv[1],
+                    ],
+                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                    fg: bg_of([ink.r, ink.g, ink.b]),
+                    bg: bg_of([block.r, block.g, block.b]),
+                });
+            }
+        }
+    }
     out
 }
 
@@ -272,6 +415,65 @@ pub fn strip_quads(
 pub struct RowInst {
     pub bg: Vec<CellInstance>,
     pub glyphs: Vec<CellInstance>,
+}
+
+/// D28 hover URI 气泡:主窗 overlay(spec 的 WS_POPUP 简化——零新窗口零
+/// 新管线,同功能;越窗裁剪 v1 接受)。bg + 1px 边框 + 等宽文字(截断
+/// 40 字符),锚点为鼠标位 + 偏移(app 侧传入)。
+pub fn tooltip_quads(
+    url: &str,
+    x: f32,
+    y: f32,
+    router: &mut dyn GlyphRouter,
+    metrics: &FontMetrics,
+    palette: &Palette,
+) -> Vec<CellInstance> {
+    let bg_of = |rgb: [u8; 3]| to_color(rgb);
+    let chars: Vec<char> = url.chars().take(40).collect();
+    let text_w = chars.len() as f32 * metrics.cell_width;
+    let pad = 6.0;
+    let w = text_w + pad * 2.0;
+    let h = metrics.line_height + pad;
+    let mut out = Vec::with_capacity(2 + 4 + chars.len());
+    // bg(底色槽 0)+ fg 边框
+    out.push(CellInstance {
+        pos_uv: [x, y, 0.0, 0.0],
+        size_uv: [w, h, 0.0, 0.0],
+        fg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+        bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+    });
+    let border = |bx: f32, by: f32, bw: f32, bh: f32| CellInstance {
+        pos_uv: [bx, by, 0.0, 0.0],
+        size_uv: [bw, bh, 0.0, 0.0],
+        // blank 形画 bg:边框色进 bg 槽(冒烟抓出的同类错误)
+        fg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
+        bg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
+    };
+    out.extend([
+        border(x, y, w, 1.0),
+        border(x, y + h - 1.0, w, 1.0),
+        border(x, y, 1.0, h),
+        border(x + w - 1.0, y, 1.0, h),
+    ]);
+    let text_y = (h - metrics.line_height) / 2.0;
+    for (ci, ch) in chars.iter().enumerate() {
+        let g = router.route(*ch, GlyphStyle::PLAIN);
+        if g.size_px[0] <= 0.0 {
+            continue;
+        }
+        out.push(CellInstance {
+            pos_uv: [
+                x + pad + ci as f32 * metrics.cell_width + g.offset_px[0],
+                y + text_y + g.offset_px[1],
+                g.uv[0],
+                g.uv[1],
+            ],
+            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+            fg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
+            bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+        });
+    }
+    out
 }
 
 /// 行级重建入口(Task 8),按 `damage` 分路:
@@ -406,6 +608,54 @@ fn link_underline(x: f32, y: f32, metrics: &FontMetrics, fg: [u8; 3]) -> CellIns
     }
 }
 
+/// SGR 下划线族(M5a/T5):UNDERLINE 直线、DOUBLE 双线、UNDERCURL 波浪、
+/// DOTTED/DASHED 点/虚线(近似形态)。1px 高,底部对齐;波浪 = 2px 段在
+/// bottom-1/bottom-3 交替。色 = fg(SGR 58 专属下划线色未接,边界记录)。
+fn underline_quads(
+    flags: Flags,
+    x: f32,
+    y: f32,
+    metrics: &FontMetrics,
+    fg: [u8; 3],
+) -> Vec<CellInstance> {
+    let mut out = Vec::new();
+    let w = metrics.cell_width;
+    let bottom = y + metrics.line_height;
+    let q = |qx: f32, qy: f32, qw: f32| CellInstance {
+        pos_uv: [qx, qy, 0.0, 0.0],
+        size_uv: [qw, 1.0, 0.0, 0.0],
+        fg: to_color(fg),
+        bg: to_color(fg),
+    };
+    if flags.contains(Flags::UNDERCURL) {
+        let mut sx = x;
+        let mut hi = false;
+        while sx < x + w - 0.5 {
+            let seg = 2.0f32.min(x + w - sx);
+            out.push(q(sx, if hi { bottom - 3.0 } else { bottom - 1.0 }, seg));
+            hi = !hi;
+            sx += seg;
+        }
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        out.push(q(x, bottom - 1.0, w));
+        out.push(q(x, bottom - 3.0, w));
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        let mut sx = x;
+        while sx < x + w - 0.5 {
+            out.push(q(sx, bottom - 1.0, 1.0));
+            sx += 2.0;
+        }
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        out.push(q(x, bottom - 1.0, w.min(4.0)));
+        if w > 6.0 {
+            out.push(q(x + 6.0, bottom - 1.0, (w - 6.0).min(2.0)));
+        }
+    } else if flags.contains(Flags::UNDERLINE) {
+        out.push(q(x, bottom - 1.0, w));
+    }
+    out
+}
+
 /// 光标条实例(D20):Underline=底部 2px、Beam=左侧 1.2px;色 = palette.cursor。
 /// 放字形段头部(bg 之上、字之下;细条与字重叠小,不必顶层)。
 fn cursor_bar(
@@ -512,6 +762,9 @@ fn build_row(
             // OSC 8 链接下划线(D28),与 build_instances 同序同构
             row.glyphs.insert(0, link_underline(x, y, metrics, fg));
         }
+        // SGR 下划线族(T5):与 build_instances 同序同构
+        row.glyphs
+            .extend(underline_quads(cell.flags, x, y, metrics, fg));
         row.bg.push(blank(x, y, metrics, fg, bg));
     }
     if let Some((shape, x, y)) = bar {
@@ -602,6 +855,54 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CellInstance, size_uv), 16);
         assert_eq!(std::mem::offset_of!(CellInstance, fg), 32);
         assert_eq!(std::mem::offset_of!(CellInstance, bg), 48);
+    }
+
+    #[test]
+    fn strip_exit_dot_octagon_and_colors() {
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let titles = vec![("t".to_string(), true)];
+        let palette = Palette::DEFAULT;
+        let none_len = strip_quads(
+            &titles,
+            &mut r,
+            &metrics_8x16(),
+            &palette,
+            Default::default(),
+        )
+        .len();
+        let dot = strip_quads(
+            &titles,
+            &mut r,
+            &metrics_8x16(),
+            &palette,
+            StripExtras {
+                exit_dot: Some(ExitDot::Green),
+                ..Default::default()
+            },
+        );
+        // 八边形 = 3 个 rect;None 不画
+        assert_eq!(dot.len() - none_len, 3);
+        let to_u8 = |c: f32| (c * 255.0 + 0.5) as u8;
+        for q in &dot[none_len..] {
+            // blank 形(uv 0)画的是 bg 槽——色必须断在 bg(冒烟教训:
+            // 断 fg 曾让"绿色永不绘制"的 bug 溜过单测)
+            assert_eq!(
+                [to_u8(q.bg[0]), to_u8(q.bg[1]), to_u8(q.bg[2])],
+                [
+                    palette.colors[2].r,
+                    palette.colors[2].g,
+                    palette.colors[2].b
+                ],
+                "绿点取调色板 slot 2(经 bg 槽渲染)"
+            );
+            assert_eq!(q.size_uv[2], 0.0, "实心 quad,uv 尺寸 0");
+        }
     }
 
     /// 可编程假路由:每个字符回固定字形,便于断言几何。
@@ -1208,6 +1509,53 @@ mod tests {
         );
     }
 
+    /// SGR 下划线族(T5):直线/双线/波浪三态渲染 + 两构建器对拍。
+    #[test]
+    fn sgr_underline_family_in_both_builders() {
+        // 直线(4)/双线(4:2)/波浪(4:3)三态同屏,对拍两构建器逐字节一致
+        let mut s = Surface::new(ScreenSize::new(6, 1));
+        s.feed(b"\x1b[4ma\x1b[4:2mb\x1b[4:3mc");
+        let calls = std::cell::Cell::new(0);
+        let fresh = std::cell::Cell::new(0);
+        let mut router = counting_router(&calls, &fresh);
+        let damage = s.take_damage();
+        let mut rows = Vec::new();
+        build_rows(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            None,
+            &damage,
+            &mut rows,
+        );
+        let repacked = repack(&rows);
+        let golden = build_instances(
+            &s,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(bytes(&repacked), bytes(&golden), "对拍(下划线族)");
+        // 下划线段 = 1px 高、uv 尺寸 0 横条:直线 1 + 双线 2 + 波浪 4
+        // (cell_width 8 / 2px 段)
+        let u: Vec<&CellInstance> = golden
+            .iter()
+            .filter(|q| q.size_uv[1] == 1.0 && q.size_uv[2] == 0.0)
+            .collect();
+        assert_eq!(u.len(), 7, "直线1 + 双线2 + 波浪4");
+        let ys: Vec<f32> = u[3..].iter().map(|q| q.pos_uv[1]).collect();
+        assert!(
+            ys.contains(&15.0) && ys.contains(&13.0),
+            "波浪两档 bottom-1/bottom-3,实际 {ys:?}"
+        );
+    }
+
     /// 行级增量:只重建受损行——路由调用次数作证,未伤行的实例位图原样。
     #[test]
     fn partial_damage_rebuilds_only_damaged_rows() {
@@ -1346,5 +1694,94 @@ mod tests {
             assert_eq!(packed[i].pos_uv[0], x);
             assert_eq!(packed[3 + i].pos_uv[0], x);
         }
+    }
+}
+
+/// M5c/T3(D34):渲染吞吐基准——build_rows 全管线路径(feed→damage→
+/// 重建),无 GPU 依赖,CI 可跑。80×24×500 行回放,cells/s。
+/// `#ignored` + `--release`:`cargo test -p mica-render bench -- --ignored --nocapture`。
+/// 输出可被 CI 的 perf job 抓取:`BENCH cells_per_sec=<f64> frame_us=<f64>`。
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::font::router::{GlyphInfo, GlyphRouter};
+    use mica_core::config::palette::Palette;
+    use mica_core::surface::{Damage, ScreenSize, Surface};
+
+    struct BenchRouter;
+    impl GlyphRouter for BenchRouter {
+        fn route(&mut self, ch: char, _style: crate::font::GlyphStyle) -> GlyphInfo {
+            GlyphInfo {
+                // 4×8 定形:uv/尺寸稳定,图集无关(不测上传,测 CPU 组装)
+                uv: [0.25, 0.25, 4.0 / 256.0, 8.0 / 256.0],
+                size_px: [4.0, 8.0],
+                offset_px: [1.0, 2.0],
+                color: ch as u32 & 0xff == 1, // 极少彩色
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_build_rows_throughput() {
+        let mut s = Surface::new(ScreenSize::new(80, 24));
+        // 混合负载:SGR/文本/CJK 交替,代表真实色彩输出
+        let line = b"\x1b[32mhello world 0123456789 \x1b[m plain text here\r\n";
+        let mut router = BenchRouter;
+        let metrics = crate::font::metrics::FontMetrics {
+            cell_width: 9.0,
+            line_height: 19.0,
+            ascent: 15.0,
+            descent: 4.0,
+        };
+        let palette = Palette::DEFAULT;
+        // 预喂 500 行(全量 damage 状态)
+        for _ in 0..500 {
+            s.feed(line);
+        }
+        let mut rows = Vec::new();
+        let t0 = std::time::Instant::now();
+        let mut total_cells = 0usize;
+        for round in 0..3 {
+            let damage = if round == 0 {
+                Damage::Full
+            } else {
+                Damage::Lines(vec![round % 24])
+            };
+            rows.clear();
+            build_rows(
+                &s,
+                &mut router,
+                &metrics,
+                &palette,
+                None,
+                0,
+                None,
+                &damage,
+                &mut rows,
+            );
+            total_cells += rows
+                .iter()
+                .map(|r| r.bg.len() + r.glyphs.len())
+                .sum::<usize>();
+        }
+        let elapsed = t0.elapsed();
+        // 单帧(全量)基准
+        let t1 = std::time::Instant::now();
+        rows.clear();
+        build_rows(
+            &s,
+            &mut router,
+            &metrics,
+            &palette,
+            None,
+            0,
+            None,
+            &Damage::Full,
+            &mut rows,
+        );
+        let frame_us = t1.elapsed().as_secs_f64() * 1e6;
+        let cells_per_sec = total_cells as f64 / elapsed.as_secs_f64();
+        println!("BENCH cells_per_sec={cells_per_sec:.0} frame_us={frame_us:.0}");
     }
 }
