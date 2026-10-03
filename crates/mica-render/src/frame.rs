@@ -317,12 +317,10 @@ pub fn strip_quads(
             out.push(CellInstance {
                 pos_uv: [rx, ry, 0.0, 0.0],
                 size_uv: [rw, rh, 0.0, 0.0],
+                // blank 形(uv 0)shader 只画 bg、墨恒 0——实心色必须进 bg 槽
+                // (link_underline 同款约定;fg 字段同色冗余存档)
                 fg: bg_of([slot.r, slot.g, slot.b]),
-                bg: bg_of([
-                    palette.colors[0].r,
-                    palette.colors[0].g,
-                    palette.colors[0].b,
-                ]),
+                bg: bg_of([slot.r, slot.g, slot.b]),
             });
         }
     }
@@ -395,8 +393,9 @@ pub fn tooltip_quads(
     let border = |bx: f32, by: f32, bw: f32, bh: f32| CellInstance {
         pos_uv: [bx, by, 0.0, 0.0],
         size_uv: [bw, bh, 0.0, 0.0],
+        // blank 形画 bg:边框色进 bg 槽(冒烟抓出的同类错误)
         fg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
-        bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+        bg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
     };
     out.extend([
         border(x, y, w, 1.0),
@@ -840,14 +839,16 @@ mod tests {
         assert_eq!(dot.len() - none_len, 3);
         let to_u8 = |c: f32| (c * 255.0 + 0.5) as u8;
         for q in &dot[none_len..] {
+            // blank 形(uv 0)画的是 bg 槽——色必须断在 bg(冒烟教训:
+            // 断 fg 曾让"绿色永不绘制"的 bug 溜过单测)
             assert_eq!(
-                ([to_u8(q.fg[0]), to_u8(q.fg[1]), to_u8(q.fg[2])]),
+                [to_u8(q.bg[0]), to_u8(q.bg[1]), to_u8(q.bg[2])],
                 [
                     palette.colors[2].r,
                     palette.colors[2].g,
                     palette.colors[2].b
                 ],
-                "绿点取调色板 slot 2"
+                "绿点取调色板 slot 2(经 bg 槽渲染)"
             );
             assert_eq!(q.size_uv[2], 0.0, "实心 quad,uv 尺寸 0");
         }
