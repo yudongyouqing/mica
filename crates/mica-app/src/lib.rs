@@ -44,10 +44,29 @@ pub fn handle_cli() -> i32 {
                 }
             }
         }
-        Some("new-tab") => dispatch_ipc(
-            IpcMessage::new_tab(args.get(1).cloned()),
-            "powershell.exe -NoLogo".into(),
-        ),
+        Some("new-tab") => {
+            // mica new-tab [profile] [--font-size N](T9 每标签字号)
+            let mut profile = None;
+            let mut font_size = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--font-size" | "-f" => {
+                        if let Some(v) = args.get(i + 1).and_then(|a| a.parse::<f32>().ok()) {
+                            font_size = Some(v);
+                            i += 1;
+                        }
+                    }
+                    _ if profile.is_none() => profile = args.get(i).cloned(),
+                    _ => {}
+                }
+                i += 1;
+            }
+            dispatch_ipc(
+                IpcMessage::new_tab_with(profile, font_size),
+                "powershell.exe -NoLogo".into(),
+            )
+        }
         Some(other) => {
             eprintln!(
                 "mica [new-tab [profile] | wsl [distro] | list-profiles]

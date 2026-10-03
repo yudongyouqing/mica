@@ -35,8 +35,19 @@ pub enum ShellMark {
     CommandStart,
     /// C:输出开始
     OutputStart,
-    /// D:命令结束(exit code 可选参数忽略——M5 消费时再议)
-    CommandEnd,
+    /// D:命令结束;exit code(D37:状态点消费)。FinalTerm 各实现形态
+    /// 不一(`err=0` 与裸 `0` 都常见),宽松双形态都收,缺失/不可解析 = None
+    CommandEnd { exit: Option<i32> },
+}
+
+/// `133;D` 第三参解析:`err=<n>` / 裸 `<n>` 双形态。
+fn parse_exit(raw: Option<&[u8]>) -> Option<i32> {
+    let raw = raw?;
+    let digits = raw.strip_prefix(b"err=").unwrap_or(raw);
+    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit() || *b == b'-') {
+        return None;
+    }
+    std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
 struct SidecarRecord {
@@ -76,7 +87,9 @@ impl alacritty_terminal::vte::Perform for SidecarRecord {
                 Some(b"A") => ShellMark::PromptStart,
                 Some(b"B") => ShellMark::CommandStart,
                 Some(b"C") => ShellMark::OutputStart,
-                Some(b"D") => ShellMark::CommandEnd,
+                Some(b"D") => ShellMark::CommandEnd {
+                    exit: parse_exit(params.get(2).copied()),
+                },
                 _ => return, // 未知标记丢弃(D30:非法参数丢弃)
             };
             self.events.marks.push(mark);
@@ -256,7 +269,7 @@ mod tests {
                 ShellMark::PromptStart,
                 ShellMark::CommandStart,
                 ShellMark::OutputStart,
-                ShellMark::CommandEnd,
+                ShellMark::CommandEnd { exit: None },
             ]
         );
     }
@@ -266,6 +279,21 @@ mod tests {
         assert_eq!(scan(b"\x1b]133;E\x07").marks, Vec::<ShellMark>::new());
         assert_eq!(scan(b"hello \x1b[31m world").marks, Vec::<ShellMark>::new());
         assert_eq!(scan(b"\x1b]0;title\x07"), SidecarEvents::default());
+    }
+
+    #[test]
+    fn osc133_exit_code_dual_forms() {
+        let e = scan(b"]133;D;err=0");
+        assert_eq!(e.marks, vec![ShellMark::CommandEnd { exit: Some(0) }]);
+        let e = scan(b"]133;D;127");
+        assert_eq!(e.marks, vec![ShellMark::CommandEnd { exit: Some(127) }]);
+        let e = scan(b"]133;D;err=-1");
+        assert_eq!(e.marks, vec![ShellMark::CommandEnd { exit: Some(-1) }]);
+        // 不可解析/缺失
+        let e = scan(b"]133;D;err=x");
+        assert_eq!(e.marks, vec![ShellMark::CommandEnd { exit: None }]);
+        let e = scan(b"]133;D");
+        assert_eq!(e.marks, vec![ShellMark::CommandEnd { exit: None }]);
     }
 
     #[test]
@@ -302,7 +330,7 @@ mod tests {
         let mut p = SidecarParser::new();
         assert_eq!(p.scan(b"text\x1b]13"), SidecarEvents::default());
         let e = p.scan(b"3;D\x07");
-        assert_eq!(e.marks, vec![ShellMark::CommandEnd]);
+        assert_eq!(e.marks, vec![ShellMark::CommandEnd { exit: None }]);
     }
 
     #[test]

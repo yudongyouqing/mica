@@ -154,17 +154,36 @@ pub struct Surface {
     sidecar: crate::protocol::sidecar::SidecarParser,
     /// 最近一次 feed 是否处于同步输出窗口(2026h..2026l),app 据此持帧。
     sync_output: bool,
-    /// 最近一次 feed 到达的 OSC 133 标记(取走即清)。
-    pending_marks: Vec<RowMark>,
+    /// OSC 133 行属性表(D37):持久累积,超 `MAX_MARKS` 淘汰最旧。
+    marks: Vec<MarkRecord>,
+    /// jump 锚(D37):上次 jump_prompt 的目标(行 + epoch);手动滚动即重置。
+    jump_ref: Option<(i32, usize)>,
+    /// 活动选区的端点(begin/update 时记录;extend_edge 用其列——上游
+    /// region 私有且 to_range 给的是排序 span,分不出端点在哪侧)。
+    sel_end: Point,
 }
 
 /// OSC 133 标记 + 记录时的光标行(视口行,0=顶,与 `Damage::Lines` 同一
-/// 坐标系;上游光标坐标恒在活动屏内,与 display_offset 无关)。M5 消费。
+/// 坐标系;上游光标坐标恒在活动屏内,与 display_offset 无关)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowMark {
     pub mark: crate::protocol::sidecar::ShellMark,
     pub line: i32,
 }
+
+/// 行属性表的内部记录:行号 + 记录瞬间的 history 深度(epoch)。
+/// 消费时换算:`current = line - (hist_now - epoch)`——内容上滚 = 行号
+/// 减小 = history 同步增长的恒等式。resize 重排会破恒等式(近似,v1 接受,
+/// M5a 冒烟把关);alt screen 的标记视同废弃。
+#[derive(Debug, Clone, Copy)]
+struct MarkRecord {
+    mark: crate::protocol::sidecar::ShellMark,
+    line: i32,
+    epoch: usize,
+}
+
+/// 行属性表上限:长会话千级 prompt 足够,jump 只关心最近的。
+const MAX_MARKS: usize = 4096;
 
 impl Surface {
     pub fn new(size: ScreenSize) -> Self {
@@ -186,7 +205,9 @@ impl Surface {
             has_drawn: false,
             sidecar: crate::protocol::sidecar::SidecarParser::new(),
             sync_output: false,
-            pending_marks: Vec::new(),
+            marks: Vec::new(),
+            jump_ref: None,
+            sel_end: Point::new(Line(0), Column(0)),
         }
     }
 
@@ -206,8 +227,18 @@ impl Surface {
             // sidecar 不产字节偏移,块内多个标记共用同一行——块粒度近似,
             // 典型 shell 集成每个标记独立 write,实践偏差为零。
             let line = self.term.grid().cursor.point.line.0;
-            self.pending_marks
-                .extend(events.marks.into_iter().map(|mark| RowMark { mark, line }));
+            let epoch = self.term.grid().history_size();
+            self.marks
+                .extend(
+                    events
+                        .marks
+                        .into_iter()
+                        .map(|mark| MarkRecord { mark, line, epoch }),
+                );
+            let overflow = self.marks.len().saturating_sub(MAX_MARKS);
+            if overflow > 0 {
+                self.marks.drain(..overflow);
+            }
         }
         self.parser.advance(&mut self.term, bytes);
     }
@@ -225,10 +256,31 @@ impl Surface {
         self.sync_output = false;
     }
 
-    /// 取走上次 feed 后到达的 OSC 133 标记(D30:解析+存储,M5 消费)。line 为
-    /// 标记所在块开始时的光标行(视口坐标,0=顶,与 damage 同一坐标系)。
-    pub fn take_shell_marks(&mut self) -> Vec<RowMark> {
-        std::mem::take(&mut self.pending_marks)
+    /// OSC 133 行属性表(D37):换算到当前视口坐标的标记行,幂等读。
+    /// 持久累积(上限 MAX_MARKS);换算恒等式见 `MarkRecord`。
+    pub fn shell_marks(&self) -> Vec<RowMark> {
+        let now = self.term.grid().history_size() as i32;
+        self.marks
+            .iter()
+            .map(|r| RowMark {
+                mark: r.mark,
+                line: r.line - (now - r.epoch as i32),
+            })
+            .collect()
+    }
+
+    /// D37 状态点:最近一个 D 的 exit code;其后的 B(命令开始)清除。
+    /// 外层 None = 无点;内层 None = D 带不可解析参数(灰点)。
+    /// A/C 不影响状态(继续向前找)。
+    pub fn last_exit_code(&self) -> Option<Option<i32>> {
+        for m in self.marks.iter().rev() {
+            match m.mark {
+                crate::protocol::sidecar::ShellMark::CommandEnd { exit } => return Some(exit),
+                crate::protocol::sidecar::ShellMark::CommandStart => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     pub fn resize(&mut self, size: ScreenSize) {
@@ -346,8 +398,53 @@ impl Surface {
     }
 
     /// 视口滚动(scrollback)。Delta(正) 向历史方向,Bottom 归零跟随。
+    /// 手动滚动重置 jump 锚(D37:锚只在连续 jump 链中保持)。
     pub fn scroll_display(&mut self, scroll: Scroll) {
+        self.jump_ref = None;
         self.term.scroll_display(scroll);
+    }
+
+    /// OSC 133 prompt 间跳转(D37)。锚 = 上次跳转目标(经 epoch 换算),
+    /// 无锚时取当前视口顶行;目标 prompt 行置于视口顶(负 Line = 历史区,
+    /// 活动屏内的目标只能归底跟随——无法滚出负偏移,天然限制)。
+    /// next 越过最新 prompt = 回底部跟随。返回是否发生滚动(需重绘)。
+    pub fn jump_prompt(&mut self, forward: bool) -> bool {
+        let hist = self.term.grid().history_size() as i32;
+        let ref_line = match self.jump_ref {
+            Some((l, e)) => l - (hist - e as i32),
+            None => -(self.term.grid().display_offset() as i32),
+        };
+        let prompts: Vec<i32> = self
+            .marks
+            .iter()
+            .filter(|m| matches!(m.mark, crate::protocol::sidecar::ShellMark::PromptStart))
+            .map(|m| m.line - (hist - m.epoch as i32))
+            .collect();
+        let target = if forward {
+            prompts.into_iter().filter(|&l| l > ref_line).min()
+        } else {
+            prompts.into_iter().filter(|&l| l < ref_line).max()
+        };
+        match target {
+            Some(l) => {
+                let want = (-l).max(0) as usize;
+                let delta = want as i32 - self.term.grid().display_offset() as i32;
+                if delta != 0 {
+                    self.term.scroll_display(Scroll::Delta(delta));
+                }
+                self.jump_ref = Some((l, hist as usize));
+                delta != 0
+            }
+            None => {
+                if forward && self.term.grid().display_offset() > 0 {
+                    self.term.scroll_display(Scroll::Bottom);
+                    self.jump_ref = None;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     /// 当前滚动偏移(0 = 钉在屏幕底跟随输出)。
@@ -360,14 +457,37 @@ impl Surface {
     /// 开始一次选择(按下/双击/三击分别传 Simple/Semantic/Lines)。
     /// point 为 buffer 坐标(视口行 + display_offset)。
     pub fn selection_begin(&mut self, ty: SelectionType, point: Point, side: Side) {
+        self.sel_end = point;
         self.term.selection = Some(Selection::new(ty, point, side));
     }
 
     /// 拖动更新选区末端。
     pub fn selection_update(&mut self, point: Point, side: Side) {
+        self.sel_end = point;
         if let Some(sel) = &mut self.term.selection {
             sel.update(point, side);
         }
+    }
+
+    /// 拖选接续滚轮(M5a/T6):活动选区端点扩到视口顶/底行,列保持端点
+    /// 原值。返回是否变化。方向语义:滚轮向上 = 端点跟到视口顶,向下 =
+    /// 跟到底——与选区几何无关(anchor 与被推端点间的区域即增长方向)。
+    pub fn selection_extend_edge(&mut self, to_top: bool) -> bool {
+        if self.term.selection.is_none() {
+            return false;
+        }
+        let rows = self.size.screen_lines() as i32;
+        let offset = self.term.grid().display_offset() as i32;
+        let line = if to_top { -offset } else { rows - 1 - offset };
+        if self.sel_end.line == Line(line) {
+            return false; // 已在边缘,幂等
+        }
+        let point = Point::new(Line(line), self.sel_end.column);
+        self.sel_end = point;
+        if let Some(sel) = &mut self.term.selection {
+            sel.update(point, Side::Left);
+        }
+        true
     }
 
     /// 清空选区(点击空白/ESC/复制后)。
@@ -716,12 +836,12 @@ mod tests {
         use crate::protocol::sidecar::ShellMark;
         let mut s = Surface::new(ScreenSize::new(10, 3));
         assert!(!s.sync_output_active());
-        assert!(s.take_shell_marks().is_empty());
+        assert!(s.shell_marks().is_empty());
         // 2026h + 133;A 同流到达
         s.feed(b"\x1b[?2026h chunk1 \x1b]133;A\x1b\\ prompt");
         assert!(s.sync_output_active(), "2026h 后进入同步窗口");
         assert_eq!(
-            s.take_shell_marks(),
+            s.shell_marks(),
             vec![RowMark {
                 mark: ShellMark::PromptStart,
                 line: 0
@@ -746,14 +866,123 @@ mod tests {
         s.feed(b"one\r\ntwo\r\n");
         s.feed(b"\x1b]133;C\x07out");
         assert_eq!(
-            s.take_shell_marks(),
+            s.shell_marks(),
             vec![RowMark {
                 mark: ShellMark::OutputStart,
                 line: 2
             }]
         );
-        // 取走即清
-        assert!(s.take_shell_marks().is_empty());
+        // 幂等读:重复调用不消耗
+        assert_eq!(s.shell_marks().len(), 1);
+    }
+
+    #[test]
+    fn marks_shift_with_scrollback() {
+        use crate::protocol::sidecar::ShellMark;
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        // prompt 标记落在第 0 行(epoch 0),随后输出把屏幕滚 3 行
+        s.feed(b"\x1b]133;A\x07PS> ");
+        s.feed(b"l1\r\nl2\r\nl3\r\nl4\r\nl5\r\nl6\r\n");
+        let marks = s.shell_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(
+            marks[0].mark,
+            ShellMark::PromptStart,
+            "标记类型保持;行号换算到当前视口系"
+        );
+        // 3 行屏:6 行文本+尾换行,前 3 行填屏后滚出 4 行 → history 4,
+        // 原 0 行 → 0 - 4 = -4(滚进历史区,负 Line 语义)
+        assert_eq!(marks[0].line, -4);
+    }
+
+    #[test]
+    fn exit_code_state_from_marks() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert_eq!(s.last_exit_code(), None, "无标记无点");
+        s.feed(b"\x1b]133;D;err=0\x07");
+        assert_eq!(s.last_exit_code(), Some(Some(0)), "绿(0)");
+        s.feed(b"\x1b]133;B\x07");
+        assert_eq!(s.last_exit_code(), None, "B 清除");
+        s.feed(b"\x1b]133;D;127\x07");
+        assert_eq!(s.last_exit_code(), Some(Some(127)), "红(裸数字形态)");
+        s.feed(b"\x1b]133;C\x07tail");
+        assert_eq!(s.last_exit_code(), Some(Some(127)), "C 不影响");
+        s.feed(b"\x1b]133;D;err=x\x07");
+        assert_eq!(s.last_exit_code(), Some(None), "灰(参数不可解析)");
+    }
+
+    #[test]
+    fn selection_extends_to_viewport_edge() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        s.feed(b"aaa\r\nbbb\r\nccc\r\nddd\r\neee\r\n");
+        // 选中行 1 的 0..3 列,滚轮向上 → 端点应跟到视口顶行(列保持)
+        s.selection_begin(
+            SelectionType::Simple,
+            Point::new(Line(1), Column(0)),
+            Side::Left,
+        );
+        s.selection_update(Point::new(Line(1), Column(3)), Side::Right);
+        assert!(s.selection_extend_edge(true));
+        let range = s.selection_range().expect("选区仍在");
+        // 排序 span:端点 (0,3) < anchor (1,0),故 start 即新端点
+        assert_eq!(range.start.line, Line(0), "端点扩到视口顶行");
+        assert_eq!(range.start.column, Column(3), "列保持端点原值");
+        // 幂等:已在边缘
+        assert!(!s.selection_extend_edge(true));
+        // 向下跟到底行
+        assert!(s.selection_extend_edge(false));
+        let range = s.selection_range().expect("选区仍在");
+        assert_eq!(range.end.line, Line(2), "端点跟到视口底行");
+        // 无选区时 no-op
+        s.selection_clear();
+        assert!(!s.selection_extend_edge(true));
+    }
+
+    #[test]
+    fn jump_prompt_steps_through_prompts() {
+        let mut s = Surface::new(ScreenSize::new(10, 4));
+        s.feed(b"\x1b]133;A\x07p1\r\n");
+        s.feed(b"\x1b]133;A\x07p2\r\n");
+        s.feed(b"\x1b]133;A\x07p3\r\nout\r\n");
+        // hist=1;prompt 当前行:p1=-1(历史)、p2=0、p3=1(活动屏)
+        assert!(s.jump_prompt(false), "prev:唯一历史 prompt 命中");
+        assert_eq!(s.display_offset(), 1, "目标行置于视口顶");
+        assert!(!s.jump_prompt(false), "再往上没有 prompt");
+        assert!(s.jump_prompt(true), "next:回到 p2");
+        assert_eq!(s.display_offset(), 0);
+        assert!(!s.jump_prompt(true), "p3 在活动屏内,无需滚动即命中");
+        assert!(!s.jump_prompt(true), "越过最新且已在底:无变化");
+    }
+
+    #[test]
+    fn jump_prompt_next_past_all_snaps_to_bottom() {
+        let mut s = Surface::new(ScreenSize::new(10, 2));
+        s.feed(b"\x1b]133;A\x07p1\r\n");
+        s.feed(b"\x1b]133;A\x07p2\r\n");
+        s.feed(b"x\r\ny\r\nz\r\n");
+        // hist=4,p1=-4、p2=-3;滚到顶(offset 4,ref=-4)
+        s.scroll_display(ScrollCommand::Top);
+        assert_eq!(s.display_offset(), 4);
+        assert!(s.jump_prompt(true));
+        assert_eq!(s.display_offset(), 3, "跳到 p2");
+        // ref=-3,无更靠下的 prompt → 回底跟随
+        assert!(s.jump_prompt(true));
+        assert_eq!(s.display_offset(), 0, "越过全部 prompt = 回底");
+    }
+
+    #[test]
+    fn manual_scroll_resets_jump_anchor() {
+        let mut s = Surface::new(ScreenSize::new(10, 4));
+        s.feed(b"\x1b]133;A\x07p1\r\n");
+        s.feed(b"\x1b]133;A\x07p2\r\n");
+        s.feed(b"\x1b]133;A\x07p3\r\nout\r\n");
+        assert!(s.jump_prompt(false));
+        assert_eq!(s.display_offset(), 1);
+        // 手动滚回底:锚清除,next 的参照回到视口顶(0)而非锚(-1)
+        s.scroll_display(ScrollCommand::Bottom);
+        assert_eq!(s.display_offset(), 0);
+        assert!(s.jump_prompt(false), "锚已重置,ref=0 再次命中 p1(-1)");
+        assert_eq!(s.display_offset(), 1);
     }
 
     /// D29 吞吐预算:sidecar 双解析的回归。10MB 混合负载(SGR 文本行),

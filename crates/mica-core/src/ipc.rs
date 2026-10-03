@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 
 /// 客户端 → 服务端。op 语义:
 /// - `activate`:聚焦既有窗口(二次启动/new-tab 默认附带)
-/// - `new-tab`:开新标签;profile 缺省走默认 shell
+/// - `new-tab`:开新标签;profile 缺省走默认 shell;font_size 覆盖
+///   启动字号(M5a/T9 每标签字号,pt;None = 跟随全局)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpcMessage {
     pub op: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub font_size: Option<f32>,
 }
 
 impl IpcMessage {
@@ -20,13 +23,20 @@ impl IpcMessage {
         Self {
             op: "activate".into(),
             profile: None,
+            font_size: None,
         }
     }
 
     pub fn new_tab(profile: Option<String>) -> Self {
+        Self::new_tab_with(profile, None)
+    }
+
+    /// T9:new-tab 带字号覆盖(`mica new-tab [profile] --font-size N`)。
+    pub fn new_tab_with(profile: Option<String>, font_size: Option<f32>) -> Self {
         Self {
             op: "new-tab".into(),
             profile,
+            font_size,
         }
     }
 }
@@ -69,6 +79,19 @@ pub fn take_frame(buf: &[u8]) -> Option<(IpcMessage, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_size_roundtrips_and_defaults_none() {
+        let m = decode(&encode(&IpcMessage::new_tab_with(None, Some(18.0)))).unwrap();
+        assert_eq!(m.font_size, Some(18.0));
+        assert_eq!(m.op, "new-tab");
+        // 老客户端不带该字段:serde default 兜 None(协议向后兼容)
+        let payload = br#"{"op":"new-tab","profile":"cmd"}"#;
+        let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(payload);
+        let legacy = decode(&framed).unwrap();
+        assert_eq!(legacy.font_size, None);
+    }
 
     #[test]
     fn roundtrip_both_ops() {
