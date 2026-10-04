@@ -79,7 +79,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段);标签 tear-off 砍单(D32)
 - defterm 整体撤除(1.0.2):RRVA 一级注册实测是陷阱——装完即劫持默认终端且无 COM 实现接管,console 程序全弹 0xC0000142。真实现(ITerminalHandoff)完成前不再注册;winget 清单首提待做
 - Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M5c 观察;QT 输入已对齐主窗契约(M5a 修双发)
-- IME(M5b 已实现跟随:组合/候选窗定光标格下缘)——**高风险未验证**:1.0.2 时代 ImmGetContext 单行曾实测 6/10 崩,当时"平反"依据是禁虚拟显卡后稳定,但该依据已被 UIA 案推翻(UIA 崩溃与驱动无关);IME 手验(两款输入法)前保持怀疑
+- IME(M5b 已实现跟随:组合/候选窗定光标格下缘)——**2026-10-04 用户手验通过**(中文输入正常、候选框跟随、不崩);旧 6/10 崩账定性为坏驱动栈时代伪影(1.0.8 后复测无恙)
 - OSC 4 全域正确(16-231 立方/232-255 灰阶,M5a 落);SGR 下划线族已渲染(M5a,此前从未画)
 - DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始窗口物理尺寸在高 DPI 屏偏小(创建尺寸未乘 scale,打磨票)
 
