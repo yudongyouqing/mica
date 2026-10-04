@@ -48,6 +48,29 @@ pub struct PtySession {
 
 /// 命令行字符串(exe + 空格分隔参数)→ CommandBuilder(M3a profile 用;
 /// 引号语义不支持——profile 命令都是受控生成,不含带空格路径)。
+/// ConPTY 宿主消毒(1.0.6):Windows 的 CreatePseudoConsole 在系统内部
+/// 解析宿主 exe(OpenConsole/conhost),解析会扫进程 PATH——装了 WezTerm
+/// 的机器上 F:\WezTerm 的 OpenConsole 抢位成功,我们的 ConPTY 会话寄生
+/// 在第三方宿主里(与 WezTerm 版本无契约,行为不可控,实测现场)。
+/// 解法零系统侵入:只在 Mica 进程内剔除"含 OpenConsole.exe 的 PATH 目录",
+/// 解析回退系统 conhost。WezTerm 本体、用户系统 PATH 均不受影响。
+pub fn sanitize_conpty_host_path() {
+    let Some(path) = std::env::var_os("PATH") else {
+        return;
+    };
+    let kept: Vec<std::path::PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| {
+            // 目录下躺着 OpenConsole.exe = 第三方 ConPTY 宿主注入点,剔除
+            !dir.join("OpenConsole.exe").is_file()
+        })
+        .collect();
+    let joined = std::env::join_paths(kept).unwrap_or(path);
+    // SAFETY: run() 早期、单线程窗口创建前调用,无并发读者(调用点契约)
+    unsafe {
+        std::env::set_var("PATH", joined);
+    }
+}
+
 pub fn command_from_str(cmd: &str) -> CommandBuilder {
     let mut parts = cmd.split_whitespace();
     let Some(exe) = parts.next() else {
