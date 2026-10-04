@@ -203,8 +203,11 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 /// 退出序取走 QT 状态(调用方 mem::forget——故意泄漏换可靠退出,见
 /// message_loop 退出序注释;teardown drop 在坏驱动栈上会陷内核卡死)。
 pub fn forget_state() {
-    // 取到的 QtState 原地 forget——类型私有,泄漏细节留在模块内
-    if let Some(st) = QT.with(|q| q.borrow_mut().take()) {
+    // 取到的 QtState:先杀 pty 子进程(与 TABS 退出序同款——否则 QT 的
+    // powershell 泄漏成孤儿,下次启动被清杀时 defterm 弹窗/142,
+    // "第二次启动报错"的 QT 分支),再 forget
+    if let Some(mut st) = QT.with(|q| q.borrow_mut().take()) {
+        st.terminal.session.kill_child();
         std::mem::forget(st);
     }
 }

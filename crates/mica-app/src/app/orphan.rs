@@ -50,6 +50,30 @@ pub fn sweep_orphaned_conhost(execute: bool) -> usize {
     let mut killed = 0;
     // SAFETY: TerminateProcess 目标句柄由本侧 OpenProcess 获得
     unsafe {
+        // 先收集孤儿 OpenConsole,先杀它们的子进程(powershell 等)——
+        // 只杀 OpenConsole 会把 powershell 打成无宿主,defterm 立刻弹
+        // WT/142("第二次启动报错"的清杀分支,1.0.4 实证);先杀子后杀
+        // 父,子进程被我们 TerminateProcess 就不会再被 defterm 接管
+        let orphan_conhost: Vec<u32> = procs
+            .iter()
+            .filter(|(_, parent, name)| name == "openconsole.exe" && !alive.contains(parent))
+            .map(|(pid, _, _)| *pid)
+            .collect();
+        for (pid, parent, name) in &procs {
+            if orphan_conhost.contains(parent)
+                && name.ends_with(".exe")
+                && *pid != *parent
+                && let Ok(h) = windows::Win32::System::Threading::OpenProcess(
+                    windows::Win32::System::Threading::PROCESS_TERMINATE,
+                    false,
+                    *pid,
+                )
+                && h != HANDLE::default()
+            {
+                let _ = windows::Win32::System::Threading::TerminateProcess(h, 1);
+                let _ = CloseHandle(h);
+            }
+        }
         for (pid, parent, name) in &procs {
             if name != "openconsole.exe" || alive.contains(parent) {
                 continue;
