@@ -221,6 +221,10 @@ impl TabState {
 }
 
 pub fn run() {
+    // ConPTY 宿主消毒(1.0.6):进程内剔除第三方 OpenConsole 目录,
+    // 见 pty.rs 的 sanitize_conpty_host_path 文档——必须在一切 spawn
+    // 之前(profile 扫描/QT/主窗 pty 全部受益)
+    mica_core::pty::sanitize_conpty_host_path();
     unsafe {
         let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
         let wc = WNDCLASSEXW {

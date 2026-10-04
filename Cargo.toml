@@ -4,7 +4,7 @@ members = ["crates/mica-core", "crates/mica-render", "crates/mica-app"]
 
 [workspace.package]
 edition = "2024"
-version = "1.0.5"
+version = "1.0.6"
 license = "MIT OR Apache-2.0"
 authors = ["yudongyouqing"]
 
