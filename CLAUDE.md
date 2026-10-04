@@ -87,6 +87,10 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 
 Conventional commits(`feat:`/`fix:`/`test:`/`docs:`/`chore:`),正文讲"为什么"。所有贡献者提交以本人身份署名。
 
+**发版流程**(2026-10-05 定档,来自 1.0.8 大审查 P2):dev→main PR →
+tag → release 附 MSI → **同步 CLAUDE.md 边界清单**(新撤线/新边界/已修
+条目逐条过——"文档说做了"≠代码对,九连发的元教训)。
+
 ## 分支与合并规范
 
 - **分支命名**:`<type>/<slug>`——type 与提交规范同集(`feat`/`fix`/`test`/`docs`/`chore`),slug 小写连字符、≤5 词。例:`feat/m1b-config`、`fix/atlas-gate-miss`。不用裸词分支名。

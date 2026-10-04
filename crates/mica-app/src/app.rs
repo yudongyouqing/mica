@@ -507,10 +507,10 @@ fn spawn_render_forwarder(
                     Some(chunk) => {
                         {
                             // 锁只罩 extend,绝不跨 PostMessageW 持锁
-                            let mut pending = buffer.lock().expect("pty buffer poisoned");
+                            let mut pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
                             pending.extend_from_slice(&chunk);
                         }
-                        let hwnd = *hwnd_slot.lock().expect("hwnd slot poisoned");
+                        let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(raw) = hwnd {
                             // 失败(队列满/窗口已死)忽略即可;Post 到死句柄无害
                             let hwnd = HWND(raw as *mut std::ffi::c_void);
@@ -552,7 +552,7 @@ fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<notify::Result<Event>>, hwnd_
         if !path.exists() {
             continue;
         }
-        let hwnd = *hwnd_slot.lock().expect("hwnd slot poisoned");
+        let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hwnd) = hwnd {
             // 失败(队列满/窗口已死)忽略即可;Post 到死句柄无害
             let hwnd = HWND(hwnd as *mut std::ffi::c_void);
@@ -798,7 +798,7 @@ fn restart_active_pane() -> bool {
         t.term = term;
         t.row_insts.clear();
         t.force_full = true;
-        t.pty_buf.lock().expect("pty buffer poisoned").clear();
+        t.pty_buf.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // 重挂转发线程(同 pane id:WM_APP_RENDER 寻址不变)
         let pty_buf = Arc::clone(&t.pty_buf);
         if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
@@ -1052,7 +1052,14 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
         let Some(target) = tab.active_pane_id() else {
             return;
         };
-        let (pane, reader) = create_pane(hwnd, "powershell.exe -NoLogo");
+        let (pane, reader) = match create_pane(hwnd, "powershell.exe -NoLogo") {
+            Ok(pair) => pair,
+            Err(e) => {
+                // P1(1.0.9 大审查):内存紧张时 spawn 失败不能闪退整个 app
+                warn_box(&e);
+                return;
+            }
+        };
         let pane_id = pane.id;
         let pty_buf = Arc::clone(&pane.terminal.pty_buf);
         tab.layout.split(target, dir, pane_id);
@@ -1065,7 +1072,7 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
     });
 }
 
-unsafe fn create_pane(hwnd: HWND, shell_command: &str) -> (PaneState, PtyReader) {
+unsafe fn create_pane(hwnd: HWND, shell_command: &str) -> Result<(PaneState, PtyReader), String> {
     create_pane_with_size(hwnd, shell_command, None)
 }
 
@@ -1074,7 +1081,7 @@ unsafe fn create_pane_with_size(
     hwnd: HWND,
     shell_command: &str,
     font_size: Option<f32>,
-) -> (PaneState, PtyReader) {
+) -> Result<(PaneState, PtyReader), String> {
     let (families, size_pt) = TAB_SEED.with(|s| s.borrow().clone());
     let size_pt = font_size
         .filter(|s| (6.0..=72.0).contains(s))
@@ -1114,7 +1121,7 @@ unsafe fn create_pane_with_size(
     }));
     let (session, reader) =
         PtySession::spawn(mica_core::pty::command_from_str(shell_command), cols, rows)
-            .expect("spawn shell");
+            .map_err(|e| format!("无法启动 shell({shell_command}):{e}"))?;
     let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
     let terminal = Terminal {
@@ -1133,13 +1140,13 @@ unsafe fn create_pane_with_size(
         exited: None,
     };
     let pane_id = NEXT_TAB_ID.with(|n| n.replace(n.get() + 1));
-    (
+    Ok((
         PaneState {
             id: pane_id,
             terminal,
         },
         reader,
-    )
+    ))
 }
 
 /// 建标签并接入渲染链(T7):create_pane 包成 Tab → 入池 → forwarder
@@ -1171,7 +1178,14 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>, font_size: O
         .as_ref()
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "PowerShell".to_string());
-    let (pane, reader) = create_pane_with_size(hwnd, &shell, font_size);
+    let (pane, reader) = match create_pane_with_size(hwnd, &shell, font_size) {
+        Ok(pair) => pair,
+        Err(e) => {
+            // P1(1.0.9):新标签 spawn 失败——提示而非闪退(保活既有标签)
+            warn_box(&e);
+            return;
+        }
+    };
     let pane_id = pane.id;
     let tab = TabState {
         title,
@@ -1218,10 +1232,10 @@ pub(crate) fn spawn_qt_forwarder(
                 match reader.recv_block() {
                     Some(chunk) => {
                         {
-                            let mut pending = buffer.lock().expect("qt buf poisoned");
+                            let mut pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
                             pending.extend_from_slice(&chunk);
                         }
-                        let hwnd = *hwnd_slot.lock().expect("hwnd slot poisoned");
+                        let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(raw) = hwnd {
                             let hwnd = HWND(raw as *mut std::ffi::c_void);
                             // SAFETY: Post 到死句柄无害
@@ -1264,7 +1278,7 @@ unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     // 上(异步不阻塞,join 安全)";本实现它泊在 recv_block,pty 不断开就
     // 不醒,先杀后 join 才不悬挂(偏差已记 task 报告)。
     eprintln!("[exit] step1: sentinel None");
-    *hwnd_slot.lock().expect("hwnd slot poisoned") = None;
+    *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
     eprintln!("[exit] step2: watcher drop + join");
     if let Some(reload) = reload {
         drop(reload.watcher);
@@ -2076,7 +2090,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 else {
                     return;
                 };
-                let bytes = std::mem::take(&mut *t.pty_buf.lock().expect("pty buffer poisoned"));
+                let bytes =
+                    std::mem::take(&mut *t.pty_buf.lock().unwrap_or_else(|e| e.into_inner()));
                 if bytes.is_empty() {
                     return; // 积压的重复唤醒:缓冲已被上一条取空,免重绘
                 }
