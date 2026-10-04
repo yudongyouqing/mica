@@ -1,0 +1,39 @@
+#pragma code_page(65001)
+1 VERSIONINFO
+PRODUCTVERSION 1, 0, 3, 0
+FILEFLAGS 0x0
+FILETYPE 0x1
+FILEFLAGSMASK 0x3f
+FILEOS 0x40004
+FILEVERSION 1, 0, 3, 0
+FILESUBTYPE 0x0
+{
+BLOCK "StringFileInfo"
+{
+BLOCK "000004b0"
+{
+VALUE "LegalCopyright", "MIT OR Apache-2.0"
+VALUE "ProductVersion", "1.0.3"
+VALUE "ProductName", "Mica"
+VALUE "FileDescription", "Mica — Windows-native terminal"
+VALUE "FileVersion", "1.0.3"
+}
+}
+BLOCK "VarFileInfo" {
+VALUE "Translation", 0x0, 0x04b0
+}
+}
+1 ICON "C:\\Project folder\\项目\\mica\\target-t\\release\\build\\mica-app-cc669ab0e93dd0a2\\out\\mica.ico"
+1 24
+{
+" <?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?> "
+" <assembly xmlns=""urn:schemas-microsoft-com:asm.v1"" manifestVersion=""1.0""> "
+" <application xmlns=""urn:schemas-microsoft-com:asm.v3""> "
+" <windowsSettings> "
+" <dpiAware xmlns=""http://schemas.microsoft.com/SMI/2005/WindowsSettings"">true/pm</dpiAware> "
+" <dpiAwareness xmlns=""http://schemas.microsoft.com/SMI/2016/WindowsSettings"">PerMonitorV2, PerMonitor</dpiAwareness> "
+" </windowsSettings> "
+" </application> "
+" </assembly> "
+}
+

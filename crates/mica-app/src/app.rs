@@ -779,7 +779,9 @@ fn restart_active_pane() -> bool {
             eprintln!("[restart] spawn 失败: {shell}");
             return;
         };
-        t.session = session; // 旧 session drop(子已死,kill 无副作用)
+        t.session.kill_child(); // 先杀旧子(非阻塞);restart 语义=旧会话终结
+        let old = std::mem::replace(&mut t.session, session);
+        std::mem::forget(old); // 不 drop——统一脏退出哲学,不留任何 drop 路径
         t.exited = None;
         // 干净起步:新 Surface 重置网格(度量/调色板/剪贴板 provider 同建)
         let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
@@ -1017,7 +1019,9 @@ fn close_pane_action() {
             return;
         }
         if let Some(pos) = tab.panes.iter().position(|p| p.id == pid) {
-            std::mem::forget(tab.panes.remove(pos)); // 脏退出(同 close_tab 注释)
+            let mut removed = tab.panes.remove(pos);
+            removed.terminal.session.kill_child(); // 泄漏前杀子(同 close_tab)
+            std::mem::forget(removed);
         }
         tab.focused = tab.focused.min(tab.panes.len() - 1);
         for p in tab.panes.iter_mut() {
@@ -1267,7 +1271,15 @@ unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     // 调用,进程杀不死(僵尸占管道连锁害死后续实例,用户实报"关窗未
     // 响应")。故意泄漏换可靠退出(Alacritty/WezTerm 同款哲学):进程
     // 一死 OS 全额回收,泄漏上限 = 进程生命期。
-    eprintln!("[exit] step5: leak GPU/QT/terminals (deliberate)");
+    eprintln!("[exit] step5: kill children, then leak GPU/QT/terminals");
+    TABS.with(|tabs| {
+        for tab in tabs.borrow_mut().iter_mut() {
+            for pane in tab.panes.iter_mut() {
+                pane.terminal.session.kill_child(); // 泄漏前杀子——否则 powershell
+                // 孤儿被下次启动的清杀打掉宿主,defterm 重派终端(WT 弹窗/142)
+            }
+        }
+    });
     std::mem::forget(TABS.with(|tabs| std::mem::take(&mut *tabs.borrow_mut())));
     std::mem::forget(GPU.with(|g| g.borrow_mut().take()));
     crate::app::quickterm::forget_state();
@@ -2366,7 +2378,11 @@ fn close_tab(idx: usize) {
         // 半死(坏驱动栈常见)时 ReadFile 卡内核,join 挂死 wndproc(用户
         // 实报"关窗未响应"的主挂点)。forget 换即时关窗;pty 子进程成孤儿
         // 由启动期孤儿清杀闭环(M5c/T1)兜底。
-        std::mem::forget(guard.remove(idx));
+        let mut removed = guard.remove(idx);
+        for pane in removed.panes.iter_mut() {
+            pane.terminal.session.kill_child(); // 泄漏前杀子(防 defterm 弹窗,见 pty.rs)
+        }
+        std::mem::forget(removed);
         let len = guard.len();
         if len == 0 {
             quit = true;
