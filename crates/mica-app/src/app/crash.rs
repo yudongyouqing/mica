@@ -29,6 +29,16 @@ pub fn crash_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("crashes"))
 }
 
+/// 触发一次真实的 access violation(读 null)——`--crash-native-test`
+/// 集成测试用:SEH filter 必须在进程死前落盘 mica-native-*.txt。
+pub fn trigger_native_crash() {
+    // SAFETY: 故意 AV——这是诊断钩子,只在 --crash-native-test 下调用
+    unsafe {
+        let p: *const u8 = std::ptr::null();
+        std::ptr::read_volatile(p);
+    }
+}
+
 /// native 崩溃(access violation 等)不走 Rust panic hook——专门为
 /// UIA/Narrator 闪退排查加的 SEH 捕获:写 minidump 后交回系统默认处理
 /// (进程仍会退出,但现场留下)。

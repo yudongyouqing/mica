@@ -71,19 +71,25 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - DECSET 2026:sidecar 检测→帧持有管线单测全绿,但 ConPTY 不透传 2026(2026-10-03 真机探针实证 feed 零命中;同路径 OSC 8 可透传,唯 2026 被消费——ConPTY 自带同步缓冲)——直连 pty 场景生效,ConPTY 场景由其自身机制兜底
 - sidecar 快筛(M4b/D29 备胎,已启用):候选前缀深跑 + carry/open_seq 跨块续命;基准测试 `sidecar_throughput_budget`(#ignored,release 跑)预算 5%
 - 启动清理孤儿 ConPTY 宿主(M5c):强杀终端必留 OpenConsole 孤儿,管道断裂后 busy-loop——2026-10-03 冒烟事故实证 13 个孤儿各烧满 1 核;启动时按"父进程已死"清杀(真开着的 WT 父进程活着不受影响),与 minidump 崩溃恢复成对
+- UIA 撤线(1.0.8):深度查询(Narrator/FindAll)稳定触发 native crash(panic/SEH 均接不住,无 dmp)——自定义 provider 走系统 host provider 替代,Narrator 仍可读窗口标题;uia.rs 模块与 COM 闭环测试保留,崩溃根因修复后恢复分派
+- Quick Terminal 的 shell 退出无轮询(主窗 poll_exits 只轮 TABS):QT 里敲 exit 后无 [exit N] 提示、无重开入口——体验欠账(通道断 forwarder 自然退,不挂死)
 - kitty graphics:ConPTY 剥离 APC(M4c 字节级实证,与 2026/OSC 52 同类)——Windows 主路径不可达,不实现;金丝雀测试 `conpty_strips_apc_today_canary` 变红 = 边界移动,重估(预研文档含 M5 立项建议)
 - OSC 133 UI(jump/exit 状态点,M5a):数据层/渲染全绿,但 ConPTY 毁引导符(ESC]→ESC\,载荷文本泄漏、BEL 被吃;OSC 8 是唯一透传例外)——经 ConPTY 不可达,金丝雀 `conpty_strips_osc133_today_canary` 守边界;直连 pty 场景即生效
 - 标签溢出滚动:滚轮+活跃自动跟随已落,箭头命中区暂缓(计划偏差注记)
 - 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段);标签 tear-off 砍单(D32)
-- defterm 二级(ITerminalHandoff COM 完整接管):RRVA 一级已上线(设置列表可见),COM 手绑 M4 探针;winget 清单首提待做
+- defterm 整体撤除(1.0.2):RRVA 一级注册实测是陷阱——装完即劫持默认终端且无 COM 实现接管,console 程序全弹 0xC0000142。真实现(ITerminalHandoff)完成前不再注册;winget 清单首提待做
 - Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M5c 观察;QT 输入已对齐主窗契约(M5a 修双发)
-- WM_CHAR 无代理对之外的 IME 组合窗口(M3 系统级 IME)
+- IME(M5b 已实现跟随:组合/候选窗定光标格下缘)——**2026-10-04 用户手验通过**(中文输入正常、候选框跟随、不崩);旧 6/10 崩账定性为坏驱动栈时代伪影(1.0.8 后复测无恙)
 - OSC 4 全域正确(16-231 立方/232-255 灰阶,M5a 落);SGR 下划线族已渲染(M5a,此前从未画)
 - DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始窗口物理尺寸在高 DPI 屏偏小(创建尺寸未乘 scale,打磨票)
 
 ## 提交规范
 
 Conventional commits(`feat:`/`fix:`/`test:`/`docs:`/`chore:`),正文讲"为什么"。所有贡献者提交以本人身份署名。
+
+**发版流程**(2026-10-05 定档,来自 1.0.8 大审查 P2):dev→main PR →
+tag → release 附 MSI → **同步 CLAUDE.md 边界清单**(新撤线/新边界/已修
+条目逐条过——"文档说做了"≠代码对,九连发的元教训)。
 
 ## 分支与合并规范
 

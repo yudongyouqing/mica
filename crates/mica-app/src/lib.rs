@@ -24,6 +24,11 @@ pub fn handle_cli() -> i32 {
         Some("--panic-test") => {
             panic!("--panic-test 自检");
         }
+        // 隐藏自检:SEH native 崩溃档案(P2-3,1.0.9)
+        Some("--crash-native-test") => {
+            app::crash::trigger_native_crash();
+            0 // 不会到达(AV 先死)
+        }
         Some("list-profiles") => {
             for p in mica_core::profile::scan_all() {
                 println!("{}", p.name);
