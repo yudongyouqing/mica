@@ -1501,9 +1501,13 @@ fn draw_frame() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_GETOBJECT => {
-            // 最小 UIA(M5c/T2):OBJID_CLIENT 走自定义 provider,其余默认
-            uia::handle_getobject(hwnd, wparam, lparam)
-                .unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
+            // 最小 UIA 撤线(1.0.8):深度 UIA 查询(Narrator/FindAll)实测
+            // 触发 native 闪退(native crash,Rust panic hook 与 SEH filter
+            // 均接不住;FindAll TreeScope::Element 稳定复现)。半吊子
+            // provider 与 defterm 同理是陷阱——撤分派,走系统默认 host
+            // provider(Narrator 仍可读窗口标题),自定义汇总等 provider
+            // 崩溃根因修复后恢复(uia.rs 模块与 COM 闭环测试保留)。
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_IME_SETCONTEXT | WM_IME_STARTCOMPOSITION => {
             // IME 跟随(M5b/T5):激活/开始组合前把组合窗与候选窗定到终端

@@ -11,9 +11,12 @@ use windows::Win32::Storage::FileSystem::{
     CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE,
 };
 use windows::Win32::System::Diagnostics::Debug::{
-    MiniDumpNormal, MiniDumpWithDataSegs, MiniDumpWriteDump,
+    EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION, MiniDumpNormal, MiniDumpWithDataSegs,
+    MiniDumpWriteDump,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
+};
 use windows::core::HSTRING;
 
 /// 递归护栏:hook 内再 panic(MessageBox/IO 失败等)直接落到 stderr,不再进 hook。
@@ -26,8 +29,75 @@ pub fn crash_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("crashes"))
 }
 
+/// native 崩溃(access violation 等)不走 Rust panic hook——专门为
+/// UIA/Narrator 闪退排查加的 SEH 捕获:写 minidump 后交回系统默认处理
+/// (进程仍会退出,但现场留下)。
+unsafe extern "system" fn native_crash_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+    let dir = crash_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let base = dir.join(format!(
+        "mica-native-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    let rec = (*info).ExceptionRecord;
+    let code = if rec.is_null() {
+        0
+    } else {
+        (*rec).ExceptionCode.0 as u32
+    };
+    let addr = if rec.is_null() {
+        0
+    } else {
+        (*rec).ExceptionAddress as usize
+    };
+    let _ = std::fs::write(
+        base.with_extension("txt"),
+        format!("native exception code=0x{code:08X} addr=0x{addr:016X}"),
+    );
+    // SAFETY: 进程级诊断调用,句柄自持
+    unsafe {
+        let name = HSTRING::from(base.with_extension("dmp").as_os_str());
+        if let Ok(h) = CreateFileW(
+            &name,
+            GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        ) {
+            let mei = MINIDUMP_EXCEPTION_INFORMATION {
+                ThreadId: GetCurrentThreadId(),
+                ExceptionPointers: info as *const _ as *mut _,
+                ClientPointers: windows_core::BOOL::default(),
+            };
+            let _ = MiniDumpWriteDump(
+                GetCurrentProcess(),
+                GetCurrentProcessId(),
+                h,
+                MiniDumpNormal | MiniDumpWithDataSegs,
+                Some(&mei),
+                None,
+                None,
+            );
+            let _ = CloseHandle(h);
+        }
+    }
+    // EXCEPTION_CONTINUE_SEARCH:交给系统默认(WER + 退出)
+    0
+}
+
 /// 安装 panic hook。进程生命期一次(重复调用静默替换——set_hook 语义)。
 pub fn install() {
+    // SAFETY: 进程早期单线程注册;filter 内部只做文件 IO + 系统调用
+    unsafe {
+        windows::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(
+            native_crash_filter,
+        ));
+    }
     std::panic::set_hook(Box::new(|info| {
         if IN_HOOK.swap(true, Ordering::SeqCst) {
             eprintln!("[crash] nested panic: {info}");
