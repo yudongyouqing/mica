@@ -102,15 +102,20 @@ pub fn scan_all() -> Vec<Profile> {
     out
 }
 
-/// 子进程枚举(3s 超时;任何失败 → 空)。CREATE_NO_WINDOW 由 pty 层管不到
-/// 这里——CLI `mica list-profiles` 允许闪控制台,GUI 路径在 app 侧首帧前
-/// 调用一次,窗口已存在不感知闪烁;记为已知瑕疵,M3c 打磨票。
+/// 子进程枚举(3s 超时;任何失败 → 空)。CREATE_NO_WINDOW 必须带:
+/// 不带的裸 console 子进程在 defterm=WT 的 Win11 上被系统委托给
+/// Windows Terminal 托管——GUI 启动时弹 WT 窗口(用户实报"双击弹三个
+/// 窗口"之一),defterm 目标异常时则弹 0xC0000142。1.0.2 前的"M3c
+/// 打磨票"定性完全错了,这是启动体验级 bug。
 pub fn list_wsl_distributions() -> Vec<String> {
-    let output = Command::new("wsl.exe")
-        .args(["--list", "--all"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success());
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args(["--list", "--all"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW(见函数 doc)
+    }
+    let output = cmd.output().ok().filter(|o| o.status.success());
     let Some(output) = output else {
         return Vec::new();
     };
