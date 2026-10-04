@@ -2,3 +2,6 @@
 .DS_Store
 *.log
 smoke_shots/
+
+# 测试用临时构建目录(1.0.4 排障引入 CARGO_TARGET_DIR)
+/target-t/

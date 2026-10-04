@@ -137,6 +137,16 @@ impl PtySession {
         Ok(())
     }
 
+    /// 非阻塞杀子(1.0.4):退出/关闭路径在 mem::forget 前调用——
+    /// 泄漏 Terminal 连子进程一起漏,powershell 成孤儿;下次启动孤儿
+    /// 清杀只杀 OpenConsole,powershell 失宿主被 defterm 重派终端
+    /// (WT 弹窗/0xC0000142,"第二次启动报错"的真身)。kill 是
+    /// TerminateProcess 非阻塞,try_wait 收割不等待——永不挂。
+    pub fn kill_child(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.try_wait();
+    }
+
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
     }
