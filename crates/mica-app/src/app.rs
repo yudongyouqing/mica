@@ -154,6 +154,11 @@ struct WindowGpu {
     renderer: Renderer,
     wgpu_surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    /// GPU 纹理当前装载的图集归属(pane id, revision)——窗口级唯一
+    /// 纹理配窗口级所有权(1.0.10 修切标签乱码:此前 revision 按标签记,
+    /// 切回旧标签时其自身 revision 未变便跳过重传,GPU 里还是别的标签
+    /// 的字形,稳定乱码)。
+    atlas_owner: Option<(u64, u64)>,
 }
 
 /// 单个标签的终端态:GPU 以外的一切(M1 时代的 Terminal 字段原样)。
@@ -169,9 +174,6 @@ struct Terminal {
     palette: Palette,
     cols: u16,
     rows: u16,
-    /// 已传给 Renderer 的图集修订号(C1:普通 insert 也递增);u64::MAX
-    /// 起步保证空图集(修订 0)也完成首次上传,不踩 set_atlas 契约
-    renderer_atlas_revision: u64,
     /// 行级实例缓存(Task 8):draw_frame 按 damage 增量重建,容量恒等于
     /// 视口行数(结构守恒在 frame::build_rows 内兜底)
     row_insts: Vec<RowInst>,
@@ -613,8 +615,6 @@ unsafe fn reload_config(hwnd: HWND) {
                 let rows = ((term_h as f32 / metrics.line_height).max(1.0)) as u16;
                 t.router = router;
                 t.metrics = metrics;
-                // 修订号镜像回 u64::MAX:新图集必完成首次上传(与 init 同款契约)
-                t.renderer_atlas_revision = u64::MAX;
                 t.cols = cols;
                 t.rows = rows;
                 t.term.resize(ScreenSize::new(cols as usize, rows as usize));
@@ -705,6 +705,7 @@ unsafe fn init_window_gpu(hwnd: HWND) -> WindowGpu {
         renderer,
         wgpu_surface,
         config,
+        atlas_owner: None,
     }
 }
 
@@ -727,7 +728,6 @@ fn rebuild_gpu_after_loss() {
     TABS.with(|tabs| {
         for tab in tabs.borrow_mut().iter_mut() {
             for pane in tab.panes.iter_mut() {
-                pane.terminal.renderer_atlas_revision = u64::MAX;
                 pane.terminal.force_full = true;
             }
         }
@@ -847,7 +847,6 @@ unsafe fn reload_dpi(hwnd: HWND, dpi: u32) {
                 let rows = ((term_h as f32 / metrics.line_height).max(1.0)) as u16;
                 t.router = router;
                 t.metrics = metrics;
-                t.renderer_atlas_revision = u64::MAX;
                 t.cols = cols;
                 t.rows = rows;
                 t.term.resize(ScreenSize::new(cols as usize, rows as usize));
@@ -1133,7 +1132,6 @@ unsafe fn create_pane_with_size(
         palette,
         cols,
         rows,
-        renderer_atlas_revision: u64::MAX,
         row_insts: Vec::new(), // 首建即空:build_rows 的长度守恒兜底 → 首帧全量
         force_full: true,      // 首帧显式全量,不依赖哨兵的先后
         shell: shell_command.to_string(),
@@ -1354,7 +1352,7 @@ fn draw_frame() {
             area_h.max(1.0),
         );
         let rects: Vec<(u64, Rect)> = active.layout.rects(area);
-        let focused_pane_id = active.active_pane_id();
+        let focused_pane_id = active.active_pane_id().unwrap_or(0);
 
         let mut all_instances: Vec<mica_render::frame::CellInstance> = Vec::new();
         // 焦点边框的色与 strip 用同一个 pane 的 router/色板
@@ -1414,8 +1412,8 @@ fn draw_frame() {
             }
         }
         // 焦点 pane 边框:1px 亮线四条(palette.colors[4] 蓝)
-        if let Some(pid) = focused_pane_id
-            && let Some((_, r)) = rects.iter().find(|(id, _)| *id == pid)
+        if focused_pane_id != 0
+            && let Some((_, r)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
             && let Some(t) = active
                 .panes
                 .get_mut(head_pane_index)
@@ -1495,15 +1493,19 @@ fn draw_frame() {
         let revision = t.router.atlas_revision();
         let atlas = t.router.atlas();
         strip.append(&mut all_instances);
-        // GPU 窗口级(T7):set_atlas 切到活跃标签的图集再 draw
+        // GPU 窗口级(T7):set_atlas 切到活跃标签的图集再 draw。
+        // 门控用窗口级所有权(pane_id, revision)——1.0.10 修切标签乱码:
+        // 旧逻辑按标签记 revision,切回旧标签时其自身未变便跳过重传,
+        // GPU 纹理还装着别人的字形(用户稳定复现:多会话点第一个全乱码)
+        // pane id 在借 active_pane 之前取,避开可变借用交叉
         GPU.with(|g| {
             let mut gpu_guard = g.borrow_mut();
             let Some(gpu) = gpu_guard.as_mut() else {
                 return;
             };
-            if t.renderer_atlas_revision != revision {
+            if gpu.atlas_owner != Some((focused_pane_id, revision)) {
                 gpu.renderer.set_atlas(atlas);
-                t.renderer_atlas_revision = revision;
+                gpu.atlas_owner = Some((focused_pane_id, revision));
             }
             gpu.renderer.draw(&gpu.wgpu_surface, &gpu.config, &strip);
         });

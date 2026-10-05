@@ -38,6 +38,9 @@ struct QtState {
     config: wgpu::SurfaceConfiguration,
     /// 输入辅助:QT 窗口自己的代理对暂存(与主窗共用 TLS 会串号,故本地)
     pending_surrogate: u32,
+    /// QT renderer 装载的图集修订号(单 pane 独占窗口,无跨标签共享——
+    /// 主窗的窗口级所有权方案见 WindowGpu::atlas_owner)
+    atlas_revision: u64,
 }
 
 thread_local! {
@@ -176,7 +179,6 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         palette,
         cols,
         rows,
-        renderer_atlas_revision: u64::MAX,
         row_insts: Vec::new(),
         force_full: true,
         shell: "powershell.exe -NoLogo".into(),
@@ -189,6 +191,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
             wgpu_surface,
             config,
             pending_surrogate: 0,
+            atlas_revision: u64::MAX,
         })
     });
 
@@ -405,9 +408,9 @@ fn qt_draw(st: &mut QtState) {
     );
     let revision = t.router.atlas_revision();
     let atlas = t.router.atlas();
-    if t.renderer_atlas_revision != revision {
+    if st.atlas_revision != revision {
         st.renderer.set_atlas(atlas);
-        t.renderer_atlas_revision = revision;
+        st.atlas_revision = revision;
     }
     let instances = repack(&t.row_insts);
     st.renderer.draw(&st.wgpu_surface, &st.config, &instances);
