@@ -48,6 +48,35 @@ fn blank(x_px: f32, y_px: f32, metrics: &FontMetrics, fg: [u8; 3], bg: [u8; 3]) 
     }
 }
 
+/// 圆角 blank quad(2026-10 UI 对标):blend:None 下没有 alpha 混合,圆角
+/// 抗锯齿的唯一途径是 per-fragment 把**已知底衬色**与面色按 SDF 覆盖率
+/// premix(见 cells.wgsl 的 rounded_coverage)。槽位语义仅对无字形 quad
+/// 合法:fg.rgb=底衬色、bg.w=上圆角半径、fg.w=下圆角半径(px,0=方角);
+/// 字形 quad 的 fg 是墨色,不得走圆角路径。
+fn rounded(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    face: [u8; 3],
+    under: [u8; 3],
+    radii: (f32, f32), // (上, 下)
+) -> CellInstance {
+    let c = |rgb: [u8; 3]| {
+        [
+            rgb[0] as f32 / 255.0,
+            rgb[1] as f32 / 255.0,
+            rgb[2] as f32 / 255.0,
+        ]
+    };
+    CellInstance {
+        pos_uv: [x, y, 0.0, 0.0],
+        size_uv: [w, h, 0.0, 0.0],
+        fg: [c(under)[0], c(under)[1], c(under)[2], radii.1],
+        bg: [c(face)[0], c(face)[1], c(face)[2], radii.0],
+    }
+}
+
 /// Snapshot the visible screen into draw instances. Two-instance, two-pass
 /// contract: pass 1 emits a full-cell background quad (`blank`, ink_mask 0)
 /// for EVERY cell, row-major; pass 2 then emits the glyph quad for every
@@ -209,6 +238,26 @@ pub struct StripExtras {
     pub layout: StripLayout,
     /// M5b/T3 pane 退出码(活跃 pane 已退出时显示 [exit N])
     pub pane_exit: Option<u32>,
+    /// 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的可视反馈
+    pub hover: StripHover,
+}
+
+/// strip 悬停命中(与 app 层 hit-test 同几何单源;命中区互斥)。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StripHover {
+    /// 悬停的非激活标签(激活标签无反馈必要)
+    pub tab: Option<usize>,
+    pub plus: bool,
+    /// caption 三键(— □ ×)
+    pub caption: Option<CaptionBtn>,
+}
+
+/// caption 按钮序(与 NCHITTEST 的从左到右一致)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptionBtn {
+    Min,
+    Max,
+    Close,
 }
 
 /// tab strip 的 UI 实例(T7,spec §3 同管线),Ghostty 视觉语义:
@@ -234,8 +283,10 @@ pub fn strip_quads(
         caption_x,
         layout,
         pane_exit,
+        hover,
     } = extras;
     let mut out = Vec::new();
+    let single = titles.len() == 1;
     let total_w = titles.len() as f32 * TAB_W + TAB_PLUS_W;
     let shift = layout.tab_scroll as f32 * TAB_W;
     let bg_of = |rgb: [u8; 3]| to_color(rgb);
@@ -259,6 +310,7 @@ pub fn strip_quads(
         palette.colors[7].g,
         palette.colors[7].b,
     ];
+    let white = [palette.fg.r, palette.fg.g, palette.fg.b];
     // 底条:整窗宽(caption 区含)——材质条;旧"黑槽按需宽"在材质色
     // ≠ 清屏色后会留色阶断口,必须铺满
     let strip_w = caption_x
@@ -272,64 +324,112 @@ pub fn strip_quads(
         bg: bg_of(tint),
     });
     let text_y = (STRIP_H - metrics.line_height).max(0.0) / 2.0;
-    for (i, (title, active)) in titles.iter().enumerate() {
-        let x = i as f32 * TAB_W - shift;
-        if x + TAB_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w) {
-            continue; // 滚出可视区的标签不发射
-        }
-        // 激活:背景本色块(y 从 2 到底缘——与终端区同色无缝);非激活:
-        // 无块,文字直接落在材质条上(次级灰)
-        let (backdrop, ink) = if *active {
-            (
-                [palette.bg.r, palette.bg.g, palette.bg.b],
-                [palette.fg.r, palette.fg.g, palette.fg.b],
-            )
-        } else {
-            (tint, dim)
-        };
-        if *active {
-            out.push(CellInstance {
-                pos_uv: [x + 1.0, 2.0, 0.0, 0.0],
-                size_uv: [TAB_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
-                fg: bg_of(backdrop),
-                bg: bg_of(backdrop),
-            });
-        }
-        // 标题:8px 内边距,超宽截断(等宽步进)
-        let max_chars = (((TAB_W - 16.0) / metrics.cell_width) as usize).max(1);
+    // 单标签(Ghostty 单窗口观感):不画标签块与"+"按钮,标题以主色
+    // 居中——标签形制只在 ≥2 时出现(macOS 原生 tabs 同语义)
+    if single {
+        let (title, _) = &titles[0];
+        let avail = caption_x.unwrap_or(strip_w);
+        let max_chars = ((avail / metrics.cell_width) as usize)
+            .saturating_sub(2)
+            .max(1);
+        let text_w = title.chars().count().min(max_chars) as f32 * metrics.cell_width;
+        let start = ((avail - text_w) / 2.0).max(0.0);
         for (ci, ch) in title.chars().take(max_chars).enumerate() {
             let g = router.route(ch, GlyphStyle::PLAIN);
             if g.size_px[0] <= 0.0 {
-                continue; // 空白/未路由字符跳过
+                continue;
             }
             out.push(CellInstance {
                 pos_uv: [
-                    x + 8.0 + ci as f32 * metrics.cell_width + g.offset_px[0],
+                    start + ci as f32 * metrics.cell_width + g.offset_px[0],
                     text_y + g.offset_px[1],
                     g.uv[0],
                     g.uv[1],
                 ],
                 size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: bg_of(ink),
-                bg: bg_of(backdrop),
+                fg: bg_of(white),
+                bg: bg_of(tint),
             });
         }
-    }
-    // "+" 按钮(裸字形减淡,随滚动平移,同裁剪;Ghostty 失焦 50% 同族)
-    let x = titles.len() as f32 * TAB_W - shift;
-    if !(x + TAB_PLUS_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
-        let g = router.route('+', GlyphStyle::PLAIN);
-        out.push(CellInstance {
-            pos_uv: [
-                x + (TAB_PLUS_W - g.size_px[0]) / 2.0,
-                (STRIP_H - g.size_px[1]) / 2.0,
-                g.uv[0],
-                g.uv[1],
-            ],
-            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-            fg: bg_of(dim),
-            bg: bg_of(tint),
-        });
+    } else {
+        for (i, (title, active)) in titles.iter().enumerate() {
+            let x = i as f32 * TAB_W - shift;
+            if x + TAB_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w) {
+                continue; // 滚出可视区的标签不发射
+            }
+            // 激活:背景本色块(上圆角,底缘与终端区同色无缝);非激活:
+            // 无块,文字落在材质条上(次级灰),悬停时轻亮块提示可点
+            let hovered = hover.tab == Some(i);
+            let hover_face = mix(tint, white, 0.05);
+            let (backdrop, ink) = if *active {
+                ([palette.bg.r, palette.bg.g, palette.bg.b], white)
+            } else if hovered {
+                (hover_face, dim)
+            } else {
+                (tint, dim)
+            };
+            if *active || hovered {
+                out.push(rounded(
+                    x + 1.0,
+                    2.0,
+                    TAB_W - 2.0,
+                    STRIP_H - 2.0,
+                    backdrop,
+                    tint,
+                    (8.0, 0.0),
+                ));
+            }
+            // 标题:8px 内边距,超宽截断(等宽步进)
+            let max_chars = (((TAB_W - 16.0) / metrics.cell_width) as usize).max(1);
+            for (ci, ch) in title.chars().take(max_chars).enumerate() {
+                let g = router.route(ch, GlyphStyle::PLAIN);
+                if g.size_px[0] <= 0.0 {
+                    continue; // 空白/未路由字符跳过
+                }
+                out.push(CellInstance {
+                    pos_uv: [
+                        x + 8.0 + ci as f32 * metrics.cell_width + g.offset_px[0],
+                        text_y + g.offset_px[1],
+                        g.uv[0],
+                        g.uv[1],
+                    ],
+                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                    fg: bg_of(ink),
+                    bg: bg_of(backdrop),
+                });
+            }
+        }
+        // "+" 按钮(裸字形减淡,随滚动平移,同裁剪;Ghostty 失焦 50% 同族;
+        // 悬停轻亮块)。单标签时隐藏(见上)
+        let x = titles.len() as f32 * TAB_W - shift;
+        if !(x + TAB_PLUS_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
+            let hovered = hover.plus;
+            let face = mix(tint, white, 0.05);
+            let (glyph_bg, ink) = if hovered { (face, dim) } else { (tint, dim) };
+            if hovered {
+                out.push(rounded(
+                    x + 1.0,
+                    2.0,
+                    TAB_PLUS_W - 2.0,
+                    STRIP_H - 2.0,
+                    face,
+                    tint,
+                    (4.0, 4.0),
+                ));
+            }
+            let g = router.route('+', GlyphStyle::PLAIN);
+            out.push(CellInstance {
+                pos_uv: [
+                    x + (TAB_PLUS_W - g.size_px[0]) / 2.0,
+                    (STRIP_H - g.size_px[1]) / 2.0,
+                    g.uv[0],
+                    g.uv[1],
+                ],
+                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                fg: bg_of(ink),
+                bg: bg_of(glyph_bg),
+            });
+        }
     }
     // pane 退出态(M5b/T3):dot 槽左侧文本(标题后缀会被截断吃掉——
     // 长 cwd 标题实测);0 绿/非 0 红。OSC133 点在 caption_x-14,
@@ -363,7 +463,7 @@ pub fn strip_quads(
         }
     }
     // D37 exit 状态点:caption 区左邻(固定锚;无 caption 时 "+" 右侧),
-    // 6px 八边形(3 rect 逼近,quad 管线零扩展)
+    // 7px 真圆(圆角半径 = 半宽,2026-10 从 3-rect 八边形升级)
     if let Some(dot) = exit_dot {
         let slot = match dot {
             ExitDot::Green => palette.colors[2],
@@ -372,27 +472,48 @@ pub fn strip_quads(
         };
         let dx = caption_x.map(|cx| cx - 14.0).unwrap_or(total_w + 10.0);
         let cy = STRIP_H / 2.0;
-        for [rx, ry, rw, rh] in [
-            [dx + 1.0, cy - 3.0, 4.0, 1.0],
-            [dx, cy - 2.0, 6.0, 4.0],
-            [dx + 1.0, cy + 2.0, 4.0, 1.0],
-        ] {
-            out.push(CellInstance {
-                pos_uv: [rx, ry, 0.0, 0.0],
-                size_uv: [rw, rh, 0.0, 0.0],
-                // blank 形(uv 0)shader 只画 bg、墨恒 0——实心色必须进 bg 槽
-                // (link_underline 同款约定;fg 字段同色冗余存档)
-                fg: bg_of([slot.r, slot.g, slot.b]),
-                bg: bg_of([slot.r, slot.g, slot.b]),
-            });
-        }
+        out.push(rounded(
+            dx,
+            cy - 3.5,
+            7.0,
+            7.0,
+            [slot.r, slot.g, slot.b],
+            tint,
+            (3.5, 3.5),
+        ));
     }
     // 系统按钮区(T8):— □ ×,裸字形减淡(Ghostty 交通灯无底块同语义;
     // hit-test 已在 NCHITTEST,同几何单源:每颗 CAPTION_BTN 宽,起点
-    // caption_x = 客户区右缘 - 3×宽;hover 高亮留后续)
+    // caption_x = 客户区右缘 - 3×宽)。hover:min/max 轻亮块、close 红
+    // 底白字(Windows 关闭钮惯例;Ghostty 交通灯 hover 亦是着色)
     if let Some(cx) = caption_x {
         for (i, glyph) in ['\u{2500}', '\u{25a1}', '\u{00d7}'].iter().enumerate() {
             let bx = cx + i as f32 * CAPTION_BTN;
+            let hovered = hover.caption
+                == Some(match i {
+                    0 => CaptionBtn::Min,
+                    1 => CaptionBtn::Max,
+                    _ => CaptionBtn::Close,
+                });
+            let lighten = mix(tint, white, 0.08);
+            let red = [
+                palette.colors[1].r,
+                palette.colors[1].g,
+                palette.colors[1].b,
+            ];
+            let (face, ink) = match (hovered, i) {
+                (true, 2) => (red, white),     // close hover:红底白字
+                (true, _) => (lighten, white), // min/max hover:轻亮块
+                (false, _) => (tint, dim),
+            };
+            if hovered {
+                out.push(CellInstance {
+                    pos_uv: [bx, 0.0, 0.0, 0.0],
+                    size_uv: [CAPTION_BTN, STRIP_H, 0.0, 0.0],
+                    fg: bg_of(face),
+                    bg: bg_of(face),
+                });
+            }
             let g = router.route(*glyph, GlyphStyle::PLAIN);
             if g.size_px[0] > 0.0 {
                 out.push(CellInstance {
@@ -403,8 +524,8 @@ pub fn strip_quads(
                         g.uv[1],
                     ],
                     size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                    fg: bg_of(dim),
-                    bg: bg_of(tint),
+                    fg: bg_of(ink),
+                    bg: bg_of(face),
                 });
             }
         }
@@ -890,23 +1011,134 @@ mod tests {
                 ..Default::default()
             },
         );
-        // 八边形 = 3 个 rect;None 不画
-        assert_eq!(dot.len() - none_len, 3);
+        // 真圆 = 1 个圆角 quad;None 不画
+        assert_eq!(dot.len() - none_len, 1);
         let to_u8 = |c: f32| (c * 255.0 + 0.5) as u8;
-        for q in &dot[none_len..] {
-            // blank 形(uv 0)画的是 bg 槽——色必须断在 bg(冒烟教训:
-            // 断 fg 曾让"绿色永不绘制"的 bug 溜过单测)
-            assert_eq!(
-                [to_u8(q.bg[0]), to_u8(q.bg[1]), to_u8(q.bg[2])],
-                [
-                    palette.colors[2].r,
-                    palette.colors[2].g,
-                    palette.colors[2].b
-                ],
-                "绿点取调色板 slot 2(经 bg 槽渲染)"
-            );
-            assert_eq!(q.size_uv[2], 0.0, "实心 quad,uv 尺寸 0");
-        }
+        let q = &dot[none_len];
+        // 圆角半径 = 半宽(7×7,r=3.5),编码在 alpha 槽
+        assert_eq!(q.size_uv, [7.0, 7.0, 0.0, 0.0]);
+        assert_eq!(q.bg[3], 3.5, "上圆角半径在 bg.w");
+        assert_eq!(q.fg[3], 3.5, "下圆角半径在 fg.w");
+        // 面色必须断在 bg.rgb(冒烟教训:断 fg 曾让"绿色永不绘制"的 bug
+        // 溜过单测);fg.rgb 是底衬(premix AA 契约)
+        assert_eq!(
+            [to_u8(q.bg[0]), to_u8(q.bg[1]), to_u8(q.bg[2])],
+            [
+                palette.colors[2].r,
+                palette.colors[2].g,
+                palette.colors[2].b
+            ],
+            "绿点取调色板 slot 2(经 bg.rgb 渲染)"
+        );
+        assert_eq!(q.size_uv[2], 0.0, "实心 quad,uv 尺寸 0");
+    }
+
+    #[test]
+    fn strip_tab_block_rounded_and_hover() {
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let titles = vec![
+            ("a".to_string(), false),
+            ("b".to_string(), true),
+            ("c".to_string(), false),
+        ];
+        let palette = Palette::DEFAULT;
+        let plain = strip_quads(
+            &titles,
+            &mut r,
+            &metrics_8x16(),
+            &palette,
+            Default::default(),
+        );
+        // 激活标签块:上圆角 8、下 0(底缘与终端区无缝),bg.rgb=背景本色
+        let block = plain
+            .iter()
+            .find(|q| q.size_uv[0] == TAB_W - 2.0 && q.size_uv[1] == STRIP_H - 2.0)
+            .expect("active tab block emitted");
+        assert_eq!(block.bg[3], 8.0, "上圆角半径 8px");
+        assert_eq!(block.fg[3], 0.0, "下缘方角(无缝拼接终端区)");
+        let to_u8 = |c: f32| (c * 255.0 + 0.5) as u8;
+        assert_eq!(
+            [to_u8(block.bg[0]), to_u8(block.bg[1]), to_u8(block.bg[2])],
+            [palette.bg.r, palette.bg.g, palette.bg.b],
+            "激活块=背景本色"
+        );
+        // hover 非激活标签 0:轻亮圆角块出现(plain 态无此块)
+        assert!(!plain.iter().any(|q| q.pos_uv[0] == 1.0 && q.bg[3] == 8.0));
+        let hovered = strip_quads(
+            &titles,
+            &mut r,
+            &metrics_8x16(),
+            &palette,
+            StripExtras {
+                hover: StripHover {
+                    tab: Some(0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            hovered
+                .iter()
+                .filter(|q| q.bg[3] == 8.0 && q.fg[3] == 0.0)
+                .count(),
+            2,
+            "激活块 + hover 块(上圆角)共 2"
+        );
+    }
+
+    #[test]
+    fn strip_single_tab_centers_title_without_block() {
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let one = vec![("solo".to_string(), true)];
+        let two = vec![("a".to_string(), true), ("b".to_string(), false)];
+        let palette = Palette::DEFAULT;
+        let extras = StripExtras {
+            caption_x: Some(400.0),
+            ..Default::default()
+        };
+        let single = strip_quads(&one, &mut r, &metrics_8x16(), &palette, extras);
+        let multi = strip_quads(&two, &mut r, &metrics_8x16(), &palette, extras);
+        // 单标签:无标签块、无"+"字形;标题字形起点 > 0(居中)
+        assert!(
+            !single
+                .iter()
+                .any(|q| q.size_uv[0] == TAB_W - 2.0 && q.size_uv[1] == STRIP_H - 2.0),
+            "单标签无块"
+        );
+        assert!(
+            !single
+                .iter()
+                .any(|q| q.pos_uv[2] > 0.0 && q.pos_uv[0] > 140.0 && q.pos_uv[0] < 176.0),
+            "无 plus 字形(单标签隐藏,plus 区在 x∈[140,176))"
+        );
+        let title_x = single
+            .iter()
+            .find(|q| q.pos_uv[2] > 0.0)
+            .map(|q| q.pos_uv[0])
+            .expect("title glyph");
+        assert!(
+            title_x > 100.0,
+            "标题居中(4 字符 ×8px,中心 200 → 起点 ≈184,得 {title_x})"
+        );
+        assert!(
+            multi
+                .iter()
+                .any(|q| q.size_uv[0] == TAB_W - 2.0 && q.size_uv[1] == STRIP_H - 2.0),
+            "多标签有块"
+        );
     }
 
     /// 可编程假路由:每个字符回固定字形,便于断言几何。

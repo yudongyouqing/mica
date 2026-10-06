@@ -22,14 +22,35 @@ pub async fn create_context(
     instance: &wgpu::Instance,
     compatible_surface: Option<&wgpu::Surface<'_>>,
 ) -> anyhow::Result<GpuContext> {
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface,
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        })
-        .await?;
+    // 适配器择优(2026-10-06 真机事故定案):request_adapter(LowPower)
+    // 在装了远控虚拟显卡的机器上会随机选中虚拟适配器——表面兼容但呈现
+    // 落空,整窗停留在未初始化显存(症状:窗口内容为每次不同的杂色、
+    // 残影错位,与渲染逻辑无关;基线构建同样复现)。改为显式枚举:
+    // 离散 > 集成 > 其余(VirtualGpu/Cpu 仅兜底),并日志留痕——下次
+    // 选卡异常一眼可辨。
+    let adapter = {
+        let candidates: Vec<wgpu::Adapter> = instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .await
+            .into_iter()
+            .filter(|a| compatible_surface.is_none_or(|s| a.is_surface_supported(s)))
+            .collect();
+        let rank = |a: &wgpu::Adapter| match a.get_info().device_type {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            _ => 2,
+        };
+        let best = candidates
+            .iter()
+            .min_by_key(|a| (rank(a), a.get_info().name.clone()))
+            .ok_or_else(|| anyhow::anyhow!("no surface-compatible adapter"))?;
+        let info = best.get_info();
+        eprintln!(
+            "adapter: {} ({:?}, {} {}, backend {:?})",
+            info.name, info.device_type, info.driver, info.driver_info, info.backend
+        );
+        best.clone()
+    };
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("mica-render"),

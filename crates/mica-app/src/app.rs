@@ -38,7 +38,7 @@ use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TME_HOVER, TME_LEAVE, TRACKMOUSEEVENT,
+    GetKeyState, ReleaseCapture, SetCapture, TME_HOVER, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
     TrackMouseEvent, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_INSERT,
     VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
 };
@@ -53,8 +53,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
     WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_PAINT, WM_SIZE,
-    WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMOUSEMOVE, WM_PAINT,
+    WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
     WS_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -141,6 +141,15 @@ thread_local! {
     /// D28 hover 气泡:URL + 绘制锚(客户区坐标)。None = 不画
     static HOVER_URL: RefCell<Option<(String, f32, f32)>> =
         const { RefCell::new(None) };
+    /// strip 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的反馈
+    /// (const 初始化用字面量——Default::default 不是 const fn)
+    static HOVER_STRIP: std::cell::Cell<mica_render::frame::StripHover> = const {
+        std::cell::Cell::new(mica_render::frame::StripHover {
+            tab: None,
+            plus: false,
+            caption: None,
+        })
+    };
     /// 上次双击的 (时刻, x, y):三击 = 同位置 450ms 内的第二次双击
     static LAST_DBLCLK: std::cell::RefCell<Option<(std::time::Instant, i32, i32)>> =
         const { std::cell::RefCell::new(None) };
@@ -1498,6 +1507,7 @@ fn draw_frame() {
                     avail_w: (area_w - 3.0 * CAPTION_BTN_W as f32).max(0.0),
                 },
                 pane_exit,
+                hover: HOVER_STRIP.with(std::cell::Cell::get),
             },
         );
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
@@ -1908,7 +1918,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 !same
             });
-            if changed {
+            // strip 悬停(2026-10):标签/加号/标题区命中变化 → 反馈重绘
+            let hover = strip_hover_at(px, py);
+            let hover_changed = HOVER_STRIP.with(|s| {
+                let old = s.get();
+                if old != hover {
+                    s.set(hover);
+                    true
+                } else {
+                    false
+                }
+            });
+            if changed || hover_changed {
                 draw_frame();
             }
             LRESULT(0)
@@ -1917,6 +1938,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // TrackMouseEvent TME_LEAVE 投递(675,本地声明——windows-rs 未收录)
             HOVER_ARMED.with(|a| a.set(false));
             let had = HOVER_URL.with(|h| h.borrow_mut().take().is_some());
+            let strip_had = HOVER_STRIP.with(|s| {
+                let had = s.get() != mica_render::frame::StripHover::default();
+                s.set(mica_render::frame::StripHover::default());
+                had
+            });
+            if had || strip_had {
+                draw_frame();
+            }
+            LRESULT(0)
+        }
+        WM_NCMOUSEMOVE => {
+            // caption 按钮区(NCHITTEST 判非客户区)的悬停流:lparam 屏幕
+            // 坐标 → 客户系后同源命中;变化即重绘并武装 NC leave
+            let mut pt = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+            // SAFETY: 坐标换算,输出写回本侧 POINT
+            unsafe {
+                pt.x = (lparam.0 & 0xffff) as u16 as i16 as i32;
+                pt.y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+                let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+            }
+            let hover = strip_hover_at(pt.x, pt.y);
+            let changed = HOVER_STRIP.with(|s| {
+                let old = s.get();
+                if old != hover {
+                    s.set(hover);
+                    true
+                } else {
+                    false
+                }
+            });
+            if changed {
+                arm_nc_leave(hwnd);
+                draw_frame();
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_NCMOUSELEAVE => {
+            // TME_NONCLIENT 投递(674 = 0x02A2,本地声明——windows-rs 未收录)
+            let had = HOVER_STRIP.with(|s| {
+                let had = s.get() != mica_render::frame::StripHover::default();
+                s.set(mica_render::frame::StripHover::default());
+                had
+            });
             if had {
                 draw_frame();
             }
@@ -2471,6 +2535,49 @@ fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
     }
 }
 
+/// strip 悬停命中(2026-10 UI 对标):客户区坐标 → 标签/加号/caption 三键。
+/// 与 strip_hit 同几何单源;caption 右端区 strip_hit 不覆盖,此处补齐。
+fn strip_hover_at(px: i32, py: i32) -> mica_render::frame::StripHover {
+    use mica_render::frame::{CaptionBtn, StripHover};
+    let mut h = StripHover::default();
+    if py < 0 || py as f32 >= mica_render::frame::STRIP_H {
+        return h;
+    }
+    match strip_hit(px, py) {
+        Some(Some(i)) => h.tab = Some(i),
+        Some(None) => h.plus = true,
+        None => {
+            let w = GPU
+                .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as i32))
+                .unwrap_or(0);
+            let left = w - CAPTION_BTN_W * 3;
+            if px >= left {
+                h.caption = Some(match (px - left) / CAPTION_BTN_W {
+                    0 => CaptionBtn::Min,
+                    1 => CaptionBtn::Max,
+                    _ => CaptionBtn::Close,
+                });
+            }
+        }
+    }
+    h
+}
+
+/// NC 悬停离开武装(TME_NONCLIENT):caption 按钮区被 NCHITTEST 判为非客户
+/// 区,离开事件是 WM_NCMOUSELEAVE 而非 WM_MOUSELEAVE
+fn arm_nc_leave(hwnd: HWND) {
+    let mut tme = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_NONCLIENT | TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    // SAFETY: OS 追踪注册;失败只是收不到 NC leave,悬停态由下一帧覆盖
+    unsafe {
+        let _ = TrackMouseEvent(&mut tme);
+    }
+}
+
 /// 标签溢出滚动调整(T8):步进 1 个标签宽,clamp 到 [0, max];返回是否变化。
 fn tab_scroll_adjust(delta: i32) -> bool {
     let area_w = GPU
@@ -2671,6 +2778,8 @@ fn mouse_xy(lparam: LPARAM) -> (i32, i32) {
 /// 只收在未启用的 Win32_UI_Controls feature,本地声明免开整包)。
 const WM_MOUSEHOVER: u32 = 673;
 const WM_MOUSELEAVE: u32 = 675;
+/// TrackMouseEvent TME_NONCLIENT 投递(0x02A2;windows-rs 未收录)
+const WM_NCMOUSELEAVE: u32 = 674;
 
 /// 武装 hover/leave 追踪(WM_MOUSEMOVE 非拖选路径与 WM_MOUSEHOVER 重武装共用)。
 /// dwell 300ms:观感上"停一下才出提示",误触率与响应速度的折中。
