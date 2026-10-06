@@ -1497,6 +1497,9 @@ fn draw_frame() {
         // 门控用窗口级所有权(pane_id, revision)——1.0.10 修切标签乱码:
         // 旧逻辑按标签记 revision,切回旧标签时其自身未变便跳过重传,
         // GPU 纹理还装着别人的字形(用户稳定复现:多会话点第一个全乱码)
+        // 二段修复:a883e6e 的身份门曾 Renderer 内部另有一道"revision
+        // 数值相等"早退,字符集相似的两标签计数撞车即漏传(手验推翻
+        // 探针验证)——内门已拆,set_atlas 无条件上传,身份判断只在此处
         // pane id 在借 active_pane 之前取,避开可变借用交叉
         GPU.with(|g| {
             let mut gpu_guard = g.borrow_mut();

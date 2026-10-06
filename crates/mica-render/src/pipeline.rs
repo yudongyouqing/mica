@@ -77,8 +77,12 @@ pub struct Renderer {
     globals_buf: wgpu::Buffer,
     instance_buf: wgpu::Buffer,
     instance_capacity: usize,
-    /// 已上传图集的 revision;变化才重传
+    /// 最近一次上传的 revision(诊断值,不做门控——见 set_atlas 注释)
     atlas_revision: u64,
+    /// set_atlas 实际执行次数。回归锁的观测面:窗口级纹理被多个
+    /// pane 的图集轮流占用,任何"按内容/数值跳过上传"的内部门都会
+    /// 在此计数上现形(两次调用必须两次计数)
+    atlas_uploads: usize,
     /// 持有当前图集纹理供 bind group 引用(替换时旧纹理随之释放)
     atlas_texture: Option<wgpu::Texture>,
     clear_color: wgpu::Color,
@@ -208,6 +212,7 @@ impl Renderer {
             instance_buf,
             instance_capacity,
             atlas_revision: 0,
+            atlas_uploads: 0,
             atlas_texture: None,
             clear_color: bg_clear_color(&Palette::DEFAULT),
         }
@@ -219,14 +224,17 @@ impl Renderer {
         self.clear_color = bg_clear_color(palette);
     }
 
-    /// 图集更新(revision 变化才重传;首次调用建立纹理与 bind group)。
-    /// 门控用 revision 而非 version:普通 insert 不重排但改了纹理内容,
-    /// 漏传会让新字形隐形(GPU 侧还是旧数据,ink=0)。
+    /// 图集上传(无条件执行;首次调用建立纹理与 bind group)。
+    /// 1.0.10 教训:这里曾按"revision 数值相等"早退——但窗口级纹理会被
+    /// 多个 pane 的图集轮流占用,字符集相似的两个标签 revision 计数完全
+    /// 可能相同,数值门必撞车漏传(用户稳定复现:多标签点回第一个全
+    /// 乱码;app 层 a883e6e 的身份门被这道内门废掉)。"GPU 里装的是谁
+    /// 的图集"只有调用方知道(app 的 WindowGpu::atlas_owner 按 pane
+    /// 身份判断),本函数只忠实上传。insert 改纹理内容、grow 改尺寸,
+    /// 都由调用方的 revision 触发到这里,无内门则永不漏。
     pub fn set_atlas(&mut self, atlas: &GlyphAtlas) {
-        if self.atlas_revision == atlas.revision() && self.atlas_texture.is_some() {
-            return;
-        }
         self.atlas_revision = atlas.revision();
+        self.atlas_uploads += 1;
         let size = wgpu::Extent3d {
             width: atlas.width(),
             height: atlas.height(),
@@ -462,16 +470,33 @@ mod tests {
         let rect = atlas.insert(&bmp);
         assert!(rect.u + rect.w <= atlas.width());
         renderer.set_atlas(&atlas);
-        // 内容未变再次调用:revision 门早退,不重传也不应 panic
+        assert_eq!(renderer.atlas_uploads, 1);
+        // 重复调用同一图集:无条件路径也必须正常(门控职责在 app 层)
         renderer.set_atlas(&atlas);
+        assert_eq!(renderer.atlas_uploads, 2);
+        // 撞车回归锁(1.0.10 二段修复):两份内容不同、revision 计数相同
+        // 的图集——旧的内门按数值相等早退,第二份静默漏传=切标签乱码
+        // 的机制本体。现在必须两次都真实上传。
+        let mut other = GlyphAtlas::new(256, 256);
+        let other_bmp = GlyphBitmap::from_coverage(10, 10, vec![90; 10 * 10]);
+        other.insert(&other_bmp);
+        assert_eq!(
+            other.revision(),
+            atlas.revision(),
+            "前提:两图集 revision 计数此刻相同"
+        );
+        renderer.set_atlas(&other);
+        renderer.set_atlas(&atlas);
+        assert_eq!(renderer.atlas_uploads, 4, "数值撞车不得跳过上传");
         // C1 回归锁:普通插入(不触发 grow)version 不动但 revision 递增,
-        // set_atlas 必须重传——旧门控只看 version 时这类插入会静默漏传
+        // 调用方据此触发 set_atlas——本函数无条件消费,永不漏传
         let plain = GlyphBitmap::from_coverage(6, 9, vec![200; (6 * 9) as usize]);
         atlas.insert(&plain);
         assert_eq!(atlas.version(), 0, "此插入不应触发 grow");
         renderer.set_atlas(&atlas);
-        // 直接读私有字段:门控必须消费 insert 后的 revision
+        // 直接读私有字段:诊断值随最近一次上传更新
         assert_eq!(renderer.atlas_revision, atlas.revision());
+        assert_eq!(renderer.atlas_uploads, 5);
         // 高 250 的字形在剩余空间放不下(12+250>256)→ grow 后 version 递增;
         // set_atlas 走"重建纹理+重传"路径(新尺寸 256×512)
         let big = GlyphBitmap::from_coverage(8, 250, vec![128; (8 * 250) as usize]);
