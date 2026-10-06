@@ -69,6 +69,9 @@ const ROWS: u16 = 30;
 
 /// 自绘顶栏(T8):右上三颗系统按钮各 46px 宽;resize 拖拽边宽
 const CAPTION_BTN_W: i32 = 46;
+/// 内容区内边距(Ghostty window-padding-x/y 默认 2px 同值):网格区
+/// 左右下各缩 2px,余边由清屏色(背景色)填充——文字不贴窗沿
+const PAD: f32 = 2.0;
 const RESIZE_BORDER: i32 = 6;
 
 /// WM_APP 用户消息区(0x8000 起):
@@ -289,6 +292,24 @@ pub fn run() {
             None,
         )
         .expect("CreateWindowExW failed");
+
+        // 创建即折叠原生边框(Win11 实测):创建路径里 NCCALCSIZE 先按默认
+        // 计算落框,折叠(返回 0)仅在 FRAMECHANGED 强制重算时应用——不补
+        // 这一发,窗口顶着原生标题栏+边框运行,与 strip 自绘的 caption
+        // 形成双 chrome(用户实测 offset X=8/Y=30,2026-10-06 UI 对标首日)
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+        );
 
         // 暗色标题栏;Win10 1809 前忽略失败
         let dark: i32 = 1;
@@ -1346,10 +1367,10 @@ fn draw_frame() {
             - mica_render::frame::STRIP_H;
         use mica_core::layout::Rect;
         let area = Rect::new(
-            0.0,
+            PAD,
             mica_render::frame::STRIP_H,
-            area_w.max(1.0),
-            area_h.max(1.0),
+            (area_w - 2.0 * PAD).max(1.0),
+            (area_h - PAD).max(1.0),
         );
         let rects: Vec<(u64, Rect)> = active.layout.rects(area);
         let focused_pane_id = active.active_pane_id().unwrap_or(0);

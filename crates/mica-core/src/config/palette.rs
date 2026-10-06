@@ -26,49 +26,50 @@ impl Default for Palette {
 }
 
 impl Palette {
-    /// M0 时代的默认值(BASE16 + 白前景 + #1e1e1e 底 + 白光标)——
-    /// 退到无主题无用户配置时,观感与 M1-A 完全一致。
+    /// Ghostty 官方默认(上游 src/terminal/color.zig Name.default + Config 默认:
+    /// Tomorrow 系 16 色 + #282C34 底 + 纯白前景 + 白光标)——UI 对标
+    /// Ghostty 的基准观感;无主题无用户配置时与官方截图一致。
     pub const DEFAULT: Self = Self {
         colors: [
             Rgb {
-                r: 0x1e,
-                g: 0x1e,
-                b: 0x1e,
+                r: 0x1d,
+                g: 0x1f,
+                b: 0x21,
             },
             Rgb {
-                r: 0xf7,
-                g: 0x4b,
-                b: 0x50,
+                r: 0xcc,
+                g: 0x66,
+                b: 0x66,
             },
             Rgb {
-                r: 0x24,
-                g: 0xb0,
-                b: 0x7a,
+                r: 0xb5,
+                g: 0xbd,
+                b: 0x68,
             },
             Rgb {
-                r: 0xf2,
-                g: 0xa6,
-                b: 0x0d,
+                r: 0xf0,
+                g: 0xc6,
+                b: 0x74,
             },
             Rgb {
-                r: 0x43,
-                g: 0x9e,
-                b: 0xff,
+                r: 0x81,
+                g: 0xa2,
+                b: 0xbe,
             },
             Rgb {
-                r: 0xd3,
-                g: 0x82,
-                b: 0xea,
+                r: 0xb2,
+                g: 0x94,
+                b: 0xbb,
             },
             Rgb {
-                r: 0x4f,
-                g: 0xc5,
-                b: 0xe1,
+                r: 0x8a,
+                g: 0xbe,
+                b: 0xb7,
             },
             Rgb {
-                r: 0xd4,
-                g: 0xd4,
-                b: 0xd4,
+                r: 0xc5,
+                g: 0xc8,
+                b: 0xc6,
             },
             Rgb {
                 r: 0x66,
@@ -76,39 +77,39 @@ impl Palette {
                 b: 0x66,
             },
             Rgb {
-                r: 0xff,
-                g: 0x6c,
-                b: 0x70,
+                r: 0xd5,
+                g: 0x4e,
+                b: 0x53,
             },
             Rgb {
-                r: 0x3c,
-                g: 0xd6,
-                b: 0x96,
+                r: 0xb9,
+                g: 0xca,
+                b: 0x4a,
             },
             Rgb {
-                r: 0xff,
-                g: 0xc6,
-                b: 0x4d,
+                r: 0xe7,
+                g: 0xc5,
+                b: 0x47,
             },
             Rgb {
-                r: 0x63,
-                g: 0xb3,
-                b: 0xff,
+                r: 0x7a,
+                g: 0xa6,
+                b: 0xda,
             },
             Rgb {
-                r: 0xd8,
-                g: 0x98,
-                b: 0xf2,
+                r: 0xc3,
+                g: 0x97,
+                b: 0xd8,
             },
             Rgb {
-                r: 0x6c,
-                g: 0xd9,
-                b: 0xfa,
+                r: 0x70,
+                g: 0xc0,
+                b: 0xb1,
             },
             Rgb {
-                r: 0xff,
-                g: 0xff,
-                b: 0xff,
+                r: 0xea,
+                g: 0xea,
+                b: 0xea,
             },
         ],
         fg: Rgb {
@@ -117,9 +118,9 @@ impl Palette {
             b: 0xff,
         },
         bg: Rgb {
-            r: 0x1e,
-            g: 0x1e,
-            b: 0x1e,
+            r: 0x28,
+            g: 0x2c,
+            b: 0x34,
         },
         cursor: Rgb {
             r: 0xff,
@@ -127,14 +128,14 @@ impl Palette {
             b: 0xff,
         },
         selection_fg: Rgb {
-            r: 0x1e,
-            g: 0x1e,
-            b: 0x1e,
+            r: 0x28,
+            g: 0x2c,
+            b: 0x34,
         },
         selection_bg: Rgb {
-            r: 0xd4,
-            g: 0xd4,
-            b: 0xd4,
+            r: 0xc5,
+            g: 0xc8,
+            b: 0xc6,
         },
     };
 
@@ -215,14 +216,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_matches_m0_observed_colors() {
+    fn default_matches_ghostty_upstream() {
+        // 锚 Ghostty 官方默认(上游 src/terminal/color.zig Name.default +
+        // Config 默认 bg/fg)——UI 对标的基准值,漂移即回归
         let p = Palette::DEFAULT;
         assert_eq!(
             p.bg,
             Rgb {
-                r: 0x1e,
-                g: 0x1e,
-                b: 0x1e
+                r: 0x28,
+                g: 0x2c,
+                b: 0x34
             }
         );
         assert_eq!(
@@ -236,11 +239,20 @@ mod tests {
         assert_eq!(
             p.colors[1],
             Rgb {
-                r: 0xf7,
-                g: 0x4b,
-                b: 0x50
+                r: 0xcc,
+                g: 0x66,
+                b: 0x66
             },
             "red 槽"
+        );
+        assert_eq!(
+            p.colors[7],
+            Rgb {
+                r: 0xc5,
+                g: 0xc8,
+                b: 0xc6
+            },
+            "white 槽(strip 次级字色)"
         );
     }
 

@@ -424,9 +424,9 @@ mod tests {
     #[test]
     fn clear_color_follows_palette_bg() {
         let c = bg_clear_color(&Palette::DEFAULT);
-        assert_eq!(c.r, f64::from(0x1e) / 255.0);
-        assert_eq!(c.g, f64::from(0x1e) / 255.0);
-        assert_eq!(c.b, f64::from(0x1e) / 255.0);
+        assert_eq!(c.r, f64::from(0x28) / 255.0);
+        assert_eq!(c.g, f64::from(0x2c) / 255.0);
+        assert_eq!(c.b, f64::from(0x34) / 255.0);
         assert_eq!(c.a, 1.0);
         let mut p = Palette::DEFAULT;
         p.apply_pair("background", "#abcdef").unwrap();

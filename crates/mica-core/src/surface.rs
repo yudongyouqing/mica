@@ -653,11 +653,12 @@ mod tests {
     #[test]
     fn color_request_default_answers_fg_and_bg() {
         let mut s = Surface::new(ScreenSize::new(10, 3));
-        // 256=前景(白)、257=背景(#1e1e1e)——M0 全答白是欠账,现在按 palette 分流
+        // 256=前景(白)、257=背景(#282c34,Ghostty 官方默认)——M0 全答白是
+        // 欠账,现在按 palette 分流
         s.proxy.send_event(Event::ColorRequest(256, fmt_rgb()));
         assert_eq!(s.take_pty_writes(), vec!["ffffff".to_string()]);
         s.proxy.send_event(Event::ColorRequest(257, fmt_rgb()));
-        assert_eq!(s.take_pty_writes(), vec!["1e1e1e".to_string()]);
+        assert_eq!(s.take_pty_writes(), vec!["282c34".to_string()]);
     }
 
     #[test]

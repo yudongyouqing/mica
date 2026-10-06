@@ -211,12 +211,15 @@ pub struct StripExtras {
     pub pane_exit: Option<u32>,
 }
 
-/// tab strip 的 UI 实例(T7,spec §3 同管线):底条 + 标签块(活跃高亮),
-/// 标题文字经 router 路由(与终端共享图集),尾部 "+" 按钮开新标签。
-/// 文字按等宽 cell 步进排版——strip 只有标题一行,粗排版与终端观感一致。
+/// tab strip 的 UI 实例(T7,spec §3 同管线),Ghostty 视觉语义:
+/// 底条 = 终端背景轻染材质(无黑槽无分隔线,与内容区同族),激活
+/// 标签 = 背景本色块(底缘与终端区无缝——内容区向上延伸),非激活
+/// 标签无块仅次级灰字。标题文字经 router 路由(与终端共享图集),
+/// 尾部 "+" 按钮开新标签。文字按等宽 cell 步进排版——strip 只有
+/// 标题一行,粗排版与终端观感一致。
 /// exit_dot(D37):活跃标签的命令状态点,画在 caption 区左邻(固定锚)。
 /// caption_x(T8):系统按钮区起点(客户区坐标);Some 时画 — □ × 字形
-/// (路由字符,hit-test 已在;hover 态留后续)。
+/// (裸字形减淡,hit-test 已在;hover 态留后续)。
 /// layout(T8):溢出滚动——越界标签不发射(右缘由 caption bg 自然覆盖),
 /// 滚轮驱动滚动,箭头命中区暂缓(滚轮覆盖主痛点)。
 pub fn strip_quads(
@@ -236,16 +239,37 @@ pub fn strip_quads(
     let total_w = titles.len() as f32 * TAB_W + TAB_PLUS_W;
     let shift = layout.tab_scroll as f32 * TAB_W;
     let bg_of = |rgb: [u8; 3]| to_color(rgb);
-    // 底条(黑槽):宽度按需,不足以铺满也无妨(清屏色同源)
+    // 材质:背景向前景微混(Ghostty 上游 titlebarColor = backgroundColor、
+    // 原生 NSTabBar 材质的平面翻译)。k=0.06:暗底轻亮、亮底轻暗,
+    // 两类主题都成立
+    let mix = |a: [u8; 3], b: [u8; 3], k: f32| {
+        [
+            (a[0] as f32 + (b[0] as f32 - a[0] as f32) * k + 0.5) as u8,
+            (a[1] as f32 + (b[1] as f32 - a[1] as f32) * k + 0.5) as u8,
+            (a[2] as f32 + (b[2] as f32 - a[2] as f32) * k + 0.5) as u8,
+        ]
+    };
+    let tint = mix(
+        [palette.bg.r, palette.bg.g, palette.bg.b],
+        [palette.fg.r, palette.fg.g, palette.fg.b],
+        0.06,
+    );
+    let dim = [
+        palette.colors[7].r,
+        palette.colors[7].g,
+        palette.colors[7].b,
+    ];
+    // 底条:整窗宽(caption 区含)——材质条;旧"黑槽按需宽"在材质色
+    // ≠ 清屏色后会留色阶断口,必须铺满
+    let strip_w = caption_x
+        .map(|cx| cx + 3.0 * CAPTION_BTN)
+        .unwrap_or(total_w)
+        .max(total_w);
     out.push(CellInstance {
         pos_uv: [0.0, 0.0, 0.0, 0.0],
-        size_uv: [total_w, STRIP_H, 0.0, 0.0],
-        fg: bg_of([0, 0, 0]),
-        bg: bg_of([
-            palette.colors[0].r,
-            palette.colors[0].g,
-            palette.colors[0].b,
-        ]),
+        size_uv: [strip_w, STRIP_H, 0.0, 0.0],
+        fg: bg_of(tint),
+        bg: bg_of(tint),
     });
     let text_y = (STRIP_H - metrics.line_height).max(0.0) / 2.0;
     for (i, (title, active)) in titles.iter().enumerate() {
@@ -253,22 +277,24 @@ pub fn strip_quads(
         if x + TAB_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w) {
             continue; // 滚出可视区的标签不发射
         }
-        let block = if *active {
-            palette.bg
+        // 激活:背景本色块(y 从 2 到底缘——与终端区同色无缝);非激活:
+        // 无块,文字直接落在材质条上(次级灰)
+        let (backdrop, ink) = if *active {
+            (
+                [palette.bg.r, palette.bg.g, palette.bg.b],
+                [palette.fg.r, palette.fg.g, palette.fg.b],
+            )
         } else {
-            palette.colors[8]
+            (tint, dim)
         };
-        let ink = if *active {
-            palette.fg
-        } else {
-            palette.colors[7]
-        };
-        out.push(CellInstance {
-            pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
-            size_uv: [TAB_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
-            fg: bg_of([ink.r, ink.g, ink.b]),
-            bg: bg_of([block.r, block.g, block.b]),
-        });
+        if *active {
+            out.push(CellInstance {
+                pos_uv: [x + 1.0, 2.0, 0.0, 0.0],
+                size_uv: [TAB_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
+                fg: bg_of(backdrop),
+                bg: bg_of(backdrop),
+            });
+        }
         // 标题:8px 内边距,超宽截断(等宽步进)
         let max_chars = (((TAB_W - 16.0) / metrics.cell_width) as usize).max(1);
         for (ci, ch) in title.chars().take(max_chars).enumerate() {
@@ -284,25 +310,14 @@ pub fn strip_quads(
                     g.uv[1],
                 ],
                 size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: bg_of([ink.r, ink.g, ink.b]),
-                bg: bg_of([block.r, block.g, block.b]),
+                fg: bg_of(ink),
+                bg: bg_of(backdrop),
             });
         }
     }
-    // "+" 按钮(随滚动平移,同裁剪)
+    // "+" 按钮(裸字形减淡,随滚动平移,同裁剪;Ghostty 失焦 50% 同族)
     let x = titles.len() as f32 * TAB_W - shift;
     if !(x + TAB_PLUS_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
-        let block = palette.colors[0];
-        let ink = palette.fg;
-        // 顶栏系统按钮占位(T8):右上三颗 — □ × 由 NC hit-test 命中;视觉
-        // 字形由 hit-test 的 CAPTION_BTN_W 常量几何驱动(同布局单源约束下,
-        // 按钮字形绘制放 app 层后续打磨,先保证 hit-test 可用)
-        out.push(CellInstance {
-            pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
-            size_uv: [TAB_PLUS_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
-            fg: bg_of([ink.r, ink.g, ink.b]),
-            bg: bg_of([block.r, block.g, block.b]),
-        });
         let g = router.route('+', GlyphStyle::PLAIN);
         out.push(CellInstance {
             pos_uv: [
@@ -312,8 +327,8 @@ pub fn strip_quads(
                 g.uv[1],
             ],
             size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-            fg: bg_of([ink.r, ink.g, ink.b]),
-            bg: bg_of([block.r, block.g, block.b]),
+            fg: bg_of(dim),
+            bg: bg_of(tint),
         });
     }
     // pane 退出态(M5b/T3):dot 槽左侧文本(标题后缀会被截断吃掉——
@@ -343,11 +358,7 @@ pub fn strip_quads(
                 ],
                 size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
                 fg: bg_of([slot.r, slot.g, slot.b]),
-                bg: bg_of([
-                    palette.colors[0].r,
-                    palette.colors[0].g,
-                    palette.colors[0].b,
-                ]),
+                bg: bg_of(tint),
             });
         }
     }
@@ -376,19 +387,12 @@ pub fn strip_quads(
             });
         }
     }
-    // 系统按钮区(T8):— □ ×,路由字符(hit-test 已在 NCHITTEST,同几何
-    // 单源:每颗 CAPTION_BTN 宽,起点 caption_x = 客户区右缘 - 3×宽)
+    // 系统按钮区(T8):— □ ×,裸字形减淡(Ghostty 交通灯无底块同语义;
+    // hit-test 已在 NCHITTEST,同几何单源:每颗 CAPTION_BTN 宽,起点
+    // caption_x = 客户区右缘 - 3×宽;hover 高亮留后续)
     if let Some(cx) = caption_x {
-        let ink = palette.fg;
-        let block = palette.colors[0];
         for (i, glyph) in ['\u{2500}', '\u{25a1}', '\u{00d7}'].iter().enumerate() {
             let bx = cx + i as f32 * CAPTION_BTN;
-            out.push(CellInstance {
-                pos_uv: [bx + 1.0, 1.0, 0.0, 0.0],
-                size_uv: [CAPTION_BTN - 2.0, STRIP_H - 2.0, 0.0, 0.0],
-                fg: bg_of([ink.r, ink.g, ink.b]),
-                bg: bg_of([block.r, block.g, block.b]),
-            });
             let g = router.route(*glyph, GlyphStyle::PLAIN);
             if g.size_px[0] > 0.0 {
                 out.push(CellInstance {
@@ -399,8 +403,8 @@ pub fn strip_quads(
                         g.uv[1],
                     ],
                     size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                    fg: bg_of([ink.r, ink.g, ink.b]),
-                    bg: bg_of([block.r, block.g, block.b]),
+                    fg: bg_of(dim),
+                    bg: bg_of(tint),
                 });
             }
         }
@@ -1285,9 +1289,9 @@ mod tests {
         assert_eq!(
             inst[0].bg,
             [
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
+                0x28 as f32 / 255.0,
+                0x2c as f32 / 255.0,
+                0x34 as f32 / 255.0,
                 0.0
             ]
         );
@@ -1296,9 +1300,9 @@ mod tests {
         assert_eq!(
             inst[1].fg,
             [
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
+                0x28 as f32 / 255.0,
+                0x2c as f32 / 255.0,
+                0x34 as f32 / 255.0,
                 0.0
             ]
         );
@@ -1309,9 +1313,9 @@ mod tests {
         assert_eq!(
             inst[2].fg,
             [
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
+                0x28 as f32 / 255.0,
+                0x2c as f32 / 255.0,
+                0x34 as f32 / 255.0,
                 0.0
             ]
         );
@@ -1324,9 +1328,9 @@ mod tests {
         assert_eq!(
             inst[5].fg,
             [
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
+                0x28 as f32 / 255.0,
+                0x2c as f32 / 255.0,
+                0x34 as f32 / 255.0,
                 0.0
             ]
         );
