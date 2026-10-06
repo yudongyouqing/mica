@@ -36,6 +36,10 @@ pub struct Settings {
     pub cursor_blink: bool,
     /// Quick Terminal 全局热键(M3b,默认 Win+`;禁用写 `none`)。
     pub quick_terminal_key: Option<String>,
+    /// 锁定标题(Ghostty `title` 同义):设定时窗口/标签标题恒为此值,
+    /// 程序发的 OSC 0/2 标题被忽略;空串 = 解除锁定回落 shell 标题。
+    /// 想视觉隐藏标题写单空格(Ghostty 文档同法)。
+    pub title: Option<String>,
 }
 
 impl Default for Settings {
@@ -43,6 +47,7 @@ impl Default for Settings {
         Self {
             font_families: DEFAULT_FAMILIES.iter().map(|s| s.to_string()).collect(),
             font_size_pt: DEFAULT_FONT_SIZE_PT,
+            title: None,
             palette: Palette::DEFAULT,
             theme_name: None,
             keymap: Keymap::wt_default(),
@@ -123,6 +128,8 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                     .push(format!("font-size 应为 4-72 的数字,得 `{value}`")),
             },
             "theme" => settings.theme_name = Some(value),
+            // 空值 = 解除锁定(Ghostty:置空回落默认/shell 标题)
+            "title" => settings.title = Some(value).filter(|v| !v.is_empty()),
             "quick-terminal-key" => {
                 if value.eq_ignore_ascii_case("none") {
                     settings.quick_terminal_key = None;
@@ -187,6 +194,15 @@ mod tests {
         assert_eq!(s.theme_name.as_deref(), Some("Dracula"));
         assert_eq!(s.palette.bg.r, 0x00, "用户 background 覆盖主题");
         assert_eq!(s.palette.colors[1].r, 0xff, "palette 槽来自主题(#ff5555)");
+    }
+
+    #[test]
+    fn title_locks_and_empty_unlocks() {
+        // Ghostty `title` 同义:设值锁定,置空解除
+        let s = resolve("title = 我的终端").unwrap();
+        assert_eq!(s.title.as_deref(), Some("我的终端"));
+        let s = resolve("title = ").unwrap();
+        assert_eq!(s.title, None, "空值=解除锁定");
     }
 
     #[test]

@@ -131,6 +131,9 @@ thread_local! {
     static TAB_SEED: RefCell<(Vec<String>, f32)> = const { RefCell::new((Vec::new(), 12.0)) };
     /// 当前生效调色板(建新标签用;热重载时更新)
     static CURRENT_PALETTE: RefCell<Palette> = const { RefCell::new(Palette::DEFAULT) };
+    /// 锁定标题(Ghostty `title` 同义,2026-10-07):Some = 窗口/标签恒显
+    /// 此值,OSC 0/2 忽略;None = 跟随 shell 标题(exe 路径智能缩短)
+    static TITLE_LOCK: RefCell<Option<String>> = const { RefCell::new(None) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -278,6 +281,7 @@ pub fn run() {
         let settings = load_settings();
         // 窗口级键位表与设置同源(用户 keybind 覆盖 WT 默认)
         KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
+        TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
@@ -722,6 +726,7 @@ unsafe fn reload_config(hwnd: HWND) {
         }
     });
     KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
+    TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
     // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
@@ -1394,10 +1399,16 @@ fn draw_frame() {
     TABS.with(|tabs| {
         let mut guard = tabs.borrow_mut();
         // titles 先行收集(不可变借用),再取活跃标签可变借用
+        let lock = TITLE_LOCK.with(|t| t.borrow().clone());
         let titles: Vec<(String, bool)> = guard
             .iter()
             .enumerate()
-            .map(|(i, tab)| (tab.title.clone(), i == ACTIVE.get()))
+            .map(|(i, tab)| {
+                (
+                    lock.clone().unwrap_or_else(|| tab.title.clone()),
+                    i == ACTIVE.get(),
+                )
+            })
             .collect();
         // pane 退出态(M5b/T3):strip 右侧标签(标题后缀会被长标题截断吃掉)
         let pane_exit = guard
@@ -2277,9 +2288,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     t.force_full = true;
                 }
                 if let Some(title) = title_opt {
-                    guard[tab_idx].title = title.clone();
+                    // 锁定标题(Ghostty `title`):OSC 0/2 忽略;窗口标题
+                    // 保持锁定值(draw_frame titles 已同源,无需另写)
+                    let shown = pretty_title(&title);
+                    guard[tab_idx].title = shown.clone();
                     if is_active {
-                        let _ = SetWindowTextW(hwnd, &HSTRING::from(title));
+                        let win_title = TITLE_LOCK.with(|t| t.borrow().clone()).unwrap_or(shown);
+                        let _ = SetWindowTextW(hwnd, &HSTRING::from(win_title));
                     }
                 }
                 if is_active {
@@ -2848,6 +2863,32 @@ fn px_to_buffer_point(
 }
 
 /// 鼠标消息 lparam 的有符号客户区坐标。
+/// 标题呈现(Ghostty 语义的 Windows 适配):OSC 0/2 原样信任(Ghostty 的
+/// shell 集成会发 user@host:cwd 这类好标题);Windows shell 常发裸 exe
+/// 路径(PowerShell 默认),取 basename 去扩展——与 Ghostty direct
+/// command 取 argv[0] 同一意图:标题=正在跑的程序名。
+fn pretty_title(raw: &str) -> String {
+    let t = raw.trim();
+    let lower = t.to_ascii_lowercase();
+    if lower.ends_with(".exe") || lower.ends_with(".cmd") || lower.ends_with(".bat") {
+        let base = t.rsplit(['\\', '/']).next().unwrap_or(t);
+        return base
+            .strip_suffix({
+                let l = base.to_ascii_lowercase();
+                if l.ends_with(".exe") {
+                    ".exe"
+                } else if l.ends_with(".cmd") {
+                    ".cmd"
+                } else {
+                    ".bat"
+                }
+            })
+            .unwrap_or(base)
+            .to_string();
+    }
+    t.to_string()
+}
+
 fn mouse_xy(lparam: LPARAM) -> (i32, i32) {
     (
         (lparam.0 & 0xffff) as u16 as i16 as i32,
@@ -2923,5 +2964,23 @@ fn current_mods() -> Mods {
             ctrl: down(VK_CONTROL),
             win: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pretty_title;
+
+    /// 标题呈现:exe 路径 basename 去扩展(Ghostty direct-command argv[0]
+    /// 的 Windows 适配);普通 OSC 标题原样(nvim / user@host:cwd)
+    #[test]
+    fn pretty_title_basenames_exe_paths_only() {
+        assert_eq!(
+            pretty_title(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "powershell"
+        );
+        assert_eq!(pretty_title(r"C:\Windows\system32\cmd.exe"), "cmd");
+        assert_eq!(pretty_title("nvim"), "nvim");
+        assert_eq!(pretty_title("user@host: ~/mica"), "user@host: ~/mica");
     }
 }
