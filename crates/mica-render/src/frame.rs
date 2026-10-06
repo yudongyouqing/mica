@@ -451,7 +451,7 @@ pub fn strip_quads(
                     out.push(CellInstance {
                         pos_uv: [
                             x + sm.tab_w - 22.0 * k - g.size_px[0] / 2.0 + g.offset_px[0],
-                            (sm.h - g.size_px[1]) / 2.0 + g.offset_px[1],
+                            text_y + g.offset_px[1],
                             g.uv[0],
                             g.uv[1],
                         ],
@@ -484,7 +484,7 @@ pub fn strip_quads(
             out.push(CellInstance {
                 pos_uv: [
                     x + (sm.plus_w - g.size_px[0]) / 2.0,
-                    (sm.h - g.size_px[1]) / 2.0,
+                    text_y + g.offset_px[1],
                     g.uv[0],
                     g.uv[1],
                 ],
@@ -585,7 +585,7 @@ pub fn strip_quads(
                 out.push(CellInstance {
                     pos_uv: [
                         bx + (sm.caption_w - g.size_px[0]) / 2.0 + g.offset_px[0],
-                        (sm.h - g.size_px[1]) / 2.0 + g.offset_px[1],
+                        text_y + g.offset_px[1],
                         g.uv[0],
                         g.uv[1],
                     ],
