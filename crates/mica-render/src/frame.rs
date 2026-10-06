@@ -379,8 +379,8 @@ pub fn strip_quads(
                     (8.0, 0.0),
                 ));
             }
-            // 标题:8px 内边距,超宽截断(等宽步进)
-            let max_chars = (((TAB_W - 16.0) / metrics.cell_width) as usize).max(1);
+            // 标题:8px 内边距,右侧 26px 预留 × 关闭钮,超宽截断(等宽步进)
+            let max_chars = (((TAB_W - 42.0) / metrics.cell_width) as usize).max(1);
             for (ci, ch) in title.chars().take(max_chars).enumerate() {
                 let g = router.route(ch, GlyphStyle::PLAIN);
                 if g.size_px[0] <= 0.0 {
@@ -397,6 +397,25 @@ pub fn strip_quads(
                     fg: bg_of(ink),
                     bg: bg_of(backdrop),
                 });
+            }
+            // × 关闭钮(Windows 惯例):活跃常显(次级灰,克制的常驻)、
+            // 非活跃悬停浮现(主色);点区几何在 app::WM_LBUTTONDOWN 同源判定
+            if *active || hovered {
+                let g = router.route('\u{00d7}', GlyphStyle::PLAIN);
+                let kink = if *active { dim } else { white };
+                if g.size_px[0] > 0.0 {
+                    out.push(CellInstance {
+                        pos_uv: [
+                            x + TAB_W - 22.0 - g.size_px[0] / 2.0 + g.offset_px[0],
+                            (STRIP_H - g.size_px[1]) / 2.0 + g.offset_px[1],
+                            g.uv[0],
+                            g.uv[1],
+                        ],
+                        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                        fg: bg_of(kink),
+                        bg: bg_of(backdrop),
+                    });
+                }
             }
         }
         // "+" 按钮(裸字形减淡,随滚动平移,同裁剪;Ghostty 失焦 50% 同族;
@@ -533,6 +552,19 @@ pub fn strip_quads(
     out
 }
 
+/// 圆角硬边 quad(悬浮层用):底衬是任意终端内容、不可预知,premix AA
+/// 无从谈起——blend:None 下正解是圆角外硬 discard(fg.w<0 哨兵,
+/// cells.wgsl 判定)。小半径硬边肉眼可接受。
+fn rounded_hard(x: f32, y: f32, w: f32, h: f32, face: [u8; 3], r: f32) -> CellInstance {
+    let c = |v: u8| v as f32 / 255.0;
+    CellInstance {
+        pos_uv: [x, y, 0.0, 0.0],
+        size_uv: [w, h, 0.0, 0.0],
+        fg: [c(face[0]), c(face[1]), c(face[2]), -1.0],
+        bg: [c(face[0]), c(face[1]), c(face[2]), r],
+    }
+}
+
 /// 一行的两段实例:bg 整格段(行内每格一实例)+ 字形段(仅非空白格)。
 /// 行主序持有;**全局**两遍发射契约(全部 bg 先于全部字形)由 [`repack`]
 /// 平铺时恢复——行内只保序,平铺才定序。
@@ -559,27 +591,23 @@ pub fn tooltip_quads(
     let pad = 6.0;
     let w = text_w + pad * 2.0;
     let h = metrics.line_height + pad;
-    let mut out = Vec::with_capacity(2 + 4 + chars.len());
-    // bg(底色槽 0)+ fg 边框
-    out.push(CellInstance {
-        pos_uv: [x, y, 0.0, 0.0],
-        size_uv: [w, h, 0.0, 0.0],
-        fg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
-        bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
-    });
-    let border = |bx: f32, by: f32, bw: f32, bh: f32| CellInstance {
-        pos_uv: [bx, by, 0.0, 0.0],
-        size_uv: [bw, bh, 0.0, 0.0],
-        // blank 形画 bg:边框色进 bg 槽(冒烟抓出的同类错误)
-        fg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
-        bg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
+    let mut out = Vec::with_capacity(1 + chars.len());
+    // 圆角悬浮片(2026-10):面色 = 背景向前景 18% 提亮(纯背景色会隐身),
+    // 硬边圆角(discard 模式,rounded_hard)——悬浮层下是任意终端内容,
+    // 底衬不可预知;旧 1px 边框随圆角化退役
+    let mix = |a: [u8; 3], b: [u8; 3], k: f32| {
+        [
+            (a[0] as f32 + (b[0] as f32 - a[0] as f32) * k + 0.5) as u8,
+            (a[1] as f32 + (b[1] as f32 - a[1] as f32) * k + 0.5) as u8,
+            (a[2] as f32 + (b[2] as f32 - a[2] as f32) * k + 0.5) as u8,
+        ]
     };
-    out.extend([
-        border(x, y, w, 1.0),
-        border(x, y + h - 1.0, w, 1.0),
-        border(x, y, 1.0, h),
-        border(x + w - 1.0, y, 1.0, h),
-    ]);
+    let face = mix(
+        [palette.bg.r, palette.bg.g, palette.bg.b],
+        [palette.fg.r, palette.fg.g, palette.fg.b],
+        0.18,
+    );
+    out.push(rounded_hard(x, y, w, h, face, 6.0));
     let text_y = (h - metrics.line_height) / 2.0;
     for (ci, ch) in chars.iter().enumerate() {
         let g = router.route(*ch, GlyphStyle::PLAIN);
@@ -595,7 +623,7 @@ pub fn tooltip_quads(
             ],
             size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
             fg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
-            bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+            bg: bg_of(face),
         });
     }
     out
@@ -1091,6 +1119,62 @@ mod tests {
             2,
             "激活块 + hover 块(上圆角)共 2"
         );
+    }
+
+    #[test]
+    fn strip_active_tab_emits_close_glyph() {
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let titles = vec![("a".to_string(), false), ("b".to_string(), true)];
+        let out = strip_quads(
+            &titles,
+            &mut r,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            StripExtras {
+                caption_x: Some(400.0),
+                ..Default::default()
+            },
+        );
+        // 活跃标签(tab1, x=140)的 ×:字形实例落在标签尾部 [TAB_W-26, TAB_W)
+        // 区间;非激活无 hover 时 tab0(x=0)不出现 ×
+        let close_x1 = out
+            .iter()
+            .filter(|q| q.size_uv[2] > 0.0)
+            .map(|q| q.pos_uv[0])
+            .filter(|x| *x >= 140.0 + TAB_W - 26.0 && *x < 140.0 + TAB_W)
+            .count();
+        assert!(close_x1 >= 1, "活跃标签尾部应有 × 字形");
+        let close_x0 = out
+            .iter()
+            .filter(|q| q.size_uv[2] > 0.0)
+            .map(|q| q.pos_uv[0])
+            .filter(|x| *x >= TAB_W - 26.0 && *x < TAB_W)
+            .count();
+        assert_eq!(close_x0, 0, "非激活未悬停不显示 ×");
+    }
+
+    #[test]
+    fn tooltip_is_hard_rounded_chip() {
+        let mut r = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let out = tooltip_quads("ab", 10.0, 10.0, &mut r, &metrics_8x16(), &Palette::DEFAULT);
+        let chip = out.first().expect("chip quad");
+        assert_eq!(chip.fg[3], -1.0, "fg.w<0 = discard 模式哨兵");
+        assert_eq!(chip.bg[3], 6.0, "圆角半径 6");
+        assert_eq!(chip.size_uv[2], 0.0, "无字形 quad");
+        // 旧 1px 边框退役:首个之后全是文字字形(uv>0),无空 quad
+        assert!(out[1..].iter().all(|q| q.size_uv[2] > 0.0));
     }
 
     #[test]

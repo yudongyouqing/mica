@@ -11,6 +11,9 @@ use crate::keymap::{self, Keymap};
 /// 默认字体回退链(D9)。定义在此(core)——render 侧 re-export,
 /// 与格子度量一样保持单一来源。
 pub const DEFAULT_FAMILIES: &[&str] = &[
+    // JetBrains Mono 打头(Ghostty 官方观感;未安装时 DWrite 回退链自然
+    // 落到 Cascadia);Sarasa 装 CJK 等宽首选,再 Cascadia/YaHei/Emoji
+    "JetBrains Mono",
     "Sarasa Mono SC",
     "Cascadia Mono",
     "Microsoft YaHei",
@@ -173,7 +176,8 @@ mod tests {
     #[test]
     fn empty_source_is_all_defaults() {
         assert_eq!(resolve("").unwrap(), Settings::default());
-        assert_eq!(Settings::default().font_families.len(), 4);
+        // JetBrains Mono 打头后链长 5(2026-10 UI 对标)
+        assert_eq!(Settings::default().font_families.len(), 5);
     }
 
     #[test]

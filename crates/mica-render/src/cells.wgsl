@@ -68,7 +68,15 @@ fn rounded_coverage(local: vec2f, size_px: vec2f, r_top: f32, r_bot: f32) -> f32
 @fragment
 fn fs(inp: VsOut) -> @location(0) vec4f {
     if (inp.geo.z > 0.0 || inp.geo.w > 0.0) {
-        let cov = rounded_coverage(inp.local, inp.geo.xy, inp.geo.z, inp.geo.w);
+        // fg.w < 0 哨兵 = 未知底衬(悬浮层):圆角外硬 discard——premix AA
+        // 无从谈起,小半径硬边可接受;半径取 bg.w(上下同值)
+        let hard = inp.geo.w < 0.0;
+        let r_bot = select(inp.geo.w, inp.geo.z, hard);
+        let cov = rounded_coverage(inp.local, inp.geo.xy, inp.geo.z, r_bot);
+        if (hard) {
+            if (cov < 0.5) { discard; }
+            return vec4f(inp.bg, 1.0);
+        }
         return vec4f(mix(inp.fg, inp.bg, cov), 1.0);
     }
     let tex = textureSample(glyphs, glyph_sampler, inp.uv);

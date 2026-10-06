@@ -103,8 +103,11 @@ mod tests {
     }
 
     #[test]
-    fn default_families_lead_with_sarasa() {
-        assert_eq!(DEFAULT_FAMILIES[0], "Sarasa Mono SC");
+    fn default_families_lead_with_jetbrains_mono() {
+        // JetBrains Mono 打头 = Ghostty 官方观感;链中保留 Sarasa(CJK
+        // 等宽装了即用)与 Emoji 兜底
+        assert_eq!(DEFAULT_FAMILIES[0], "JetBrains Mono");
+        assert!(DEFAULT_FAMILIES.contains(&"Sarasa Mono SC"));
         assert!(DEFAULT_FAMILIES.contains(&"Segoe UI Emoji"));
     }
 }

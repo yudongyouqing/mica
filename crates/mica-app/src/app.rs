@@ -1795,6 +1795,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // strip 区(T7):命中标签则切换、命中 + 则新建,不走选择
             match strip_hit(px, py) {
                 Some(Some(idx)) => {
+                    // × 关闭区(与 strip_quads 的 × 同几何):标签尾部 26px;
+                    // 单标签无 ×(整窗关闭走 caption),退回切换
+                    let n = TABS.with(|t| t.borrow().len());
+                    let shift =
+                        TAB_SCROLL.with(std::cell::Cell::get) as f32 * mica_render::frame::TAB_W;
+                    let local = px as f32 + shift - idx as f32 * mica_render::frame::TAB_W;
+                    if n > 1 && local >= mica_render::frame::TAB_W - 26.0 {
+                        close_tab(idx);
+                        draw_frame();
+                        return LRESULT(0);
+                    }
                     switch_tab(idx);
                     return LRESULT(0);
                 }
