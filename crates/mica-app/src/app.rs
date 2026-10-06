@@ -134,6 +134,10 @@ thread_local! {
     /// 锁定标题(Ghostty `title` 同义,2026-10-07):Some = 窗口/标签恒显
     /// 此值,OSC 0/2 忽略;None = 跟随 shell 标题(exe 路径智能缩短)
     static TITLE_LOCK: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// 打字藏鼠标(Ghostty mouse-hide-while-typing 默认 true):键入隐藏
+    /// 指针、移动恢复;ShowCursor 计数严格配对(藏一次显一次)
+    static MOUSE_HIDE_ON_TYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static CURSOR_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -282,6 +286,7 @@ pub fn run() {
         // 窗口级键位表与设置同源(用户 keybind 覆盖 WT 默认)
         KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
         TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
+        MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
@@ -727,6 +732,7 @@ unsafe fn reload_config(hwnd: HWND) {
     });
     KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
     TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
+    MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
     // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
@@ -1633,6 +1639,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_CHAR => {
+            hide_cursor_if_typing();
             // 代理对重组:Rust 的 char 不含代理码位,不重组的话 emoji
             // 两个 WM_CHAR 都在 from_u32 处变 None 被丢弃,永远发不出去
             let code = wparam.0 as u32;
@@ -1690,6 +1697,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_KEYDOWN => {
+            hide_cursor_if_typing();
             // 剪贴板组合(T5;T6 Keymap 落地后迁入 Action 表):
             // Ctrl+C 有选区 → 复制并清选区,无选区 → 放行给 WM_CHAR 的
             // (ETX 中断,WT 同款语义);Ctrl+V / Shift+Insert → 粘贴
@@ -1947,6 +1955,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            // 打字藏鼠标的恢复(Ghostty mouse-hide-while-typing):一动即显
+            if CURSOR_HIDDEN.take() {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::ShowCursor(true);
+                }
+            }
             if !MOUSE_DOWN.with(std::cell::Cell::get) {
                 // D28 hover:非拖选时武装悬停追踪(每会话一次,HOVER/LEAVE 都会重置)
                 if !HOVER_ARMED.with(|a| a.replace(true)) {
@@ -2075,6 +2089,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_LBUTTONUP => {
             MOUSE_DOWN.with(|m| m.set(false));
             let _ = ReleaseCapture();
+            // copy-on-select(Ghostty 默认 true):选区完成即入剪贴板;
+            // 空选区(单击清除)不覆盖
+            TABS.with(|tabs| {
+                let mut guard = tabs.borrow_mut();
+                if let Some(t) = guard
+                    .get_mut(ACTIVE.get())
+                    .and_then(|tab| tab.active_pane())
+                    && let Some(text) = t.term.selection_text()
+                    && !text.is_empty()
+                {
+                    clipboard::set_text(&text);
+                }
+            });
             LRESULT(0)
         }
         WM_LBUTTONDBLCLK => {
@@ -2863,6 +2890,18 @@ fn px_to_buffer_point(
 }
 
 /// 鼠标消息 lparam 的有符号客户区坐标。
+/// 打字藏鼠标(Ghostty mouse-hide-while-typing):ShowCursor 计数式,
+/// CURSOR_HIDDEN 独占配对——藏一次显一次;WM_MOUSEMOVE 处恢复
+fn hide_cursor_if_typing() {
+    if MOUSE_HIDE_ON_TYPE.with(std::cell::Cell::get) && !CURSOR_HIDDEN.with(std::cell::Cell::get) {
+        CURSOR_HIDDEN.with(|c| c.set(true));
+        // SAFETY: 指针显示计数 -1;恢复在 WM_MOUSEMOVE(配对)
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowCursor(false);
+        }
+    }
+}
+
 /// 标题呈现(Ghostty 语义的 Windows 适配):OSC 0/2 原样信任(Ghostty 的
 /// shell 集成会发 user@host:cwd 这类好标题);Windows shell 常发裸 exe
 /// 路径(PowerShell 默认),取 basename 去扩展——与 Ghostty direct

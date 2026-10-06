@@ -585,7 +585,9 @@ pub fn strip_quads(
                 out.push(CellInstance {
                     pos_uv: [
                         bx + (sm.caption_w - g.size_px[0]) / 2.0 + g.offset_px[0],
-                        text_y + g.offset_px[1],
+                        // 窗口三键保持 T8 原式(用户裁定别动:与标签 × 是
+                        // 不同语义的控件,不随标签对齐修复联动)
+                        (sm.h - g.size_px[1]) / 2.0 + g.offset_px[1],
                         g.uv[0],
                         g.uv[1],
                     ],

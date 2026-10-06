@@ -36,6 +36,8 @@ pub struct Settings {
     pub cursor_blink: bool,
     /// Quick Terminal 全局热键(M3b,默认 Win+`;禁用写 `none`)。
     pub quick_terminal_key: Option<String>,
+    /// 打字藏鼠标(Ghostty mouse-hide-while-typing,默认 true)。
+    pub mouse_hide_while_typing: bool,
     /// 锁定标题(Ghostty `title` 同义):设定时窗口/标签标题恒为此值,
     /// 程序发的 OSC 0/2 标题被忽略;空串 = 解除锁定回落 shell 标题。
     /// 想视觉隐藏标题写单空格(Ghostty 文档同法)。
@@ -48,6 +50,7 @@ impl Default for Settings {
             font_families: DEFAULT_FAMILIES.iter().map(|s| s.to_string()).collect(),
             font_size_pt: DEFAULT_FONT_SIZE_PT,
             title: None,
+            mouse_hide_while_typing: true,
             palette: Palette::DEFAULT,
             theme_name: None,
             keymap: Keymap::wt_default(),
@@ -141,6 +144,13 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                     ));
                 }
             }
+            "mouse-hide-while-typing" => match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => settings.mouse_hide_while_typing = true,
+                "false" | "0" | "no" => settings.mouse_hide_while_typing = false,
+                _ => err.values.push(format!(
+                    "mouse-hide-while-typing 应为 true/false,得 `{value}`"
+                )),
+            },
             "cursor-blink" => match value.to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" => settings.cursor_blink = true,
                 "false" | "0" | "no" => settings.cursor_blink = false,
