@@ -75,7 +75,7 @@ fn strip_metrics() -> mica_render::frame::StripMetrics {
 /// 字号随 DPI:DWrite 光栅按 96dpi 像素出图,pt×scale 才与屏幕物理一致。
 /// reload_dpi 一直这么乘,其余建 router 站点曾全漏(单 150% 屏无
 /// WM_DPICHANGED,字体永远 ×1.0)——2026-10-06 统一单源
-fn scaled_pt(base_pt: f32) -> f32 {
+pub(crate) fn scaled_pt(base_pt: f32) -> f32 {
     (base_pt * DPI_SCALE.with(std::cell::Cell::get)).clamp(6.0, 72.0)
 }
 
@@ -334,6 +334,15 @@ pub fn run() {
             hwnd,
             windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,
             &backdrop as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        // 圆角(Win11 DWM):NCCALCSIZE 自绘帧下默认策略不保证圆角,显式
+        // 声明 ROUND(最大化时 DWM 自动去圆,无需处理)
+        let corner: i32 = windows::Win32::Graphics::Dwm::DWMWCP_ROUND.0;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner as *const i32 as *const std::ffi::c_void,
             std::mem::size_of::<i32>() as u32,
         );
 

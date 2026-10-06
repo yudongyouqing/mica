@@ -95,6 +95,19 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         None,
     )
     .expect("CreateWindowExW (quick terminal)");
+    // 圆角(Win11 DWM,与主窗同款;下拉面板圆角是 Ghostty QT 观感)
+    {
+        let corner: i32 = windows::Win32::Graphics::Dwm::DWMWCP_ROUND.0;
+        // SAFETY: 属性设置,失败静默(老系统无此属性)
+        unsafe {
+            let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                hwnd_qt,
+                windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
+                &corner as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+    }
     QT_HWND.with(|c| c.set(hwnd_qt.0 as usize));
 
     // 热键:Win+`(可配;失败记日志,QT 仍可用 IPC 激活留 M3c)
@@ -106,6 +119,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 
     // QT 终端状态:复用 TAB_SEED/CURRENT_PALETTE 建字体与 pty
     let (families, size_pt) = crate::app::tab_seed();
+    let size_pt = crate::app::scaled_pt(size_pt); // 字号随 DPI(与主窗单源)
     let fam_ref: Vec<&str> = families.iter().map(String::as_str).collect();
     let Ok(router) = DwriteRouter::new(size_pt, &fam_ref) else {
         eprintln!("quickterm: 字体链失败,QT 禁用");
