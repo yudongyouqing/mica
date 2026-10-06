@@ -72,6 +72,13 @@ fn strip_metrics() -> mica_render::frame::StripMetrics {
     mica_render::frame::StripMetrics::from_scale(DPI_SCALE.with(std::cell::Cell::get))
 }
 
+/// 字号随 DPI:DWrite 光栅按 96dpi 像素出图,pt×scale 才与屏幕物理一致。
+/// reload_dpi 一直这么乘,其余建 router 站点曾全漏(单 150% 屏无
+/// WM_DPICHANGED,字体永远 ×1.0)——2026-10-06 统一单源
+fn scaled_pt(base_pt: f32) -> f32 {
+    (base_pt * DPI_SCALE.with(std::cell::Cell::get)).clamp(6.0, 72.0)
+}
+
 /// 内容区内边距(Ghostty window-padding-x/y 默认 2px 逻辑值,随 DPI 缩放)
 fn pad() -> f32 {
     2.0 * DPI_SCALE.with(std::cell::Cell::get)
@@ -273,25 +280,10 @@ pub fn run() {
         KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
-        let router = {
-            let families: Vec<&str> = if settings.font_families.is_empty() {
-                DEFAULT_FAMILIES.to_vec() // resolve 恒填默认链,此分支纯防御
-            } else {
-                settings.font_families.iter().map(String::as_str).collect()
-            };
-            DwriteRouter::new(settings.font_size_pt, &families).expect("no fonts resolved")
-        };
-        eprintln!("font families in use: {:?}", router.families_in_use()); // 冒烟期观察回退链
-        let metrics = router.metrics();
-
-        // 客户区 COLSxROWS 格,反推窗口外框
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: (f32::from(COLS) * metrics.cell_width).round() as i32,
-            bottom: (f32::from(ROWS) * metrics.line_height).round() as i32,
-        };
-        AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false).expect("AdjustWindowRect");
+        // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
+        // 乘 DPI_SCALE——三者顺序曾为 router→窗口→播种,单 150% 屏(无
+        // WM_DPICHANGED)字体永远 ×1.0 而 strip ×1.5,比例崩坏
+        // (2026-10-06 用户实测);精确网格尺寸在播种后 SetWindowPos 定
         let class_name = HSTRING::from("mica_app_class"); // Param<PCWSTR> 的已证实实现
         let title = HSTRING::from("Mica");
         let hwnd = CreateWindowExW(
@@ -301,8 +293,8 @@ pub fn run() {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            900,
+            560,
             None,
             None,
             Some(hinstance),
@@ -357,6 +349,38 @@ pub fn run() {
                 );
                 DPI_SCALE.with(|d| d.set(dpi as f32 / 96.0));
             }
+        }
+        // 精确网格尺寸(此刻 DPI 已播、字体可按屏缩放):COLS×ROWS 反推
+        // 外框并落位。度量 router 用后即弃——首标签在 start_tab_with_profile
+        // 里按 TAB_SEED/scaled_pt 另建,度量同源一致
+        {
+            let families: Vec<&str> = if settings.font_families.is_empty() {
+                DEFAULT_FAMILIES.to_vec()
+            } else {
+                settings.font_families.iter().map(String::as_str).collect()
+            };
+            let router = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families)
+                .expect("no fonts resolved");
+            eprintln!("font families in use: {:?}", router.families_in_use());
+            let metrics = router.metrics();
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: (f32::from(COLS) * metrics.cell_width).round() as i32,
+                bottom: (f32::from(ROWS) * metrics.line_height).round() as i32,
+            };
+            AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false).expect("AdjustWindowRect");
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+            );
         }
         if CURSOR_BLINK.with(std::cell::Cell::get) {
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 500, None);
@@ -636,7 +660,7 @@ unsafe fn reload_config(hwnd: HWND) {
         }
     };
     let families: Vec<&str> = settings.font_families.iter().map(String::as_str).collect();
-    let Ok(router) = DwriteRouter::new(settings.font_size_pt, &families) else {
+    let Ok(router) = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families) else {
         warn_box("重建字体链失败,继续使用当前设置。");
         return; // 保旧
     };
@@ -657,7 +681,8 @@ unsafe fn reload_config(hwnd: HWND) {
         for tab in tabs.borrow_mut().iter_mut() {
             for pane in tab.panes.iter_mut() {
                 let t = &mut pane.terminal;
-                let Ok(router) = DwriteRouter::new(settings.font_size_pt, &families) else {
+                let Ok(router) = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families)
+                else {
                     return;
                 };
                 let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
@@ -872,7 +897,7 @@ unsafe fn reload_dpi(hwnd: HWND, dpi: u32) {
     } else {
         families.iter().map(String::as_str).collect()
     };
-    let size_pt = (base_pt * scale).clamp(6.0, 72.0);
+    let size_pt = scaled_pt(base_pt);
     let Ok(head) = DwriteRouter::new(size_pt, &families) else {
         eprintln!("[dpi] 字体链重建失败,保持旧缩放观感");
         return;
@@ -1133,6 +1158,7 @@ unsafe fn create_pane_with_size(
     let size_pt = font_size
         .filter(|s| (6.0..=72.0).contains(s))
         .unwrap_or(size_pt);
+    let size_pt = scaled_pt(size_pt);
     let families: Vec<&str> = if families.is_empty() {
         DEFAULT_FAMILIES.to_vec()
     } else {
