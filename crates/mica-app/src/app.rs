@@ -137,6 +137,8 @@ thread_local! {
     /// 打字藏鼠标(Ghostty mouse-hide-while-typing 默认 true):键入隐藏
     /// 指针、移动恢复;ShowCursor 计数严格配对(藏一次显一次)
     static MOUSE_HIDE_ON_TYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
+    static MOUSE_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CURSOR_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
@@ -1891,6 +1893,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 None => {}
             }
+            // 应用捕获鼠标(yazi/TUI 族,DECSET 1000 族):上报优先于
+            // 本地选择;捕获按下置位,UP/MOVE 走上报分支
+            if forward_mouse(px, py, 0, true, false) {
+                MOUSE_DOWN.with(|m| m.set(true));
+                MOUSE_CAPTURED.with(|c| c.set(true));
+                return LRESULT(0);
+            }
             // OSC 8 Ctrl+Click(D28):按住 Ctrl 不走选择;命中带链接格直接打开浏览器
             if current_mods().ctrl {
                 if let Some(uri) = link_at(px, py) {
@@ -1969,6 +1978,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             let (px, py) = mouse_xy(lparam);
+            // 应用捕获:拖动全程上报(32+0 = 左键 motion)
+            if MOUSE_CAPTURED.with(std::cell::Cell::get) {
+                let _ = forward_mouse(px, py, 32, true, true);
+                return LRESULT(0);
+            }
             // 拖选在焦点 pane 内(坐标相对 pane 原点)
             let rects = active_pane_rects();
             TABS.with(|tabs| {
@@ -2079,8 +2093,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_MBUTTONDOWN => {
-            // WT 语义:中键点标签关闭。strip 外中键无语义(不转发)
+            // WT 语义:中键点标签关闭。strip 外:应用捕获则上报中键
             let (px, py) = mouse_xy(lparam);
+            if strip_hit(px, py).is_none() && forward_mouse(px, py, 1, true, false) {
+                return LRESULT(0);
+            }
             if let Some(Some(idx)) = strip_hit(px, py) {
                 close_tab(idx);
             }
@@ -2089,6 +2106,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_LBUTTONUP => {
             MOUSE_DOWN.with(|m| m.set(false));
             let _ = ReleaseCapture();
+            if MOUSE_CAPTURED.with(std::cell::Cell::take) {
+                let (px, py) = mouse_xy(lparam);
+                let _ = forward_mouse(px, py, 0, false, false);
+                return LRESULT(0);
+            }
             // copy-on-select(Ghostty 默认 true):选区完成即入剪贴板;
             // 空选区(单击清除)不覆盖
             TABS.with(|tabs| {
@@ -2155,6 +2177,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if tab_scroll_adjust(if delta > 0 { 1 } else { -1 }) {
                         draw_frame();
                     }
+                    return LRESULT(0);
+                }
+            }
+            // 应用捕获鼠标:滚轮上报(64=上/65=下,每 120 一事件)优先
+            // 于滚回——yazi/TUI 用它滚列表
+            {
+                let mut pt = windows::Win32::Foundation::POINT {
+                    x: (lparam.0 & 0xffff) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+                };
+                // SAFETY: 坐标换算,输出写回本侧 POINT
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+                }
+                let notches = (delta.abs() / 120).max(1);
+                let btn = if delta > 0 { 64 } else { 65 };
+                let mut sent = false;
+                for _ in 0..notches {
+                    if forward_mouse(pt.x, pt.y, btn, true, false) {
+                        sent = true;
+                    }
+                }
+                if sent {
                     return LRESULT(0);
                 }
             }
@@ -2654,6 +2699,58 @@ fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
     } else {
         None
     }
+}
+
+/// 鼠标上报路由(DECSET 1000/1002/1003 + 1006,2026-10-07):应用捕获
+/// 鼠标时把点击/拖动/滚轮编码写回 pty,替代本地选择/滚回。Shift 按住
+/// 强制本地(业界惯例——文本选择不被应用截走)。motion 事件仅在
+/// Drag/Motion 模式发。返回 true = 事件已消费,调用方勿走本地交互。
+fn forward_mouse(px: i32, py: i32, button: u8, pressed: bool, motion: bool) -> bool {
+    if current_mods().shift {
+        return false;
+    }
+    let rects = active_pane_rects();
+    TABS.with(|tabs| {
+        let mut guard = tabs.borrow_mut();
+        let Some(tab) = guard.get_mut(ACTIVE.get()) else {
+            return false;
+        };
+        let Some((pid, r)) = rects.iter().find(|(_, r)| {
+            (px as f32) >= r.x
+                && (px as f32) < r.x + r.w
+                && (py as f32) >= r.y
+                && (py as f32) < r.y + r.h
+        }) else {
+            return false;
+        };
+        let Some(t) = tab.pane_by_id(*pid).map(|p| &mut p.terminal) else {
+            return false;
+        };
+        let mode = t.term.mouse_mode();
+        use mica_core::surface::MouseMode;
+        if mode == MouseMode::Off {
+            return false;
+        }
+        if motion && mode == MouseMode::Click {
+            return false;
+        }
+        let col = (((px as f32 - r.x) / t.metrics.cell_width).floor() as u16)
+            .saturating_add(1)
+            .min(t.cols);
+        let row = (((py as f32 - r.y) / t.metrics.line_height).floor() as u16)
+            .saturating_add(1)
+            .min(t.rows);
+        let bytes = mica_core::input::mouse_report(
+            t.term.mouse_sgr(),
+            pressed,
+            button,
+            col,
+            row,
+            current_mods(),
+        );
+        let _ = t.session.write(&bytes);
+        true
+    })
 }
 
 /// strip 悬停命中(2026-10 UI 对标):客户区坐标 → 标签/加号/caption 三键。

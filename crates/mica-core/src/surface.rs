@@ -18,6 +18,17 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 /// 光标样式直通(DECSCUSR 承载;vte 枚举含 HollowBlock 等变体,
 /// 消费方按 Block/Underline/Beam 三类归一)。
 pub use alacritty_terminal::vte::ansi::CursorShape;
+
+/// 鼠标上报模式(DECSET 1000/1002/1003,2026-10-07 补课):Off = 本地
+/// 交互(选择/滚回);Click = 仅按压上报;Drag = 按压+拖动;Motion = 全
+/// 上报。SGR 与否(DECSET 1006)另行查询——编码在 mica_core::input。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseMode {
+    Off,
+    Click,
+    Drag,
+    Motion,
+}
 pub use alacritty_terminal::vte::ansi::CursorStyle;
 use alacritty_terminal::vte::ansi::Processor;
 
@@ -514,6 +525,27 @@ impl Surface {
     }
 
     /// 选区文本(上游拼接,含 wrap 语义)。
+    /// 应用是否捕获鼠标(见 MouseMode;Shift 绕过由 app 层处理)
+    pub fn mouse_mode(&self) -> MouseMode {
+        use alacritty_terminal::term::TermMode;
+        let m = self.term.mode();
+        if m.contains(TermMode::MOUSE_MOTION) {
+            MouseMode::Motion
+        } else if m.contains(TermMode::MOUSE_DRAG) {
+            MouseMode::Drag
+        } else if m.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseMode::Click
+        } else {
+            MouseMode::Off
+        }
+    }
+
+    /// SGR 鼠标编码(DECSET 1006);false = legacy X10
+    pub fn mouse_sgr(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string()
     }
@@ -648,6 +680,20 @@ mod tests {
         s.set_palette(&custom);
         s.proxy.send_event(Event::ColorRequest(258, fmt_rgb()));
         assert_eq!(s.take_pty_writes(), vec!["00ff00".to_string()]);
+    }
+
+    #[test]
+    fn mouse_mode_maps_decset_bits() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert_eq!(s.mouse_mode(), MouseMode::Off);
+        s.feed(b"[?1002;1006h");
+        assert_eq!(s.mouse_mode(), MouseMode::Drag);
+        assert!(s.mouse_sgr(), "1006 = SGR");
+        s.feed(b"[?1003h[?1002l");
+        assert_eq!(s.mouse_mode(), MouseMode::Motion);
+        s.feed(b"[?1000l[?1003l[?1006l");
+        assert_eq!(s.mouse_mode(), MouseMode::Off);
+        assert!(!s.mouse_sgr());
     }
 
     #[test]

@@ -61,6 +61,36 @@ pub enum Key {
 /// ESC followed by another, the same ambiguity xterm itself has. Alt+Tab
 /// would encode as ESC + TAB, but Windows consumes Alt+Tab at the OS level
 /// before it ever reaches the window.
+/// 鼠标上报编码(DECSET 1000/1002/1003 + 1006/1015,2026-10-07 补课):
+/// `button` = 0/1/2(左/中/右)、3(release,仅 legacy)、32|=motion、
+/// 64/65=滚轮上/下;修饰位 shift+4 / alt+8 / ctrl+16。SGR(1006)坐标
+/// 行内十进制可大;legacy X10 坐标限 33..=255(32+0 起),越界截 255。
+/// 坐标一律 1 基(app 层格子换算)。滚轮只发"按压"事件(两协议同款)。
+pub fn mouse_report(sgr: bool, pressed: bool, button: u8, x: u16, y: u16, mods: Mods) -> Vec<u8> {
+    // button 语义由调用方保证:0/1/2 按钮、32|=motion、64/65 滚轮
+    // (不再位掩——0x3f 会把滚轮 64/65 截断成 0/1,测试抓的 bug)
+    let mut cb = button as u32;
+    if mods.shift {
+        cb += 4;
+    }
+    if mods.alt {
+        cb += 8;
+    }
+    if mods.ctrl {
+        cb += 16;
+    }
+    if sgr {
+        let state = if pressed { b'M' } else { b'm' };
+        format!("[<{cb};{x};{y}{}", state as char).into_bytes()
+    } else {
+        // X10:release 编码为按钮 3;motion 位(32)由调用方并入 button
+        let b = if pressed { cb.min(255) as u8 } else { 3 };
+        let cx = 32 + (x.saturating_sub(1)).min(222) as u8;
+        let cy = 32 + (y.saturating_sub(1)).min(222) as u8;
+        vec![0x1b, b'[', b'M', b, cx, cy]
+    }
+}
+
 pub fn encode(key: Key, mods: Mods, app_cursor: bool) -> Vec<u8> {
     let p = mods.xterm_param();
     let app_nav = app_cursor && mods == Mods::NONE;
@@ -121,6 +151,53 @@ mod tests {
 
     fn enc(key: Key, mods: Mods) -> Vec<u8> {
         encode(key, mods, false)
+    }
+
+    /// SGR(1006)编解码:xterm 规范形态 ESC[<b;x;yM/m;滚轮 64/65;
+    /// motion=32+btn;ctrl 修饰 +16
+    #[test]
+    fn mouse_report_sgr_forms() {
+        let m = Mods::default();
+        assert_eq!(
+            mouse_report(true, true, 0, 12, 4, m),
+            b"[<0;12;4M".to_vec()
+        );
+        assert_eq!(
+            mouse_report(true, false, 2, 99, 30, m),
+            b"[<2;99;30m".to_vec()
+        );
+        // 滚轮只发按压
+        assert_eq!(
+            mouse_report(true, true, 64, 1, 1, m),
+            b"[<64;1;1M".to_vec()
+        );
+        // 拖动 motion:32|0
+        assert_eq!(
+            mouse_report(true, true, 32, 5, 5, m),
+            b"[<32;5;5M".to_vec()
+        );
+        let mc = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            mouse_report(true, true, 0, 1, 1, mc),
+            b"[<16;1;1M".to_vec()
+        );
+    }
+
+    /// legacy X10:ESC M b x y,release=3,坐标 32 基
+    #[test]
+    fn mouse_report_legacy_forms() {
+        let m = Mods::default();
+        assert_eq!(
+            mouse_report(false, true, 0, 1, 1, m),
+            vec![0x1b, b'[', b'M', 0, 32, 32]
+        );
+        assert_eq!(
+            mouse_report(false, false, 0, 10, 2, m),
+            vec![0x1b, b'[', b'M', 3, 41, 33]
+        );
     }
 
     #[test]
