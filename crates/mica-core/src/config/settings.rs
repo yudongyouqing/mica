@@ -17,6 +17,10 @@ pub const DEFAULT_FAMILIES: &[&str] = &[
     "Sarasa Mono SC",
     "Cascadia Mono",
     "Microsoft YaHei",
+    // Nerd Font(oh-my-posh/starship 等提示符引擎的图标/Powerline 三角
+    // 形 E0B0 族、F000 图标区;ASCII 仍由链头 JBMono 承担,此处只兜
+    // 缺字——已装 JetBrainsMonoNerdFont,未装的机器静默跳过)
+    "JetBrainsMono Nerd Font",
     "Segoe UI Emoji",
     // 图标字形(caption 按钮的 Segoe Fluent Icons PUA 区;终端文本
     // 命中 E700-E8FF 时得到图标也是正确语义,Nerd Font 同族行为)
@@ -197,7 +201,7 @@ mod tests {
     fn empty_source_is_all_defaults() {
         assert_eq!(resolve("").unwrap(), Settings::default());
         // JetBrains Mono 打头后链长 5(2026-10 UI 对标)
-        assert_eq!(Settings::default().font_families.len(), 6);
+        assert_eq!(Settings::default().font_families.len(), 7);
     }
 
     #[test]
