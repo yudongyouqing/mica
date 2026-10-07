@@ -139,6 +139,10 @@ thread_local! {
     static MOUSE_HIDE_ON_TYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
     static MOUSE_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// keymap 消费了字母/数字键(ctrl+shift+t 等):TranslateMessage 生成
+    /// 的对应 WM_CHAR(0x00-0x1F 控制字节)与 wndproc 返回值无关、照投
+    /// 不误——曾致 Ctrl+Shift+T 开新标签的同时给 shell 送去 ^T
+    static KEYMAP_ATE_CHAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CURSOR_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
@@ -346,6 +350,15 @@ pub fn run() {
             windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,
             &backdrop as *const i32 as *const std::ffi::c_void,
             std::mem::size_of::<i32>() as u32,
+        );
+        // 外框描边移除(2026-10-07 用户裁定:不要任何描边)——Win11 默认
+        // 给窗口一圈 1px 边线,DWMWA_COLOR_NONE 关掉
+        let no_border: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_BORDER_COLOR,
+            &no_border as *const u32 as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
         );
         // 圆角(Win11 DWM):NCCALCSIZE 自绘帧下默认策略不保证圆角,显式
         // 声明 ROUND(最大化时 DWM 自动去圆,无需处理)
@@ -1473,7 +1486,6 @@ fn draw_frame() {
 
         let mut all_instances: Vec<mica_render::frame::CellInstance> = Vec::new();
         // 焦点边框的色与 strip 用同一个 pane 的 router/色板
-        let mut head_pane_index = active.focused;
         for pane in active.panes.iter_mut() {
             let t = &mut pane.terminal;
             let rect = rects
@@ -1528,44 +1540,7 @@ fn draw_frame() {
                 all_instances.push(inst);
             }
         }
-        // 焦点 pane 边框:1px 亮线四条(palette.colors[4] 蓝)
-        if focused_pane_id != 0
-            && let Some((_, r)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
-            && let Some(t) = active
-                .panes
-                .get_mut(head_pane_index)
-                .map(|p| &mut p.terminal)
-        {
-            let ink = [
-                t.palette.colors[4].r,
-                t.palette.colors[4].g,
-                t.palette.colors[4].b,
-            ];
-            let b = |x: f32, y: f32, w: f32, h: f32| mica_render::frame::CellInstance {
-                pos_uv: [x, y, 0.0, 0.0],
-                size_uv: [w, h, 0.0, 0.0],
-                fg: [
-                    ink[0] as f32 / 255.0,
-                    ink[1] as f32 / 255.0,
-                    ink[2] as f32 / 255.0,
-                    0.0,
-                ],
-                bg: [
-                    ink[0] as f32 / 255.0,
-                    ink[1] as f32 / 255.0,
-                    ink[2] as f32 / 255.0,
-                    0.0,
-                ],
-            };
-            all_instances.extend([
-                b(r.x, r.y, r.w, 1.0),
-                b(r.x, r.y + r.h - 1.0, r.w, 1.0),
-                b(r.x, r.y, 1.0, r.h),
-                b(r.x + r.w - 1.0, r.y, 1.0, r.h),
-            ]);
-            head_pane_index = active.focused; // 抑制未用警告的副带(见下)
-        }
-        let _ = head_pane_index;
+        // 焦点 pane 边框退役(2026-10-07 用户裁定:不要任何描边)。
 
         // strip:焦点 pane 的 router 路由标题(活跃 tab 列表)
         let Some(active) = guard.get_mut(ACTIVE.get()) else {
@@ -1666,6 +1641,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CHAR => {
             hide_cursor_if_typing();
+            // keymap 已消费该键(如 Ctrl+Shift+T):TranslateMessage 的控制
+            // 字节伴生投递吞掉;任何 WM_CHAR 到来都清位(正常打字即复位)
+            if KEYMAP_ATE_CHAR.with(std::cell::Cell::take) && (wparam.0 as u32) < 0x20 {
+                return LRESULT(0);
+            }
             // 代理对重组:Rust 的 char 不含代理码位,不重组的话 emoji
             // 两个 WM_CHAR 都在 from_u32 处变 None 被丢弃,永远发不出去
             let code = wparam.0 as u32;
@@ -1706,6 +1686,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             // Windows 把退格发成 0x08,终端世界统一 DEL(0x7f)
+            if std::env::var_os("MICA_DEBUG_KEYS").is_some() {
+                let kitty = TABS.with(|tabs| {
+                    tabs.borrow_mut()
+                        .get_mut(ACTIVE.get())
+                        .and_then(|tab| tab.active_pane())
+                        .is_some_and(|t| t.term.kitty_flags().any())
+                });
+                eprintln!("[key] WM_CHAR ch={ch:?} code={code:#x} kitty={kitty}");
+            }
             let bytes: Vec<u8> = if ch == '\u{8}' {
                 vec![0x7f]
             } else {
@@ -1729,11 +1718,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // (ETX 中断,WT 同款语义);Ctrl+V / Shift+Insert → 粘贴
             let vk = wparam.0 as u32;
             let mods = current_mods();
-            // Keymap 终端外语义优先(D15):命中即消费,不再走 pty 编码
+            // Keymap 终端外语义优先(D15):命中即消费,不再走 pty 编码。
+            // 字母/数字键(VK 0x30..=0x5A)会被 TranslateMessage 生成对应
+            // WM_CHAR 控制字节(独立投递,拦不住)——置位让 WM_CHAR 吞
             if let Some(trigger_key) = vk_to_trigger(vk)
                 && let Some(action) = KEYMAP.with(|k| k.borrow().lookup(mods, trigger_key))
                 && execute_action(action, hwnd)
             {
+                if (0x30..=0x5A).contains(&vk) {
+                    KEYMAP_ATE_CHAR.set(true);
+                }
                 return LRESULT(0);
             }
             if mods.ctrl && !mods.alt && !mods.shift && vk == 'C' as u32 {
