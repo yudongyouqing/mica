@@ -158,6 +158,23 @@ impl Canvas {
             py = y;
         }
     }
+    /// 挖除矩形(三象限块):子像素中心在内则清
+    fn carve_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let (sx0, sx1) = self.span(x0, x1, self.pw);
+        let (sy0, sy1) = self.span(y0, y1, self.ph);
+        for sy in sy0..sy1 {
+            let cy = (sy as f32 + 0.5) / SS as f32;
+            if cy < y0 || cy >= y1 {
+                continue;
+            }
+            for sx in sx0..sx1 {
+                let cx = (sx as f32 + 0.5) / SS as f32;
+                if cx >= x0 && cx < x1 {
+                    self.mask[Self::idx(self.pw, sx as u32, sy as u32)] = false;
+                }
+            }
+        }
+    }
     fn coverage(&self) -> Vec<u8> {
         if let Some(v) = self.shade {
             return vec![v; (self.pw * self.ph) as usize];
@@ -415,6 +432,24 @@ fn draw_block(cp: u32, c: &mut Canvas) -> bool {
             rect(c, 0.5, 0.0, 1.0, 0.5);
             rect(c, 0.0, 0.5, 0.5, 1.0);
         }
+        // 三象限块(满格挖一角)——Claude Code logo 的 ▛▜ 在此;漏掉会
+        // 落回字体字形(未对齐)= logo 一块一块(用户实测)
+        0x2599 => {
+            rect(c, 0.0, 0.0, 1.0, 1.0);
+            c.carve_rect(0.5 * w, 0.0, w, 0.5 * h);
+        }
+        0x259B => {
+            rect(c, 0.0, 0.0, 1.0, 1.0);
+            c.carve_rect(0.5 * w, 0.5 * h, w, h);
+        }
+        0x259C => {
+            rect(c, 0.0, 0.0, 1.0, 1.0);
+            c.carve_rect(0.0, 0.5 * h, 0.5 * w, h);
+        }
+        0x259F => {
+            rect(c, 0.0, 0.0, 1.0, 1.0);
+            c.carve_rect(0.0, 0.0, 0.5 * w, 0.5 * h);
+        }
         _ => return false,
     }
     true
@@ -610,6 +645,20 @@ mod tests {
         assert!(blank.iter().all(|&v| v == 0), "空白盲文无墨");
         let one = draw(0x2801, w, h).unwrap().2;
         assert!(one.iter().any(|&v| v > 200), "Bit1 点应有墨");
+    }
+
+    #[test]
+    fn three_quadrant_blocks_carve_correct_corner() {
+        let (w, h) = (10.0, 21.0);
+        let idx = |x: usize, y: usize| y * w as usize + x;
+        // ▛(259B)= 满格挖右下:左上实、右下空
+        let cov = draw(0x259B, w, h).unwrap().2;
+        assert!(cov[idx(0, 0)] == 255, "259B 左上应满");
+        assert!(cov[idx(9, 20)] == 0, "▛ 右下应空");
+        // ▜(259C)= 满格挖左下:右上实、左下空
+        let cov = draw(0x259C, w, h).unwrap().2;
+        assert!(cov[idx(9, 0)] == 255, "▜ 右上应满");
+        assert!(cov[idx(0, 20)] == 0, "▜ 左下应空");
     }
 
     #[test]
