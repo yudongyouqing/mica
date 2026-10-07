@@ -48,26 +48,6 @@ impl KittyFlags {
 /// 功能键 keysym 常量(kitty 协议 functional 编号)。
 /// Key::Grave 不在其中——反引号是可打印字符,走 WM_CHAR 文本路径,
 /// kitty 协议下同样不发编码序列(除非 all-keys,M4a 不扩 Key 枚举)。
-fn functional_keysym(key: Key) -> Option<u32> {
-    Some(match key {
-        Key::Escape => 27,
-        Key::Enter => 13,
-        Key::Tab => 9,
-        Key::Backspace => 127,
-        Key::Up => 57344,
-        Key::Down => 57345,
-        Key::Right => 57346,
-        Key::Left => 57347,
-        Key::Home => 57348,
-        Key::End => 57349,
-        Key::PageUp => 57350,
-        Key::PageDown => 57351,
-        Key::Delete => 57363,
-        // 可打印字符(反引号)走 WM_CHAR 文本路径,协议编码不覆盖
-        Key::Grave => return None,
-    })
-}
-
 /// 修饰参数位:kitty = 1 + shift + alt*2 + ctrl*4 + super*8。
 fn kitty_mods(mods: Mods) -> u32 {
     1 + u32::from(mods.shift)
