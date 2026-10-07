@@ -641,7 +641,22 @@ impl GlyphRouter for DwriteRouter {
         if let Some(g) = self.cache.get(&key) {
             return *g;
         }
-        let info = self.rasterize(ch, style).unwrap_or_else(blank_glyph);
+        let mut info = self.rasterize(ch, style).unwrap_or_else(blank_glyph);
+        // 超宽 PUA 图标收缩(2026-10-07):Nerd 图标(F408 等)的字体墨宽
+        // 是格宽近两倍(其 advance 本为 2 格),而上游码宽表判 PUA 单宽
+        // ——不缩会溢出到邻格被后画字形切碎(用户所见"方格子")。等比
+        // 缩进单格、水平居中。E0B0-E0D4(Powerline 三角/圆帽)除外:
+        // 其墨迹跨格是刻意的桥接设计,缩了反而断缝。
+        // (正解=宽度表按路由字体 advance 判,留 1.1)
+        let cw = self.metrics.cell_width;
+        let is_bridge = matches!(ch, '\u{E0B0}'..='\u{E0D4}');
+        if !is_bridge && ch >= '\u{E000}' && ch <= '\u{F8FF}' && info.size_px[0] > cw * 1.3 {
+            let scale = cw / info.size_px[0];
+            let new_h = info.size_px[1] * scale;
+            info.offset_px[0] += (info.size_px[0] - cw) / 2.0;
+            info.offset_px[1] += (info.size_px[1] - new_h) / 2.0;
+            info.size_px = [cw, new_h];
+        }
         self.cache.insert(key, info);
         info
     }
