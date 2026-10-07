@@ -110,11 +110,13 @@ fn conpty_strips_osc133_today_canary() {
                 // 透传判据 = 完整六字节 `ESC ] 1 3 3 ;`(实测 ConPTY 把
                 // 引导符 ESC] 毁成 ST(ESC\),载荷 ]133;... 以纯文本泄漏,
                 // BEL 被吃——与 APC 的 `\` 泄漏同款)
+                // 2026-10-07 边界移动(Windows 更新后实证):ConPTY 从"毁引导符+载荷泄漏"
+                // 变为完整透传 OSC 133——金丝雀翻向,断言透传为常态;再红=回到剥离,更新边界文档
                 let passed = all.windows(6).any(|w| w[0] == 0x1b && &w[1..] == b"]133;");
                 assert!(
-                    !passed,
-                    "ConPTY 开始透传 OSC 133 了!边界移动——jump/exit 状态点 \
-                     即刻可用,更新边界文档;{}",
+                    passed,
+                    "ConPTY ConPTY 回到剥离 OSC 133 了!边界又动——jump/exit 状态点 \
+                     降级,更新边界文档;{}",
                     String::from_utf8_lossy(&all)
                 );
                 return;

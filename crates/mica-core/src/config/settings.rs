@@ -19,7 +19,9 @@ pub const DEFAULT_FAMILIES: &[&str] = &[
     "Microsoft YaHei",
     // Nerd Font(oh-my-posh/starship 等提示符引擎的图标/Powerline 三角
     // 形 E0B0 族、F000 图标区;ASCII 仍由链头 JBMono 承担,此处只兜
-    // 缺字——已装 JetBrainsMonoNerdFont,未装的机器静默跳过)
+    // 缺字。两个族名都挂:NF 是 v3 短名(本机实测 GDI/DWrite 都叫这个),
+    // Nerd Font 是 v2 长名——未装的机器静默跳过
+    "JetBrainsMono NF",
     "JetBrainsMono Nerd Font",
     "Segoe UI Emoji",
     // 图标字形(caption 按钮的 Segoe Fluent Icons PUA 区;终端文本
@@ -201,7 +203,7 @@ mod tests {
     fn empty_source_is_all_defaults() {
         assert_eq!(resolve("").unwrap(), Settings::default());
         // JetBrains Mono 打头后链长 5(2026-10 UI 对标)
-        assert_eq!(Settings::default().font_families.len(), 7);
+        assert_eq!(Settings::default().font_families.len(), 8);
     }
 
     #[test]
