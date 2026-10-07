@@ -1167,14 +1167,18 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
 }
 
 unsafe fn create_pane(hwnd: HWND, shell_command: &str) -> Result<(PaneState, PtyReader), String> {
-    create_pane_with_size(hwnd, shell_command, None)
+    create_pane_with_size(hwnd, shell_command, None, None)
 }
 
 /// T9:font_size 覆盖 seed 字号(Some 时),其余同 [`create_pane`]。
+/// cwd(OSC 7 继承,2026-10-07):Some = 新 pane 在此目录起 shell
+/// (Ghostty window-inherit-working-directory 同义;源 shell 须广播
+/// OSC 7——yazi 不广播,PowerShell 需 $PROFILE 钩子,见文档)
 unsafe fn create_pane_with_size(
     hwnd: HWND,
     shell_command: &str,
     font_size: Option<f32>,
+    cwd: Option<&str>,
 ) -> Result<(PaneState, PtyReader), String> {
     let (families, size_pt) = TAB_SEED.with(|s| s.borrow().clone());
     let size_pt = font_size
@@ -1214,9 +1218,12 @@ unsafe fn create_pane_with_size(
     term.set_clipboard_provider(std::sync::Arc::new(|| {
         clipboard::get_text().unwrap_or_default()
     }));
-    let (session, reader) =
-        PtySession::spawn(mica_core::pty::command_from_str(shell_command), cols, rows)
-            .map_err(|e| format!("无法启动 shell({shell_command}):{e}"))?;
+    let mut cmd = mica_core::pty::command_from_str(shell_command);
+    if let Some(dir) = cwd {
+        cmd.cwd(std::path::PathBuf::from(dir));
+    }
+    let (session, reader) = PtySession::spawn(cmd, cols, rows)
+        .map_err(|e| format!("无法启动 shell({shell_command}):{e}"))?;
     let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
     let terminal = Terminal {
@@ -1272,7 +1279,15 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>, font_size: O
         .as_ref()
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "PowerShell".to_string());
-    let (pane, reader) = match create_pane_with_size(hwnd, &shell, font_size) {
+    // 新标签继承目录:源 shell 经 OSC 7 广播过的目录(None = 未广播,
+    // 回落默认);Ctrl+T 与 IPC new-tab 同路径
+    let inherit = TABS.with(|tabs| {
+        tabs.borrow()
+            .get(ACTIVE.get())
+            .and_then(|tab| tab.active_pane_ref())
+            .and_then(|t| t.term.cwd().map(str::to_string))
+    });
+    let (pane, reader) = match create_pane_with_size(hwnd, &shell, font_size, inherit.as_deref()) {
         Ok(pair) => pair,
         Err(e) => {
             // P1(1.0.9):新标签 spawn 失败——提示而非闪退(保活既有标签)
@@ -1582,6 +1597,15 @@ fn draw_frame() {
                 },
                 pane_exit,
                 hover: HOVER_STRIP.with(std::cell::Cell::get),
+                // 最大化钮图标切换(E922/E923)
+                zoomed: SHARED_HWND
+                    .with(|h| h.borrow().as_ref().and_then(|s| *s.lock().unwrap()))
+                    .is_some_and(|v| unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::IsZoomed(
+                            windows::Win32::Foundation::HWND(v as _),
+                        )
+                        .as_bool()
+                    }),
             },
         );
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)

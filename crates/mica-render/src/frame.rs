@@ -281,6 +281,8 @@ pub struct StripExtras {
     pub pane_exit: Option<u32>,
     /// 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的可视反馈
     pub hover: StripHover,
+    /// 最大化态(2026-10-07):true 时最大化钮显还原图标(E923)
+    pub zoomed: bool,
 }
 
 /// strip 悬停命中(与 app 层 hit-test 同几何单源;命中区互斥)。
@@ -326,6 +328,7 @@ pub fn strip_quads(
         layout,
         pane_exit,
         hover,
+        zoomed,
     } = extras;
     let mut out = Vec::new();
     let single = titles.len() == 1;
@@ -553,7 +556,16 @@ pub fn strip_quads(
     // caption_x = 客户区右缘 - 3×宽)。hover:min/max 轻亮块、close 红
     // 底白字(Windows 关闭钮惯例;Ghostty 交通灯 hover 亦是着色)
     if let Some(cx) = caption_x {
-        for (i, glyph) in ['\u{2500}', '\u{25a1}', '\u{00d7}'].iter().enumerate() {
+        // 原生按钮字形(2026-10-07,用户裁定"原生的就行了"):Segoe
+        // Fluent Icons 的 ChromeMinimize / ChromeMaximize(最大化时
+        // ChromeRestore)/ ChromeClose——Windows 自绘 caption 的官方
+        // 图标集;字体链尾部挂该族,PUA 区命中即得
+        let glyphs = [
+            '\u{E921}',
+            if zoomed { '\u{E923}' } else { '\u{E922}' },
+            '\u{E8BB}',
+        ];
+        for (i, glyph) in glyphs.iter().enumerate() {
             let bx = cx + i as f32 * sm.caption_w;
             let hovered = hover.caption
                 == Some(match i {

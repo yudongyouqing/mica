@@ -24,6 +24,9 @@ pub struct SidecarEvents {
     pub sync_end: usize,
     /// OSC 133 标记(按到达顺序;行号由消费侧结合光标位记录)
     pub marks: Vec<ShellMark>,
+    /// OSC 7 当前目录(file://URL;消费侧解码)——新标签继承目录的
+    /// 数据源(Ghostty window-inherit-working-directory 同义)
+    pub cwd: Option<String>,
 }
 
 /// OSC 133 的 A/B/C/D 语义(prompt/cmd/output/end)。
@@ -81,6 +84,13 @@ impl alacritty_terminal::vte::Perform for SidecarRecord {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell: bool) {
+        // OSC 7 ; file://host/path:工作目录广播(消费侧存 per-surface)
+        if params.first().is_some_and(|p| *p == b"7")
+            && let Some(url) = params.get(1).copied()
+            && let Ok(url) = std::str::from_utf8(url)
+        {
+            self.events.cwd = Some(url.to_string());
+        }
         // OSC 133 ; <mark>:params[0] = b"133",params[1] = b"A"/"B"/"C"/"D"
         if params.first().is_some_and(|p| *p == b"133") {
             let mark = match params.get(1).copied() {
@@ -100,6 +110,8 @@ impl alacritty_terminal::vte::Perform for SidecarRecord {
 /// 候选判定:块内出现这两个前缀之一(或其块尾截断形)才深跑。
 const CSI_START: &[u8] = b"\x1b[?2026";
 const OSC_START: &[u8] = b"\x1b]133;";
+/// OSC 7 needle(2026-10-07):cwd 广播,新标签继承的数据源
+const OSC7_START: &[u8] = b"\x1b]7;";
 /// carry 判定:块尾若是这些 needle 的严格前缀(含 `\x1b[?2026` 整体——
 /// 终结符 h/l 在下一块),续到下块再判。
 const CSI_CARRY: [&[u8]; 2] = [b"\x1b[?2026h", b"\x1b[?2026l"];
@@ -161,8 +173,10 @@ impl SidecarParser {
             let tail = &input[i + rel..];
             if tail.starts_with(CSI_START)
                 || tail.starts_with(OSC_START)
+                || tail.starts_with(OSC7_START)
                 || CSI_START.starts_with(tail)
                 || OSC_START.starts_with(tail)
+                || OSC7_START.starts_with(tail)
             {
                 deep_from = Some(i + rel);
                 break;
@@ -223,6 +237,7 @@ impl SidecarParser {
                 .any(|n| n.starts_with(suffix) && n.len() > k)
                 || (CSI_START.starts_with(suffix) && CSI_START.len() > k)
                 || (OSC_START.starts_with(suffix) && OSC_START.len() > k)
+                || (OSC7_START.starts_with(suffix) && OSC7_START.len() > k)
             {
                 self.carry = suffix.to_vec();
                 return;

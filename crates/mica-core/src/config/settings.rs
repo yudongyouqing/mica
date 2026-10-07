@@ -18,6 +18,9 @@ pub const DEFAULT_FAMILIES: &[&str] = &[
     "Cascadia Mono",
     "Microsoft YaHei",
     "Segoe UI Emoji",
+    // 图标字形(caption 按钮的 Segoe Fluent Icons PUA 区;终端文本
+    // 命中 E700-E8FF 时得到图标也是正确语义,Nerd Font 同族行为)
+    "Segoe Fluent Icons",
 ];
 
 pub const DEFAULT_FONT_SIZE_PT: f32 = 12.0;
@@ -194,7 +197,7 @@ mod tests {
     fn empty_source_is_all_defaults() {
         assert_eq!(resolve("").unwrap(), Settings::default());
         // JetBrains Mono 打头后链长 5(2026-10 UI 对标)
-        assert_eq!(Settings::default().font_families.len(), 5);
+        assert_eq!(Settings::default().font_families.len(), 6);
     }
 
     #[test]
