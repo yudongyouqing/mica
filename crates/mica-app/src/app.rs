@@ -2410,20 +2410,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 let _ = flush;
             });
-            // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
+            // 合帧去抖(2026-10-07):应用重绘是几十次独立小写入,逐块
+            // 立绘 = 肉眼可见的"一块一块长出来"(用户实测 Claude Code)。
+            // 数据到 → 重置 5ms 定时器,窗口期内的新块同帧合并——5ms 对
+            // 打字回显无感,对突发重绘是整数量级的合并。2026 的持帧路径
+            // ConPTY 场景不可达(边界清单),这是其通用替代
             if drew {
-                draw_frame();
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 4).ok();
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 4, 5, None);
             }
             LRESULT(0)
         }
         WM_TIMER => {
             // id 分流:2 = 2026 同步安全阀(D29);1 = 光标闪烁(D20);
-            // 3 = 子进程退出轮询(M5b/T3)
+            // 3 = 子进程退出轮询(M5b/T3);4 = 合帧去抖到期(WM_APP_RENDER)
             if wparam.0 == 3 && poll_exits() {
                 draw_frame();
                 return LRESULT(0);
             }
             match wparam.0 {
+                4 => {
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 4).ok();
+                    draw_frame();
+                }
                 2 => {
                     windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 2).ok();
                     if SYNC_HELD.with(std::cell::Cell::take) {
