@@ -76,6 +76,47 @@ fn style_bits(s: GlyphStyle) -> u8 {
 }
 
 /// 全零字形:空白与兜底共用,不进图集。
+/// 制表符(U+2500-257F)与方块元素(U+2580-259F)的格子对齐。纯横线
+/// 只拉宽、纯竖线只拉高(保持笔画粗细),拐角/T/十字满格拉伸,半块
+/// 按码位语义吸附(▀上半/▄下半/▌左半/▐右半/█满格)。落空码位不动。
+fn fit_cell_glyph(ch: char, g: &mut GlyphInfo, cw: f32, lh: f32) {
+    let cp = ch as u32;
+    // 方块元素:按码位定义精确吸附(墨形本该如此,字体实现常差一截)
+    let rect: Option<(f32, f32, f32, f32)> = match cp {
+        0x2580 => Some((0.0, 0.0, cw, lh / 2.0)),      // ▀ 上半
+        0x2584 => Some((0.0, lh / 2.0, cw, lh / 2.0)), // ▄ 下半
+        0x2588 => Some((0.0, 0.0, cw, lh)),            // █ 满格
+        0x258C => Some((0.0, 0.0, cw / 2.0, lh)),      // ▌ 左半
+        0x2590 => Some((cw / 2.0, 0.0, cw / 2.0, lh)), // ▐ 右半
+        0x2591..=0x2593 => Some((0.0, 0.0, cw, lh)),   // ░▒▓ 满格阴影
+        _ => None,
+    };
+    if let Some((x, y, w, h)) = rect {
+        g.offset_px = [x, y];
+        g.size_px = [w, h];
+        return;
+    }
+    if !(0x2500..=0x257F).contains(&cp) {
+        return;
+    }
+    let is_h =
+        matches!(cp, 0x2500 | 0x2501 | 0x2504 | 0x2505 | 0x2550) || (0x2508..=0x250B).contains(&cp);
+    // 纯竖线(实/粗/虚/双);250C-250F 是拐角,走满格拉伸分支
+    let is_v = matches!(cp, 0x2502 | 0x2503 | 0x2506 | 0x2507 | 0x2551);
+    // 拉伸保持原墨迹在格内的相对位置(横线居中带/竖线居中带)
+    if is_h {
+        g.size_px[0] = cw;
+        g.offset_px[0] = 0.0;
+    } else if is_v {
+        g.size_px[1] = lh;
+        g.offset_px[1] = 0.0;
+    } else {
+        // 拐角/T/十字/斜线:非等比满格拉伸——笔画粗细略变,换来接缝为零
+        g.size_px = [cw, lh];
+        g.offset_px = [0.0, 0.0];
+    }
+}
+
 fn blank_glyph() -> GlyphInfo {
     GlyphInfo {
         uv: [0.0; 4],
@@ -642,6 +683,17 @@ impl GlyphRouter for DwriteRouter {
             return *g;
         }
         let mut info = self.rasterize(ch, style).unwrap_or_else(blank_glyph);
+        // 制表符/方块元素对齐格子(2026-10-07):字体自带的 ┌(8×14)对
+        // 9.6×21.12 的格竖向差 7px——拐角接不上竖线、UI 呈"一块一块拼"
+        // (用户实测 Claude Code)。终端标准技巧:把这两区字形强拉对齐
+        // 格子——横线宽=格宽、竖线高=格高、拐角/T/十字满格、半块按
+        // 码位定义吸附半格。WT/kitty 同款。
+        fit_cell_glyph(
+            ch,
+            &mut info,
+            self.metrics.cell_width,
+            self.metrics.line_height,
+        );
         // 超宽 PUA 图标收缩(2026-10-07):Nerd 图标(F408 等)的字体墨宽
         // 是格宽近两倍(其 advance 本为 2 格),而上游码宽表判 PUA 单宽
         // ——不缩会溢出到邻格被后画字形切碎(用户所见"方格子")。等比
