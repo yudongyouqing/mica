@@ -650,7 +650,7 @@ impl GlyphRouter for DwriteRouter {
             let rect = self.atlas.insert(&bmp);
             let aw = self.atlas.width() as f32;
             let ah = self.atlas.height() as f32;
-            return GlyphInfo {
+            let info = GlyphInfo {
                 uv: [
                     rect.u as f32 / aw,
                     rect.v as f32 / ah,
@@ -661,6 +661,12 @@ impl GlyphRouter for DwriteRouter {
                 offset_px: [0.0, 0.0],
                 color: false,
             };
+            // 契约(GlyphRouter 文档):同 必须命中缓存同值——不入缓
+            // 会每帧重画重插,图集无限膨胀+重排,revision 逐帧变把未脏行
+            // 的缓存 UV 全部作废(乱码)乃至纹理爆掉(黑屏/崩)。
+            // 2026-10-07 sprite 首版漏了这条,真机十分钟翻车
+            self.cache.insert(key, info);
+            return info;
         }
         let mut info = self.rasterize(ch, style).unwrap_or_else(blank_glyph);
         // 制表符/方块元素对齐格子(2026-10-07):字体自带的 ┌(8×14)对
@@ -818,6 +824,21 @@ fn shape_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// sprite 契约锁(2026-10-07 翻车复盘):同 字形路由必须缓存命中
+    /// ——重复 route 的 revision 不得再变(否则图集逐帧膨胀+重排,未脏行
+    /// 缓存 UV 全作废 = 部分乱码乃至黑屏崩)
+    #[test]
+    fn sprite_routes_are_cached() {
+        let mut r = DwriteRouter::new(12.0, &["JetBrains Mono", "Cascadia Mono"]).unwrap();
+        let rev1 = r.atlas_revision();
+        let a = r.route('\u{2500}', crate::font::GlyphStyle::PLAIN);
+        let rev2 = r.atlas_revision();
+        let b = r.route('\u{2500}', crate::font::GlyphStyle::PLAIN);
+        let rev3 = r.atlas_revision();
+        assert_eq!(a, b, "同字符两次路由同值");
+        assert!(rev2 > rev1, "首次路由应插图集");
+        assert_eq!(rev2, rev3, "重复路由必须命中缓存,不得再插图集");
+    }
 
     /// 真机回归锁:光栅化链必须产出有墨字形。曾经 ALIASED_1x1 纹理配
     /// NATURAL_SYMMETRIC 模式 bounds 恒空,每字符都落空白兜底——
