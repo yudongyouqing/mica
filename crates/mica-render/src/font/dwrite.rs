@@ -183,7 +183,9 @@ impl DwriteRouter {
             ligatures,
             em_size_dip,
             metrics,
-            atlas: GlyphAtlas::new(256, 256),
+            // 512 固定宽:覆盖 400pt 级极端字形且守卫不触发;行距对齐
+            // 512*4=2048 % 256==0 ✓。页追加式下宽度永不再变(u 稳定)
+            atlas: GlyphAtlas::new(512, 512),
             last_atlas_version: 0,
             cache: HashMap::new(),
             run_cache: HashMap::new(),
@@ -318,15 +320,11 @@ impl DwriteRouter {
         let rect = self
             .atlas
             .insert(&GlyphBitmap::from_coverage(w, h, coverage));
-        let (aw, ah) = (self.atlas.width() as f32, self.atlas.height() as f32);
         // 字形相对格左上:水平 = bounds.left;垂直 = ascent + bounds.top(top 为负 = 基线上方)
+        // UV = 纹素坐标(2026-10-08 页追加式):shader 用 globals.atlas_size
+        // 归一——高度追加不再改变既有条目的采样位置
         Some(GlyphInfo {
-            uv: [
-                rect.u as f32 / aw,
-                rect.v as f32 / ah,
-                rect.w as f32 / aw,
-                rect.h as f32 / ah,
-            ],
+            uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
             size_px: [w as f32, h as f32],
             offset_px: [bounds.left as f32, self.metrics.ascent + bounds.top as f32],
             color: false,
@@ -394,14 +392,8 @@ impl DwriteRouter {
             let rect = self
                 .atlas
                 .insert(&GlyphBitmap::from_coverage(w as u32, h as u32, coverage));
-            let (aw, ah) = (self.atlas.width() as f32, self.atlas.height() as f32);
             GlyphInfo {
-                uv: [
-                    rect.u as f32 / aw,
-                    rect.v as f32 / ah,
-                    rect.w as f32 / aw,
-                    rect.h as f32 / ah,
-                ],
+                uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
                 size_px: [w as f32, h as f32],
                 offset_px: [bounds.left as f32, self.metrics.ascent + bounds.top as f32],
                 color: false,
@@ -540,14 +532,8 @@ impl DwriteRouter {
             format: GlyphFormat::ColorRgba,
         };
         let rect = self.atlas.insert(&bmp);
-        let (aw, ah) = (self.atlas.width() as f32, self.atlas.height() as f32);
         Some(GlyphInfo {
-            uv: [
-                rect.u as f32 / aw,
-                rect.v as f32 / ah,
-                rect.w as f32 / aw,
-                rect.h as f32 / ah,
-            ],
+            uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
             size_px: [uw as f32, uh as f32],
             offset_px: [u.left as f32, self.metrics.ascent + u.top as f32],
             color: true,
@@ -662,15 +648,8 @@ impl GlyphRouter for DwriteRouter {
         {
             let bmp = GlyphBitmap::from_coverage(pw, ph, cov);
             let rect = self.atlas.insert(&bmp);
-            let aw = self.atlas.width() as f32;
-            let ah = self.atlas.height() as f32;
             let info = GlyphInfo {
-                uv: [
-                    rect.u as f32 / aw,
-                    rect.v as f32 / ah,
-                    rect.w as f32 / aw,
-                    rect.h as f32 / ah,
-                ],
+                uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
                 size_px: [self.metrics.cell_width, self.metrics.line_height],
                 offset_px: [0.0, 0.0],
                 color: false,

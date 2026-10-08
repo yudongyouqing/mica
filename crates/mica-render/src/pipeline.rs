@@ -72,7 +72,9 @@ pub async fn create_context(
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Globals {
     viewport: [f32; 2],
-    _pad: [f32; 2],
+    /// 图集纹理尺寸(纹素):UV 归一移到 shader,实例存纹素坐标——
+    /// 页追加式高度增长不改变既有条目采样位置(2026-10-08)
+    atlas_size: [f32; 2],
 }
 
 const INSTANCE_CAPACITY: usize = 4096;
@@ -123,7 +125,7 @@ impl Renderer {
             label: Some("globals"),
             contents: cast_slice(&[Globals {
                 viewport: [1.0, 1.0],
-                _pad: [0.0; 2],
+                atlas_size: [1.0, 1.0],
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -353,12 +355,22 @@ impl Renderer {
             _ => return, // Timeout/Occluded/Validation:跳过本帧
         };
         self.upload_instances(instances);
+        let atlas_w = self
+            .atlas_texture
+            .as_ref()
+            .map(|t| t.width() as f32)
+            .unwrap_or(1.0);
+        let atlas_h = self
+            .atlas_texture
+            .as_ref()
+            .map(|t| t.height() as f32)
+            .unwrap_or(1.0);
         self.queue.write_buffer(
             &self.globals_buf,
             0,
             cast_slice(&[Globals {
                 viewport: [config.width as f32, config.height as f32],
-                _pad: [0.0; 2],
+                atlas_size: [atlas_w, atlas_h],
             }]),
         );
         // set_atlas 之前 draw 是接线错误(T7 起先 set_atlas 再 draw)
@@ -518,11 +530,13 @@ mod tests {
         // 直接读私有字段:诊断值随最近一次上传更新
         assert_eq!(renderer.atlas_revision, atlas.revision());
         assert_eq!(renderer.atlas_uploads, 5);
-        // 高 250 的字形在剩余空间放不下(12+250>256)→ grow 后 version 递增;
-        // set_atlas 走"重建纹理+重传"路径(新尺寸 256×512)
+        // 高 250 的字形在剩余空间放不下 → 页追加(高度 +256,条目原位);
+        // set_atlas 走"重建纹理+重传"路径(页追加式,version 恒 0)
         let big = GlyphBitmap::from_coverage(8, 250, vec![128; (8 * 250) as usize]);
+        let before_ver = atlas.version();
         atlas.insert(&big);
-        assert!(atlas.version() > 0, "高度不足应触发 grow+版本递增");
+        assert_eq!(atlas.version(), before_ver, "页追加式无重排信号");
+        assert!(atlas.height() > 256, "高度追加");
         renderer.set_atlas(&atlas);
         // 换肤路径:构造后的 set_clear_color 更新内部清屏色(读私有字段验证)
         let mut themed = Palette::DEFAULT;

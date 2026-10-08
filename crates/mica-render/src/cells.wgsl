@@ -13,7 +13,9 @@ const CORNERS = array<vec2f, 6>(
 
 struct Globals {
     viewport: vec2f,
-    _pad: vec2f,
+    /// 图集纹理尺寸(纹素)——UV 归一在 shader 做:实例存纹素坐标,
+    /// 高度追加(页式增长)不改变既有条目的采样位置(2026-10-08)
+    atlas_size: vec2f,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var glyphs: texture_2d<f32>;
@@ -42,7 +44,7 @@ fn vs(
     let y = pos_uv.y + corner.y * size_uv.y;
     var out: VsOut;
     out.pos = vec4f(x / globals.viewport.x * 2.0 - 1.0, 1.0 - y / globals.viewport.y * 2.0, 0.0, 1.0);
-    out.uv = pos_uv.zw + corner * size_uv.zw;
+    out.uv = (pos_uv.zw + corner * size_uv.zw) / globals.atlas_size;
     out.fg = fg.rgb;
     out.bg = bg.rgb;
     out.ink_mask = select(0.0, 1.0, size_uv.z > 0.0);
