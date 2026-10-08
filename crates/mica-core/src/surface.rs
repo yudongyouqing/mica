@@ -740,6 +740,25 @@ mod tests {
     }
 
     #[test]
+    fn truecolor_bg_reaches_grid() {
+        // 连续真彩 SGR:fg(38;2) 后 bg(48;2) 是否丢(claude logo 形态)
+        let cases: Vec<(&str, bool)> = vec![
+            ("\x1b[38;2;215;119;87m\x1b[48;2;0;0;0m ", true), // 两条分开
+            ("\x1b[38;2;215;119;87;48;2;0;0;0m ", true),      // 同一条合并
+            ("\x1b[38;5;196m\x1b[48;2;0;0;0m ", true),        // 256色fg + 真彩bg
+            ("\x1b[48;2;0;0;0m ", true),                      // 裸 bg(对照,已知过)
+        ];
+        for (seq, want_bg) in cases {
+            let mut s = Surface::new(ScreenSize::new(20, 4));
+            s.feed(seq.as_bytes());
+            let c = &s.grid()[Line(0)][Column(0)];
+            let ok = matches!(c.bg, alacritty_terminal::vte::ansi::Color::Spec(_));
+            println!("{seq:?} -> bg={:?} (want_bg={want_bg})", c.bg);
+            assert_eq!(ok, want_bg, "{seq:?}");
+        }
+    }
+
+    #[test]
     fn color_request_default_answers_fg_and_bg() {
         let mut s = Surface::new(ScreenSize::new(10, 3));
         // 256=前景(白)、257=背景(#282c34,Ghostty 官方默认)——M0 全答白是
