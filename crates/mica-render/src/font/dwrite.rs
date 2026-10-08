@@ -555,6 +555,12 @@ impl GlyphRouter for DwriteRouter {
         if !self.ligatures || chars.len() < 2 {
             return None;
         }
+        // 精灵覆盖的字符不得进 shaping:整形直出字体字形,绕过精灵的
+        // 格子精确几何(Claude logo 的连续块字符段曾整段被吃,渲染成
+        // 空白/未对齐块;逐字路由让精灵与字体字形按字符混排)
+        if chars.iter().any(|&c| crate::font::sprite::covers(c as u32)) {
+            return None;
+        }
         let key = (chars.to_vec(), style_bits(style));
         if let Some(hit) = self.run_cache.get(&key) {
             return Some(hit.clone());

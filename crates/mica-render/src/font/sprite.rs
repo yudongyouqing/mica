@@ -8,6 +8,37 @@
 //! 竖线居水平中线;粗细 light = 行高/10 夹 [1,3],heavy = 2×;方块
 //! 元素按码位精确吸附;盲文 2×4 点阵;Powerline 三角满格。
 
+/// 码位是否由精灵覆盖。route_run(shaping 批量路径)据此拒绝整段整形、
+/// 强制逐字路由——shaping 直出 DWrite 字体字形会**绕过精灵**(字体墨迹
+/// 未对齐/空白,2026-10-08 实证:Claude logo 的连续块字符段整段被
+/// shaping 吃掉,精灵只拦到孤立字符,oh-my-posh 的 PUA 三角因字体缺字
+/// shaping 失败回落才偶然正常)。几何/Powerline 子集与 draw() 的命中集
+/// 严格一致,防止"covers 说有、draw 画不出"的回落死洞。
+pub fn covers(cp: u32) -> bool {
+    matches!(
+        cp,
+        0x2500..=0x257F
+            | 0x2580..=0x259F
+            | 0x2800..=0x28FF
+            | 0x25A0
+            | 0x25A1
+            | 0x25AA
+            | 0x25AB
+            | 0x25AC
+            | 0x25B2
+            | 0x25BA
+            | 0x25BC
+            | 0x25C4
+            | 0x25C6
+            | 0x25C7
+            | 0x25CB
+            | 0x25CF
+            | 0x25D0
+            | 0x25D1
+            | 0xE0B0..=0xE0BB
+    )
+}
+
 /// 超采样倍率(每轴 4 → 16 子样本/像素)
 const SS: u32 = 4;
 
