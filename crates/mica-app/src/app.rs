@@ -219,6 +219,9 @@ struct Terminal {
     row_insts: Vec<RowInst>,
     /// 重开用(M5b/T3):pane 的 shell 命令串(profile 出处不存,重启等价)
     shell: String,
+    /// 上次消费的图集布局版本(grow 重排即变)——变了必须 force_full
+    /// 重建行实例,否则旧 UV 指向重排后的错误条目(一块一块根因)
+    last_atlas_ver: u64,
     /// 子进程退出码(M5b/T3):Some = 已退出,冻结尾帧 + strip 提示 + 重开
     exited: Option<u32>,
     /// 结构性失配(resize、热重载换字体/主题)置位:下一帧无视 term 脏区
@@ -1252,6 +1255,7 @@ unsafe fn create_pane_with_size(
         force_full: true,      // 首帧显式全量,不依赖哨兵的先后
         shell: shell_command.to_string(),
         exited: None,
+        last_atlas_ver: 0,
     };
     let pane_id = NEXT_TAB_ID.with(|n| n.replace(n.get() + 1));
     Ok((
@@ -1506,6 +1510,12 @@ fn draw_frame() {
                 t.term
                     .resize(ScreenSize::new(want_cols as usize, want_rows as usize));
                 let _ = t.session.resize(want_cols, want_rows);
+                t.force_full = true;
+            }
+            // 图集 grow 重排检查:布局变了,行实例缓存的 UV 全作废
+            let ver = t.router.atlas_version();
+            if ver != t.last_atlas_ver {
+                t.last_atlas_ver = ver;
                 t.force_full = true;
             }
             // 脏区分路(同 Task 8)

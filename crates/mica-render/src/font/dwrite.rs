@@ -204,6 +204,14 @@ impl DwriteRouter {
         self.atlas.revision()
     }
 
+    /// 仅 grow 重排递增——app 侧据此作废行级实例缓存(2026-10-08:
+    /// row_insts 的 UV 是按当时图集布局烘焙的,grow 重排后全表位移,
+    /// 未重建的行 = 画到别人的字形上 = "一块一块/乱码"。新实例测不出
+    /// ——要会话内字符量把图集撑大才触发,claude+omp+精灵必中)
+    pub fn atlas_version(&self) -> u64 {
+        self.atlas.version()
+    }
+
     pub fn families_in_use(&self) -> Vec<String> {
         self.families.iter().map(|f| f.name.clone()).collect()
     }
