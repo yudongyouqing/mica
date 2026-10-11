@@ -44,7 +44,13 @@ fn vs(
     let y = pos_uv.y + corner.y * size_uv.y;
     var out: VsOut;
     out.pos = vec4f(x / globals.viewport.x * 2.0 - 1.0, 1.0 - y / globals.viewport.y * 2.0, 0.0, 1.0);
-    out.uv = (pos_uv.zw + corner * size_uv.zw) / globals.atlas_size;
+    // 半纹素内缩(2026-10-11 接缝修复):采样域从 [0, w] 收到 [0.5, w-0.5]
+    // ——边缘落在纹素中心,LINEAR 采样永不与图集零填充邻格混合。此前的
+    // 边界采样让每格最后一列像素混入 1/10 零墨 = 半亮接缝,块字符艺术
+    // (logo/横线)被切成一块一块(用户截图+逐像素亮度实测定案)
+    let inset = vec2f(0.5);
+    let texel = pos_uv.zw + inset + corner * max(size_uv.zw - 2.0 * inset, vec2f(0.0));
+    out.uv = texel / globals.atlas_size;
     out.fg = fg.rgb;
     out.bg = bg.rgb;
     out.ink_mask = select(0.0, 1.0, size_uv.z > 0.0);
