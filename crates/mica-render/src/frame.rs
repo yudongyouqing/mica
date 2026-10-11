@@ -255,7 +255,9 @@ impl StripMetrics {
             tab_close_w: TAB_CLOSE_W_BASE * s,
             plus_w: TAB_PLUS_W_BASE * s,
             caption_w: 46.0 * s,
-            tab_r: 6.0 * s,
+            // 胶囊半径 = 块高一半(macOS Tahoe 原生标签形制,Ghostty
+            // Tahoe 实现劫持 NSTabBar 视觉即 Apple 胶囊)
+            tab_r: (STRIP_H_BASE * s - 4.0 * s) / 2.0,
             chip_r: 6.0 * s,
             dot_d: 7.0 * s,
             pad: 8.0 * s,
@@ -397,6 +399,16 @@ pub fn strip_quads(
         fg: bg_of(bar),
         bg: bg_of(bar),
     });
+    // 条底发丝线(Tahoe 细节):条与终端区的分界,1px 比条再暗一档
+    // ——raised 工具条的"投在终端上的阴影"极简形。blend:None 下 1px
+    // 不做 AA(该线本身就是 hairline 语义)
+    let hair = mix(bar, [0, 0, 0], 0.30);
+    out.push(CellInstance {
+        pos_uv: [0.0, sm.h - 1.0, 0.0, 0.0],
+        size_uv: [strip_w, 1.0, 0.0, 0.0],
+        fg: bg_of(hair),
+        bg: bg_of(hair),
+    });
     let text_y = (sm.h - metrics.line_height).max(0.0) / 2.0;
     if single {
         let (title, _) = &titles[0];
@@ -433,14 +445,17 @@ pub fn strip_quads(
                 let face = mix(bar, white, 0.06);
                 let (glyph_bg, ink) = if hovered { (face, dim) } else { (bar, dim) };
                 if hovered {
+                    // 圆钮(Tahoe "+" 是圆形按钮)
+                    let d = sm.h - 4.0 * k;
+                    let r = d / 2.0;
                     out.push(rounded(
-                        x + k,
+                        x + (sm.plus_w - d) / 2.0,
                         2.0 * k,
-                        sm.plus_w - 2.0 * k,
-                        sm.h - 2.0 * k,
+                        d,
+                        d,
                         face,
                         bar,
-                        (4.0 * k, 4.0 * k),
+                        (r, r),
                     ));
                 }
                 let g = router.route('+', GlyphStyle::PLAIN);
@@ -475,15 +490,17 @@ pub fn strip_quads(
             } else {
                 (bar, dim)
             };
+            // 胶囊(Tahoe):四角全圆、上下各离 2k 悬浮——非"通底镂空"
+            // (Adwaita 文件夹标签形制已弃,2026-10-12 用户要完全同款细节)
             if *active || hovered {
                 out.push(rounded(
                     x0,
                     2.0 * k,
                     w,
-                    sm.h - 2.0 * k,
+                    sm.h - 4.0 * k,
                     backdrop,
                     bar,
-                    (sm.tab_r, 0.0),
+                    (sm.tab_r, sm.tab_r),
                 ));
             }
             let close_x = x0 + w - sm.tab_close_w;
@@ -1233,17 +1250,30 @@ mod tests {
             &StripMetrics::default(),
             StripExtras {
                 caption_x: Some(400.0),
+                layout: StripLayout {
+                    avail_w: 400.0,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
         let sm = StripMetrics::default();
-        // 活动标签(第二个)的背景本色块:宽 = tab_width("b") = pad*2+close+8
-        let want_w = (sm.tab_pad * 2.0 + sm.tab_close_w + 8.0).max(sm.tab_min_w);
+        // 活动标签胶囊(等宽):四角全圆(tab_r=块高一半)、上下悬浮 2k
+        let k = sm.h / STRIP_H_BASE;
+        let want_w = equal_tab_w(2, 400.0, &sm);
         assert!(
             out.iter().any(|q| q.size_uv[0] == want_w
-                && q.size_uv[1] == sm.h - 2.0 * (sm.h / STRIP_H_BASE)
-                && q.bg[3] == sm.tab_r),
-            "活动标签镂空块(上圆角,内容宽 {want_w})"
+                && q.size_uv[1] == sm.h - 4.0 * k
+                && q.bg[3] == sm.tab_r
+                && q.fg[3] == sm.tab_r),
+            "活动标签胶囊(全圆,等宽 {want_w})"
+        );
+        // 发丝线:条底 1px
+        assert!(
+            out.iter()
+                .any(|q| q.size_uv == [sm.h.max(1.0).min(sm.h), 1.0, 0.0, 0.0]
+                    || (q.size_uv[1] == 1.0 && q.pos_uv[1] == sm.h - 1.0)),
+            "条底发丝线存在"
         );
         // 关闭钮字形(E8BB)在:active 恒显
         assert!(
