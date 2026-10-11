@@ -78,9 +78,10 @@ pub fn handle_cli() -> i32 {
                 "powershell.exe -NoLogo".into(),
             )
         }
+        Some("new-window") => dispatch_ipc(IpcMessage::new_window(), String::new()),
         Some(other) => {
             eprintln!(
-                "mica [new-tab [profile] | wsl [distro] | list-profiles]
+                "mica [new-tab [profile] | new-window | wsl [distro] | list-profiles]
 未知命令:{other}"
             );
             2

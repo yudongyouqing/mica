@@ -29,6 +29,9 @@ impl Trigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     NewTab,
+    /// 新建独立窗口(2026-10-12):新线程 + 新 HWND,同 wndproc 同管线;
+    /// 进程活到最后一窗关闭
+    NewWindow,
     CloseTab,
     NextTab,
     PrevTab,
@@ -78,6 +81,11 @@ impl Keymap {
             m(true, true, false),
             TriggerKey::Letter('T'),
             Action::NewTab,
+        );
+        push(
+            m(true, true, false),
+            TriggerKey::Letter('N'),
+            Action::NewWindow,
         );
         // WT 语义:Ctrl+Shift+W 关焦点 pane,最后一个 pane 时升级关标签
         push(
@@ -258,6 +266,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
     let name = s.trim();
     match name {
         "new_tab" => Some(Action::NewTab),
+        "new_window" => Some(Action::NewWindow),
         "close_tab" => Some(Action::CloseTab),
         "next_tab" => Some(Action::NextTab),
         "prev_tab" => Some(Action::PrevTab),
