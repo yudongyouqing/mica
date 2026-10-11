@@ -2054,32 +2054,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // strip 区(T7):命中标签则切换、命中 + 则新建,不走选择
             match strip_hit(px, py) {
                 Some(Some(idx)) => {
-                    // × 关闭区(与渲染同几何):标签尾部 close_w;单标签
-                    // 无 ×(整窗关闭走 caption),退回切换
+                    // × 关闭区(与渲染同几何,等宽):标签尾部 close_w;
+                    // 单标签无 ×(整窗关闭走 caption),退回切换
                     let sm = strip_metrics();
                     let n = TABS.with(|t| t.borrow().len());
-                    let (x0, w) = TABS
-                        .with(|t| {
-                            let guard = t.borrow();
-                            guard.get(idx).map(|tab| {
-                                let metrics = tab
-                                    .panes
-                                    .first()
-                                    .map(|p| &p.terminal.metrics)
-                                    .expect("tab has pane");
-                                // 累加到 idx 的 x0
-                                let mut x = 6.0 * (sm.h / 36.0);
-                                for other in guard.iter().take(idx) {
-                                    x += mica_render::frame::tab_width(&other.title, metrics, &sm)
-                                        + sm.tab_gap;
-                                }
-                                (x, mica_render::frame::tab_width(&tab.title, metrics, &sm))
-                            })
-                        })
-                        .unwrap_or((0.0, sm.tab_min_w));
+                    let area_w = GPU
+                        .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
+                        .unwrap_or(0.0);
+                    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+                    let k = sm.h / mica_render::frame::STRIP_H_BASE;
+                    let tabs_x0 = 6.0 * k + sm.plus_w + 2.0 * k;
                     let local = px as f32
                         + TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w
-                        - x0;
+                        - tabs_x0
+                        - idx as f32 * (w + sm.tab_gap);
                     if n > 1 && local >= w - sm.tab_close_w {
                         close_tab(idx);
                         draw_frame();
@@ -2711,25 +2699,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 // 标签+加号可视区(单标签无块:整条留拖拽,单标签居中标题
                 // 与 Ghostty 单窗口观感一致)
-                // 动态标签宽:takes_end = 累加宽 + 边距 + 加号区;单标签
+                // 等宽标签(gtk-wide-tabs):标签区 = 条首 + 与标签尾;单标签
                 // 无块(None)→ 整条拖拽区
-                let tabs_end: Option<f32> = TABS.with(|t| {
-                    let guard = t.borrow();
-                    if guard.len() < 2 {
-                        return None;
-                    }
-                    let metrics = guard
-                        .first()
-                        .and_then(|t| t.panes.first().map(|p| &p.terminal.metrics))?;
-                    let widths: f32 = guard
-                        .iter()
-                        .map(|t| mica_render::frame::tab_width(&t.title, metrics, &sm) + sm.tab_gap)
-                        .sum();
-                    Some(8.0 * (sm.h / 36.0) + widths + 2.0 * (sm.h / 36.0) + sm.plus_w)
-                });
-                if let Some(end) = tabs_end {
+                let n = TABS.with(|t| t.borrow().len());
+                let area_w = GPU
+                    .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
+                    .unwrap_or(0.0);
+                if n > 1 {
+                    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
                     let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
-                    if (cx as f32) < end - shift {
+                    let k = sm.h / mica_render::frame::STRIP_H_BASE;
+                    let tabs_end = 6.0 * k + sm.plus_w + 2.0 * k + n as f32 * (w + sm.tab_gap);
+                    if (cx as f32) < tabs_end - shift {
                         return LRESULT(HTCLIENT as isize);
                     }
                 }
@@ -2918,37 +2899,24 @@ fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
     if py < 0 || py as f32 >= sm.h {
         return None; // 不在 strip 区
     }
-    // 动态标签宽(2026-10-12 内容自适应):逐标签累加定位——渲染与
-    // hit-test 同源取 tab_width,几何永不漂移
-    let (hit, tabs_end) = TABS.with(|tabs| {
-        let guard = tabs.borrow();
-        let mut x = 6.0 * (sm.h / 36.0); // 条左内边距(与渲染同源)
-        let mut hit = None;
-        let metrics = match guard
-            .first()
-            .and_then(|t| t.panes.first().map(|p| &p.terminal.metrics))
-        {
-            Some(m) => *m,
-            None => return (None, sm.plus_w),
-        };
-        for (i, tab) in guard.iter().enumerate() {
-            let w = mica_render::frame::tab_width(&tab.title, &metrics, &sm);
-            let x0 = x;
-            x += w + sm.tab_gap;
-            let local =
-                px.max(0) as f32 + TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
-            if local >= x0 && local < x {
-                hit = Some(i);
-            }
-        }
-        (hit, x + 2.0 * (sm.h / 36.0) + sm.plus_w)
-    });
-    if let Some(i) = hit {
-        return Some(Some(i));
+    // 等宽标签(2026-10-12 二稿:gtk-wide-tabs 默认语义,均分填充);
+    // "+" 在条首(Ghostty window.blp [start] 盒)。几何与渲染同源
+    let area_w = GPU
+        .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
+        .unwrap_or(0.0);
+    let n = TABS.with(|tabs| tabs.borrow().len());
+    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+    let k = sm.h / mica_render::frame::STRIP_H_BASE;
+    let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
+    let local = px.max(0) as f32 + shift;
+    // 条首 "+" 区
+    if local >= 6.0 * k && local < 6.0 * k + sm.plus_w {
+        return Some(None);
     }
-    let local = px.max(0) as f32 + TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
-    if local < tabs_end {
-        Some(None) // + 按钮
+    let tabs_x0 = 6.0 * k + sm.plus_w + 2.0 * k;
+    let idx = ((local - tabs_x0) / w).floor();
+    if idx >= 0.0 && (idx as usize) < n {
+        Some(Some(idx as usize))
     } else {
         None
     }
@@ -3058,34 +3026,14 @@ fn tab_scroll_adjust(delta: i32) -> bool {
         .unwrap_or(0.0);
     let sm = strip_metrics();
     let avail = (area_w - 3.0 * sm.caption_w).max(0.0);
-    let (need, first_w) = TABS.with(|tabs| {
-        let guard = tabs.borrow();
-        let metrics = guard
-            .first()
-            .and_then(|t| t.panes.first().map(|p| &p.terminal.metrics))
-            .cloned();
-        match metrics {
-            Some(m) => (
-                guard
-                    .iter()
-                    .map(|t| mica_render::frame::tab_width(&t.title, &m, &sm) + sm.tab_gap)
-                    .sum::<f32>()
-                    + 6.0 * (sm.h / 36.0)
-                    + 2.0 * (sm.h / 36.0)
-                    + sm.plus_w,
-                mica_render::frame::tab_width(
-                    &guard.first().map(|t| t.title.clone()).unwrap_or_default(),
-                    &m,
-                    &sm,
-                ),
-            ),
-            None => (sm.plus_w, sm.tab_min_w),
-        }
-    });
+    let n = TABS.with(|tabs| tabs.borrow().len());
+    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+    let k = sm.h / mica_render::frame::STRIP_H_BASE;
+    let need = 6.0 * k + sm.plus_w + 2.0 * k + n as f32 * (w + sm.tab_gap);
     let max = if avail <= 0.0 || need <= avail {
         0
     } else {
-        ((need - avail) / first_w).ceil() as i32
+        ((need - avail) / sm.tab_min_w).ceil() as i32
     };
     let old = TAB_SCROLL.with(std::cell::Cell::get);
     let new = (old + delta).clamp(0, max);
@@ -3107,7 +3055,12 @@ fn tab_follow_active() {
     let visible = if avail <= 0.0 {
         i32::MAX
     } else {
-        (((avail - strip_metrics().plus_w) / strip_metrics().tab_w).floor() as i32).max(1)
+        let sm = strip_metrics();
+        let n = TABS.with(|tabs| tabs.borrow().len());
+        let w = mica_render::frame::equal_tab_w(n, avail, &sm);
+        (((avail - 6.0 * (sm.h / 36.0) - sm.plus_w - 2.0 * (sm.h / 36.0)) / (w + sm.tab_gap))
+            .floor() as i32)
+            .max(1)
     };
     let active = ACTIVE.get() as i32;
     let cur = TAB_SCROLL.with(std::cell::Cell::get);

@@ -278,11 +278,18 @@ pub enum ExitDot {
     Gray,
 }
 
-/// 标签内容自适应宽(2026-10-12):clamp(pad*2+close_w+n*cell, min, max)。
-/// 渲染与 hit-test 同源取值(app 侧逐标签累加)。
-pub fn tab_width(title: &str, metrics: &FontMetrics, sm: &StripMetrics) -> f32 {
-    let n = title.chars().count() as f32;
-    (sm.tab_pad * 2.0 + sm.tab_close_w + n * metrics.cell_width).clamp(sm.tab_min_w, sm.tab_max_w)
+/// 标签宽(2026-10-12):**均分填充**可用宽(Ghostty gtk-wide-tabs 默认
+/// true 的 GNOME 形制,Config 文档:"tabs fill their available space");
+/// 放不下(min_w × n > avail)则固定 min_w 由溢出滚动兜底。等宽单值,
+/// 渲染与 hit-test 同源。旧内容自适应方案(2026-10-12 上午)弃——
+/// 与 Ghostty 默认相悖。
+pub fn equal_tab_w(n: usize, avail_w: f32, sm: &StripMetrics) -> f32 {
+    if n == 0 {
+        return sm.tab_min_w;
+    }
+    let gaps = sm.tab_gap * n as f32;
+    let body = (avail_w - 6.0 * (sm.h / 36.0) - sm.plus_w - 2.0 * (sm.h / 36.0) - gaps).max(0.0);
+    (body / n as f32).max(sm.tab_min_w)
 }
 
 /// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数;
@@ -368,10 +375,10 @@ pub fn strip_quads(
         ]
     };
     let bg3 = [palette.bg.r, palette.bg.g, palette.bg.b];
-    // 条底 = 比终端底色暗 35%(Adwaita 形制:阴影条,活动标签是"从条里
-    // 镂出的一块露出下面的终端色"——文件夹标签的视觉本质,2026-10-12
-    // 用户裁定旧条"太烂"整体重做)
-    let bar = mix(bg3, [0, 0, 0], 0.35);
+    // 条底 = 终端底色向白 10%(Adwaita headerbar 形制:条比内容**亮**
+    // 一档,raised 风格的阴影投在下方终端区;2026-10-12 二稿——首稿
+    // 暗条与 Adwaita/Ghostty 默认相悖,用户令对照源码重做)
+    let bar = mix(bg3, [255, 255, 255], 0.10);
     let dim = [
         palette.colors[7].r,
         palette.colors[7].g,
@@ -417,12 +424,45 @@ pub fn strip_quads(
             });
         }
     } else {
-        let tab_area_left = 6.0 * k;
-        let mut x = tab_area_left - shift;
+        // "+" 按钮在条首(Ghostty window.blp:SplitButton 挂 [start] 盒;
+        // 2026-10-12 二稿,首稿放标签尾部与上游相悖)
+        {
+            let x = 6.0 * k - shift;
+            if !(x + sm.plus_w <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
+                let hovered = hover.plus;
+                let face = mix(bar, white, 0.06);
+                let (glyph_bg, ink) = if hovered { (face, dim) } else { (bar, dim) };
+                if hovered {
+                    out.push(rounded(
+                        x + k,
+                        2.0 * k,
+                        sm.plus_w - 2.0 * k,
+                        sm.h - 2.0 * k,
+                        face,
+                        bar,
+                        (4.0 * k, 4.0 * k),
+                    ));
+                }
+                let g = router.route('+', GlyphStyle::PLAIN);
+                out.push(CellInstance {
+                    pos_uv: [
+                        x + (sm.plus_w - g.size_px[0]) / 2.0,
+                        text_y + g.offset_px[1],
+                        g.uv[0],
+                        g.uv[1],
+                    ],
+                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                    fg: bg_of(ink),
+                    bg: bg_of(glyph_bg),
+                });
+            }
+        }
+        // 均分等宽标签(gtk-wide-tabs 默认;avail 由 layout 传,0 = 不裁)
+        let w = equal_tab_w(titles.len(), layout.avail_w, sm);
+        let mut x = 6.0 * k + sm.plus_w + 2.0 * k - shift;
         for (i, (title, active)) in titles.iter().enumerate() {
-            let w = tab_width(title, metrics, sm);
+            let x0 = x;
             x += w + sm.tab_gap;
-            let x0 = x - w - sm.tab_gap;
             if x0 + w <= 0.0 || (layout.avail_w > 0.0 && x0 >= layout.avail_w) {
                 continue; // 滚出可视区的标签不发射
             }
@@ -498,36 +538,6 @@ pub fn strip_quads(
                     });
                 }
             }
-        }
-        // "+" 按钮(裸字形减淡,悬停轻亮)
-        let x = x + 2.0 * k;
-        if !(x + sm.plus_w <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
-            let hovered = hover.plus;
-            let face = mix(bar, white, 0.06);
-            let (glyph_bg, ink) = if hovered { (face, dim) } else { (bar, dim) };
-            if hovered {
-                out.push(rounded(
-                    x + k,
-                    2.0 * k,
-                    sm.plus_w - 2.0 * k,
-                    sm.h - 2.0 * k,
-                    face,
-                    bar,
-                    (4.0 * k, 4.0 * k),
-                ));
-            }
-            let g = router.route('+', GlyphStyle::PLAIN);
-            out.push(CellInstance {
-                pos_uv: [
-                    x + (sm.plus_w - g.size_px[0]) / 2.0,
-                    text_y + g.offset_px[1],
-                    g.uv[0],
-                    g.uv[1],
-                ],
-                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: bg_of(ink),
-                bg: bg_of(glyph_bg),
-            });
         }
     }
     // pane 退出态(M5b/T3):dot 槽左侧文本(标题后缀会被截断吃掉——
@@ -1190,22 +1200,19 @@ mod tests {
         );
     }
 
+    /// 均分填充契约(gtk-wide-tabs 默认):等宽、随可用宽放大、min 兜底
     #[test]
-    fn tab_width_fits_content_with_clamp() {
+    fn equal_tab_w_fills_and_clamps() {
         let sm = StripMetrics::default();
-        let m = metrics_8x16();
-        assert_eq!(tab_width("", &m, &sm), sm.tab_min_w, "空标题 = 最小宽");
-        let want = sm.tab_pad * 2.0 + sm.tab_close_w + 3.0 * 8.0;
+        assert_eq!(equal_tab_w(0, 400.0, &sm), sm.tab_min_w, "无标签 = min");
         assert_eq!(
-            tab_width("abc", &m, &sm),
-            want.max(sm.tab_min_w),
-            "短标题 = max(内容宽, min)"
+            equal_tab_w(3, 40.0, &sm),
+            sm.tab_min_w,
+            "极窄可用 = min 兜底(溢出滚动接管)"
         );
-        assert_eq!(
-            tab_width(&"x".repeat(500), &m, &sm),
-            sm.tab_max_w,
-            "长标题夹最大"
-        );
+        let k = sm.h / STRIP_H_BASE;
+        let body = 900.0 - 6.0 * k - sm.plus_w - 2.0 * k - sm.tab_gap * 2.0;
+        assert_eq!(equal_tab_w(2, 900.0, &sm), body / 2.0, "两标签均分");
     }
 
     #[test]
