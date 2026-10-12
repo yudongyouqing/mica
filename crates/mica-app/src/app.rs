@@ -272,9 +272,13 @@ thread_local! {
     /// 颜色/字体/动画全从这里走(2026-10-12 全量可配)
     static STRIP_CFG: RefCell<mica_core::config::settings::StripCfg> =
         RefCell::new(mica_core::config::settings::StripCfg::default());
-    /// 标签拖拽换序(2026-10-12):按下标签置 Some(idx) + 捕获鼠标,
-    /// MOVE 跨过邻位即换位(Chrome 语义);抬起清空
+    /// 标签拖拽换序(2026-10-12 挤压式二版):按下置 Some(idx)+捕获,
+    /// 手粘光标(DRAG_X),邻位按目标槽实时让位,松手一次性提交顺序
     static DRAG_TAB: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static DRAG_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 被拖标签左缘(px,标签空间含滚动 shift)/ 按下时光标在标签内的偏移
+    static DRAG_X: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    static DRAG_GRAB: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -1925,6 +1929,13 @@ fn draw_frame() {
                 // 失焦洗白(上游 becomeMain/resignMain 同款,动画相位驱动)
                 focus: FOCUS_PHASE.with(std::cell::Cell::get),
                 capsule_dx: capsule_dx_now(),
+                drag: DRAG_TAB.with(std::cell::Cell::get).map(|i| {
+                    (
+                        i,
+                        DRAG_SLOT.with(std::cell::Cell::get),
+                        DRAG_X.with(std::cell::Cell::get),
+                    )
+                }),
             },
         );
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
@@ -2259,9 +2270,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         return LRESULT(0);
                     }
                     switch_tab(idx);
-                    // 按下即捕获,横拖换序(Chrome/Ghostty 语义;× 区不进)
+                    // 按下即捕获,挤压式拖拽换序(× 区不进);手粘光标
                     if n > 1 {
                         DRAG_TAB.with(|d| d.set(Some(idx)));
+                        DRAG_SLOT.with(|s| s.set(idx));
+                        let span = w + sm.tab_gap;
+                        let local = px.max(0) as f32 + shift;
+                        DRAG_GRAB.with(|g| g.set((local - idx as f32 * span).clamp(0.0, w)));
+                        DRAG_X.with(|x| x.set(idx as f32 * span));
+                        CAPS_T0.with(|t| t.set(-1.0)); // 切换滑移让位给手粘光标
                         let _ = SetCapture(hwnd);
                     }
                     return LRESULT(0);
@@ -2350,7 +2367,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let _ = windows::Win32::UI::WindowsAndMessaging::ShowCursor(true);
                 }
             }
-            // 标签拖拽换序:跨过邻位即换(带捕获,窗内外都收 MOVE)
+            // 标签拖拽(挤压式):手粘光标,目标槽随中心跨位变化,邻位
+            // 让位由渲染层按槽位序实时完成;顺序只在松手时提交
             if let Some(di) = DRAG_TAB.with(std::cell::Cell::get) {
                 let px = (lparam.0 & 0xffff) as u16 as i16 as i32;
                 let sm = strip_metrics();
@@ -2364,20 +2382,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let w = mica_render::frame::tab_w_now(n, area_w, &sm);
                 let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
                 let local = px.max(0) as f32 + shift;
+                let x0 = mica_render::frame::tabs_x0(&sm);
+                let right = mica_render::frame::tabs_right(area_w, &sm);
                 let span = w + sm.tab_gap;
-                let tj = (((local - mica_render::frame::tabs_x0(&sm)) / span).floor() as i64)
-                    .clamp(0, n as i64 - 1) as usize;
-                if tj != di {
-                    TABS.with(|tabs| {
-                        let mut guard = tabs.borrow_mut();
-                        if tj < guard.len() && di < guard.len() {
-                            guard.swap(di, tj);
-                        }
-                    });
-                    ACTIVE.with(|a| a.set(tj));
-                    DRAG_TAB.with(|d| d.set(Some(tj)));
+                let grab = DRAG_GRAB.with(std::cell::Cell::get);
+                let left = (local - grab).clamp(x0, (right - w).max(x0));
+                // 目标槽 = 被拖标签**中心**所在槽(跨过邻位半程即让位)
+                let slot =
+                    (((left - x0 + w / 2.0) / span).floor() as i64).clamp(0, n as i64 - 1) as usize;
+                let moved = left != DRAG_X.with(std::cell::Cell::get)
+                    || slot != DRAG_SLOT.with(std::cell::Cell::get);
+                DRAG_X.with(|d| d.set(left));
+                DRAG_SLOT.with(|s| s.set(slot));
+                if moved {
                     draw_frame();
                 }
+                let _ = di;
                 return LRESULT(0);
             }
             if !MOUSE_DOWN.with(std::cell::Cell::get) {
@@ -2515,7 +2535,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             MOUSE_DOWN.with(|m| m.set(false));
-            DRAG_TAB.with(|d| d.set(None)); // 拖拽换序结束
+            // 拖拽换序提交:被拖标签从原位拔出插入目标槽,活跃跟过去
+            if let Some(di) = DRAG_TAB.with(std::cell::Cell::take) {
+                let slot = DRAG_SLOT.with(std::cell::Cell::get);
+                if slot != di {
+                    TABS.with(|tabs| {
+                        let mut guard = tabs.borrow_mut();
+                        if di < guard.len() {
+                            let t = guard.remove(di);
+                            let at = slot.min(guard.len());
+                            guard.insert(at, t);
+                            ACTIVE.with(|a| a.set(at));
+                        }
+                    });
+                }
+                draw_frame();
+            }
             let _ = ReleaseCapture();
             if MOUSE_CAPTURED.with(std::cell::Cell::take) {
                 let (px, py) = mouse_xy(lparam);

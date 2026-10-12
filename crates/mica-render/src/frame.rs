@@ -384,6 +384,10 @@ pub struct StripExtras {
     /// 活跃标签胶囊横移量(动画中):非零时活跃标签 x0 偏移此值,衰减到
     /// 0 即完成——切换/新建/关闭时 app 侧置初值,标签切换的滑动即此
     pub capsule_dx: f32,
+    /// 拖拽换序(挤压式):(被拖下标, 目标槽位, 被拖标签左缘 px[标签空间,
+    /// 含滚动 shift])。拖住的手粘光标,其余标签按槽位实时让位,松手由
+    /// app 侧提交顺序(Chrome/Adw 语义,2026-10-12 二版)
+    pub drag: Option<(usize, usize, f32)>,
 }
 
 /// strip 悬停命中(与 app 层 hit-test 同几何单源;命中区互斥)。
@@ -432,6 +436,7 @@ pub fn strip_quads(
         zoomed,
         focus,
         capsule_dx,
+        drag,
     } = extras;
     let mut out = Vec::new();
     let total_w = titles.len() as f32 * sm.tab_min_w + sm.plus_w;
@@ -602,17 +607,37 @@ pub fn strip_quads(
         let tab_y = sm.title_h;
         let tab_d = sm.h - sm.title_h;
         let text_y = sm.title_h + (tab_d - metrics.line_height).max(0.0) / 2.0;
-        let w = tab_w_now(titles.len(), strip_w, sm);
+        let n = titles.len();
+        let w = tab_w_now(n, strip_w, sm);
         let shift = layout.tab_scroll as f32 * sm.tab_min_w;
         let right = tabs_right(strip_w, sm);
-        let mut x = tabs_x0(sm) - shift;
-        for (i, (title, active)) in titles.iter().enumerate() {
-            let x0 = if *active { x + capsule_dx } else { x };
-            x += w + sm.tab_gap;
-            if x0 + w <= 0.0 || x0 >= right {
-                continue; // 滚出可视区的标签不发射(右缘止于 "+" 左邻)
+        // 拖拽槽位序(挤压式):被拖标签占目标槽,其余按原序填空——拖住的
+        // 手粘光标(左缘 = drag_x),邻位实时让位;松手 app 侧提交顺序
+        let (drag_idx, drag_slot, drag_x) = match drag {
+            Some((i, s, x)) if i < n => (i, s.min(n - 1), x),
+            _ => (usize::MAX, 0, 0.0),
+        };
+        let order: Vec<usize> = if drag_idx < n {
+            let mut v: Vec<usize> = (0..n).filter(|i| *i != drag_idx).collect();
+            v.insert(drag_slot.min(v.len()), drag_idx);
+            v
+        } else {
+            (0..n).collect()
+        };
+        for (slot, &i) in order.iter().enumerate() {
+            let (title, active) = &titles[i];
+            let slot_x = tabs_x0(sm) + slot as f32 * (w + sm.tab_gap) - shift;
+            let x0 = if i == drag_idx {
+                drag_x - shift
+            } else if *active {
+                slot_x + capsule_dx
+            } else {
+                slot_x
+            };
+            if x0 + w <= 0.0 || (i != drag_idx && x0 >= right) {
+                continue; // 滚出可视区的标签不发射(被拖标签恒画)
             }
-            let hovered = hover.tab == Some(i);
+            let hovered = hover.tab == Some(i) && i != drag_idx;
             let hover_face = mix(bar, white, 0.05);
             let (backdrop, ink) = if *active {
                 (active_face, white)
