@@ -311,27 +311,29 @@ pub fn tabs_right(total_w: f32, sm: &StripMetrics) -> f32 {
     plus_x(total_w, sm) - 2.0 * sm.k
 }
 
-/// 标签宽(2026-10-12):**均分填充**第二行可用宽(Ghostty gtk-wide-tabs
-/// 默认 true 的 GNOME 形制,Config 文档:"tabs fill their available
-/// space");可用域 = tabs_x0 到 tabs_right(右端 "+" 左缘)。放不下
-/// (min_w × n > 可用域)则固定 min_w 由溢出滚动兜底。等宽单值,
-/// 渲染与 hit-test 同源。旧内容自适应方案(2026-10-12 上午)弃——
-/// 与 Ghostty 默认相悖。
-pub fn equal_tab_w(n: usize, avail_w: f32, sm: &StripMetrics) -> f32 {
-    if n == 0 {
-        return sm.tab_min_w;
-    }
-    let gaps = sm.tab_gap * n as f32;
-    let body = (tabs_right(avail_w, sm) - tabs_x0(sm) - gaps).max(0.0);
-    (body / n as f32).max(sm.tab_min_w)
+/// 单标签宽(内容自适应,macOS Tahoe 形制):等宽估宽(CJK 双宽,与终端
+/// [`crate::font::char_width`] 同源)+ 左右内边距 + × 预留,夹逼
+/// [min_w, max_w]。均分填充(gtk-wide-tabs)2026-10-12 晚弃——双行下
+/// 标签行被标签占满、无拖拽区(用户实报"拖动不了窗口");自适应让标签
+/// 行尾部空档可拖。胶囊宽度与 hit-test 同取此值;标题墨宽以真字形
+/// 逐字截断(与估宽略异,截断兜底)。
+pub fn tab_w(title: &str, cw: f32, sm: &StripMetrics) -> f32 {
+    let cells: f32 = title
+        .chars()
+        .map(|c| crate::font::char_width(c).max(1) as f32)
+        .sum();
+    (cells * cw + 2.0 * sm.tab_pad + sm.tab_close_w).clamp(sm.tab_min_w, sm.tab_max_w)
 }
 
-/// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数;
-/// avail_w = 标签+加号区可用宽(客户区宽 - caption 区,0 = 不裁)。
+/// 标签总占宽(含缝);hit-test 与溢出滚动共用
+pub fn tabs_span(widths: &[f32], sm: &StripMetrics) -> f32 {
+    widths.iter().sum::<f32>() + sm.tab_gap * widths.len().saturating_sub(1) as f32
+}
+
+/// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StripLayout {
     pub tab_scroll: i32,
-    pub avail_w: f32,
 }
 
 /// strip 杂项参数打包(M5b/T3 起参数超限):状态点/pane 退出态/caption 区。
@@ -371,7 +373,8 @@ pub enum CaptionBtn {
 
 /// tab strip 的 UI 实例(T7,spec §3 同管线),**双行形制**(2026-10-12
 /// 用户裁定):第一行 = 窗口标题(活跃标签名,居中)+ 右端 caption 三键
-/// (— □ ×);第二行 = 等宽标签 + 右端 "+" 开新标签;再下才是终端主体。
+/// (— □ ×);第二行 = 内容自适应标签 + 右端 "+" 开新标签(标签行尾部
+/// 空档是拖拽区);再下才是终端主体。
 /// 条底 = 终端背景原样(macOS Ghostty titlebarColor 同义),底缘 1px 发丝线。
 /// strip 文字走终端路由(等宽字、格步进)——Segoe UI 比例试验同日被用户
 /// 否决("还不如原来那个"),回滚。
@@ -549,15 +552,15 @@ pub fn strip_quads(
         }
     }
 
-    // ---- 第二行:等宽标签(从 tabs_x0 起,右止 tabs_right)+ 右端 "+"
+    // ---- 第二行:内容自适应标签(从 tabs_x0 起,右止 tabs_right)+ 右端 "+"
     let tab_y = sm.title_h + 2.0 * k;
     let tab_d = sm.tab_h - 4.0 * k;
     let text_y = sm.title_h + (sm.tab_h - metrics.line_height).max(0.0) / 2.0;
-    let w = equal_tab_w(titles.len(), layout.avail_w, sm);
     let shift = layout.tab_scroll as f32 * sm.tab_min_w;
     let right = tabs_right(strip_w, sm);
     let mut x = tabs_x0(sm) - shift;
     for (i, (title, active)) in titles.iter().enumerate() {
+        let w = tab_w(title, cw, sm);
         let x0 = x;
         x += w + sm.tab_gap;
         if x0 + w <= 0.0 || x0 >= right {
@@ -621,7 +624,7 @@ pub fn strip_quads(
             tx += adv(&g);
         }
         // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
-        // 悬停浮现(主色);点区在 app 的 WM_LBUTTONDOWN 同几何判定
+        // 悬停浮现(主色);胶囊内双向居中,点区在 WM_LBUTTONDOWN 同几何
         if *active || hovered {
             let kink = if *active { dim } else { white };
             let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
@@ -629,7 +632,7 @@ pub fn strip_quads(
                 out.push(CellInstance {
                     pos_uv: [
                         close_x + (sm.tab_close_w - g.size_px[0]) / 2.0 + g.offset_px[0],
-                        text_y + g.offset_px[1],
+                        tab_y + (tab_d - g.size_px[1]) / 2.0 + g.offset_px[1],
                         g.uv[0],
                         g.uv[1],
                     ],
@@ -664,7 +667,7 @@ pub fn strip_quads(
             out.push(CellInstance {
                 pos_uv: [
                     x + (sm.plus_w - g.size_px[0]) / 2.0,
-                    text_y + g.offset_px[1],
+                    tab_y + (tab_d - g.size_px[1]) / 2.0 + g.offset_px[1],
                     g.uv[0],
                     g.uv[1],
                 ],
@@ -1270,19 +1273,25 @@ mod tests {
         );
     }
 
-    /// 均分填充契约(gtk-wide-tabs 默认):等宽、随可用宽放大、min 兜底;
-    /// 可用域 = tabs_x0 到 tabs_right(右端 "+" 左缘)
+    /// 内容自适应契约:短标题 min 兜底、长标题 max 封顶、CJK 双宽
     #[test]
-    fn equal_tab_w_fills_and_clamps() {
+    fn tab_w_is_content_adaptive_and_clamped() {
         let sm = StripMetrics::default();
-        assert_eq!(equal_tab_w(0, 400.0, &sm), sm.tab_min_w, "无标签 = min");
+        let cw = 8.0;
+        assert_eq!(tab_w("ab", cw, &sm), sm.tab_min_w, "短标题 = min 兜底");
         assert_eq!(
-            equal_tab_w(3, 40.0, &sm),
-            sm.tab_min_w,
-            "极窄可用 = min 兜底(溢出滚动接管)"
+            tab_w(&"x".repeat(60), cw, &sm),
+            sm.tab_max_w,
+            "超长标题 = max 封顶"
         );
-        let body = 900.0 - sm.plus_w - 14.0 * sm.k - sm.tab_gap * 2.0;
-        assert_eq!(equal_tab_w(2, 900.0, &sm), body / 2.0, "两标签均分");
+        // 内容宽 = 格数 × cw + 左右内边距 + × 预留
+        let mid = "x".repeat(20);
+        assert_eq!(
+            tab_w(&mid, cw, &sm),
+            20.0 * cw + 2.0 * sm.tab_pad + sm.tab_close_w
+        );
+        // CJK 双宽:10 个汉字 = 20 格,与 20 个 ASCII 同宽
+        assert_eq!(tab_w(&"中".repeat(10), cw, &sm), tab_w(&mid, cw, &sm));
     }
 
     #[test]
@@ -1303,17 +1312,13 @@ mod tests {
             &StripMetrics::default(),
             StripExtras {
                 caption_x: Some(400.0),
-                layout: StripLayout {
-                    avail_w: 400.0,
-                    ..Default::default()
-                },
                 ..Default::default()
             },
         );
         let sm = StripMetrics::default();
         // 活动标签胶囊:第二行(title_h+2k 起,tab_h-4k 高)、四角全圆
         let k = sm.k;
-        let want_w = equal_tab_w(2, 400.0, &sm);
+        let want_w = tab_w("b", metrics_8x16().cell_width, &sm);
         assert!(
             out.iter().any(|q| q.size_uv[0] == want_w
                 && q.size_uv[1] == sm.tab_h - 4.0 * k
