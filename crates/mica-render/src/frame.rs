@@ -363,7 +363,8 @@ pub struct StripLayout {
 }
 
 /// strip 杂项参数打包(M5b/T3 起参数超限):状态点/pane 退出态/caption 区。
-#[derive(Debug, Clone, Copy, Default)]
+/// tab_dx 非 Copy(Vec)——拖拽挤压的邻位滑移量按原始下标对位。
+#[derive(Debug, Clone, Default)]
 pub struct StripExtras {
     /// D37 OSC 133 exit 状态点
     pub exit_dot: Option<ExitDot>,
@@ -388,6 +389,9 @@ pub struct StripExtras {
     /// 含滚动 shift])。拖住的手粘光标,其余标签按槽位实时让位,松手由
     /// app 侧提交顺序(Chrome/Adw 语义,2026-10-12 二版)
     pub drag: Option<(usize, usize, f32)>,
+    /// 邻位滑移量(按原始下标):槽位变化时 app 侧记跳变差并指数衰减到
+    /// 0——挤压是**滑**过去不是瞬移(2026-10-12 三版,用户裁定)
+    pub tab_dx: Vec<f32>,
 }
 
 /// strip 悬停命中(与 app 层 hit-test 同几何单源;命中区互斥)。
@@ -437,6 +441,7 @@ pub fn strip_quads(
         focus,
         capsule_dx,
         drag,
+        tab_dx,
     } = extras;
     let mut out = Vec::new();
     let total_w = titles.len() as f32 * sm.tab_min_w + sm.plus_w;
@@ -627,12 +632,13 @@ pub fn strip_quads(
         for (slot, &i) in order.iter().enumerate() {
             let (title, active) = &titles[i];
             let slot_x = tabs_x0(sm) + slot as f32 * (w + sm.tab_gap) - shift;
+            let squeeze = tab_dx.get(i).copied().unwrap_or(0.0);
             let x0 = if i == drag_idx {
                 drag_x - shift
             } else if *active {
-                slot_x + capsule_dx
+                slot_x + capsule_dx + squeeze
             } else {
-                slot_x
+                slot_x + squeeze
             };
             if x0 + w <= 0.0 || (i != drag_idx && x0 >= right) {
                 continue; // 滚出可视区的标签不发射(被拖标签恒画)

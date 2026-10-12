@@ -134,6 +134,16 @@ fn prime_capsule_slide(old_idx: usize, new_idx: usize) {
     CAPS_T0.with(|t| t.set(now_secs()));
 }
 
+/// 拖拽排列:被拖标签占 slot,其余按原序填空(与渲染层同构)
+fn tab_order(n: usize, di: usize, slot: usize) -> Vec<usize> {
+    if di >= n {
+        return (0..n).collect();
+    }
+    let mut v: Vec<usize> = (0..n).filter(|i| *i != di).collect();
+    v.insert(slot.min(v.len()), di);
+    v
+}
+
 /// 武装 strip 动画定时器(timer 5,15ms):有动画在跑时反复调用无害
 fn ensure_anim_timer() {
     if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone())
@@ -178,6 +188,18 @@ fn strip_anim_step() -> bool {
     } else if t0 >= 0.0 {
         CAPS_T0.with(|t| t.set(-1.0));
     }
+    // 邻位滑移:指数衰减(15ms 一拍 ×0.72 ≈ 105ms 收敛),全落定即停
+    TAB_DX.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.iter().any(|v| v.abs() > 0.5) {
+            for v in d.iter_mut() {
+                *v *= 0.72;
+            }
+            busy = true;
+        } else {
+            d.clear();
+        }
+    });
     busy
 }
 
@@ -279,6 +301,9 @@ thread_local! {
     /// 被拖标签左缘(px,标签空间含滚动 shift)/ 按下时光标在标签内的偏移
     static DRAG_X: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
     static DRAG_GRAB: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    /// 邻位滑移量(按原始标签下标;槽位变化时记跳变差,timer 5 指数
+    /// 衰减到 0)——挤压是滑过去不是瞬移(2026-10-12 三版)
+    static TAB_DX: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -1936,6 +1961,7 @@ fn draw_frame() {
                         DRAG_X.with(std::cell::Cell::get),
                     )
                 }),
+                tab_dx: TAB_DX.with(|d| d.borrow().clone()),
             },
         );
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
@@ -2390,8 +2416,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // 目标槽 = 被拖标签**中心**所在槽(跨过邻位半程即让位)
                 let slot =
                     (((left - x0 + w / 2.0) / span).floor() as i64).clamp(0, n as i64 - 1) as usize;
-                let moved = left != DRAG_X.with(std::cell::Cell::get)
-                    || slot != DRAG_SLOT.with(std::cell::Cell::get);
+                let old_slot = DRAG_SLOT.with(std::cell::Cell::get);
+                if slot != old_slot {
+                    // 邻位滑移:从各自当前渲染位滑向新槽位(记跳变差,
+                    // timer 5 衰减到 0)——滑过去,不瞬移
+                    let order_old = tab_order(n, di, old_slot);
+                    let order_new = tab_order(n, di, slot);
+                    TAB_DX.with(|d| {
+                        let mut d = d.borrow_mut();
+                        d.resize(n, 0.0);
+                        for i in 0..n {
+                            if i == di {
+                                continue;
+                            }
+                            let oo = order_old.iter().position(|&j| j == i).unwrap_or(i);
+                            let on = order_new.iter().position(|&j| j == i).unwrap_or(i);
+                            let cur = x0 + oo as f32 * span + d.get(i).copied().unwrap_or(0.0);
+                            let tgt = x0 + on as f32 * span;
+                            d[i] = cur - tgt;
+                        }
+                    });
+                    ensure_anim_timer();
+                }
+                let moved = left != DRAG_X.with(std::cell::Cell::get) || slot != old_slot;
                 DRAG_X.with(|d| d.set(left));
                 DRAG_SLOT.with(|s| s.set(slot));
                 if moved {
@@ -2549,6 +2596,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     });
                 }
+                TAB_DX.with(|d| d.borrow_mut().clear()); // 各标签已在视觉终位
                 draw_frame();
             }
             let _ = ReleaseCapture();
