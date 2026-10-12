@@ -389,10 +389,9 @@ pub fn strip_quads(
         ]
     };
     let bg3 = [palette.bg.r, palette.bg.g, palette.bg.b];
-    // 条底 = 终端底色向白 10%(Adwaita headerbar 形制:条比内容**亮**
-    // 一档,raised 风格的阴影投在下方终端区;2026-10-12 二稿——首稿
-    // 暗条与 Adwaita/Ghostty 默认相悖,用户令对照源码重做)
-    let bar = mix(bg3, [255, 255, 255], 0.10);
+    // 条底 = 终端底色**原样**(macOS Ghostty:titlebarColor =
+    // backgroundColor,条与终端同色一体;三稿定档,用户已认总体 UI)
+    let bar = bg3;
     let dim = [
         palette.colors[7].r,
         palette.colors[7].g,
