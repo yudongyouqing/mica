@@ -62,7 +62,7 @@ mod tests {
         );
         assert_eq!(
             resolve(Color::Named(NamedColor::Background), &p),
-            [0x1e, 0x1e, 0x1e]
+            [0x28, 0x2c, 0x34]
         );
     }
 
@@ -71,11 +71,11 @@ mod tests {
         let p = Palette::DEFAULT;
         assert_eq!(
             resolve(Color::Named(NamedColor::Red), &p),
-            [0xf7, 0x4b, 0x50]
+            [0xcc, 0x66, 0x66]
         );
         assert_eq!(
             resolve(Color::Named(NamedColor::BrightWhite), &p),
-            [0xff, 0xff, 0xff]
+            [0xea, 0xea, 0xea]
         );
     }
 

@@ -22,14 +22,35 @@ pub async fn create_context(
     instance: &wgpu::Instance,
     compatible_surface: Option<&wgpu::Surface<'_>>,
 ) -> anyhow::Result<GpuContext> {
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            compatible_surface,
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        })
-        .await?;
+    // 适配器择优(2026-10-06 真机事故定案):request_adapter(LowPower)
+    // 在装了远控虚拟显卡的机器上会随机选中虚拟适配器——表面兼容但呈现
+    // 落空,整窗停留在未初始化显存(症状:窗口内容为每次不同的杂色、
+    // 残影错位,与渲染逻辑无关;基线构建同样复现)。改为显式枚举:
+    // 离散 > 集成 > 其余(VirtualGpu/Cpu 仅兜底),并日志留痕——下次
+    // 选卡异常一眼可辨。
+    let adapter = {
+        let candidates: Vec<wgpu::Adapter> = instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .await
+            .into_iter()
+            .filter(|a| compatible_surface.is_none_or(|s| a.is_surface_supported(s)))
+            .collect();
+        let rank = |a: &wgpu::Adapter| match a.get_info().device_type {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            _ => 2,
+        };
+        let best = candidates
+            .iter()
+            .min_by_key(|a| (rank(a), a.get_info().name.clone()))
+            .ok_or_else(|| anyhow::anyhow!("no surface-compatible adapter"))?;
+        let info = best.get_info();
+        eprintln!(
+            "adapter: {} ({:?}, {} {}, backend {:?})",
+            info.name, info.device_type, info.driver, info.driver_info, info.backend
+        );
+        best.clone()
+    };
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("mica-render"),
@@ -51,7 +72,9 @@ pub async fn create_context(
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Globals {
     viewport: [f32; 2],
-    _pad: [f32; 2],
+    /// 图集纹理尺寸(纹素):UV 归一移到 shader,实例存纹素坐标——
+    /// 页追加式高度增长不改变既有条目采样位置(2026-10-08)
+    atlas_size: [f32; 2],
 }
 
 const INSTANCE_CAPACITY: usize = 4096;
@@ -77,8 +100,12 @@ pub struct Renderer {
     globals_buf: wgpu::Buffer,
     instance_buf: wgpu::Buffer,
     instance_capacity: usize,
-    /// 已上传图集的 revision;变化才重传
+    /// 最近一次上传的 revision(诊断值,不做门控——见 set_atlas 注释)
     atlas_revision: u64,
+    /// set_atlas 实际执行次数。回归锁的观测面:窗口级纹理被多个
+    /// pane 的图集轮流占用,任何"按内容/数值跳过上传"的内部门都会
+    /// 在此计数上现形(两次调用必须两次计数)
+    atlas_uploads: usize,
     /// 持有当前图集纹理供 bind group 引用(替换时旧纹理随之释放)
     atlas_texture: Option<wgpu::Texture>,
     clear_color: wgpu::Color,
@@ -98,7 +125,7 @@ impl Renderer {
             label: Some("globals"),
             contents: cast_slice(&[Globals {
                 viewport: [1.0, 1.0],
-                _pad: [0.0; 2],
+                atlas_size: [1.0, 1.0],
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -208,6 +235,7 @@ impl Renderer {
             instance_buf,
             instance_capacity,
             atlas_revision: 0,
+            atlas_uploads: 0,
             atlas_texture: None,
             clear_color: bg_clear_color(&Palette::DEFAULT),
         }
@@ -219,14 +247,17 @@ impl Renderer {
         self.clear_color = bg_clear_color(palette);
     }
 
-    /// 图集更新(revision 变化才重传;首次调用建立纹理与 bind group)。
-    /// 门控用 revision 而非 version:普通 insert 不重排但改了纹理内容,
-    /// 漏传会让新字形隐形(GPU 侧还是旧数据,ink=0)。
+    /// 图集上传(无条件执行;首次调用建立纹理与 bind group)。
+    /// 1.0.10 教训:这里曾按"revision 数值相等"早退——但窗口级纹理会被
+    /// 多个 pane 的图集轮流占用,字符集相似的两个标签 revision 计数完全
+    /// 可能相同,数值门必撞车漏传(用户稳定复现:多标签点回第一个全
+    /// 乱码;app 层 a883e6e 的身份门被这道内门废掉)。"GPU 里装的是谁
+    /// 的图集"只有调用方知道(app 的 WindowGpu::atlas_owner 按 pane
+    /// 身份判断),本函数只忠实上传。insert 改纹理内容、grow 改尺寸,
+    /// 都由调用方的 revision 触发到这里,无内门则永不漏。
     pub fn set_atlas(&mut self, atlas: &GlyphAtlas) {
-        if self.atlas_revision == atlas.revision() && self.atlas_texture.is_some() {
-            return;
-        }
         self.atlas_revision = atlas.revision();
+        self.atlas_uploads += 1;
         let size = wgpu::Extent3d {
             width: atlas.width(),
             height: atlas.height(),
@@ -324,12 +355,22 @@ impl Renderer {
             _ => return, // Timeout/Occluded/Validation:跳过本帧
         };
         self.upload_instances(instances);
+        let atlas_w = self
+            .atlas_texture
+            .as_ref()
+            .map(|t| t.width() as f32)
+            .unwrap_or(1.0);
+        let atlas_h = self
+            .atlas_texture
+            .as_ref()
+            .map(|t| t.height() as f32)
+            .unwrap_or(1.0);
         self.queue.write_buffer(
             &self.globals_buf,
             0,
             cast_slice(&[Globals {
                 viewport: [config.width as f32, config.height as f32],
-                _pad: [0.0; 2],
+                atlas_size: [atlas_w, atlas_h],
             }]),
         );
         // set_atlas 之前 draw 是接线错误(T7 起先 set_atlas 再 draw)
@@ -416,9 +457,9 @@ mod tests {
     #[test]
     fn clear_color_follows_palette_bg() {
         let c = bg_clear_color(&Palette::DEFAULT);
-        assert_eq!(c.r, f64::from(0x1e) / 255.0);
-        assert_eq!(c.g, f64::from(0x1e) / 255.0);
-        assert_eq!(c.b, f64::from(0x1e) / 255.0);
+        assert_eq!(c.r, f64::from(0x28) / 255.0);
+        assert_eq!(c.g, f64::from(0x2c) / 255.0);
+        assert_eq!(c.b, f64::from(0x34) / 255.0);
         assert_eq!(c.a, 1.0);
         let mut p = Palette::DEFAULT;
         p.apply_pair("background", "#abcdef").unwrap();
@@ -462,21 +503,40 @@ mod tests {
         let rect = atlas.insert(&bmp);
         assert!(rect.u + rect.w <= atlas.width());
         renderer.set_atlas(&atlas);
-        // 内容未变再次调用:revision 门早退,不重传也不应 panic
+        assert_eq!(renderer.atlas_uploads, 1);
+        // 重复调用同一图集:无条件路径也必须正常(门控职责在 app 层)
         renderer.set_atlas(&atlas);
+        assert_eq!(renderer.atlas_uploads, 2);
+        // 撞车回归锁(1.0.10 二段修复):两份内容不同、revision 计数相同
+        // 的图集——旧的内门按数值相等早退,第二份静默漏传=切标签乱码
+        // 的机制本体。现在必须两次都真实上传。
+        let mut other = GlyphAtlas::new(256, 256);
+        let other_bmp = GlyphBitmap::from_coverage(10, 10, vec![90; 10 * 10]);
+        other.insert(&other_bmp);
+        assert_eq!(
+            other.revision(),
+            atlas.revision(),
+            "前提:两图集 revision 计数此刻相同"
+        );
+        renderer.set_atlas(&other);
+        renderer.set_atlas(&atlas);
+        assert_eq!(renderer.atlas_uploads, 4, "数值撞车不得跳过上传");
         // C1 回归锁:普通插入(不触发 grow)version 不动但 revision 递增,
-        // set_atlas 必须重传——旧门控只看 version 时这类插入会静默漏传
+        // 调用方据此触发 set_atlas——本函数无条件消费,永不漏传
         let plain = GlyphBitmap::from_coverage(6, 9, vec![200; (6 * 9) as usize]);
         atlas.insert(&plain);
         assert_eq!(atlas.version(), 0, "此插入不应触发 grow");
         renderer.set_atlas(&atlas);
-        // 直接读私有字段:门控必须消费 insert 后的 revision
+        // 直接读私有字段:诊断值随最近一次上传更新
         assert_eq!(renderer.atlas_revision, atlas.revision());
-        // 高 250 的字形在剩余空间放不下(12+250>256)→ grow 后 version 递增;
-        // set_atlas 走"重建纹理+重传"路径(新尺寸 256×512)
+        assert_eq!(renderer.atlas_uploads, 5);
+        // 高 250 的字形在剩余空间放不下 → 页追加(高度 +256,条目原位);
+        // set_atlas 走"重建纹理+重传"路径(页追加式,version 恒 0)
         let big = GlyphBitmap::from_coverage(8, 250, vec![128; (8 * 250) as usize]);
+        let before_ver = atlas.version();
         atlas.insert(&big);
-        assert!(atlas.version() > 0, "高度不足应触发 grow+版本递增");
+        assert_eq!(atlas.version(), before_ver, "页追加式无重排信号");
+        assert!(atlas.height() > 256, "高度追加");
         renderer.set_atlas(&atlas);
         // 换肤路径:构造后的 set_clear_color 更新内部清屏色(读私有字段验证)
         let mut themed = Palette::DEFAULT;

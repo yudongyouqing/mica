@@ -48,6 +48,35 @@ fn blank(x_px: f32, y_px: f32, metrics: &FontMetrics, fg: [u8; 3], bg: [u8; 3]) 
     }
 }
 
+/// 圆角 blank quad(2026-10 UI 对标):blend:None 下没有 alpha 混合,圆角
+/// 抗锯齿的唯一途径是 per-fragment 把**已知底衬色**与面色按 SDF 覆盖率
+/// premix(见 cells.wgsl 的 rounded_coverage)。槽位语义仅对无字形 quad
+/// 合法:fg.rgb=底衬色、bg.w=上圆角半径、fg.w=下圆角半径(px,0=方角);
+/// 字形 quad 的 fg 是墨色,不得走圆角路径。
+fn rounded(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    face: [u8; 3],
+    under: [u8; 3],
+    radii: (f32, f32), // (上, 下)
+) -> CellInstance {
+    let c = |rgb: [u8; 3]| {
+        [
+            rgb[0] as f32 / 255.0,
+            rgb[1] as f32 / 255.0,
+            rgb[2] as f32 / 255.0,
+        ]
+    };
+    CellInstance {
+        pos_uv: [x, y, 0.0, 0.0],
+        size_uv: [w, h, 0.0, 0.0],
+        fg: [c(under)[0], c(under)[1], c(under)[2], radii.1],
+        bg: [c(face)[0], c(face)[1], c(face)[2], radii.0],
+    }
+}
+
 /// Snapshot the visible screen into draw instances. Two-instance, two-pass
 /// contract: pass 1 emits a full-cell background quad (`blank`, ink_mask 0)
 /// for EVERY cell, row-major; pass 2 then emits the glyph quad for every
@@ -172,11 +201,90 @@ pub fn build_instances(
     out
 }
 
-/// tab strip 高度(T7):客户区顶部,终端区整体下移此值。
-pub const STRIP_H: f32 = 32.0;
-/// 单标签宽与 "+" 按钮宽(布局单源;app::strip_hit 依此命中)。
-pub const TAB_W: f32 = 140.0;
-pub const TAB_PLUS_W: f32 = 36.0;
+/// tab strip 基准几何(96dpi 逻辑值),**双行形制**(2026-10-12 用户裁定):
+/// 第一行 = 窗口标题 + caption 三键,第二行 = 标签 + 右端 "+"。运行时一律
+/// 经 [`StripMetrics::from_scale`] 按 DPI 缩放——物理常量在 150% 屏上不
+/// 缩放,曾致条高/×/内边距与 150% 字体错位且视觉偏小(2026-10-06 用户
+/// 实测)。app 层 hit-test 同源取值。
+pub const STRIP_H_BASE: f32 = 68.0;
+/// 第一行高(标题 + caption)
+pub const STRIP_TITLE_H_BASE: f32 = 32.0;
+/// 第二行高(标签 + "+")
+pub const STRIP_TAB_H_BASE: f32 = 36.0;
+/// 单标签宽与 "+" 按钮宽基准。
+pub const TAB_PLUS_W_BASE: f32 = 36.0;
+/// 标签内容自适应宽的夹逼(Adwaita/Ghostty 形制:标签按标题定宽,
+/// 固定宽一律退役,2026-10-12 用户裁定旧条"太烂"整体重做)
+pub const TAB_MIN_W_BASE: f32 = 88.0;
+pub const TAB_MAX_W_BASE: f32 = 220.0;
+/// 标签间缝与左右内边距(逻辑 px)
+pub const TAB_GAP_BASE: f32 = 2.0;
+pub const TAB_PAD_BASE: f32 = 10.0;
+/// × 关闭钮预留区宽(每标签恒留——宽度稳定,悬停不回流)
+pub const TAB_CLOSE_W_BASE: f32 = 24.0;
+
+/// 缩放后的 strip 运行时几何(单源:渲染与 hit-test 都从这里取)。
+/// scale = 窗口 DPI/96(M5b 的 DPI_SCALE)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StripMetrics {
+    /// 条总高(两行;客户区顶部,终端区下移此值)
+    pub h: f32,
+    /// 第一行高:窗口标题 + caption 三键
+    pub title_h: f32,
+    /// 第二行高:标签 + 右端 "+"
+    pub tab_h: f32,
+    /// DPI 缩放系数(96dpi 逻辑 px → 物理 px;曾以 h/STRIP_H_BASE 反推,
+    /// 双行后不再成立,显式持有)
+    pub k: f32,
+    pub tab_w: f32, // 退役兼容字段(溢出滚动步进用,值为 min_w)
+    pub plus_w: f32,
+    pub tab_min_w: f32,
+    pub tab_max_w: f32,
+    pub tab_gap: f32,
+    pub tab_pad: f32,
+    pub tab_close_w: f32,
+    /// caption 单键宽(— □ ×)
+    pub caption_w: f32,
+    /// 标签块上圆角半径(下缘直角:活跃块与终端区无缝相接)
+    pub tab_top_r: f32,
+    /// tooltip 圆角半径
+    pub chip_r: f32,
+    /// exit 状态点直径
+    pub dot_d: f32,
+    /// 标题左内边距(亦为 × 区的视觉基准)
+    pub pad: f32,
+}
+
+impl StripMetrics {
+    pub fn from_scale(scale: f32) -> Self {
+        let s = scale.max(1.0);
+        Self {
+            h: STRIP_H_BASE * s,
+            title_h: STRIP_TITLE_H_BASE * s,
+            tab_h: STRIP_TAB_H_BASE * s,
+            k: s,
+            tab_w: TAB_MIN_W_BASE * s,
+            tab_min_w: TAB_MIN_W_BASE * s,
+            tab_max_w: TAB_MAX_W_BASE * s,
+            tab_gap: TAB_GAP_BASE * s,
+            tab_pad: TAB_PAD_BASE * s,
+            tab_close_w: TAB_CLOSE_W_BASE * s,
+            plus_w: TAB_PLUS_W_BASE * s,
+            caption_w: 46.0 * s,
+            // 标签块上圆角(macOS 原生标签形制,下缘直抵内容区)
+            tab_top_r: 8.0 * s,
+            chip_r: 6.0 * s,
+            dot_d: 7.0 * s,
+            pad: 8.0 * s,
+        }
+    }
+}
+
+impl Default for StripMetrics {
+    fn default() -> Self {
+        Self::from_scale(1.0)
+    }
+}
 
 /// D37 exit 状态点形态:绿(0)/红(非 0)/灰(D 参数不可解析)。
 /// 色取调色板语义槽(green=2 / red=1 / bright black=8),主题同源。
@@ -187,15 +295,38 @@ pub enum ExitDot {
     Gray,
 }
 
-/// 系统按钮单宽(T8 视觉字形;hit-test 的 CAPTION_BTN_W 同值,布局单源)。
-pub const CAPTION_BTN: f32 = 46.0;
+/// 第二行标签区起点(条左内边距)
+pub fn tabs_x0(sm: &StripMetrics) -> f32 {
+    6.0 * sm.k
+}
 
-/// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数;
-/// avail_w = 标签+加号区可用宽(客户区宽 - caption 区,0 = 不裁)。
+/// 第二行右端 "+" 按钮左缘(total_w = 条全宽/客户区宽)
+pub fn plus_x(total_w: f32, sm: &StripMetrics) -> f32 {
+    total_w - sm.plus_w - 6.0 * sm.k
+}
+
+/// 标签可视右缘("+" 左邻呼吸缝;放不下的标签由溢出滚动接管)
+pub fn tabs_right(total_w: f32, sm: &StripMetrics) -> f32 {
+    plus_x(total_w, sm) - 2.0 * sm.k
+}
+
+/// 标签宽(均分填充):标签占满第二行可用宽(用户 2026-10-12 裁定
+/// "占满没事");可用域 = tabs_x0 到 tabs_right(右端 "+" 左缘)。放不下
+/// (min_w × n > 可用域)则固定 min_w 由溢出滚动兜底。等宽单值,
+/// 渲染与 hit-test 同源。
+pub fn equal_tab_w(n: usize, avail_w: f32, sm: &StripMetrics) -> f32 {
+    if n == 0 {
+        return sm.tab_min_w;
+    }
+    let gaps = sm.tab_gap * n as f32;
+    let body = (tabs_right(avail_w, sm) - tabs_x0(sm) - gaps).max(0.0);
+    (body / n as f32).max(sm.tab_min_w)
+}
+
+/// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StripLayout {
     pub tab_scroll: i32,
-    pub avail_w: f32,
 }
 
 /// strip 杂项参数打包(M5b/T3 起参数超限):状态点/pane 退出态/caption 区。
@@ -209,21 +340,50 @@ pub struct StripExtras {
     pub layout: StripLayout,
     /// M5b/T3 pane 退出码(活跃 pane 已退出时显示 [exit N])
     pub pane_exit: Option<u32>,
+    /// 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的可视反馈
+    pub hover: StripHover,
+    /// 最大化态(2026-10-07):true 时最大化钮显还原图标(E923)
+    pub zoomed: bool,
+    /// 窗口聚焦(2026-10-12):失焦整条洗白一档(上游 Tahoe
+    /// becomeMain/resignMain 同款语义)
+    pub focused: bool,
 }
 
-/// tab strip 的 UI 实例(T7,spec §3 同管线):底条 + 标签块(活跃高亮),
-/// 标题文字经 router 路由(与终端共享图集),尾部 "+" 按钮开新标签。
-/// 文字按等宽 cell 步进排版——strip 只有标题一行,粗排版与终端观感一致。
-/// exit_dot(D37):活跃标签的命令状态点,画在 caption 区左邻(固定锚)。
-/// caption_x(T8):系统按钮区起点(客户区坐标);Some 时画 — □ × 字形
-/// (路由字符,hit-test 已在;hover 态留后续)。
-/// layout(T8):溢出滚动——越界标签不发射(右缘由 caption bg 自然覆盖),
-/// 滚轮驱动滚动,箭头命中区暂缓(滚轮覆盖主痛点)。
+/// strip 悬停命中(与 app 层 hit-test 同几何单源;命中区互斥)。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StripHover {
+    /// 悬停的非激活标签(激活标签无反馈必要)
+    pub tab: Option<usize>,
+    pub plus: bool,
+    /// caption 三键(— □ ×)
+    pub caption: Option<CaptionBtn>,
+}
+
+/// caption 按钮序(与 NCHITTEST 的从左到右一致)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptionBtn {
+    Min,
+    Max,
+    Close,
+}
+
+/// tab strip 的 UI 实例(T7,spec §3 同管线),**双行形制**(2026-10-12
+/// 用户裁定):第一行 = 窗口标题(活跃标签名,居中)+ 右端 caption 三键
+/// (— □ ×);第二行 = 均分标签占满 + 右端 "+" 开新标签;再下才是终端
+/// 主体。单标签时第二行整行隐藏(上游 hasTabBar 同款)。
+/// 条底 = 常态浅灰(终端底提亮 18%;失焦再洗至 30%,上游 becomeMain/
+/// resignMain 同款),活跃标签块 = 终端底色原样、上圆下方与内容区无缝
+/// 相接。strip 文字走**小号等宽路由**(9.5pt 共享图集,app 侧注入;
+/// 字号 12pt 的终端路由出的大字形会挤出 × 关闭区,用户实报)。
+/// exit_dot(D37):活跃标签命令状态点,"+" 左邻固定锚。
+/// pane_exit(M5b/T3):[exit N] 文本,状态点左侧。
+/// layout(T8):溢出滚动——越界标签不发射,滚轮驱动,箭头命中区暂缓。
 pub fn strip_quads(
     titles: &[(String, bool)],
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
+    sm: &StripMetrics,
     extras: StripExtras,
 ) -> Vec<CellInstance> {
     let StripExtras {
@@ -231,181 +391,358 @@ pub fn strip_quads(
         caption_x,
         layout,
         pane_exit,
+        hover,
+        zoomed,
+        focused,
     } = extras;
     let mut out = Vec::new();
-    let total_w = titles.len() as f32 * TAB_W + TAB_PLUS_W;
-    let shift = layout.tab_scroll as f32 * TAB_W;
+    let total_w = titles.len() as f32 * sm.tab_min_w + sm.plus_w;
     let bg_of = |rgb: [u8; 3]| to_color(rgb);
-    // 底条(黑槽):宽度按需,不足以铺满也无妨(清屏色同源)
+    let mix = |a: [u8; 3], b: [u8; 3], k: f32| {
+        [
+            (a[0] as f32 + (b[0] as f32 - a[0] as f32) * k + 0.5) as u8,
+            (a[1] as f32 + (b[1] as f32 - a[1] as f32) * k + 0.5) as u8,
+            (a[2] as f32 + (b[2] as f32 - a[2] as f32) * k + 0.5) as u8,
+        ]
+    };
+    let bg3 = [palette.bg.r, palette.bg.g, palette.bg.b];
+    // 条底 = 常态浅灰(2026-10-12 用户实测 Ghostty:标签栏比终端底亮),
+    // 聚焦 18% 提亮、失焦 30% 再洗一档(上游 Tahoe becomeMain/resignMain
+    // 驱动 isActive 同款语义);活跃标签块 = 终端底色,与内容区无缝相接
+    let bar = mix(bg3, [255, 255, 255], if focused { 0.18 } else { 0.30 });
+    // 活跃标签面色:聚焦 = 终端底原样(与内容一体);失焦同样洗白一档
+    let active_face = if focused {
+        bg3
+    } else {
+        mix(bg3, [255, 255, 255], 0.18)
+    };
+    let white = [palette.fg.r, palette.fg.g, palette.fg.b];
+    // strip 次级墨色(2026-10-12):条底改浅灰后,旧 dim(C5C8C6)在灰上
+    // 对比度崩(+/—□× 实测不可见)——向白提亮,压着条底仍有层次
+    let ink2 = mix(white, bar, 0.35);
+    let k = sm.k;
+    let cw = metrics.cell_width;
+    // 等宽格步进的字符步长:宽字形(CJK)按墨宽推进,窄字符不小于格宽
+    let adv = |g: &crate::font::router::GlyphInfo| g.size_px[0].max(cw);
+    // 单标签 = 无第二行(上游 hasTabBar 同款):条高只余标题行
+    let single = titles.len() <= 1;
+    let eff_h = if single { sm.title_h } else { sm.h };
+    // 全条底(两行同色;发丝线退役——活跃块要与内容区无缝相接)
+    let strip_w = caption_x
+        .map(|cx| cx + 3.0 * sm.caption_w)
+        .unwrap_or(total_w)
+        .max(total_w);
     out.push(CellInstance {
         pos_uv: [0.0, 0.0, 0.0, 0.0],
-        size_uv: [total_w, STRIP_H, 0.0, 0.0],
-        fg: bg_of([0, 0, 0]),
-        bg: bg_of([
-            palette.colors[0].r,
-            palette.colors[0].g,
-            palette.colors[0].b,
-        ]),
+        size_uv: [strip_w, eff_h, 0.0, 0.0],
+        fg: bg_of(bar),
+        bg: bg_of(bar),
     });
-    let text_y = (STRIP_H - metrics.line_height).max(0.0) / 2.0;
-    for (i, (title, active)) in titles.iter().enumerate() {
-        let x = i as f32 * TAB_W - shift;
-        if x + TAB_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w) {
-            continue; // 滚出可视区的标签不发射
+
+    // ---- 第一行:窗口标题(活跃标签名,居中;caption 左界内,超宽省略号)
+    let title_y = (sm.title_h - metrics.line_height).max(0.0) / 2.0;
+    let title_avail = caption_x.unwrap_or(strip_w) - 8.0 * k;
+    let title = titles
+        .iter()
+        .find(|(_, active)| *active)
+        .map(|(t, _)| t.as_str())
+        .unwrap_or_default();
+    let ell = router.route('\u{2026}', GlyphStyle::PLAIN);
+    let routed: Vec<crate::font::router::GlyphInfo> = title
+        .chars()
+        .map(|ch| router.route(ch, GlyphStyle::PLAIN))
+        .collect();
+    let mut text_w = 0.0;
+    let mut n_take = routed.len();
+    let mut with_ell = false;
+    for (i, g) in routed.iter().enumerate() {
+        // 省略号宽度恒预留:正好装满的标题也换省略号收口,留呼吸
+        if text_w + adv(g) + adv(&ell) > title_avail {
+            n_take = i;
+            with_ell = n_take > 0;
+            break;
         }
-        let block = if *active {
-            palette.bg
-        } else {
-            palette.colors[8]
-        };
-        let ink = if *active {
-            palette.fg
-        } else {
-            palette.colors[7]
-        };
-        out.push(CellInstance {
-            pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
-            size_uv: [TAB_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
-            fg: bg_of([ink.r, ink.g, ink.b]),
-            bg: bg_of([block.r, block.g, block.b]),
-        });
-        // 标题:8px 内边距,超宽截断(等宽步进)
-        let max_chars = (((TAB_W - 16.0) / metrics.cell_width) as usize).max(1);
-        for (ci, ch) in title.chars().take(max_chars).enumerate() {
-            let g = router.route(ch, GlyphStyle::PLAIN);
-            if g.size_px[0] <= 0.0 {
-                continue; // 空白/未路由字符跳过
-            }
+        text_w += adv(g);
+    }
+    if with_ell {
+        text_w += adv(&ell);
+    }
+    let mut tx = ((title_avail - text_w) / 2.0).max(0.0);
+    let title_ink = if focused { white } else { ink2 };
+    for g in routed.iter().take(n_take) {
+        if g.size_px[0] > 0.0 {
             out.push(CellInstance {
                 pos_uv: [
-                    x + 8.0 + ci as f32 * metrics.cell_width + g.offset_px[0],
-                    text_y + g.offset_px[1],
+                    tx + g.offset_px[0],
+                    title_y + g.offset_px[1],
                     g.uv[0],
                     g.uv[1],
                 ],
                 size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: bg_of([ink.r, ink.g, ink.b]),
-                bg: bg_of([block.r, block.g, block.b]),
+                fg: bg_of(title_ink),
+                bg: bg_of(bar),
             });
         }
+        tx += adv(g);
     }
-    // "+" 按钮(随滚动平移,同裁剪)
-    let x = titles.len() as f32 * TAB_W - shift;
-    if !(x + TAB_PLUS_W <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
-        let block = palette.colors[0];
-        let ink = palette.fg;
-        // 顶栏系统按钮占位(T8):右上三颗 — □ × 由 NC hit-test 命中;视觉
-        // 字形由 hit-test 的 CAPTION_BTN_W 常量几何驱动(同布局单源约束下,
-        // 按钮字形绘制放 app 层后续打磨,先保证 hit-test 可用)
-        out.push(CellInstance {
-            pos_uv: [x + 1.0, 1.0, 0.0, 0.0],
-            size_uv: [TAB_PLUS_W - 2.0, STRIP_H - 2.0, 0.0, 0.0],
-            fg: bg_of([ink.r, ink.g, ink.b]),
-            bg: bg_of([block.r, block.g, block.b]),
-        });
-        let g = router.route('+', GlyphStyle::PLAIN);
+    if with_ell && ell.size_px[0] > 0.0 {
         out.push(CellInstance {
             pos_uv: [
-                x + (TAB_PLUS_W - g.size_px[0]) / 2.0,
-                (STRIP_H - g.size_px[1]) / 2.0,
-                g.uv[0],
-                g.uv[1],
+                tx + ell.offset_px[0],
+                title_y + ell.offset_px[1],
+                ell.uv[0],
+                ell.uv[1],
             ],
-            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-            fg: bg_of([ink.r, ink.g, ink.b]),
-            bg: bg_of([block.r, block.g, block.b]),
+            size_uv: [ell.size_px[0], ell.size_px[1], ell.uv[2], ell.uv[3]],
+            fg: bg_of(title_ink),
+            bg: bg_of(bar),
         });
     }
-    // pane 退出态(M5b/T3):dot 槽左侧文本(标题后缀会被截断吃掉——
-    // 长 cwd 标题实测);0 绿/非 0 红。OSC133 点在 caption_x-14,
-    // 文本止于 caption_x-24,无重叠
-    if let Some(code) = pane_exit {
-        let label = format!("[exit {code}]");
-        let slot = if code == 0 {
-            palette.colors[2]
-        } else {
-            palette.colors[1]
-        };
-        let text_y = (STRIP_H - metrics.line_height).max(0.0) / 2.0;
-        let end_x = caption_x.map(|cx| cx - 24.0).unwrap_or(total_w);
-        let start = end_x - label.chars().count() as f32 * metrics.cell_width;
-        for (ci, ch) in label.chars().enumerate() {
-            let g = router.route(ch, GlyphStyle::PLAIN);
-            if g.size_px[0] <= 0.0 {
-                continue;
-            }
-            out.push(CellInstance {
-                pos_uv: [
-                    start + ci as f32 * metrics.cell_width + g.offset_px[0],
-                    text_y + g.offset_px[1],
-                    g.uv[0],
-                    g.uv[1],
-                ],
-                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: bg_of([slot.r, slot.g, slot.b]),
-                bg: bg_of([
-                    palette.colors[0].r,
-                    palette.colors[0].g,
-                    palette.colors[0].b,
-                ]),
-            });
-        }
-    }
-    // D37 exit 状态点:caption 区左邻(固定锚;无 caption 时 "+" 右侧),
-    // 6px 八边形(3 rect 逼近,quad 管线零扩展)
-    if let Some(dot) = exit_dot {
-        let slot = match dot {
-            ExitDot::Green => palette.colors[2],
-            ExitDot::Red => palette.colors[1],
-            ExitDot::Gray => palette.colors[8],
-        };
-        let dx = caption_x.map(|cx| cx - 14.0).unwrap_or(total_w + 10.0);
-        let cy = STRIP_H / 2.0;
-        for [rx, ry, rw, rh] in [
-            [dx + 1.0, cy - 3.0, 4.0, 1.0],
-            [dx, cy - 2.0, 6.0, 4.0],
-            [dx + 1.0, cy + 2.0, 4.0, 1.0],
-        ] {
-            out.push(CellInstance {
-                pos_uv: [rx, ry, 0.0, 0.0],
-                size_uv: [rw, rh, 0.0, 0.0],
-                // blank 形(uv 0)shader 只画 bg、墨恒 0——实心色必须进 bg 槽
-                // (link_underline 同款约定;fg 字段同色冗余存档)
-                fg: bg_of([slot.r, slot.g, slot.b]),
-                bg: bg_of([slot.r, slot.g, slot.b]),
-            });
-        }
-    }
-    // 系统按钮区(T8):— □ ×,路由字符(hit-test 已在 NCHITTEST,同几何
-    // 单源:每颗 CAPTION_BTN 宽,起点 caption_x = 客户区右缘 - 3×宽)
+
+    // ---- caption 三键(第一行右端;hit-test 同几何在 NCHITTEST):
+    // 裸字形减淡,hover:min/max 轻亮块、close 红底白字(Windows 惯例)
     if let Some(cx) = caption_x {
-        let ink = palette.fg;
-        let block = palette.colors[0];
-        for (i, glyph) in ['\u{2500}', '\u{25a1}', '\u{00d7}'].iter().enumerate() {
-            let bx = cx + i as f32 * CAPTION_BTN;
-            out.push(CellInstance {
-                pos_uv: [bx + 1.0, 1.0, 0.0, 0.0],
-                size_uv: [CAPTION_BTN - 2.0, STRIP_H - 2.0, 0.0, 0.0],
-                fg: bg_of([ink.r, ink.g, ink.b]),
-                bg: bg_of([block.r, block.g, block.b]),
-            });
+        let glyphs = [
+            '\u{E921}',
+            if zoomed { '\u{E923}' } else { '\u{E922}' },
+            '\u{E8BB}',
+        ];
+        for (i, glyph) in glyphs.iter().enumerate() {
+            let bx = cx + i as f32 * sm.caption_w;
+            let hovered = hover.caption
+                == Some(match i {
+                    0 => CaptionBtn::Min,
+                    1 => CaptionBtn::Max,
+                    _ => CaptionBtn::Close,
+                });
+            let lighten = mix(bar, white, 0.08);
+            let red = [
+                palette.colors[1].r,
+                palette.colors[1].g,
+                palette.colors[1].b,
+            ];
+            let (face, ink) = match (hovered, i) {
+                (true, 2) => (red, white),     // close hover:红底白字
+                (true, _) => (lighten, white), // min/max hover:轻亮块
+                (false, _) => (bar, ink2),
+            };
+            if hovered {
+                out.push(CellInstance {
+                    pos_uv: [bx, 0.0, 0.0, 0.0],
+                    size_uv: [sm.caption_w, sm.title_h, 0.0, 0.0],
+                    fg: bg_of(face),
+                    bg: bg_of(face),
+                });
+            }
             let g = router.route(*glyph, GlyphStyle::PLAIN);
             if g.size_px[0] > 0.0 {
                 out.push(CellInstance {
                     pos_uv: [
-                        bx + (CAPTION_BTN - g.size_px[0]) / 2.0 + g.offset_px[0],
-                        (STRIP_H - g.size_px[1]) / 2.0 + g.offset_px[1],
+                        bx + (sm.caption_w - g.size_px[0]) / 2.0 + g.offset_px[0],
+                        (sm.title_h - g.size_px[1]) / 2.0 + g.offset_px[1],
                         g.uv[0],
                         g.uv[1],
                     ],
                     size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                    fg: bg_of([ink.r, ink.g, ink.b]),
-                    bg: bg_of([block.r, block.g, block.b]),
+                    fg: bg_of(ink),
+                    bg: bg_of(face),
                 });
             }
         }
     }
+
+    // ---- 第二行:均分标签占满 + 右端 "+"(单标签时整行隐藏,不发射)
+    if !single {
+        let tab_y = sm.title_h;
+        let tab_d = sm.h - sm.title_h;
+        let text_y = sm.title_h + (tab_d - metrics.line_height).max(0.0) / 2.0;
+        let w = equal_tab_w(titles.len(), strip_w, sm);
+        let shift = layout.tab_scroll as f32 * sm.tab_min_w;
+        let right = tabs_right(strip_w, sm);
+        let mut x = tabs_x0(sm) - shift;
+        for (i, (title, active)) in titles.iter().enumerate() {
+            let x0 = x;
+            x += w + sm.tab_gap;
+            if x0 + w <= 0.0 || x0 >= right {
+                continue; // 滚出可视区的标签不发射(右缘止于 "+" 左邻)
+            }
+            let hovered = hover.tab == Some(i);
+            let hover_face = mix(bar, white, 0.05);
+            let (backdrop, ink) = if *active {
+                (active_face, white)
+            } else if hovered {
+                (hover_face, white)
+            } else {
+                (bar, ink2)
+            };
+            // 标签块:上圆下方——活跃块 = 终端底色,下缘直抵内容区无缝
+            // 相接(macOS 原生标签形制);非活跃悬停轻提亮
+            if *active || hovered {
+                out.push(rounded(
+                    x0,
+                    tab_y,
+                    w,
+                    tab_d,
+                    backdrop,
+                    bar,
+                    (sm.tab_top_r, 0.0),
+                ));
+            }
+            // 标题:等宽格步进,超宽以省略号截断(× 区前留呼吸)
+            let close_x = x0 + w - sm.tab_close_w;
+            let mut tx = x0 + sm.tab_pad;
+            for ch in title.chars() {
+                let g = router.route(ch, GlyphStyle::PLAIN);
+                if tx + adv(&g) + adv(&ell) > close_x - 6.0 * k {
+                    if ell.size_px[0] > 0.0 {
+                        out.push(CellInstance {
+                            pos_uv: [
+                                tx + ell.offset_px[0],
+                                text_y + ell.offset_px[1],
+                                ell.uv[0],
+                                ell.uv[1],
+                            ],
+                            size_uv: [ell.size_px[0], ell.size_px[1], ell.uv[2], ell.uv[3]],
+                            fg: bg_of(ink),
+                            bg: bg_of(backdrop),
+                        });
+                    }
+                    break;
+                }
+                if g.size_px[0] > 0.0 {
+                    out.push(CellInstance {
+                        pos_uv: [
+                            tx + g.offset_px[0],
+                            text_y + g.offset_px[1],
+                            g.uv[0],
+                            g.uv[1],
+                        ],
+                        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                        fg: bg_of(ink),
+                        bg: bg_of(backdrop),
+                    });
+                }
+                tx += adv(&g);
+            }
+            // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
+            // 悬停浮现(主色);胶囊内双向居中,点区在 WM_LBUTTONDOWN 同几何
+            if *active || hovered {
+                let kink = if *active { ink2 } else { white };
+                let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
+                if g.size_px[0] > 0.0 {
+                    out.push(CellInstance {
+                        pos_uv: [
+                            close_x + (sm.tab_close_w - g.size_px[0]) / 2.0 + g.offset_px[0],
+                            tab_y + (tab_d - g.size_px[1]) / 2.0 + g.offset_px[1],
+                            g.uv[0],
+                            g.uv[1],
+                        ],
+                        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                        fg: bg_of(kink),
+                        bg: bg_of(backdrop),
+                    });
+                }
+            }
+        }
+        // "+" 开新标签(第二行右端;Chrome/WT/Tahoe 都在标签行右端,
+        // 2026-10-12 双行重排时用户点名"最右边")
+        {
+            let x = plus_x(strip_w, sm);
+            let hovered = hover.plus;
+            let face = mix(bar, white, 0.05);
+            // "+":开标签的主入口,恒白(旧 dim 在浅灰条上实测不可见)
+            let (glyph_bg, ink) = if hovered { (face, white) } else { (bar, white) };
+            if hovered {
+                let r = tab_d / 2.0;
+                out.push(rounded(
+                    x + (sm.plus_w - tab_d) / 2.0,
+                    tab_y,
+                    tab_d,
+                    tab_d,
+                    face,
+                    bar,
+                    (r, r),
+                ));
+            }
+            let g = router.route('+', GlyphStyle::PLAIN);
+            if g.size_px[0] > 0.0 {
+                out.push(CellInstance {
+                    pos_uv: [
+                        x + (sm.plus_w - g.size_px[0]) / 2.0,
+                        tab_y + (tab_d - g.size_px[1]) / 2.0 + g.offset_px[1],
+                        g.uv[0],
+                        g.uv[1],
+                    ],
+                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                    fg: bg_of(ink),
+                    bg: bg_of(glyph_bg),
+                });
+            }
+        }
+        // pane 退出态(M5b/T3):第二行右端、"+" 左邻(标签标题截断吃不到);
+        // 0 绿/非 0 红,文本止于状态点左
+        if let Some(code) = pane_exit {
+            let label = format!("[exit {code}]");
+            let slot = if code == 0 {
+                palette.colors[2]
+            } else {
+                palette.colors[1]
+            };
+            let end_x = plus_x(strip_w, sm) - 12.0 * k - sm.dot_d - 8.0 * k;
+            let start = end_x - label.chars().count() as f32 * cw;
+            for (ci, ch) in label.chars().enumerate() {
+                let g = router.route(ch, GlyphStyle::PLAIN);
+                if g.size_px[0] <= 0.0 {
+                    continue;
+                }
+                out.push(CellInstance {
+                    pos_uv: [
+                        start + ci as f32 * cw + g.offset_px[0],
+                        text_y + g.offset_px[1],
+                        g.uv[0],
+                        g.uv[1],
+                    ],
+                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                    fg: bg_of([slot.r, slot.g, slot.b]),
+                    bg: bg_of(bar),
+                });
+            }
+        }
+        // D37 exit 状态点:第二行右端、"+" 左邻(固定锚),真圆(半径 = 半宽)
+        if let Some(dot) = exit_dot {
+            let slot = match dot {
+                ExitDot::Green => palette.colors[2],
+                ExitDot::Red => palette.colors[1],
+                ExitDot::Gray => palette.colors[8],
+            };
+            let dx = plus_x(strip_w, sm) - 12.0 * k - sm.dot_d;
+            let cy = sm.title_h + sm.tab_h / 2.0;
+            let d = sm.dot_d;
+            out.push(rounded(
+                dx,
+                cy - d / 2.0,
+                d,
+                d,
+                [slot.r, slot.g, slot.b],
+                bar,
+                (d / 2.0, d / 2.0),
+            ));
+        }
+    }
     out
+}
+
+/// 圆角硬边 quad(悬浮层用):底衬是任意终端内容、不可预知,premix AA
+/// 无从谈起——blend:None 下正解是圆角外硬 discard(fg.w<0 哨兵,
+/// cells.wgsl 判定)。小半径硬边肉眼可接受。
+fn rounded_hard(x: f32, y: f32, w: f32, h: f32, face: [u8; 3], r: f32) -> CellInstance {
+    let c = |v: u8| v as f32 / 255.0;
+    CellInstance {
+        pos_uv: [x, y, 0.0, 0.0],
+        size_uv: [w, h, 0.0, 0.0],
+        fg: [c(face[0]), c(face[1]), c(face[2]), -1.0],
+        bg: [c(face[0]), c(face[1]), c(face[2]), r],
+    }
 }
 
 /// 一行的两段实例:bg 整格段(行内每格一实例)+ 字形段(仅非空白格)。
@@ -434,27 +771,23 @@ pub fn tooltip_quads(
     let pad = 6.0;
     let w = text_w + pad * 2.0;
     let h = metrics.line_height + pad;
-    let mut out = Vec::with_capacity(2 + 4 + chars.len());
-    // bg(底色槽 0)+ fg 边框
-    out.push(CellInstance {
-        pos_uv: [x, y, 0.0, 0.0],
-        size_uv: [w, h, 0.0, 0.0],
-        fg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
-        bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
-    });
-    let border = |bx: f32, by: f32, bw: f32, bh: f32| CellInstance {
-        pos_uv: [bx, by, 0.0, 0.0],
-        size_uv: [bw, bh, 0.0, 0.0],
-        // blank 形画 bg:边框色进 bg 槽(冒烟抓出的同类错误)
-        fg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
-        bg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
+    let mut out = Vec::with_capacity(1 + chars.len());
+    // 圆角悬浮片(2026-10):面色 = 背景向前景 18% 提亮(纯背景色会隐身),
+    // 硬边圆角(discard 模式,rounded_hard)——悬浮层下是任意终端内容,
+    // 底衬不可预知;旧 1px 边框随圆角化退役
+    let mix = |a: [u8; 3], b: [u8; 3], k: f32| {
+        [
+            (a[0] as f32 + (b[0] as f32 - a[0] as f32) * k + 0.5) as u8,
+            (a[1] as f32 + (b[1] as f32 - a[1] as f32) * k + 0.5) as u8,
+            (a[2] as f32 + (b[2] as f32 - a[2] as f32) * k + 0.5) as u8,
+        ]
     };
-    out.extend([
-        border(x, y, w, 1.0),
-        border(x, y + h - 1.0, w, 1.0),
-        border(x, y, 1.0, h),
-        border(x + w - 1.0, y, 1.0, h),
-    ]);
+    let face = mix(
+        [palette.bg.r, palette.bg.g, palette.bg.b],
+        [palette.fg.r, palette.fg.g, palette.fg.b],
+        0.18,
+    );
+    out.push(rounded_hard(x, y, w, h, face, 6.0));
     let text_y = (h - metrics.line_height) / 2.0;
     for (ci, ch) in chars.iter().enumerate() {
         let g = router.route(*ch, GlyphStyle::PLAIN);
@@ -470,7 +803,7 @@ pub fn tooltip_quads(
             ],
             size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
             fg: bg_of([palette.fg.r, palette.fg.g, palette.fg.b]),
-            bg: bg_of([palette.bg.r, palette.bg.g, palette.bg.b]),
+            bg: bg_of(face),
         });
     }
     out
@@ -846,7 +1179,45 @@ pub fn repack(rows: &[RowInst]) -> Vec<CellInstance> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mica_core::surface::ScreenSize;
+    use crate::font::sprite::draw;
+
+    /// 可编程假路由:每字符回固定字形,便于断言几何。
+    struct FakeRouter {
+        atlas_w: f32,
+        atlas_h: f32,
+        glyph_w: f32,
+        glyph_h: f32,
+        #[allow(dead_code)]
+        wide: fn(char) -> bool,
+    }
+    impl crate::font::router::GlyphRouter for FakeRouter {
+        fn route(
+            &mut self,
+            _ch: char,
+            _style: crate::font::GlyphStyle,
+        ) -> crate::font::router::GlyphInfo {
+            crate::font::router::GlyphInfo {
+                uv: [
+                    0.25,
+                    0.25,
+                    self.glyph_w / self.atlas_w,
+                    self.glyph_h / self.atlas_h,
+                ],
+                size_px: [self.glyph_w, self.glyph_h],
+                offset_px: [1.0, 2.0],
+                color: false,
+            }
+        }
+    }
+
+    fn metrics_8x16() -> FontMetrics {
+        FontMetrics {
+            cell_width: 8.0,
+            line_height: 16.0,
+            ascent: 13.0,
+            descent: 3.0,
+        }
+    }
 
     #[test]
     fn instance_layout_is_pod_64() {
@@ -866,13 +1237,15 @@ mod tests {
             glyph_h: 8.0,
             wide: |_| false,
         };
-        let titles = vec![("t".to_string(), true)];
+        // 双标签:状态点属第二行,单标签整行隐藏
+        let titles = vec![("a".to_string(), true), ("b".to_string(), false)];
         let palette = Palette::DEFAULT;
         let none_len = strip_quads(
             &titles,
             &mut r,
             &metrics_8x16(),
             &palette,
+            &StripMetrics::default(),
             Default::default(),
         )
         .len();
@@ -881,819 +1254,183 @@ mod tests {
             &mut r,
             &metrics_8x16(),
             &palette,
+            &StripMetrics::default(),
             StripExtras {
                 exit_dot: Some(ExitDot::Green),
                 ..Default::default()
             },
         );
-        // 八边形 = 3 个 rect;None 不画
-        assert_eq!(dot.len() - none_len, 3);
+        assert_eq!(dot.len() - none_len, 1, "真圆 = 1 圆角 quad;None 不画");
+        let q = &dot[none_len];
+        assert_eq!(q.size_uv, [7.0, 7.0, 0.0, 0.0]);
+        assert_eq!(q.bg[3], 3.5, "上圆角半径在 bg.w");
+        assert_eq!(q.fg[3], 3.5, "下圆角半径在 fg.w");
         let to_u8 = |c: f32| (c * 255.0 + 0.5) as u8;
-        for q in &dot[none_len..] {
-            // blank 形(uv 0)画的是 bg 槽——色必须断在 bg(冒烟教训:
-            // 断 fg 曾让"绿色永不绘制"的 bug 溜过单测)
-            assert_eq!(
-                [to_u8(q.bg[0]), to_u8(q.bg[1]), to_u8(q.bg[2])],
-                [
-                    palette.colors[2].r,
-                    palette.colors[2].g,
-                    palette.colors[2].b
-                ],
-                "绿点取调色板 slot 2(经 bg 槽渲染)"
-            );
-            assert_eq!(q.size_uv[2], 0.0, "实心 quad,uv 尺寸 0");
-        }
-    }
-
-    /// 可编程假路由:每个字符回固定字形,便于断言几何。
-    struct FakeRouter {
-        atlas_w: f32,
-        atlas_h: f32,
-        glyph_w: f32,
-        glyph_h: f32,
-        wide: fn(char) -> bool,
-    }
-    impl crate::font::router::GlyphRouter for FakeRouter {
-        fn route(
-            &mut self,
-            ch: char,
-            _style: crate::font::GlyphStyle,
-        ) -> crate::font::router::GlyphInfo {
-            let w = if (self.wide)(ch) {
-                self.glyph_w * 2.0
-            } else {
-                self.glyph_w
-            };
-            crate::font::router::GlyphInfo {
-                uv: [0.25, 0.25, w / self.atlas_w, self.glyph_h / self.atlas_h],
-                size_px: [w, self.glyph_h],
-                offset_px: [1.0, 2.0],
-                color: false,
-            }
-        }
-    }
-
-    fn metrics_8x16() -> crate::font::metrics::FontMetrics {
-        crate::font::metrics::FontMetrics {
-            cell_width: 8.0,
-            line_height: 16.0,
-            ascent: 12.0,
-            descent: 4.0,
-        }
-    }
-
-    #[test]
-    fn every_cell_yields_instance_with_background() {
-        let s = Surface::new(ScreenSize::new(4, 2));
-        let mut r = FakeRouter {
-            atlas_w: 64.0,
-            atlas_h: 64.0,
-            glyph_w: 6.0,
-            glyph_h: 12.0,
-            wide: |_| false,
-        };
         assert_eq!(
-            build_instances(
-                &s,
-                &mut r,
-                &metrics_8x16(),
-                &Palette::DEFAULT,
-                None,
-                0,
-                Some(CursorShape::Block)
-            )
-            .len(),
-            8
+            [to_u8(q.bg[0]), to_u8(q.bg[1]), to_u8(q.bg[2])],
+            [
+                palette.colors[2].r,
+                palette.colors[2].g,
+                palette.colors[2].b
+            ],
+            "绿点取调色板 slot 2(经 bg.rgb 渲染)"
         );
     }
 
+    /// 均分填充契约:等宽、随可用宽放大、min 兜底;可用域到 "+" 左缘
     #[test]
-    fn typed_glyph_uses_router_geometry() {
-        let mut s = Surface::new(ScreenSize::new(4, 1));
-        s.feed(b"A");
+    fn equal_tab_w_fills_and_clamps() {
+        let sm = StripMetrics::default();
+        assert_eq!(equal_tab_w(0, 400.0, &sm), sm.tab_min_w, "无标签 = min");
+        assert_eq!(
+            equal_tab_w(3, 40.0, &sm),
+            sm.tab_min_w,
+            "极窄可用 = min 兜底(溢出滚动接管)"
+        );
+        let body = 900.0 - sm.plus_w - 14.0 * sm.k - sm.tab_gap * 2.0;
+        assert_eq!(equal_tab_w(2, 900.0, &sm), body / 2.0, "两标签均分");
+    }
+
+    #[test]
+    fn strip_two_tabs_active_block_and_close() {
         let mut r = FakeRouter {
             atlas_w: 64.0,
             atlas_h: 64.0,
-            glyph_w: 6.0,
-            glyph_h: 12.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
             wide: |_| false,
         };
-        let inst = build_instances(
-            &s,
+        let titles = vec![("a".to_string(), false), ("b".to_string(), true)];
+        let out = strip_quads(
+            &titles,
             &mut r,
             &metrics_8x16(),
             &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-        );
-        // 两段式:bg 段 inst[0..4) 行优先每格一整格 quad,字形段随后
-        assert_eq!(inst.len(), 5, "4 bg + 1 字形");
-        assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(inst[0].size_uv, [8.0, 16.0, 0.0, 0.0]);
-        // 字形段 inst[4] = A 的字形:格左上 (0,0) + offset (1,2);尺寸 6x12;uv 来自路由
-        assert_eq!(inst[4].pos_uv, [1.0, 2.0, 0.25, 0.25]);
-        assert_eq!(inst[4].size_uv, [6.0, 12.0, 6.0 / 64.0, 12.0 / 64.0]);
-        // bg 段其余:格 1..3 空格 blank——尺寸 = 格尺寸,uv 尺寸 0
-        for (i, x) in [8.0, 16.0, 24.0].into_iter().enumerate() {
-            let b = &inst[1 + i];
-            assert_eq!(b.pos_uv[0], x, "空格格 {i} x");
-            assert_eq!(b.size_uv, [8.0, 16.0, 0.0, 0.0], "空格格 {i} 整格背景");
-        }
-    }
-
-    #[test]
-    fn wide_char_routes_wide_spacer_blank() {
-        let mut s = Surface::new(ScreenSize::new(4, 1));
-        s.feed("中".as_bytes()); // WIDE_CHAR + SPACER(alacritty 网格语义)
-        let mut r = FakeRouter {
-            atlas_w: 64.0,
-            atlas_h: 64.0,
-            glyph_w: 6.0,
-            glyph_h: 12.0,
-            wide: |_| true,
-        };
-        let inst = build_instances(
-            &s,
-            &mut r,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-        );
-        assert_eq!(inst.len(), 5, "4 bg + 1 宽字形(spacer 不出字形)");
-        // bg 段:格 0 与 spacer 格(格 1)都是整格 blank
-        assert_eq!(inst[0].pos_uv, [0.0, 0.0, 0.0, 0.0]);
-        assert_eq!(inst[0].size_uv, [8.0, 16.0, 0.0, 0.0]);
-        assert_eq!(inst[1].pos_uv[0], 8.0, "spacer 在格 1");
-        assert_eq!(inst[1].size_uv, [8.0, 16.0, 0.0, 0.0]);
-        // 字形段:宽字形在全部 bg 之后,横跨 2 格
-        assert_eq!(inst[4].size_uv[0], 12.0, "宽字形横跨 2 格");
-    }
-
-    #[test]
-    fn selected_cells_use_palette_selection_colors() {
-        use alacritty_terminal::index::{Column, Line, Point};
-        use alacritty_terminal::selection::SelectionRange;
-        let mut s = Surface::new(ScreenSize::new(4, 1));
-        s.feed(b"ABCD");
-        let mut r = FakeRouter {
-            atlas_w: 64.0,
-            atlas_h: 64.0,
-            glyph_w: 6.0,
-            glyph_h: 12.0,
-            wide: |_| false,
-        };
-        // 选中 (0,1)-(0,2) 两个格
-        let range = SelectionRange::new(
-            Point::new(Line(0), Column(1)),
-            Point::new(Line(0), Column(2)),
-            false,
-        );
-        let inst = build_instances(
-            &s,
-            &mut r,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            Some(&range),
-            0,
-            Some(CursorShape::Block),
-        );
-        // bg 段 4 格:1、2 格用 selection 对,0、3 格默认
-        let sel_bg = [
-            Palette::DEFAULT.selection_bg.r as f32 / 255.0,
-            Palette::DEFAULT.selection_bg.g as f32 / 255.0,
-            Palette::DEFAULT.selection_bg.b as f32 / 255.0,
-            0.0,
-        ];
-        let sel_fg = [
-            Palette::DEFAULT.selection_fg.r as f32 / 255.0,
-            Palette::DEFAULT.selection_fg.g as f32 / 255.0,
-            Palette::DEFAULT.selection_fg.b as f32 / 255.0,
-            0.0,
-        ];
-        let _ = &inst[0];
-        assert_eq!(inst[1].bg, sel_bg, "选中格 bg = selection_bg");
-        assert_eq!(inst[1].fg, sel_fg, "选中格 fg = selection_fg");
-        assert_eq!(inst[2].bg, sel_bg);
-        assert_ne!(inst[0].bg, sel_bg, "选区外格不受影响");
-        assert_ne!(inst[3].bg, sel_bg);
-    }
-
-    /// 连字路由:仅对 "=>" 序列产合成字形(宽 2 格),其余 None 回退逐字。
-    struct LigatureRouter {
-        inner: FakeRouter,
-    }
-    impl GlyphRouter for LigatureRouter {
-        fn route(&mut self, ch: char, style: GlyphStyle) -> crate::font::router::GlyphInfo {
-            self.inner.route(ch, style)
-        }
-        fn route_run(
-            &mut self,
-            chars: &[char],
-            _style: GlyphStyle,
-        ) -> Option<Vec<crate::font::router::ClusterLayout>> {
-            use crate::font::router::ClusterLayout;
-            // "a=>b":a 单字、=> 连字、b 单字
-            if chars == ['a', '=', '>', 'b'] {
-                Some(vec![
-                    ClusterLayout {
-                        len: 1,
-                        glyph: None,
-                    },
-                    ClusterLayout {
-                        len: 2,
-                        glyph: Some(crate::font::router::GlyphInfo {
-                            uv: [0.5, 0.5, 0.2, 0.2],
-                            size_px: [16.0, 12.0],
-                            offset_px: [0.0, 2.0],
-                            color: false,
-                        }),
-                    },
-                    ClusterLayout {
-                        len: 1,
-                        glyph: None,
-                    },
-                ])
-            } else {
-                None
-            }
-        }
-    }
-
-    #[test]
-    fn ligature_run_collapses_to_single_glyph() {
-        let mut s = Surface::new(ScreenSize::new(8, 1));
-        s.feed(b"a=>b");
-        let mut r = LigatureRouter {
-            inner: FakeRouter {
-                atlas_w: 64.0,
-                atlas_h: 64.0,
-                glyph_w: 6.0,
-                glyph_h: 12.0,
-                wide: |_| false,
+            &StripMetrics::default(),
+            StripExtras {
+                caption_x: Some(400.0),
+                focused: true,
+                ..Default::default()
             },
-        };
-        let inst = build_instances(
-            &s,
-            &mut r,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
         );
-        // 8 bg + 字形段:a、=>(合成)、b = 3 个字形(逐字路径是 4 个)
-        assert_eq!(inst.len(), 8 + 3, "连字段收敛为单字形");
-        let lig = &inst[9]; // 字形段第 2 个
-        assert_eq!(lig.pos_uv[0], 8.0 + 0.0, "首格承载(a 占格 0)");
-        assert_eq!(lig.size_uv[0], 16.0, "合成字形宽 2 格");
-        // 隔离:相邻不同段不受影响,a 与 b 仍 6px
-        assert_eq!(inst[8].size_uv[0], 6.0);
-        assert_eq!(inst[10].pos_uv[0], 25.0, "b 在格 3(Fake offset+1)");
-    }
-
-    #[test]
-    fn cursor_shapes_render_block_swap_and_bars() {
-        let mut s = Surface::new(ScreenSize::new(4, 1));
-        s.feed(b"A");
-        let m = metrics_8x16();
-        let mut r = FakeRouter {
-            atlas_w: 64.0,
-            atlas_h: 64.0,
-            glyph_w: 6.0,
-            glyph_h: 12.0,
-            wide: |_| false,
-        };
-        // 块:光标格(0,0)交换(白底暗字)
-        let inst = build_instances(
-            &s,
-            &mut r,
-            &m,
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-        );
-        assert_eq!(
-            inst[1].bg,
-            [1.0, 1.0, 1.0, 0.0],
-            "块=交换白底(光标格 feed 后在 (0,1))"
-        );
-        // beam:不交换 + 字形段头一条 1.2px 竖条(cursor 色)
-        let inst = build_instances(
-            &s,
-            &mut r,
-            &m,
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Beam),
-        );
-        assert_ne!(inst[1].bg, [1.0, 1.0, 1.0, 0.0], "条形不交换");
-        let bar = inst
-            .iter()
-            .find(|i| i.size_uv[1] == m.line_height && i.size_uv[0] == 1.2)
-            .expect("beam 竖条");
-        assert_eq!(bar.pos_uv[0], 8.0, "条在光标格(0,1)左侧");
-        assert_eq!(
-            bar.fg,
-            to_color([255, 255, 255]),
-            "条色=palette.cursor(默认白)"
-        );
-        // underline:底部 2px 横条
-        let inst = build_instances(
-            &s,
-            &mut r,
-            &m,
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Underline),
-        );
-        let bar = inst
-            .iter()
-            .find(|i| i.size_uv[0] == m.cell_width && i.size_uv[1] == 2.0)
-            .expect("underline 横条");
-        assert_eq!(bar.pos_uv[1], m.line_height - 2.0, "条贴行底");
-        // None(闪烁关闭):既不交换也无条
-        let inst = build_instances(&s, &mut r, &m, &Palette::DEFAULT, None, 0, None);
-        assert_ne!(inst[1].bg, [1.0, 1.0, 1.0, 0.0], "关相位完全不画");
+        let sm = StripMetrics::default();
+        // 活动标签块:第二行整高(title_h 起)、上圆下方、面色 = 终端底
+        let want_w = equal_tab_w(2, 400.0 + 3.0 * sm.caption_w, &sm);
         assert!(
-            !inst
-                .iter()
-                .any(|i| i.size_uv[1] == 2.0 && i.size_uv[0] == m.cell_width)
+            out.iter().any(|q| q.size_uv[0] == want_w
+                && q.size_uv[1] == sm.h - sm.title_h
+                && q.pos_uv[1] == sm.title_h
+                && q.bg[3] == sm.tab_top_r
+                && q.fg[3] == 0.0),
+            "活动标签块(第二行整高,上圆下方,等宽 {want_w})"
+        );
+        // 条底浅灰:聚焦态 = 终端底 18% 提亮
+        let p = Palette::DEFAULT;
+        let want_bar = [
+            p.bg.r + ((255 - p.bg.r) as f32 * 0.18 + 0.5) as u8,
+            p.bg.g + ((255 - p.bg.g) as f32 * 0.18 + 0.5) as u8,
+            p.bg.b + ((255 - p.bg.b) as f32 * 0.18 + 0.5) as u8,
+        ];
+        assert!(
+            out.iter().any(
+                |q| q.size_uv == [400.0 + 3.0 * sm.caption_w, sm.h, 0.0, 0.0]
+                    && q.bg[0] == want_bar[0] as f32 / 255.0
+                    && q.bg[1] == want_bar[1] as f32 / 255.0
+                    && q.bg[2] == want_bar[2] as f32 / 255.0
+            ),
+            "条底 = 浅灰(18% 提亮)"
+        );
+        // 关闭钮字形(E8BB)在:active 恒显(第二行)
+        assert!(
+            out.iter()
+                .any(|q| q.size_uv[2] > 0.0 && q.pos_uv[1] >= sm.title_h),
+            "× 字形存在(第二行)"
         );
     }
 
+    /// 单标签 = 第二行整行隐藏(上游 hasTabBar 同款):无标签块、无 "+",
+    /// 条高只余标题行
     #[test]
-    fn bold_style_routed_and_inverse_cursor_kept() {
-        let mut s = Surface::new(ScreenSize::new(4, 1));
-        s.feed(b"\x1b[1mA\x1b[m\x1b[7mB");
-        let seen_styles = std::cell::RefCell::new(Vec::new());
-        struct RecordingRouter<'a> {
-            seen: &'a std::cell::RefCell<Vec<crate::font::GlyphStyle>>,
-            inner: FakeRouter,
-        }
-        impl crate::font::router::GlyphRouter for RecordingRouter<'_> {
-            fn route(
-                &mut self,
-                ch: char,
-                style: crate::font::GlyphStyle,
-            ) -> crate::font::router::GlyphInfo {
-                self.seen.borrow_mut().push(style);
-                self.inner.route(ch, style)
-            }
-        }
-        let mut r = RecordingRouter {
-            seen: &seen_styles,
-            inner: FakeRouter {
-                atlas_w: 64.0,
-                atlas_h: 64.0,
-                glyph_w: 6.0,
-                glyph_h: 12.0,
-                wide: |_| false,
-            },
-        };
-        let inst = build_instances(
-            &s,
-            &mut r,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-        );
-        // 顺序:A@0(bold)、B@1(反色)、光标@2(空格)、空格@3
-        // 两段式:bg 段 [0..4) = A、B、光标格、空格;字形段 [4..6) = A、B
-        assert_eq!(inst.len(), 6, "4 bg + A、B 两个字形");
-        // 样式确实到达路由:两个非空格字形,第一个带 bold(bg 段不经路由)
-        assert_eq!(
-            *seen_styles.borrow(),
-            vec![
-                crate::font::GlyphStyle {
-                    bold: true,
-                    italic: false
-                },
-                crate::font::GlyphStyle::PLAIN,
-            ]
-        );
-        // inst[0] = A 的整格背景(默认色,fg 白、bg 暗)
-        assert_eq!(inst[0].size_uv, [8.0, 16.0, 0.0, 0.0]);
-        assert_eq!(inst[0].fg, [1.0, 1.0, 1.0, 0.0]);
-        assert_eq!(
-            inst[0].bg,
-            [
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0.0
-            ]
-        );
-        // inst[1] = B 的背景 quad:INVERSE 交换一次——fg 暗底、bg 白
-        assert_eq!(inst[1].pos_uv[0], 8.0, "B 在格 1");
-        assert_eq!(
-            inst[1].fg,
-            [
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0.0
-            ]
-        );
-        assert_eq!(inst[1].bg, [1.0, 1.0, 1.0, 0.0]);
-        // inst[2] = 光标格 (2,0) 的空白背景:默认色上仅光标交换一次
-        // (无 INVERSE,无双交换)→ 白块光标:fg 暗、bg 白
-        assert_eq!(inst[2].pos_uv[0], 16.0);
-        assert_eq!(
-            inst[2].fg,
-            [
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0.0
-            ]
-        );
-        assert_eq!(inst[2].bg, [1.0, 1.0, 1.0, 0.0]);
-        // 字形段 inst[4] = A 的字形(bold 样式的几何)
-        assert_eq!(inst[4].pos_uv, [1.0, 2.0, 0.25, 0.25]);
-        assert_eq!(inst[4].size_uv, [6.0, 12.0, 6.0 / 64.0, 12.0 / 64.0]);
-        // inst[5] = B 的字形:同一对交换色(字形自绘 bg 盖 bbox,无害叠绘)
-        assert_eq!(inst[5].pos_uv, [9.0, 2.0, 0.25, 0.25]);
-        assert_eq!(
-            inst[5].fg,
-            [
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0x1e as f32 / 255.0,
-                0.0
-            ]
-        );
-        assert_eq!(inst[5].bg, [1.0, 1.0, 1.0, 0.0]);
-    }
-
-    /// 跨格画家序回归:旧逐格交错序下,spacer 格的 bg 后发,blend:None
-    /// 直接擦掉宽字形右半。两段式下全部 bg 必须先于全部字形。
-    #[test]
-    fn wide_glyph_instance_follows_all_backgrounds() {
-        let mut s = Surface::new(ScreenSize::new(4, 1));
-        s.feed("中".as_bytes());
+    fn strip_single_tab_hides_tab_row() {
         let mut r = FakeRouter {
             atlas_w: 64.0,
             atlas_h: 64.0,
-            glyph_w: 6.0,
-            glyph_h: 12.0,
-            wide: |_| true,
-        };
-        let inst = build_instances(
-            &s,
-            &mut r,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-        );
-        // bg 段:全部 4 格在前,均整格 blank(uv 尺寸 0),行优先
-        for (i, cell) in inst.iter().take(4).enumerate() {
-            assert_eq!(
-                cell.size_uv,
-                [8.0, 16.0, 0.0, 0.0],
-                "inst[{i}] 应为整格背景"
-            );
-            assert_eq!(cell.pos_uv[0], i as f32 * 8.0, "inst[{i}] 行优先格 x");
-        }
-        // 字形段:宽字形在全部 bg 之后(索引 4),横跨 2 格,其后无实例
-        assert_eq!(inst.len(), 5, "宽字形之后不得再有任何实例");
-        assert_eq!(inst[4].size_uv, [12.0, 12.0, 12.0 / 64.0, 12.0 / 64.0]);
-    }
-
-    /// 实例颜色必须来自传入的 palette,而非任何内置常量:
-    /// 槽 1 喂红色前景、bg 换浅色,两段(bg quad + 字形)都随行。
-    #[test]
-    fn instance_colors_flow_from_palette() {
-        let mut s = Surface::new(ScreenSize::new(4, 1));
-        s.feed(b"\x1b[31mA");
-        let mut r = FakeRouter {
-            atlas_w: 64.0,
-            atlas_h: 64.0,
-            glyph_w: 6.0,
-            glyph_h: 12.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
             wide: |_| false,
         };
-        let mut pal = Palette::DEFAULT;
-        pal.apply_pair("palette", "1=#112233").unwrap();
-        pal.apply_pair("background", "#abcdef").unwrap();
-        let inst = build_instances(
-            &s,
+        let one = vec![("solo".to_string(), true)];
+        let out = strip_quads(
+            &one,
             &mut r,
             &metrics_8x16(),
-            &pal,
-            None,
-            0,
-            Some(CursorShape::Block),
-        );
-        // bg 段 inst[0]:A 的背景 = palette.bg(浅色),前景 = 槽 1
-        assert_eq!(
-            inst[0].bg,
-            [
-                0xab as f32 / 255.0,
-                0xcd as f32 / 255.0,
-                0xef as f32 / 255.0,
-                0.0
-            ]
-        );
-        assert_eq!(
-            inst[0].fg,
-            [
-                0x11 as f32 / 255.0,
-                0x22 as f32 / 255.0,
-                0x33 as f32 / 255.0,
-                0.0
-            ]
-        );
-        // 字形段 inst[4]:同一对颜色(自绘 bg 盖 bbox,无害叠绘)
-        assert_eq!(inst[4].fg, inst[0].fg);
-        assert_eq!(inst[4].bg, inst[0].bg);
-    }
-
-    // ---- Task 8: 行级脏区重建 + repack ----
-
-    fn bytes(insts: &[CellInstance]) -> &[u8] {
-        bytemuck::cast_slice(insts)
-    }
-
-    /// 计数路由:转调 FakeRouter。`calls` = route 原始调用次数(受伤行重发
-    /// 必然重复路由),`fresh` = 首见 (char, style) 数——模拟 DwriteRouter 的
-    /// 图集缓存语义:重复字形命中缓存,不再产生真实光栅化工作。
-    struct CountingRouter<'a> {
-        calls: &'a std::cell::Cell<usize>,
-        fresh: &'a std::cell::Cell<usize>,
-        seen: std::collections::HashSet<(char, crate::font::GlyphStyle)>,
-        inner: FakeRouter,
-    }
-    impl crate::font::router::GlyphRouter for CountingRouter<'_> {
-        fn route(
-            &mut self,
-            ch: char,
-            style: crate::font::GlyphStyle,
-        ) -> crate::font::router::GlyphInfo {
-            self.calls.set(self.calls.get() + 1);
-            if self.seen.insert((ch, style)) {
-                self.fresh.set(self.fresh.get() + 1);
-            }
-            self.inner.route(ch, style)
-        }
-    }
-
-    fn counting_router<'a>(
-        calls: &'a std::cell::Cell<usize>,
-        fresh: &'a std::cell::Cell<usize>,
-    ) -> CountingRouter<'a> {
-        CountingRouter {
-            calls,
-            fresh,
-            seen: std::collections::HashSet::new(),
-            inner: FakeRouter {
-                atlas_w: 64.0,
-                atlas_h: 64.0,
-                glyph_w: 6.0,
-                glyph_h: 12.0,
-                wide: |_| true, // 空格不路由,wide 与否只影响几何,计数不受影响
+            &Palette::DEFAULT,
+            &StripMetrics::default(),
+            StripExtras {
+                caption_x: Some(400.0),
+                focused: true,
+                ..Default::default()
             },
-        }
-    }
-
-    /// 黄金对拍(计划 Step 4):Full 全量的 rows → repack 必须与黄金源
-    /// build_instances 逐字节等价——两遍发射契约没有在行级重排中漂移。
-    /// 内容覆盖:普通字符、SGR 颜色、反色、bold、宽字形(含 spacer)、
-    /// 光标格与滚屏内容。
-    #[test]
-    fn golden_full_repack_matches_build_instances_byte_for_byte() {
-        let mut s = Surface::new(ScreenSize::new(6, 4));
-        s.feed(b"A\x1b[31mB\x1b[7mC\r\n");
-        s.feed("中D".as_bytes());
-        s.feed(b"\r\n\r\n\x1b[1mE");
-        let calls = std::cell::Cell::new(0);
-        let fresh = std::cell::Cell::new(0);
-        let mut router = counting_router(&calls, &fresh);
-        let damage = s.take_damage();
-        assert_eq!(damage, mica_core::surface::Damage::Full, "首帧哨兵必全量");
-        let mut rows = Vec::new();
-        build_rows(
-            &s,
-            &mut router,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-            &damage,
-            &mut rows,
         );
-        let repacked = repack(&rows);
-        let golden = build_instances(
-            &s,
-            &mut router,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-        );
-        assert_eq!(
-            bytes(&repacked),
-            bytes(&golden),
-            "repack(build_rows(Full)) 必须与 build_instances 逐字节一致"
-        );
-    }
-
-    /// SGR 下划线族(T5):直线/双线/波浪三态渲染 + 两构建器对拍。
-    #[test]
-    fn sgr_underline_family_in_both_builders() {
-        // 直线(4)/双线(4:2)/波浪(4:3)三态同屏,对拍两构建器逐字节一致
-        let mut s = Surface::new(ScreenSize::new(6, 1));
-        s.feed(b"\x1b[4ma\x1b[4:2mb\x1b[4:3mc");
-        let calls = std::cell::Cell::new(0);
-        let fresh = std::cell::Cell::new(0);
-        let mut router = counting_router(&calls, &fresh);
-        let damage = s.take_damage();
-        let mut rows = Vec::new();
-        build_rows(
-            &s,
-            &mut router,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            None,
-            &damage,
-            &mut rows,
-        );
-        let repacked = repack(&rows);
-        let golden = build_instances(
-            &s,
-            &mut router,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            None,
-        );
-        assert_eq!(bytes(&repacked), bytes(&golden), "对拍(下划线族)");
-        // 下划线段 = 1px 高、uv 尺寸 0 横条:直线 1 + 双线 2 + 波浪 4
-        // (cell_width 8 / 2px 段)
-        let u: Vec<&CellInstance> = golden
-            .iter()
-            .filter(|q| q.size_uv[1] == 1.0 && q.size_uv[2] == 0.0)
-            .collect();
-        assert_eq!(u.len(), 7, "直线1 + 双线2 + 波浪4");
-        let ys: Vec<f32> = u[3..].iter().map(|q| q.pos_uv[1]).collect();
+        let sm = StripMetrics::default();
+        // 条底只到标题行底
         assert!(
-            ys.contains(&15.0) && ys.contains(&13.0),
-            "波浪两档 bottom-1/bottom-3,实际 {ys:?}"
+            out.iter()
+                .any(|q| q.size_uv == [400.0 + 3.0 * sm.caption_w, sm.title_h, 0.0, 0.0]),
+            "单标签:条高 = 标题行"
+        );
+        assert!(
+            !out.iter().any(|q| q.bg[3] > 0.0 && q.size_uv[1] > 1.0),
+            "无标签块/胶囊"
+        );
+        assert!(
+            out.iter()
+                .any(|q| q.size_uv[2] > 0.0 && q.pos_uv[1] < sm.title_h),
+            "标题字形在第一行"
+        );
+        assert!(
+            !out.iter()
+                .any(|q| q.size_uv[2] > 0.0 && q.pos_uv[1] >= sm.title_h),
+            "第二行无任何字形(隐藏)"
         );
     }
 
-    /// 行级增量:只重建受损行——路由调用次数作证,未伤行的实例位图原样。
     #[test]
-    fn partial_damage_rebuilds_only_damaged_rows() {
-        let mut s = Surface::new(ScreenSize::new(4, 3));
-        s.feed(b"AB\x1b[3;1HC"); // 行 0 写 AB,行 2 写 C(光标停行 2)
-        let calls = std::cell::Cell::new(0);
-        let fresh = std::cell::Cell::new(0);
-        let mut router = counting_router(&calls, &fresh);
-        let mut rows = Vec::new();
-        let damage = s.take_damage();
-        assert_eq!(damage, mica_core::surface::Damage::Full, "首帧哨兵必全量");
-        build_rows(
-            &s,
-            &mut router,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-            &damage,
-            &mut rows,
-        );
-        assert_eq!(calls.get(), 3, "全量:A、B、C 各路由一次");
-        assert_eq!(fresh.get(), 3, "全量首见:A、B、C");
-        let row0_bg = bytes(&rows[0].bg).to_vec();
-        let row0_glyphs = bytes(&rows[0].glyphs).to_vec();
-        let row1 = rows[1].clone();
-
-        s.feed(b"D"); // 光标已停行 2:只伤行 2
-        let damage = s.take_damage();
-        assert_eq!(damage, mica_core::surface::Damage::Lines(vec![2]));
-        calls.set(0);
-        build_rows(
-            &s,
-            &mut router,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-            &damage,
-            &mut rows,
-        );
-        assert_eq!(calls.get(), 2, "受伤行整行重发:C(缓存命中)+ D");
-        assert_eq!(fresh.get(), 4, "图集缓存兜底:仅 D 是新字形");
-        assert_eq!(
-            bytes(&rows[0].bg),
-            &row0_bg[..],
-            "未伤行 0 的 bg 段不得变化"
-        );
-        assert_eq!(
-            bytes(&rows[0].glyphs),
-            &row0_glyphs[..],
-            "未伤行 0 的字形段不得变化"
-        );
-        assert_eq!(rows[1], row1, "未伤行 1 原样");
-        // 受伤行拿到的是当前 grid 状态
-        assert_eq!(rows[2].glyphs.len(), 2, "行 2 现有 C、D 两个字形");
+    fn three_quadrant_blocks_carve_correct_corner() {
+        let (w, h) = (10.0, 21.0);
+        let idx = |x: usize, y: usize| y * w as usize + x;
+        let cov = draw(0x259B, w, h).unwrap().2;
+        assert!(cov[idx(0, 0)] == 255, "259B 左上应满");
+        assert!(cov[idx(9, 20)] == 0, "259B 右下应空");
+        let cov = draw(0x259C, w, h).unwrap().2;
+        assert!(cov[idx(9, 0)] == 255, "259C 右上应满");
+        assert!(cov[idx(0, 20)] == 0, "259C 左下应空");
     }
 
-    /// 空 Lines 脏区 = 纯 no-op:零路由调用,行缓存位图原样。
-    /// (上游 Term::damage() 恒伤光标行,空集经 Surface::take_damage 不可达;
-    /// 此分支是"无变化不重绘"的库级兜底。)
     #[test]
-    fn empty_damage_is_no_op() {
-        let s = Surface::new(ScreenSize::new(2, 2));
-        let calls = std::cell::Cell::new(0);
-        let fresh = std::cell::Cell::new(0);
-        let mut router = counting_router(&calls, &fresh);
-        let mut rows = Vec::new();
-        build_rows(
-            &s,
-            &mut router,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-            &mica_core::surface::Damage::Full,
-            &mut rows,
-        );
-        let snapshot = rows.clone();
-        calls.set(0);
-        build_rows(
-            &s,
-            &mut router,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-            &mica_core::surface::Damage::Lines(vec![]),
-            &mut rows,
-        );
-        assert_eq!(calls.get(), 0, "空脏区不得触发任何路由");
-        assert_eq!(rows, snapshot, "空脏区行缓存原样");
+    fn out_of_range_returns_none() {
+        assert!(draw(0x41, 10.0, 21.0).is_none(), "字母回落字体");
+        assert!(draw(0x25FF, 10.0, 21.0).is_none(), "未覆盖几何形状回落字体");
     }
 
-    /// repack 平铺恢复全局两遍发射序:全部行的 bg 段在前(行主序连续),
-    /// 全部字形段随后——管线 blend:None 契约的行级等价物。
     #[test]
-    fn repack_emits_all_backgrounds_before_all_glyphs() {
-        let mut s = Surface::new(ScreenSize::new(3, 2));
-        s.feed("中E".as_bytes()); // 行 0 宽字形(占 2 格)+ E
-        s.feed(b"\r\nF"); // 行 1 字形
-        let calls = std::cell::Cell::new(0);
-        let fresh = std::cell::Cell::new(0);
-        let mut router = counting_router(&calls, &fresh);
-        let mut rows = Vec::new();
-        build_rows(
-            &s,
-            &mut router,
-            &metrics_8x16(),
-            &Palette::DEFAULT,
-            None,
-            0,
-            Some(CursorShape::Block),
-            &mica_core::surface::Damage::Full,
-            &mut rows,
-        );
-        let packed = repack(&rows);
-        let bg_total: usize = rows.iter().map(|r| r.bg.len()).sum();
-        assert_eq!(bg_total, 6, "每格一整格背景:2 行 x 3 格");
-        assert_eq!(packed.len(), bg_total + 3, "字形段:中、E、F");
-        for (i, inst) in packed.iter().take(bg_total).enumerate() {
-            assert_eq!(
-                inst.size_uv[2], 0.0,
-                "packed[{i}] 在 bg 段内:uv 尺寸 0(blank 形态)"
-            );
+    fn powerline_triangles_fill_cell() {
+        let (w, h) = (10.0, 21.0);
+        let cov = draw(0xE0B0, w, h).unwrap().2;
+        let idx = |x: usize, y: usize| y * w as usize + x;
+        for y in 0..h as usize {
+            assert!(cov[idx(0, y)] > 80, "E0B0 左缘第 {y} 行缺墨");
         }
-        for (i, inst) in packed.iter().skip(bg_total).enumerate() {
-            assert!(inst.size_uv[2] > 0.0, "packed[{}] 在字形段内", bg_total + i);
-        }
-        // 行主序:bg 段内前 3 个是行 0(x = 0/8/16),后 3 个是行 1
-        for (i, x) in [0.0, 8.0, 16.0].into_iter().enumerate() {
-            assert_eq!(packed[i].pos_uv[0], x);
-            assert_eq!(packed[3 + i].pos_uv[0], x);
-        }
+        assert!(cov[idx(9, 10)] > 80, "E0B0 斜边中点缺墨");
+    }
+
+    #[test]
+    fn braille_dots_follow_bits() {
+        let (w, h) = (10.0, 21.0);
+        let blank = draw(0x2800, w, h).unwrap().2;
+        assert!(blank.iter().all(|&v| v == 0), "空白盲文无墨");
+        let one = draw(0x2801, w, h).unwrap().2;
+        assert!(one.iter().any(|&v| v > 200), "Bit1 点应有墨");
     }
 }
 
@@ -1701,6 +1438,7 @@ mod tests {
 /// 重建),无 GPU 依赖,CI 可跑。80×24×500 行回放,cells/s。
 /// `#ignored` + `--release`:`cargo test -p mica-render bench -- --ignored --nocapture`。
 /// 输出可被 CI 的 perf job 抓取:`BENCH cells_per_sec=<f64> frame_us=<f64>`。
+/// 2026-10-12 重建:bbb71d2 标签栏重写误删本模块,perf job 抓零红(实证)。
 #[cfg(test)]
 mod bench {
     use super::*;

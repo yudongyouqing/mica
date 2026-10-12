@@ -1,4 +1,10 @@
-//! 字形图集:RGBA8 纹素(D19,M2b 起)、shelf 行分配、放不下自动倍增高并重排。
+//! 字形图集(2026-10-08 页追加式根治重构):RGBA8 纹素、shelf 行分配、
+//! 放不下**只向下追加整页**——条目一旦落位永不位移。这是结构性契约:
+//! 历史版本 grow 时全表重排,所有烘焙了 UV 的跨帧缓存(路由缓存/行级
+//! 实例缓存)同时作废,漏一处监听就是"一块一块/乱码"(同类四连发,
+//! 见 0608b73 复盘);页追加后这类 bug 从结构上不可能发生。
+//! 配套:GlyphInfo 的 UV 语义改为**纹素坐标**,shader 用 globals.
+//! atlas_size 归一——高度追加不改变既有条目的归一化结果。
 //! 仅在主线程访问(渲染路径),无锁。
 //! 存储非预乘:灰度字形 RGB 恒白、A=coverage(染色交给 shader 的 fg 乘);
 //! 彩色字形(COLR)RGB=原色、A=不透明度,渲染时 fg 填白即得原色。
@@ -59,12 +65,11 @@ pub struct GlyphAtlas {
     height: u32,
     data: Vec<u8>,
     shelves: Vec<Shelf>,
-    /// 重排保真用条目表(M1 字形量级百级,克隆成本可忽略)
-    entries: Vec<(GlyphBitmap, Rect)>,
-    /// 仅 grow(重排搬动全部条目)递增。DwriteRouter 据此清 UV 缓存;
-    /// 普通插入不动它,否则每个新字形都白清一次缓存。
+    /// 历史遗留兼容字段:页追加式下**永不再变**(无重排)。保留是
+    /// 为了消费方(DwriteRouter/行缓存)的版本对比代码零改动——
+    /// 恒 0 意味着永不触发清缓存,语义安全。
     version: u64,
-    /// 每次内容写入(普通 insert 与 grow)都递增。`Renderer::set_atlas`
+    /// 每次内容写入(普通 insert 与页追加)都递增。`Renderer::set_atlas`
     /// 据此决定是否重传纹理——普通插入也得重传,漏了字形就隐形。
     revision: u64,
 }
@@ -77,7 +82,6 @@ impl GlyphAtlas {
             height,
             data: vec![0; (width * height) as usize * 4], // RGBA8
             shelves: Vec::new(),
-            entries: Vec::new(),
             version: 0,
             revision: 0,
         }
@@ -105,6 +109,14 @@ impl GlyphAtlas {
     }
 
     pub fn insert(&mut self, bmp: &GlyphBitmap) -> Rect {
+        // 宽度恒定的守卫:超宽字形无页可追加(会死循环)——512px 宽
+        // 已覆盖 400pt 级字形的极限,真触发说明字体栈异常,宁可快败
+        assert!(
+            bmp.width < self.width,
+            "字形宽 {} 超过图集固定宽 {}(字体栈异常?)",
+            bmp.width,
+            self.width
+        );
         // I2 处方(M5a/T8):右/下各 +1px 零填充——半纹素采样越界时读到
         // 零墨而非邻居字形边缘,渗色消除。矩形保持真实尺寸,UV 不变;
         // 预留位靠 data 零初始化 + 布局推进保持零(重排路径同样 +1)
@@ -113,11 +125,10 @@ impl GlyphAtlas {
                 rect.w = bmp.width;
                 rect.h = bmp.height;
                 self.blit(bmp, rect);
-                self.entries.push((bmp.clone(), rect));
                 self.revision += 1;
                 return rect;
             }
-            self.grow(bmp.width + 1);
+            self.grow();
         }
     }
 
@@ -154,29 +165,15 @@ impl GlyphAtlas {
         None
     }
 
-    fn grow(&mut self, pending_w: u32) {
-        // 单字形超宽:宽度提到能容纳它的 2 的幂——既保证本轮必能放下,
-        // 也保持纹理边长为 2 的幂(GPU 纹理友好,UV 归一化稳定)。
-        if pending_w > self.width {
-            self.width = pending_w.next_power_of_two();
-        }
-        // 高度倍增
-        self.height = self.height.saturating_mul(2).max(1);
-        self.data = vec![0; (self.width * self.height) as usize * 4]; // RGBA8
-        self.shelves.clear();
-        self.version += 1;
+    /// 页追加(2026-10-08 根治):放不下时**只把高度加一整页**(256px),
+    /// 数据区尾部补零,既有条目与 shelf 全部原样不动。历史版本的
+    /// "倍增+全表重排"是四连发 bug 的结构病灶,已删除。
+    /// 页高取 256:与初始宽一致,bytes_per_row 对齐契约不变。
+    fn grow(&mut self) {
+        const PAGE: u32 = 256;
+        self.height += PAGE;
+        self.data.resize((self.width * self.height) as usize * 4, 0);
         self.revision += 1;
-        let entries = std::mem::take(&mut self.entries);
-        for (bmp, _) in entries {
-            // 重排同款 +1 零填充(I2):预留位随搬移重建,保持零墨
-            let mut rect = self
-                .try_place(bmp.width + 1, bmp.height + 1)
-                .expect("doubled atlas must fit prior entries");
-            rect.w = bmp.width;
-            rect.h = bmp.height;
-            self.blit(&bmp, rect);
-            self.entries.push((bmp, rect));
-        }
     }
 
     fn blit(&mut self, bmp: &GlyphBitmap, r: Rect) {
@@ -228,18 +225,18 @@ mod tests {
         assert_eq!(r2.u, r1.u + 11, "同 shelf 布局推进 = w+1(含填充)");
         assert_eq!(tex_alpha(&a, r1.u + 10, r1.v), 0, "右侧 padding 零墨");
         assert_eq!(tex_alpha(&a, r1.u, r1.v + 10), 0, "下侧 padding 零墨");
-        // 重排(grow)后填充保持
-        let big = bmp(200, 10, 0xff); // 触发 grow 加宽
+        // 页追加(grow)后填充保持:高字形触发追加页,旧条目原位
+        let big = bmp(10, 200, 0xff); // 触发页追加
         let r3 = a.insert(&big);
         assert_eq!(
             tex_alpha(&a, r3.u + r3.w, r3.v),
             0,
-            "grow 重排后右 padding 仍零"
+            "追加页条目右 padding 零"
         );
         assert_eq!(
             tex_alpha(&a, r1.u + 10, r1.v),
             0,
-            "旧条目重排后右 padding 仍零"
+            "旧条目原位,右 padding 仍零"
         );
         assert_eq!(
             a.texture().len(),
@@ -259,42 +256,38 @@ mod tests {
         }
     }
 
+    /// 页追加契约(2026-10-08 根治重构):grow 后**条目原位不动**——
+    /// 坐标逐位相等 + 内容原样,version 恒 0(无重排信号)。
+    /// 这是四连发 bug 类的结构性死亡证明。
     #[test]
-    fn growth_repacks_and_preserves_pixels() {
+    fn growth_appends_page_and_never_moves_entries() {
         let mut a = GlyphAtlas::new(32, 32);
         let r1 = a.insert(&bmp(16, 16, 9));
-        assert_eq!(a.version(), 0);
-        assert_eq!(a.revision(), 1);
-        // 高度 30 的字形在 32 高图集放不下 → 倍增重排
-        let r2 = a.insert(&bmp(16, 30, 5));
-        assert_eq!(a.height(), 64);
-        assert!(a.version() >= 1);
-        assert!(a.revision() >= 2);
-        // 两个矩形的内容都还在(位置可能变了)
-        for (r, tag) in [(r1, 9u8), (r2, 5u8)] {
+        let r2 = a.insert(&bmp(16, 10, 6));
+        let (v1, rev1) = (a.version(), a.revision());
+        // 高度 30 的字形在 32 高图集放不下 → 追加一整页
+        let r3 = a.insert(&bmp(16, 30, 5));
+        assert_eq!(a.height(), 32 + 256, "追加整页 256");
+        assert_eq!(a.version(), v1, "无重排:version 恒不变");
+        assert!(a.revision() > rev1);
+        // 旧条目坐标逐位不变:内容仍在原坐标即证(r1/r2 的 rect 在
+        // 追加前后未被重算——页追加式下 insert 不触碰既有条目)
+        for (r, tag) in [(r1, 9u8), (r2, 6u8), (r3, 5u8)] {
             for y in 0..r.h {
                 for x in 0..r.w {
                     assert_eq!(tex_alpha(&a, r.u + x, r.v + y), tag, "{r:?} tag{tag}");
                 }
             }
         }
+        assert!(r3.v + r3.h > 32, "新条目必然伸入追加页(原 32 高放不下)");
     }
 
+    /// 超宽字形守卫(页追加式):宽度恒定,超宽即快败(不静默死循环)
     #[test]
-    fn glyph_wider_than_atlas_grows_width_and_terminates() {
+    #[should_panic(expected = "超过图集固定宽")]
+    fn glyph_wider_than_atlas_panics_loudly() {
         let mut a = GlyphAtlas::new(16, 16);
-        let r = a.insert(&bmp(40, 8, 3)); // 比图集宽
-        assert!(r.u + r.w <= a.width() && r.v + r.h <= a.height());
-        assert!(a.width() >= 40);
-        // 内容落位
-        for y in 0..r.h {
-            for x in 0..r.w {
-                assert_eq!(tex_alpha(&a, r.u + x, r.v + y), 3);
-            }
-        }
-        // 后续常规插入继续正常
-        let r2 = a.insert(&bmp(5, 5, 4));
-        assert!(r2.u + r2.w <= a.width() && r2.v + r2.h <= a.height());
+        let _ = a.insert(&bmp(40, 8, 3));
     }
 
     /// C1 回归锁:普通插入必须递增 revision(set_atlas 门控靠它重传),

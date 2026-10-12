@@ -11,10 +11,22 @@ use crate::keymap::{self, Keymap};
 /// 默认字体回退链(D9)。定义在此(core)——render 侧 re-export,
 /// 与格子度量一样保持单一来源。
 pub const DEFAULT_FAMILIES: &[&str] = &[
+    // JetBrains Mono 打头(Ghostty 官方观感;未安装时 DWrite 回退链自然
+    // 落到 Cascadia);Sarasa 装 CJK 等宽首选,再 Cascadia/YaHei/Emoji
+    "JetBrains Mono",
     "Sarasa Mono SC",
     "Cascadia Mono",
     "Microsoft YaHei",
+    // Nerd Font(oh-my-posh/starship 等提示符引擎的图标/Powerline 三角
+    // 形 E0B0 族、F000 图标区;ASCII 仍由链头 JBMono 承担,此处只兜
+    // 缺字。两个族名都挂:NF 是 v3 短名(本机实测 GDI/DWrite 都叫这个),
+    // Nerd Font 是 v2 长名——未装的机器静默跳过
+    "JetBrainsMono NF",
+    "JetBrainsMono Nerd Font",
     "Segoe UI Emoji",
+    // 图标字形(caption 按钮的 Segoe Fluent Icons PUA 区;终端文本
+    // 命中 E700-E8FF 时得到图标也是正确语义,Nerd Font 同族行为)
+    "Segoe Fluent Icons",
 ];
 
 pub const DEFAULT_FONT_SIZE_PT: f32 = 12.0;
@@ -33,6 +45,12 @@ pub struct Settings {
     pub cursor_blink: bool,
     /// Quick Terminal 全局热键(M3b,默认 Win+`;禁用写 `none`)。
     pub quick_terminal_key: Option<String>,
+    /// 打字藏鼠标(Ghostty mouse-hide-while-typing,默认 true)。
+    pub mouse_hide_while_typing: bool,
+    /// 锁定标题(Ghostty `title` 同义):设定时窗口/标签标题恒为此值,
+    /// 程序发的 OSC 0/2 标题被忽略;空串 = 解除锁定回落 shell 标题。
+    /// 想视觉隐藏标题写单空格(Ghostty 文档同法)。
+    pub title: Option<String>,
 }
 
 impl Default for Settings {
@@ -40,6 +58,8 @@ impl Default for Settings {
         Self {
             font_families: DEFAULT_FAMILIES.iter().map(|s| s.to_string()).collect(),
             font_size_pt: DEFAULT_FONT_SIZE_PT,
+            title: None,
+            mouse_hide_while_typing: true,
             palette: Palette::DEFAULT,
             theme_name: None,
             keymap: Keymap::wt_default(),
@@ -70,6 +90,9 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
     err.parse = parse_errors;
 
     let mut settings = Settings::default();
+    // 选区/光标是否被任何层显式设置(theme 或用户);[0]=selection-fg
+    // [1]=selection-bg [2]=cursor——缺省派生(见尾部)不覆盖显式值
+    let mut explicit = [false; 3];
 
     // theme 片段在用户片段之前应用:用户键可以覆盖主题同名键
     let theme_name = user_pairs
@@ -82,12 +105,25 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
             Ok(source) => {
                 let (pairs, theme_errors) = parse::parse(&source);
                 err.parse.extend(theme_errors);
-                apply_pairs(&mut settings, pairs, &mut err);
+                apply_pairs(&mut settings, pairs, &mut err, &mut explicit);
             }
             Err(reason) => err.values.push(reason),
         }
     }
-    apply_pairs(&mut settings, user_pairs, &mut err);
+    apply_pairs(&mut settings, user_pairs, &mut err, &mut explicit);
+
+    // Ghostty 缺省语义(上游 renderer/generic.zig 实证):selection/cursor
+    // 未显式配置时**动态互换/跟前景**——选区底 = 前景、选区字 = 背景、
+    // 光标 = 前景。不是常量:用户只改 foreground 时选区光标随之走
+    if !explicit[0] {
+        settings.palette.selection_fg = settings.palette.bg;
+    }
+    if !explicit[1] {
+        settings.palette.selection_bg = settings.palette.fg;
+    }
+    if !explicit[2] {
+        settings.palette.cursor = settings.palette.fg;
+    }
 
     if err.is_empty() {
         Ok(settings)
@@ -96,9 +132,15 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
     }
 }
 
-/// 键集分派:font-family 追加、font-size 限幅、色键走 Palette;
-/// 未知键(含 selection-*/cursor-text,M2 接)静默跳过——Ghostty 同款容忍。
-fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut ConfigError) {
+/// 键集分派:font-family 追加、font-size 限幅、色键(含 selection-*)走
+/// Palette;未知键(含 cursor-text——块光标反色绘制已等价)静默跳过
+/// ——Ghostty 同款容忍。explicit 记录选区/光标是否显式设置(缺省派生用)。
+fn apply_pairs(
+    settings: &mut Settings,
+    pairs: Vec<(String, String)>,
+    err: &mut ConfigError,
+    explicit: &mut [bool; 3],
+) {
     // 首个显式 font-family 重置默认链(Ghostty 配置语义:显式键覆盖默认值),
     // 之后的声明追加
     let mut family_declared = false;
@@ -120,6 +162,8 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                     .push(format!("font-size 应为 4-72 的数字,得 `{value}`")),
             },
             "theme" => settings.theme_name = Some(value),
+            // 空值 = 解除锁定(Ghostty:置空回落默认/shell 标题)
+            "title" => settings.title = Some(value).filter(|v| !v.is_empty()),
             "quick-terminal-key" => {
                 if value.eq_ignore_ascii_case("none") {
                     settings.quick_terminal_key = None;
@@ -131,6 +175,13 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                     ));
                 }
             }
+            "mouse-hide-while-typing" => match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => settings.mouse_hide_while_typing = true,
+                "false" | "0" | "no" => settings.mouse_hide_while_typing = false,
+                _ => err.values.push(format!(
+                    "mouse-hide-while-typing 应为 true/false,得 `{value}`"
+                )),
+            },
             "cursor-blink" => match value.to_ascii_lowercase().as_str() {
                 "true" | "1" | "yes" => settings.cursor_blink = true,
                 "false" | "0" | "no" => settings.cursor_blink = false,
@@ -160,6 +211,16 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                 if let Err(reason) = settings.palette.apply_pair(&key, &value) {
                     err.values.push(format!("{key}: {reason}"));
                 }
+                if key == "cursor-color" {
+                    explicit[2] = true;
+                }
+            }
+            "selection-foreground" | "selection-background" => {
+                if let Err(reason) = settings.palette.apply_pair(&key, &value) {
+                    err.values.push(format!("{key}: {reason}"));
+                }
+                let slot = if key == "selection-background" { 1 } else { 0 };
+                explicit[slot] = true;
             }
             _ => {}
         }
@@ -173,7 +234,8 @@ mod tests {
     #[test]
     fn empty_source_is_all_defaults() {
         assert_eq!(resolve("").unwrap(), Settings::default());
-        assert_eq!(Settings::default().font_families.len(), 4);
+        // JetBrains Mono 打头后链长 5(2026-10 UI 对标)
+        assert_eq!(Settings::default().font_families.len(), 8);
     }
 
     #[test]
@@ -183,6 +245,84 @@ mod tests {
         assert_eq!(s.theme_name.as_deref(), Some("Dracula"));
         assert_eq!(s.palette.bg.r, 0x00, "用户 background 覆盖主题");
         assert_eq!(s.palette.colors[1].r, 0xff, "palette 槽来自主题(#ff5555)");
+    }
+
+    /// Ghostty 缺省选区/光标语义(上游 generic.zig):未显式配置时
+    /// 选区 = 前景/背景互换、光标 = 前景——动态跟随,非常量
+    #[test]
+    fn selection_and_cursor_follow_fg_bg_when_unset() {
+        use alacritty_terminal::vte::ansi::Rgb;
+        let s = resolve("").unwrap();
+        assert_eq!(s.palette.selection_bg, s.palette.fg, "选区底 = 前景");
+        assert_eq!(s.palette.selection_fg, s.palette.bg, "选区字 = 背景");
+        assert_eq!(s.palette.cursor, s.palette.fg, "光标 = 前景");
+
+        // 只改前景/背景:选区与光标跟着走(不是 DEFAULT 常量)
+        let s = resolve("foreground = #123456\nbackground = #abcdef\n").unwrap();
+        assert_eq!(
+            s.palette.selection_bg,
+            Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56
+            }
+        );
+        assert_eq!(
+            s.palette.selection_fg,
+            Rgb {
+                r: 0xab,
+                g: 0xcd,
+                b: 0xef
+            }
+        );
+        assert_eq!(
+            s.palette.cursor,
+            Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56
+            }
+        );
+
+        // 显式 selection-*/cursor-color:不被派生覆盖
+        let s = resolve(
+            "foreground = #123456\nbackground = #abcdef\nselection-background = #111111\ncursor-color = #222222\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.palette.selection_bg,
+            Rgb {
+                r: 0x11,
+                g: 0x11,
+                b: 0x11
+            }
+        );
+        assert_eq!(
+            s.palette.selection_fg,
+            Rgb {
+                r: 0xab,
+                g: 0xcd,
+                b: 0xef
+            },
+            "未显式的半边仍派生"
+        );
+        assert_eq!(
+            s.palette.cursor,
+            Rgb {
+                r: 0x22,
+                g: 0x22,
+                b: 0x22
+            }
+        );
+    }
+
+    #[test]
+    fn title_locks_and_empty_unlocks() {
+        // Ghostty `title` 同义:设值锁定,置空解除
+        let s = resolve("title = 我的终端").unwrap();
+        assert_eq!(s.title.as_deref(), Some("我的终端"));
+        let s = resolve("title = ").unwrap();
+        assert_eq!(s.title, None, "空值=解除锁定");
     }
 
     #[test]

@@ -2,6 +2,10 @@
 //   (0) [x_px, y_px, u, v]  (1) [w_px, h_px, uw, uvh]
 //   (2) fg.rgb,_            (3) bg.rgb,_
 // 空白格(空格/spacer)uv 尺寸为 0:vs 输出 ink_mask=0,fragment 不采样出墨。
+// 圆角扩展(2026-10 UI 对标):无字形 quad 的 fg/bg alpha 槽复用为
+//   bg.w = 上圆角半径,fg.w = 下圆角半径(px,0=方角);fg.rgb 同时复用为
+//   底衬色——blend:None 下无 alpha 混合,圆角 AA 只能 premix 已知底色。
+// 字形 quad 的 fg 是墨色,不得启用圆角(半径恒 0)。
 const CORNERS = array<vec2f, 6>(
     vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0),
     vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
@@ -9,7 +13,9 @@ const CORNERS = array<vec2f, 6>(
 
 struct Globals {
     viewport: vec2f,
-    _pad: vec2f,
+    /// 图集纹理尺寸(纹素)——UV 归一在 shader 做:实例存纹素坐标,
+    /// 高度追加(页式增长)不改变既有条目的采样位置(2026-10-08)
+    atlas_size: vec2f,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var glyphs: texture_2d<f32>;
@@ -21,6 +27,8 @@ struct VsOut {
     @location(1) fg: vec3f,
     @location(2) bg: vec3f,
     @location(3) ink_mask: f32,
+    @location(4) local: vec2f,
+    @location(5) geo: vec4f,
 };
 
 @vertex
@@ -36,11 +44,30 @@ fn vs(
     let y = pos_uv.y + corner.y * size_uv.y;
     var out: VsOut;
     out.pos = vec4f(x / globals.viewport.x * 2.0 - 1.0, 1.0 - y / globals.viewport.y * 2.0, 0.0, 1.0);
-    out.uv = pos_uv.zw + corner * size_uv.zw;
+    // 半纹素内缩(2026-10-11 接缝修复):采样域从 [0, w] 收到 [0.5, w-0.5]
+    // ——边缘落在纹素中心,LINEAR 采样永不与图集零填充邻格混合。此前的
+    // 边界采样让每格最后一列像素混入 1/10 零墨 = 半亮接缝,块字符艺术
+    // (logo/横线)被切成一块一块(用户截图+逐像素亮度实测定案)
+    let inset = vec2f(0.5);
+    let texel = pos_uv.zw + inset + corner * max(size_uv.zw - 2.0 * inset, vec2f(0.0));
+    out.uv = texel / globals.atlas_size;
     out.fg = fg.rgb;
     out.bg = bg.rgb;
     out.ink_mask = select(0.0, 1.0, size_uv.z > 0.0);
+    out.local = corner * size_uv.xy;
+    out.geo = vec4f(size_uv.x, size_uv.y, bg.w, fg.w);
     return out;
+}
+
+// 圆角矩形 SDF 覆盖率(上下两组半径,取片段所在纵向半区的半径;clamp 防
+// 尺寸小于 2r 的退化)。cov 混底衬与面色 —— premix 即无混合 AA。
+fn rounded_coverage(local: vec2f, size_px: vec2f, r_top: f32, r_bot: f32) -> f32 {
+    let half = size_px * 0.5;
+    var r = select(r_bot, r_top, local.y < size_px.y * 0.5);
+    r = min(r, min(size_px.x, size_px.y) * 0.5);
+    let q = abs(local - half) - (half - vec2f(r));
+    let d = length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    return 1.0 - smoothstep(-0.7, 0.7, d);
 }
 
 // RGBA 图集(D19):灰度字形 texel = (白, coverage) → rgb*fg 染色、a 做 ink,
@@ -48,6 +75,18 @@ fn vs(
 // 实例对彩色字形 fg 填白即得原色——一条公式覆盖两种格式。
 @fragment
 fn fs(inp: VsOut) -> @location(0) vec4f {
+    if (inp.geo.z > 0.0 || inp.geo.w > 0.0) {
+        // fg.w < 0 哨兵 = 未知底衬(悬浮层):圆角外硬 discard——premix AA
+        // 无从谈起,小半径硬边可接受;半径取 bg.w(上下同值)
+        let hard = inp.geo.w < 0.0;
+        let r_bot = select(inp.geo.w, inp.geo.z, hard);
+        let cov = rounded_coverage(inp.local, inp.geo.xy, inp.geo.z, r_bot);
+        if (hard) {
+            if (cov < 0.5) { discard; }
+            return vec4f(inp.bg, 1.0);
+        }
+        return vec4f(mix(inp.fg, inp.bg, cov), 1.0);
+    }
     let tex = textureSample(glyphs, glyph_sampler, inp.uv);
     let ink = tex.a * inp.ink_mask;
     return vec4f(mix(inp.bg, tex.rgb * inp.fg, ink), 1.0);

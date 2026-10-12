@@ -74,7 +74,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - UIA 撤线(1.0.8):深度查询(Narrator/FindAll)稳定触发 native crash(panic/SEH 均接不住,无 dmp)——自定义 provider 走系统 host provider 替代,Narrator 仍可读窗口标题;uia.rs 模块与 COM 闭环测试保留,崩溃根因修复后恢复分派
 - Quick Terminal 的 shell 退出无轮询(主窗 poll_exits 只轮 TABS):QT 里敲 exit 后无 [exit N] 提示、无重开入口——体验欠账(通道断 forwarder 自然退,不挂死)
 - kitty graphics:ConPTY 剥离 APC(M4c 字节级实证,与 2026/OSC 52 同类)——Windows 主路径不可达,不实现;金丝雀测试 `conpty_strips_apc_today_canary` 变红 = 边界移动,重估(预研文档含 M5 立项建议)
-- OSC 133 UI(jump/exit 状态点,M5a):数据层/渲染全绿,但 ConPTY 毁引导符(ESC]→ESC\,载荷文本泄漏、BEL 被吃;OSC 8 是唯一透传例外)——经 ConPTY 不可达,金丝雀 `conpty_strips_osc133_today_canary` 守边界;直连 pty 场景即生效
+- OSC 133(**边界随 OS build 走,2026-10-12 CI 实证修正**):≥26300(客户端实测)**完整透传**——jump/exit 状态点即刻可达;26100(CI Server 2025 实测)仍剥离。金丝雀按 `cmd /c ver` build 号分档断言,任一档翻向=边界移动。OSC 7 透传(新标签目录继承的数据源)
 - 标签溢出滚动:滚轮+活跃自动跟随已落,箭头命中区暂缓(计划偏差注记)
 - 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段);标签 tear-off 砍单(D32)
 - defterm 整体撤除(1.0.2):RRVA 一级注册实测是陷阱——装完即劫持默认终端且无 COM 实现接管,console 程序全弹 0xC0000142。真实现(ITerminalHandoff)完成前不再注册;winget 清单首提待做

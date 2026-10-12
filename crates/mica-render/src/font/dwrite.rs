@@ -59,7 +59,10 @@ pub struct DwriteRouter {
     families: Vec<FamilyFaces>,
     em_size_dip: f32,
     metrics: FontMetrics,
-    atlas: GlyphAtlas,
+    /// 共享图集(Rc<RefCell>):终端路由与 strip UI 字体路由**共写同一
+    /// 图集**——单次 draw 只绑一张纹理的硬约束(2026-10-12 共享图集
+    /// 重构;此前每路由私有一份,strip 换 UI 字体必然两张图集)
+    atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
     /// 图集版本哨兵:grow 会重排搬动全部条目,缓存里的 UV 是按当时尺寸归一的
     last_atlas_version: u64,
     cache: HashMap<(char, u8), GlyphInfo>,
@@ -75,7 +78,6 @@ fn style_bits(s: GlyphStyle) -> u8 {
     u8::from(s.bold) | (u8::from(s.italic) << 1)
 }
 
-/// 全零字形:空白与兜底共用,不进图集。
 fn blank_glyph() -> GlyphInfo {
     GlyphInfo {
         uv: [0.0; 4],
@@ -104,6 +106,25 @@ fn face_with_glyph(font: &IDWriteFont, ch: char) -> Option<(IDWriteFontFace, u16
 }
 
 impl DwriteRouter {
+    /// 共享图集路由(2026-10-12):与既有路由共写同一图集——strip UI
+    /// 字体路由与终端路由的绑定方式;单 draw 单纹理的硬约束
+    pub fn new_with_atlas(
+        font_size_pt: f32,
+        families: &[&str],
+        atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
+    ) -> anyhow::Result<Self> {
+        let mut r = Self::new(font_size_pt, families)?;
+        r.atlas = atlas;
+        // 版本哨兵对齐共享图集当前值(其上已有终端字形——不能误清)
+        r.last_atlas_version = r.atlas.borrow().version();
+        Ok(r)
+    }
+
+    /// 图集句柄(Rc 克隆)——窗口内建兄弟路由用
+    pub fn shared_atlas(&self) -> std::rc::Rc<std::cell::RefCell<GlyphAtlas>> {
+        std::rc::Rc::clone(&self.atlas)
+    }
+
     pub fn new(font_size_pt: f32, families: &[&str]) -> anyhow::Result<Self> {
         // SAFETY: 工厂创建,T 由 turbofish 指定
         let factory = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
@@ -184,7 +205,9 @@ impl DwriteRouter {
             ligatures,
             em_size_dip,
             metrics,
-            atlas: GlyphAtlas::new(256, 256),
+            // 512 固定宽:覆盖 400pt 级极端字形且守卫不触发;行距对齐
+            // 512*4=2048 % 256==0 ✓。页追加式下宽度永不再变(u 稳定)
+            atlas: std::rc::Rc::new(std::cell::RefCell::new(GlyphAtlas::new(512, 512))),
             last_atlas_version: 0,
             cache: HashMap::new(),
             run_cache: HashMap::new(),
@@ -195,14 +218,22 @@ impl DwriteRouter {
         self.metrics
     }
 
-    pub fn atlas(&self) -> &GlyphAtlas {
-        &self.atlas
+    pub fn atlas(&self) -> std::cell::Ref<'_, GlyphAtlas> {
+        self.atlas.borrow()
     }
 
     /// app 每帧比对此修订号,变了才 `Renderer::set_atlas`——内容变更
     /// (普通 insert 或 grow)都得重传,与是否重排无关。
     pub fn atlas_revision(&self) -> u64 {
-        self.atlas.revision()
+        self.atlas.borrow().revision()
+    }
+
+    /// 仅 grow 重排递增——app 侧据此作废行级实例缓存(2026-10-08:
+    /// row_insts 的 UV 是按当时图集布局烘焙的,grow 重排后全表位移,
+    /// 未重建的行 = 画到别人的字形上 = "一块一块/乱码"。新实例测不出
+    /// ——要会话内字符量把图集撑大才触发,claude+omp+精灵必中)
+    pub fn atlas_version(&self) -> u64 {
+        self.atlas.borrow().version()
     }
 
     pub fn families_in_use(&self) -> Vec<String> {
@@ -310,16 +341,13 @@ impl DwriteRouter {
         let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
         let rect = self
             .atlas
+            .borrow_mut()
             .insert(&GlyphBitmap::from_coverage(w, h, coverage));
-        let (aw, ah) = (self.atlas.width() as f32, self.atlas.height() as f32);
         // 字形相对格左上:水平 = bounds.left;垂直 = ascent + bounds.top(top 为负 = 基线上方)
+        // UV = 纹素坐标(2026-10-08 页追加式):shader 用 globals.atlas_size
+        // 归一——高度追加不再改变既有条目的采样位置
         Some(GlyphInfo {
-            uv: [
-                rect.u as f32 / aw,
-                rect.v as f32 / ah,
-                rect.w as f32 / aw,
-                rect.h as f32 / ah,
-            ],
+            uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
             size_px: [w as f32, h as f32],
             offset_px: [bounds.left as f32, self.metrics.ascent + bounds.top as f32],
             color: false,
@@ -386,15 +414,10 @@ impl DwriteRouter {
             let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
             let rect = self
                 .atlas
+                .borrow_mut()
                 .insert(&GlyphBitmap::from_coverage(w as u32, h as u32, coverage));
-            let (aw, ah) = (self.atlas.width() as f32, self.atlas.height() as f32);
             GlyphInfo {
-                uv: [
-                    rect.u as f32 / aw,
-                    rect.v as f32 / ah,
-                    rect.w as f32 / aw,
-                    rect.h as f32 / ah,
-                ],
+                uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
                 size_px: [w as f32, h as f32],
                 offset_px: [bounds.left as f32, self.metrics.ascent + bounds.top as f32],
                 color: false,
@@ -532,15 +555,9 @@ impl DwriteRouter {
             pixels,
             format: GlyphFormat::ColorRgba,
         };
-        let rect = self.atlas.insert(&bmp);
-        let (aw, ah) = (self.atlas.width() as f32, self.atlas.height() as f32);
+        let rect = self.atlas.borrow_mut().insert(&bmp);
         Some(GlyphInfo {
-            uv: [
-                rect.u as f32 / aw,
-                rect.v as f32 / ah,
-                rect.w as f32 / aw,
-                rect.h as f32 / ah,
-            ],
+            uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
             size_px: [uw as f32, uh as f32],
             offset_px: [u.left as f32, self.metrics.ascent + u.top as f32],
             color: true,
@@ -554,6 +571,12 @@ impl GlyphRouter for DwriteRouter {
     /// GlyphInfo(光栅化单 glyph 位图,宽 = cluster 总 advance)。
     fn route_run(&mut self, chars: &[char], style: GlyphStyle) -> Option<Vec<ClusterLayout>> {
         if !self.ligatures || chars.len() < 2 {
+            return None;
+        }
+        // 精灵覆盖的字符不得进 shaping:整形直出字体字形,绕过精灵的
+        // 格子精确几何(Claude logo 的连续块字符段曾整段被吃,渲染成
+        // 空白/未对齐块;逐字路由让精灵与字体字形按字符混排)
+        if chars.iter().any(|&c| crate::font::sprite::covers(c as u32)) {
             return None;
         }
         let key = (chars.to_vec(), style_bits(style));
@@ -632,7 +655,7 @@ impl GlyphRouter for DwriteRouter {
     fn route(&mut self, ch: char, style: GlyphStyle) -> GlyphInfo {
         // 图集 grow 重排后全部条目换了位置,旧缓存的 UV 按当时尺寸归一已失效——
         // 版本号一动即清缓存(本轮新插入本就按当前尺寸计算,不受影响)
-        let version = self.atlas.version();
+        let version = self.atlas.borrow().version();
         if version != self.last_atlas_version {
             self.cache.clear();
             self.last_atlas_version = version;
@@ -641,7 +664,48 @@ impl GlyphRouter for DwriteRouter {
         if let Some(g) = self.cache.get(&key) {
             return *g;
         }
-        let info = self.rasterize(ch, style).unwrap_or_else(blank_glyph);
+        // sprite face(2026-10-07):制表符/方块/几何/盲文/Powerline 程序化
+        // 绘制——精确几何天然无缝,优先于字体(字体墨迹与格子差几像素,
+        // 曾致 TUI 边框"一块一块")。不在精灵范围 → 字体路径
+        if let Some((pw, ph, cov)) =
+            crate::font::sprite::draw(ch as u32, self.metrics.cell_width, self.metrics.line_height)
+        {
+            let bmp = GlyphBitmap::from_coverage(pw, ph, cov);
+            let rect = self.atlas.borrow_mut().insert(&bmp);
+            let info = GlyphInfo {
+                uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
+                size_px: [self.metrics.cell_width, self.metrics.line_height],
+                offset_px: [0.0, 0.0],
+                color: false,
+            };
+            // 契约(GlyphRouter 文档):同 必须命中缓存同值——不入缓
+            // 会每帧重画重插,图集无限膨胀+重排,revision 逐帧变把未脏行
+            // 的缓存 UV 全部作废(乱码)乃至纹理爆掉(黑屏/崩)。
+            // 2026-10-07 sprite 首版漏了这条,真机十分钟翻车
+            self.cache.insert(key, info);
+            return info;
+        }
+        let mut info = self.rasterize(ch, style).unwrap_or_else(blank_glyph);
+        // 制表符/方块元素对齐格子(2026-10-07):字体自带的 ┌(8×14)对
+        // 9.6×21.12 的格竖向差 7px——拐角接不上竖线、UI 呈"一块一块拼"
+        // (用户实测 Claude Code)。终端标准技巧:把这两区字形强拉对齐
+        // 格子——横线宽=格宽、竖线高=格高、拐角/T/十字满格、半块按
+        // 码位定义吸附半格。WT/kitty 同款。
+        // 超宽 PUA 图标收缩(2026-10-07):Nerd 图标(F408 等)的字体墨宽
+        // 是格宽近两倍(其 advance 本为 2 格),而上游码宽表判 PUA 单宽
+        // ——不缩会溢出到邻格被后画字形切碎(用户所见"方格子")。等比
+        // 缩进单格、水平居中。E0B0-E0D4(Powerline 三角/圆帽)除外:
+        // 其墨迹跨格是刻意的桥接设计,缩了反而断缝。
+        // (正解=宽度表按路由字体 advance 判,留 1.1)
+        let cw = self.metrics.cell_width;
+        let is_bridge = matches!(ch, '\u{E0B0}'..='\u{E0D4}');
+        if !is_bridge && ('\u{E000}'..='\u{F8FF}').contains(&ch) && info.size_px[0] > cw * 1.3 {
+            let scale = cw / info.size_px[0];
+            let new_h = info.size_px[1] * scale;
+            info.offset_px[0] += (info.size_px[0] - cw) / 2.0;
+            info.offset_px[1] += (info.size_px[1] - new_h) / 2.0;
+            info.size_px = [cw, new_h];
+        }
         self.cache.insert(key, info);
         info
     }
@@ -777,6 +841,21 @@ fn shape_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// sprite 契约锁(2026-10-07 翻车复盘):同 字形路由必须缓存命中
+    /// ——重复 route 的 revision 不得再变(否则图集逐帧膨胀+重排,未脏行
+    /// 缓存 UV 全作废 = 部分乱码乃至黑屏崩)
+    #[test]
+    fn sprite_routes_are_cached() {
+        let mut r = DwriteRouter::new(12.0, &["JetBrains Mono", "Cascadia Mono"]).unwrap();
+        let rev1 = r.atlas_revision();
+        let a = r.route('\u{2500}', crate::font::GlyphStyle::PLAIN);
+        let rev2 = r.atlas_revision();
+        let b = r.route('\u{2500}', crate::font::GlyphStyle::PLAIN);
+        let rev3 = r.atlas_revision();
+        assert_eq!(a, b, "同字符两次路由同值");
+        assert!(rev2 > rev1, "首次路由应插图集");
+        assert_eq!(rev2, rev3, "重复路由必须命中缓存,不得再插图集");
+    }
 
     /// 真机回归锁:光栅化链必须产出有墨字形。曾经 ALIASED_1x1 纹理配
     /// NATURAL_SYMMETRIC 模式 bounds 恒空,每字符都落空白兜底——

@@ -31,6 +31,14 @@ impl IpcMessage {
         Self::new_tab_with(profile, None)
     }
 
+    /// 新建独立窗口(2026-10-12):既有实例起第二个窗口。
+    pub fn new_window() -> Self {
+        Self {
+            op: "new-window".into(),
+            ..Self::activate()
+        }
+    }
+
     /// T9:new-tab 带字号覆盖(`mica new-tab [profile] --font-size N`)。
     pub fn new_tab_with(profile: Option<String>, font_size: Option<f32>) -> Self {
         Self {

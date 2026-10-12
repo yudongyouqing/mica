@@ -18,6 +18,45 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 /// 光标样式直通(DECSCUSR 承载;vte 枚举含 HollowBlock 等变体,
 /// 消费方按 Block/Underline/Beam 三类归一)。
 pub use alacritty_terminal::vte::ansi::CursorShape;
+
+/// OSC 7 `file://host/path` → 本机路径(宽容:剥 scheme/authority、
+/// 百分号解码;Windows 盘符形如 file:///C:/Users 或 file://host/C:/)
+fn osc7_to_path(url: &str) -> String {
+    let rest = url.strip_prefix("file://").unwrap_or(url);
+    // 剥 authority(到第一个 '/';无 authority(///)则空)
+    let path = match rest.find('/') {
+        Some(0) => rest,
+        Some(i) => &rest[i + 1..],
+        None => rest,
+    };
+    let mut out = String::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(v as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// 鼠标上报模式(DECSET 1000/1002/1003,2026-10-07 补课):Off = 本地
+/// 交互(选择/滚回);Click = 仅按压上报;Drag = 按压+拖动;Motion = 全
+/// 上报。SGR 与否(DECSET 1006)另行查询——编码在 mica_core::input。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseMode {
+    Off,
+    Click,
+    Drag,
+    Motion,
+}
 pub use alacritty_terminal::vte::ansi::CursorStyle;
 use alacritty_terminal::vte::ansi::Processor;
 
@@ -154,6 +193,8 @@ pub struct Surface {
     sidecar: crate::protocol::sidecar::SidecarParser,
     /// 最近一次 feed 是否处于同步输出窗口(2026h..2026l),app 据此持帧。
     sync_output: bool,
+    /// OSC 7 上报的当前目录(2026-10-07;None = 应用从未广播)。
+    cwd: Option<String>,
     /// OSC 133 行属性表(D37):持久累积,超 `MAX_MARKS` 淘汰最旧。
     marks: Vec<MarkRecord>,
     /// jump 锚(D37):上次 jump_prompt 的目标(行 + epoch);手动滚动即重置。
@@ -204,6 +245,7 @@ impl Surface {
             size,
             has_drawn: false,
             sidecar: crate::protocol::sidecar::SidecarParser::new(),
+            cwd: None,
             sync_output: false,
             marks: Vec::new(),
             jump_ref: None,
@@ -217,6 +259,13 @@ impl Surface {
         let events = self.sidecar.scan(bytes);
         if events.sync_begin > 0 {
             self.sync_output = true;
+        }
+        if let Some(url) = events.cwd {
+            let path = osc7_to_path(&url);
+            if std::env::var_os("MICA_DEBUG_CWD").is_some() {
+                eprintln!("[osc7] cwd <- {path}");
+            }
+            self.cwd = Some(path);
         }
         if events.sync_end > 0 {
             // 幂等:end 在超时后到(HELD 已 false)只画不重置(D29 竞态缓解)。
@@ -514,6 +563,32 @@ impl Surface {
     }
 
     /// 选区文本(上游拼接,含 wrap 语义)。
+    /// OSC 7 上报的工作目录(新标签继承用;None = 未广播)
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    /// 应用是否捕获鼠标(见 MouseMode;Shift 绕过由 app 层处理)
+    pub fn mouse_mode(&self) -> MouseMode {
+        use alacritty_terminal::term::TermMode;
+        let m = self.term.mode();
+        if m.contains(TermMode::MOUSE_MOTION) {
+            MouseMode::Motion
+        } else if m.contains(TermMode::MOUSE_DRAG) {
+            MouseMode::Drag
+        } else if m.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseMode::Click
+        } else {
+            MouseMode::Off
+        }
+    }
+
+    /// SGR 鼠标编码(DECSET 1006);false = legacy X10
+    pub fn mouse_sgr(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
     pub fn selection_text(&self) -> Option<String> {
         self.term.selection_to_string()
     }
@@ -651,13 +726,47 @@ mod tests {
     }
 
     #[test]
+    fn mouse_mode_maps_decset_bits() {
+        let mut s = Surface::new(ScreenSize::new(10, 3));
+        assert_eq!(s.mouse_mode(), MouseMode::Off);
+        s.feed(b"[?1002;1006h");
+        assert_eq!(s.mouse_mode(), MouseMode::Drag);
+        assert!(s.mouse_sgr(), "1006 = SGR");
+        s.feed(b"[?1003h[?1002l");
+        assert_eq!(s.mouse_mode(), MouseMode::Motion);
+        s.feed(b"[?1000l[?1003l[?1006l");
+        assert_eq!(s.mouse_mode(), MouseMode::Off);
+        assert!(!s.mouse_sgr());
+    }
+
+    #[test]
+    fn truecolor_bg_reaches_grid() {
+        // 连续真彩 SGR:fg(38;2) 后 bg(48;2) 是否丢(claude logo 形态)
+        let cases: Vec<(&str, bool)> = vec![
+            ("\x1b[38;2;215;119;87m\x1b[48;2;0;0;0m ", true), // 两条分开
+            ("\x1b[38;2;215;119;87;48;2;0;0;0m ", true),      // 同一条合并
+            ("\x1b[38;5;196m\x1b[48;2;0;0;0m ", true),        // 256色fg + 真彩bg
+            ("\x1b[48;2;0;0;0m ", true),                      // 裸 bg(对照,已知过)
+        ];
+        for (seq, want_bg) in cases {
+            let mut s = Surface::new(ScreenSize::new(20, 4));
+            s.feed(seq.as_bytes());
+            let c = &s.grid()[Line(0)][Column(0)];
+            let ok = matches!(c.bg, alacritty_terminal::vte::ansi::Color::Spec(_));
+            println!("{seq:?} -> bg={:?} (want_bg={want_bg})", c.bg);
+            assert_eq!(ok, want_bg, "{seq:?}");
+        }
+    }
+
+    #[test]
     fn color_request_default_answers_fg_and_bg() {
         let mut s = Surface::new(ScreenSize::new(10, 3));
-        // 256=前景(白)、257=背景(#1e1e1e)——M0 全答白是欠账,现在按 palette 分流
+        // 256=前景(白)、257=背景(#282c34,Ghostty 官方默认)——M0 全答白是
+        // 欠账,现在按 palette 分流
         s.proxy.send_event(Event::ColorRequest(256, fmt_rgb()));
         assert_eq!(s.take_pty_writes(), vec!["ffffff".to_string()]);
         s.proxy.send_event(Event::ColorRequest(257, fmt_rgb()));
-        assert_eq!(s.take_pty_writes(), vec!["1e1e1e".to_string()]);
+        assert_eq!(s.take_pty_writes(), vec!["282c34".to_string()]);
     }
 
     #[test]

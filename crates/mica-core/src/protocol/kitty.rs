@@ -48,26 +48,6 @@ impl KittyFlags {
 /// 功能键 keysym 常量(kitty 协议 functional 编号)。
 /// Key::Grave 不在其中——反引号是可打印字符,走 WM_CHAR 文本路径,
 /// kitty 协议下同样不发编码序列(除非 all-keys,M4a 不扩 Key 枚举)。
-fn functional_keysym(key: Key) -> Option<u32> {
-    Some(match key {
-        Key::Escape => 27,
-        Key::Enter => 13,
-        Key::Tab => 9,
-        Key::Backspace => 127,
-        Key::Up => 57344,
-        Key::Down => 57345,
-        Key::Right => 57346,
-        Key::Left => 57347,
-        Key::Home => 57348,
-        Key::End => 57349,
-        Key::PageUp => 57350,
-        Key::PageDown => 57351,
-        Key::Delete => 57363,
-        // 可打印字符(反引号)走 WM_CHAR 文本路径,协议编码不覆盖
-        Key::Grave => return None,
-    })
-}
-
 /// 修饰参数位:kitty = 1 + shift + alt*2 + ctrl*4 + super*8。
 fn kitty_mods(mods: Mods) -> u32 {
     1 + u32::from(mods.shift)
@@ -83,28 +63,47 @@ pub fn kitty_encode(key: Key, mods: Mods, kind: EventKind, flags: KittyFlags) ->
     if !flags.contains(KittyFlags::REPORT_EVENT_TYPES) && !matches!(kind, EventKind::Press) {
         return None;
     }
-    // None(可打印字符如 Grave)走 WM_CHAR 文本路径,不在此编码
-    let code = functional_keysym(key)?;
     // 功能键在 disambiguate 任一形态开启时编码;全关时功能键本来就不歧义
     // (legacy CSI 序列已覆盖),回 None。
     if !flags.disambiguate() {
         return None;
     }
     let m = kitty_mods(mods);
-    let mut seq = format!("\x1b[{code}:{m}").into_bytes();
+    // kitty 规范的 legacy 功能键形态:箭头/Home/End 用字母终结符
+    // (CSI 1;m A/B/C/D/H/F),PgUp/Ins/Del 族用 CSI n;m~,Enter/Tab/
+    // Backspace/Escape(unicode 码位键)用 CSI n;m u。修饰位分号连接、
+    // 事件类型冒号连接且在终结符前。57344+ 的 PUA 码是应答身份码,
+    // 不是编码形态——曾误用 ESC[57344:1u,Claude Code 这类严格 kitty
+    // 解析器整类丢弃(方向键全失灵,2026-10-07 实测修复)
+    let (params, tail): (u32, &str) = match key {
+        Key::Up => (1, "A"),
+        Key::Down => (1, "B"),
+        Key::Right => (1, "C"),
+        Key::Left => (1, "D"),
+        Key::Home => (1, "H"),
+        Key::End => (1, "F"),
+        Key::PageUp => (5, "~"),
+        Key::PageDown => (6, "~"),
+        Key::Delete => (3, "~"),
+        Key::Escape => (27, "u"),
+        Key::Enter => (13, "u"),
+        Key::Tab => (9, "u"),
+        Key::Backspace => (127, "u"),
+        // 可打印字符(反引号)走 WM_CHAR 文本路径,协议编码不覆盖
+        Key::Grave => return None,
+    };
+    let mut seq = format!("\x1b[{params};{m}");
     if flags.contains(KittyFlags::REPORT_EVENT_TYPES) {
         let et = match kind {
             EventKind::Press => 1,
             EventKind::Repeat => 2,
             EventKind::Release => 3,
         };
-        seq.extend_from_slice(format!(":{et}").as_bytes());
+        seq.push_str(&format!(":{et}"));
     }
-    // 功能键无 associated text(协议:文本仅与 unicode keycode 同发)
-    seq.extend_from_slice(b"u");
-    Some(seq)
+    seq.push_str(tail);
+    Some(seq.into_bytes())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,7 +146,7 @@ mod tests {
     fn disambiguate_encodes_functional_press() {
         assert_eq!(
             kitty_encode(Key::Up, plain(), EventKind::Press, KittyFlags::DISAMBIGUATE),
-            Some(b"\x1b[57344:1u".to_vec())
+            Some(b"\x1b[1;1A".to_vec())
         );
     }
 
@@ -160,7 +159,7 @@ mod tests {
                 EventKind::Press,
                 KittyFlags::DISAMBIGUATE
             ),
-            Some(b"\x1b[57346:5u".to_vec()),
+            Some(b"\x1b[1;5C".to_vec()),
             "ctrl = 1+4"
         );
         assert_eq!(
@@ -170,7 +169,7 @@ mod tests {
                 EventKind::Press,
                 KittyFlags::DISAMBIGUATE
             ),
-            Some(b"\x1b[57347:6u".to_vec()),
+            Some(b"\x1b[1;6D".to_vec()),
             "shift+ctrl = 1+1+4"
         );
     }
@@ -183,7 +182,7 @@ mod tests {
         };
         assert_eq!(
             kitty_encode(Key::Up, mods, EventKind::Press, KittyFlags::DISAMBIGUATE),
-            Some(b"\x1b[57344:9u".to_vec()),
+            Some(b"\x1b[1;9A".to_vec()),
             "super = 1+8"
         );
     }
@@ -207,7 +206,7 @@ mod tests {
                 EventKind::Release,
                 KittyFlags(1 << 18 | 1 << 19)
             ),
-            Some(b"\x1b[57344:1:3u".to_vec())
+            Some(b"\x1b[1;1:3A".to_vec())
         );
         assert_eq!(
             kitty_encode(
@@ -216,7 +215,7 @@ mod tests {
                 EventKind::Repeat,
                 KittyFlags(1 << 18 | 1 << 19)
             ),
-            Some(b"\x1b[57345:1:2u".to_vec()),
+            Some(b"\x1b[1;1:2B".to_vec()),
             "repeat 同门(编码还需 disambiguate 路由)"
         );
     }
@@ -230,7 +229,7 @@ mod tests {
                 EventKind::Press,
                 KittyFlags::ALL_KEYS_AS_ESC
             ),
-            Some(b"\x1b[13:1u".to_vec())
+            Some(b"\x1b[13;1u".to_vec())
         );
     }
 

@@ -38,6 +38,9 @@ struct QtState {
     config: wgpu::SurfaceConfiguration,
     /// 输入辅助:QT 窗口自己的代理对暂存(与主窗共用 TLS 会串号,故本地)
     pending_surrogate: u32,
+    /// QT renderer 装载的图集修订号(单 pane 独占窗口,无跨标签共享——
+    /// 主窗的窗口级所有权方案见 WindowGpu::atlas_owner)
+    atlas_revision: u64,
 }
 
 thread_local! {
@@ -92,6 +95,19 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         None,
     )
     .expect("CreateWindowExW (quick terminal)");
+    // 圆角(Win11 DWM,与主窗同款;下拉面板圆角是 Ghostty QT 观感)
+    {
+        let corner: i32 = windows::Win32::Graphics::Dwm::DWMWCP_ROUND.0;
+        // SAFETY: 属性设置,失败静默(老系统无此属性)
+        unsafe {
+            let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                hwnd_qt,
+                windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
+                &corner as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+    }
     QT_HWND.with(|c| c.set(hwnd_qt.0 as usize));
 
     // 热键:Win+`(可配;失败记日志,QT 仍可用 IPC 激活留 M3c)
@@ -103,6 +119,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 
     // QT 终端状态:复用 TAB_SEED/CURRENT_PALETTE 建字体与 pty
     let (families, size_pt) = crate::app::tab_seed();
+    let size_pt = crate::app::scaled_pt(size_pt); // 字号随 DPI(与主窗单源)
     let fam_ref: Vec<&str> = families.iter().map(String::as_str).collect();
     let Ok(router) = DwriteRouter::new(size_pt, &fam_ref) else {
         eprintln!("quickterm: 字体链失败,QT 禁用");
@@ -176,11 +193,12 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         palette,
         cols,
         rows,
-        renderer_atlas_revision: u64::MAX,
         row_insts: Vec::new(),
         force_full: true,
         shell: "powershell.exe -NoLogo".into(),
         exited: None,
+        strip_router: None,
+        last_atlas_ver: 0,
     };
     QT.with(|q| {
         *q.borrow_mut() = Some(QtState {
@@ -189,6 +207,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
             wgpu_surface,
             config,
             pending_surrogate: 0,
+            atlas_revision: u64::MAX,
         })
     });
 
@@ -405,9 +424,9 @@ fn qt_draw(st: &mut QtState) {
     );
     let revision = t.router.atlas_revision();
     let atlas = t.router.atlas();
-    if t.renderer_atlas_revision != revision {
-        st.renderer.set_atlas(atlas);
-        t.renderer_atlas_revision = revision;
+    if st.atlas_revision != revision {
+        st.renderer.set_atlas(&atlas);
+        st.atlas_revision = revision;
     }
     let instances = repack(&t.row_insts);
     st.renderer.draw(&st.wgpu_surface, &st.config, &instances);
