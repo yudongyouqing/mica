@@ -90,6 +90,9 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
     err.parse = parse_errors;
 
     let mut settings = Settings::default();
+    // 选区/光标是否被任何层显式设置(theme 或用户);[0]=selection-fg
+    // [1]=selection-bg [2]=cursor——缺省派生(见尾部)不覆盖显式值
+    let mut explicit = [false; 3];
 
     // theme 片段在用户片段之前应用:用户键可以覆盖主题同名键
     let theme_name = user_pairs
@@ -102,12 +105,25 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
             Ok(source) => {
                 let (pairs, theme_errors) = parse::parse(&source);
                 err.parse.extend(theme_errors);
-                apply_pairs(&mut settings, pairs, &mut err);
+                apply_pairs(&mut settings, pairs, &mut err, &mut explicit);
             }
             Err(reason) => err.values.push(reason),
         }
     }
-    apply_pairs(&mut settings, user_pairs, &mut err);
+    apply_pairs(&mut settings, user_pairs, &mut err, &mut explicit);
+
+    // Ghostty 缺省语义(上游 renderer/generic.zig 实证):selection/cursor
+    // 未显式配置时**动态互换/跟前景**——选区底 = 前景、选区字 = 背景、
+    // 光标 = 前景。不是常量:用户只改 foreground 时选区光标随之走
+    if !explicit[0] {
+        settings.palette.selection_fg = settings.palette.bg;
+    }
+    if !explicit[1] {
+        settings.palette.selection_bg = settings.palette.fg;
+    }
+    if !explicit[2] {
+        settings.palette.cursor = settings.palette.fg;
+    }
 
     if err.is_empty() {
         Ok(settings)
@@ -116,9 +132,15 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
     }
 }
 
-/// 键集分派:font-family 追加、font-size 限幅、色键走 Palette;
-/// 未知键(含 selection-*/cursor-text,M2 接)静默跳过——Ghostty 同款容忍。
-fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut ConfigError) {
+/// 键集分派:font-family 追加、font-size 限幅、色键(含 selection-*)走
+/// Palette;未知键(含 cursor-text——块光标反色绘制已等价)静默跳过
+/// ——Ghostty 同款容忍。explicit 记录选区/光标是否显式设置(缺省派生用)。
+fn apply_pairs(
+    settings: &mut Settings,
+    pairs: Vec<(String, String)>,
+    err: &mut ConfigError,
+    explicit: &mut [bool; 3],
+) {
     // 首个显式 font-family 重置默认链(Ghostty 配置语义:显式键覆盖默认值),
     // 之后的声明追加
     let mut family_declared = false;
@@ -189,6 +211,16 @@ fn apply_pairs(settings: &mut Settings, pairs: Vec<(String, String)>, err: &mut 
                 if let Err(reason) = settings.palette.apply_pair(&key, &value) {
                     err.values.push(format!("{key}: {reason}"));
                 }
+                if key == "cursor-color" {
+                    explicit[2] = true;
+                }
+            }
+            "selection-foreground" | "selection-background" => {
+                if let Err(reason) = settings.palette.apply_pair(&key, &value) {
+                    err.values.push(format!("{key}: {reason}"));
+                }
+                let slot = if key == "selection-background" { 1 } else { 0 };
+                explicit[slot] = true;
             }
             _ => {}
         }
@@ -213,6 +245,75 @@ mod tests {
         assert_eq!(s.theme_name.as_deref(), Some("Dracula"));
         assert_eq!(s.palette.bg.r, 0x00, "用户 background 覆盖主题");
         assert_eq!(s.palette.colors[1].r, 0xff, "palette 槽来自主题(#ff5555)");
+    }
+
+    /// Ghostty 缺省选区/光标语义(上游 generic.zig):未显式配置时
+    /// 选区 = 前景/背景互换、光标 = 前景——动态跟随,非常量
+    #[test]
+    fn selection_and_cursor_follow_fg_bg_when_unset() {
+        use alacritty_terminal::vte::ansi::Rgb;
+        let s = resolve("").unwrap();
+        assert_eq!(s.palette.selection_bg, s.palette.fg, "选区底 = 前景");
+        assert_eq!(s.palette.selection_fg, s.palette.bg, "选区字 = 背景");
+        assert_eq!(s.palette.cursor, s.palette.fg, "光标 = 前景");
+
+        // 只改前景/背景:选区与光标跟着走(不是 DEFAULT 常量)
+        let s = resolve("foreground = #123456\nbackground = #abcdef\n").unwrap();
+        assert_eq!(
+            s.palette.selection_bg,
+            Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56
+            }
+        );
+        assert_eq!(
+            s.palette.selection_fg,
+            Rgb {
+                r: 0xab,
+                g: 0xcd,
+                b: 0xef
+            }
+        );
+        assert_eq!(
+            s.palette.cursor,
+            Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56
+            }
+        );
+
+        // 显式 selection-*/cursor-color:不被派生覆盖
+        let s = resolve(
+            "foreground = #123456\nbackground = #abcdef\nselection-background = #111111\ncursor-color = #222222\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.palette.selection_bg,
+            Rgb {
+                r: 0x11,
+                g: 0x11,
+                b: 0x11
+            }
+        );
+        assert_eq!(
+            s.palette.selection_fg,
+            Rgb {
+                r: 0xab,
+                g: 0xcd,
+                b: 0xef
+            },
+            "未显式的半边仍派生"
+        );
+        assert_eq!(
+            s.palette.cursor,
+            Rgb {
+                r: 0x22,
+                g: 0x22,
+                b: 0x22
+            }
+        );
     }
 
     #[test]

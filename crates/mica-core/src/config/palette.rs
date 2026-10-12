@@ -27,8 +27,10 @@ impl Default for Palette {
 
 impl Palette {
     /// Ghostty 官方默认(上游 src/terminal/color.zig Name.default + Config 默认:
-    /// Tomorrow 系 16 色 + #282C34 底 + 纯白前景 + 白光标)——UI 对标
-    /// Ghostty 的基准观感;无主题无用户配置时与官方截图一致。
+    /// Tomorrow 系 16 色 + #282C34 底 + 纯白前景 + 白光标;选区 = 前景/
+    /// 背景互换,上游 generic.zig "selection background is our foreground"
+    /// 实证)——UI 对标 Ghostty 的基准观感;无主题无用户配置时与官方一致。
+    /// 未显式配置时的动态互换/跟前景语义在 settings::resolve 收尾派生。
     pub const DEFAULT: Self = Self {
         colors: [
             Rgb {
@@ -133,9 +135,9 @@ impl Palette {
             b: 0x34,
         },
         selection_bg: Rgb {
-            r: 0xc5,
-            g: 0xc8,
-            b: 0xc6,
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
         },
     };
 
@@ -254,6 +256,9 @@ mod tests {
             },
             "white 槽(strip 次级字色)"
         );
+        // 选区 = 前景/背景互换(上游 generic.zig null-selection 语义)
+        assert_eq!(p.selection_bg, p.fg, "选区底 = 前景");
+        assert_eq!(p.selection_fg, p.bg, "选区字 = 背景");
     }
 
     #[test]
