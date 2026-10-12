@@ -2909,11 +2909,12 @@ fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
     let k = sm.h / mica_render::frame::STRIP_H_BASE;
     let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
     let local = px.max(0) as f32 + shift;
-    // 条首 "+" 区
-    if local >= 6.0 * k && local < 6.0 * k + sm.plus_w {
+    let tabs_x0 = 6.0 * k;
+    // "+" 在标签尾:落在 [n*(w+gap), ...plus_w) = 加号区
+    let tabs_end = tabs_x0 + n as f32 * (w + sm.tab_gap) + 2.0 * k;
+    if local >= tabs_end && local < tabs_end + sm.plus_w {
         return Some(None);
     }
-    let tabs_x0 = 6.0 * k + sm.plus_w + 2.0 * k;
     let idx = ((local - tabs_x0) / w).floor();
     if idx >= 0.0 && (idx as usize) < n {
         Some(Some(idx as usize))

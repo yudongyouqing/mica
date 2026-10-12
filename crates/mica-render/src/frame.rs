@@ -436,42 +436,6 @@ pub fn strip_quads(
             });
         }
     } else {
-        // "+" 按钮在条首(Ghostty window.blp:SplitButton 挂 [start] 盒;
-        // 2026-10-12 二稿,首稿放标签尾部与上游相悖)
-        {
-            let x = 6.0 * k - shift;
-            if !(x + sm.plus_w <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
-                let hovered = hover.plus;
-                let face = mix(bar, white, 0.06);
-                let (glyph_bg, ink) = if hovered { (face, dim) } else { (bar, dim) };
-                if hovered {
-                    // 圆钮(Tahoe "+" 是圆形按钮)
-                    let d = sm.h - 4.0 * k;
-                    let r = d / 2.0;
-                    out.push(rounded(
-                        x + (sm.plus_w - d) / 2.0,
-                        2.0 * k,
-                        d,
-                        d,
-                        face,
-                        bar,
-                        (r, r),
-                    ));
-                }
-                let g = router.route('+', GlyphStyle::PLAIN);
-                out.push(CellInstance {
-                    pos_uv: [
-                        x + (sm.plus_w - g.size_px[0]) / 2.0,
-                        text_y + g.offset_px[1],
-                        g.uv[0],
-                        g.uv[1],
-                    ],
-                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                    fg: bg_of(ink),
-                    bg: bg_of(glyph_bg),
-                });
-            }
-        }
         // 均分等宽标签(gtk-wide-tabs 默认;avail 由 layout 传,0 = 不裁)
         let w = equal_tab_w(titles.len(), layout.avail_w, sm);
         let mut x = 6.0 * k + sm.plus_w + 2.0 * k - shift;
@@ -482,9 +446,9 @@ pub fn strip_quads(
                 continue; // 滚出可视区的标签不发射
             }
             let hovered = hover.tab == Some(i);
-            let hover_face = mix(bar, white, 0.06);
+            let hover_face = mix(bar, white, 0.04);
             let (backdrop, ink) = if *active {
-                (bg3, white)
+                (mix(bg3, white, 0.08), white)
             } else if hovered {
                 (hover_face, dim)
             } else {
@@ -554,6 +518,42 @@ pub fn strip_quads(
                         bg: bg_of(backdrop),
                     });
                 }
+            }
+        }
+        // "+" 在标签后(Windows/macOS 通用布局:Chrome/WT/Tahoe;
+        // 二稿曾放条首系 GTK 专属,用户参照非 GTK,三稿移回)
+        {
+            let x_end = 6.0 * k + titles.len() as f32 * (w + sm.tab_gap);
+            let x = x_end + 2.0 * k - shift;
+            if !(x + sm.plus_w <= 0.0 || (layout.avail_w > 0.0 && x >= layout.avail_w)) {
+                let hovered = hover.plus;
+                let face = mix(bar, white, 0.04);
+                let (glyph_bg, ink) = if hovered { (face, dim) } else { (bar, dim) };
+                if hovered {
+                    let d = sm.h - 4.0 * k;
+                    let r = d / 2.0;
+                    out.push(rounded(
+                        x + (sm.plus_w - d) / 2.0,
+                        2.0 * k,
+                        d,
+                        d,
+                        face,
+                        bar,
+                        (r, r),
+                    ));
+                }
+                let g = router.route('+', GlyphStyle::PLAIN);
+                out.push(CellInstance {
+                    pos_uv: [
+                        x + (sm.plus_w - g.size_px[0]) / 2.0,
+                        text_y + g.offset_px[1],
+                        g.uv[0],
+                        g.uv[1],
+                    ],
+                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                    fg: bg_of(ink),
+                    bg: bg_of(glyph_bg),
+                });
             }
         }
     }
