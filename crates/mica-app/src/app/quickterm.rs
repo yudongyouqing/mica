@@ -197,6 +197,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         force_full: true,
         shell: "powershell.exe -NoLogo".into(),
         exited: None,
+        strip_router: None,
         last_atlas_ver: 0,
     };
     QT.with(|q| {
@@ -424,7 +425,7 @@ fn qt_draw(st: &mut QtState) {
     let revision = t.router.atlas_revision();
     let atlas = t.router.atlas();
     if st.atlas_revision != revision {
-        st.renderer.set_atlas(atlas);
+        st.renderer.set_atlas(&atlas);
         st.atlas_revision = revision;
     }
     let instances = repack(&t.row_insts);

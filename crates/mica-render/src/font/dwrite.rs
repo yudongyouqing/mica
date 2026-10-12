@@ -59,7 +59,10 @@ pub struct DwriteRouter {
     families: Vec<FamilyFaces>,
     em_size_dip: f32,
     metrics: FontMetrics,
-    atlas: GlyphAtlas,
+    /// 共享图集(Rc<RefCell>):终端路由与 strip UI 字体路由**共写同一
+    /// 图集**——单次 draw 只绑一张纹理的硬约束(2026-10-12 共享图集
+    /// 重构;此前每路由私有一份,strip 换 UI 字体必然两张图集)
+    atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
     /// 图集版本哨兵:grow 会重排搬动全部条目,缓存里的 UV 是按当时尺寸归一的
     last_atlas_version: u64,
     cache: HashMap<(char, u8), GlyphInfo>,
@@ -103,6 +106,25 @@ fn face_with_glyph(font: &IDWriteFont, ch: char) -> Option<(IDWriteFontFace, u16
 }
 
 impl DwriteRouter {
+    /// 共享图集路由(2026-10-12):与既有路由共写同一图集——strip UI
+    /// 字体路由与终端路由的绑定方式;单 draw 单纹理的硬约束
+    pub fn new_with_atlas(
+        font_size_pt: f32,
+        families: &[&str],
+        atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
+    ) -> anyhow::Result<Self> {
+        let mut r = Self::new(font_size_pt, families)?;
+        r.atlas = atlas;
+        // 版本哨兵对齐共享图集当前值(其上已有终端字形——不能误清)
+        r.last_atlas_version = r.atlas.borrow().version();
+        Ok(r)
+    }
+
+    /// 图集句柄(Rc 克隆)——窗口内建兄弟路由用
+    pub fn shared_atlas(&self) -> std::rc::Rc<std::cell::RefCell<GlyphAtlas>> {
+        std::rc::Rc::clone(&self.atlas)
+    }
+
     pub fn new(font_size_pt: f32, families: &[&str]) -> anyhow::Result<Self> {
         // SAFETY: 工厂创建,T 由 turbofish 指定
         let factory = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
@@ -185,7 +207,7 @@ impl DwriteRouter {
             metrics,
             // 512 固定宽:覆盖 400pt 级极端字形且守卫不触发;行距对齐
             // 512*4=2048 % 256==0 ✓。页追加式下宽度永不再变(u 稳定)
-            atlas: GlyphAtlas::new(512, 512),
+            atlas: std::rc::Rc::new(std::cell::RefCell::new(GlyphAtlas::new(512, 512))),
             last_atlas_version: 0,
             cache: HashMap::new(),
             run_cache: HashMap::new(),
@@ -196,14 +218,14 @@ impl DwriteRouter {
         self.metrics
     }
 
-    pub fn atlas(&self) -> &GlyphAtlas {
-        &self.atlas
+    pub fn atlas(&self) -> std::cell::Ref<'_, GlyphAtlas> {
+        self.atlas.borrow()
     }
 
     /// app 每帧比对此修订号,变了才 `Renderer::set_atlas`——内容变更
     /// (普通 insert 或 grow)都得重传,与是否重排无关。
     pub fn atlas_revision(&self) -> u64 {
-        self.atlas.revision()
+        self.atlas.borrow().revision()
     }
 
     /// 仅 grow 重排递增——app 侧据此作废行级实例缓存(2026-10-08:
@@ -211,7 +233,7 @@ impl DwriteRouter {
     /// 未重建的行 = 画到别人的字形上 = "一块一块/乱码"。新实例测不出
     /// ——要会话内字符量把图集撑大才触发,claude+omp+精灵必中)
     pub fn atlas_version(&self) -> u64 {
-        self.atlas.version()
+        self.atlas.borrow().version()
     }
 
     pub fn families_in_use(&self) -> Vec<String> {
@@ -319,6 +341,7 @@ impl DwriteRouter {
         let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
         let rect = self
             .atlas
+            .borrow_mut()
             .insert(&GlyphBitmap::from_coverage(w, h, coverage));
         // 字形相对格左上:水平 = bounds.left;垂直 = ascent + bounds.top(top 为负 = 基线上方)
         // UV = 纹素坐标(2026-10-08 页追加式):shader 用 globals.atlas_size
@@ -391,6 +414,7 @@ impl DwriteRouter {
             let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
             let rect = self
                 .atlas
+                .borrow_mut()
                 .insert(&GlyphBitmap::from_coverage(w as u32, h as u32, coverage));
             GlyphInfo {
                 uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
@@ -531,7 +555,7 @@ impl DwriteRouter {
             pixels,
             format: GlyphFormat::ColorRgba,
         };
-        let rect = self.atlas.insert(&bmp);
+        let rect = self.atlas.borrow_mut().insert(&bmp);
         Some(GlyphInfo {
             uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
             size_px: [uw as f32, uh as f32],
@@ -631,7 +655,7 @@ impl GlyphRouter for DwriteRouter {
     fn route(&mut self, ch: char, style: GlyphStyle) -> GlyphInfo {
         // 图集 grow 重排后全部条目换了位置,旧缓存的 UV 按当时尺寸归一已失效——
         // 版本号一动即清缓存(本轮新插入本就按当前尺寸计算,不受影响)
-        let version = self.atlas.version();
+        let version = self.atlas.borrow().version();
         if version != self.last_atlas_version {
             self.cache.clear();
             self.last_atlas_version = version;
@@ -647,7 +671,7 @@ impl GlyphRouter for DwriteRouter {
             crate::font::sprite::draw(ch as u32, self.metrics.cell_width, self.metrics.line_height)
         {
             let bmp = GlyphBitmap::from_coverage(pw, ph, cov);
-            let rect = self.atlas.insert(&bmp);
+            let rect = self.atlas.borrow_mut().insert(&bmp);
             let info = GlyphInfo {
                 uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
                 size_px: [self.metrics.cell_width, self.metrics.line_height],

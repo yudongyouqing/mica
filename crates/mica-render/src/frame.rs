@@ -205,6 +205,8 @@ pub fn build_instances(
 /// 按 DPI 缩放——物理常量在 150% 屏上不缩放,曾致条高/×/内边距与 150%
 /// 字体错位且视觉偏小(2026-10-06 用户实测)。app 层 hit-test 同源取值。
 pub const STRIP_H_BASE: f32 = 36.0;
+/// strip 比例字距(UI 字体无格宽,墨宽 + 追字距;2026-10-12 UI 字体重构)
+pub const STRIP_TRACKING: f32 = 0.7;
 /// 单标签宽与 "+" 按钮宽基准。
 pub const TAB_PLUS_W_BASE: f32 = 36.0;
 /// 标签内容自适应宽的夹逼(Adwaita/Ghostty 形制:标签按标题定宽,
@@ -348,14 +350,24 @@ pub enum CaptionBtn {
 /// (裸字形减淡,hit-test 已在;hover 态留后续)。
 /// layout(T8):溢出滚动——越界标签不发射(右缘由 caption bg 自然覆盖),
 /// 滚轮驱动滚动,箭头命中区暂缓(滚轮覆盖主痛点)。
+/// strip 文字环境打包(2026-10-12 共享图集重构):UI 字体路由 + 其度量。
+/// strip 文字全走 UI 字体(Ghostty 用系统字体,等宽 UI 退役)。
+pub struct StripUi<'a> {
+    pub router: &'a mut dyn GlyphRouter,
+    pub metrics: &'a FontMetrics,
+}
+
 pub fn strip_quads(
     titles: &[(String, bool)],
     router: &mut dyn GlyphRouter,
     metrics: &FontMetrics,
     palette: &Palette,
     sm: &StripMetrics,
+    ui: StripUi<'_>,
     extras: StripExtras,
 ) -> Vec<CellInstance> {
+    let (ui, ui_m) = (ui.router, ui.metrics);
+    let _ = metrics; // 终端度量退役(strip 文字全走 ui 比例步进)
     let StripExtras {
         exit_dot,
         caption_x,
@@ -409,23 +421,24 @@ pub fn strip_quads(
         fg: bg_of(hair),
         bg: bg_of(hair),
     });
-    let text_y = (sm.h - metrics.line_height).max(0.0) / 2.0;
+    let text_y = (sm.h - ui_m.line_height).max(0.0) / 2.0;
     if single {
         let (title, _) = &titles[0];
         let avail = caption_x.unwrap_or(strip_w);
-        let max_chars = ((avail / metrics.cell_width) as usize)
-            .saturating_sub(2)
-            .max(1);
-        let text_w = title.chars().count().min(max_chars) as f32 * metrics.cell_width;
-        let start = ((avail - text_w) / 2.0).max(0.0);
-        for (ci, ch) in title.chars().take(max_chars).enumerate() {
-            let g = router.route(ch, GlyphStyle::PLAIN);
+        let mut text_w = 0.0;
+        for ch in title.chars() {
+            let g = ui.route(ch, GlyphStyle::PLAIN);
+            text_w += g.size_px[0] + STRIP_TRACKING;
+        }
+        let mut tx = ((avail - text_w) / 2.0).max(0.0);
+        for ch in title.chars() {
+            let g = ui.route(ch, GlyphStyle::PLAIN);
             if g.size_px[0] <= 0.0 {
                 continue;
             }
             out.push(CellInstance {
                 pos_uv: [
-                    start + ci as f32 * metrics.cell_width + g.offset_px[0],
+                    tx + g.offset_px[0],
                     text_y + g.offset_px[1],
                     g.uv[0],
                     g.uv[1],
@@ -434,6 +447,7 @@ pub fn strip_quads(
                 fg: bg_of(white),
                 bg: bg_of(bar),
             });
+            tx += g.size_px[0] + STRIP_TRACKING;
         }
     } else {
         // 均分等宽标签(gtk-wide-tabs 默认;avail 由 layout 传,0 = 不裁)
@@ -467,30 +481,35 @@ pub fn strip_quads(
                     (sm.tab_r, sm.tab_r),
                 ));
             }
+            // 标题:比例步进(墨宽 + 字距),超宽以省略号截断
             let close_x = x0 + w - sm.tab_close_w;
-            let text_avail = w - sm.tab_pad - sm.tab_close_w;
-            let max_chars = ((text_avail / metrics.cell_width) as usize).max(1);
-            let chars: Vec<char> = title.chars().collect();
-            let trunc = chars.len() > max_chars;
-            let shown: Vec<(usize, char)> = chars
-                .iter()
-                .take(max_chars.saturating_sub(if trunc { 1 } else { 0 }))
-                .enumerate()
-                .map(|(ci, &c)| (ci, c))
-                .chain(if trunc {
-                    vec![(max_chars - 1, '…')]
-                } else {
-                    vec![]
-                })
-                .collect();
-            for (ci, ch) in shown {
-                let g = router.route(ch, GlyphStyle::PLAIN);
+            let ell_pad = 6.0 * (sm.h / STRIP_H_BASE);
+            let mut tx = x0 + sm.tab_pad;
+            for ch in title.chars() {
+                let g = ui.route(ch, GlyphStyle::PLAIN);
                 if g.size_px[0] <= 0.0 {
                     continue;
                 }
+                if tx + g.size_px[0] + STRIP_TRACKING + ell_pad > close_x {
+                    let e = ui.route('\u{2026}', GlyphStyle::PLAIN);
+                    if e.size_px[0] > 0.0 {
+                        out.push(CellInstance {
+                            pos_uv: [
+                                tx + e.offset_px[0],
+                                text_y + e.offset_px[1],
+                                e.uv[0],
+                                e.uv[1],
+                            ],
+                            size_uv: [e.size_px[0], e.size_px[1], e.uv[2], e.uv[3]],
+                            fg: bg_of(ink),
+                            bg: bg_of(backdrop),
+                        });
+                    }
+                    break;
+                }
                 out.push(CellInstance {
                     pos_uv: [
-                        x0 + sm.tab_pad + ci as f32 * metrics.cell_width + g.offset_px[0],
+                        tx + g.offset_px[0],
                         text_y + g.offset_px[1],
                         g.uv[0],
                         g.uv[1],
@@ -499,12 +518,13 @@ pub fn strip_quads(
                     fg: bg_of(ink),
                     bg: bg_of(backdrop),
                 });
+                tx += g.size_px[0] + STRIP_TRACKING;
             }
             // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
             // 悬停浮现(主色);点区在 app 的 WM_LBUTTONDOWN 同几何判定
             if *active || hovered {
                 let kink = if *active { dim } else { white };
-                let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
+                let g = ui.route('\u{E8BB}', GlyphStyle::PLAIN);
                 if g.size_px[0] > 0.0 {
                     out.push(CellInstance {
                         pos_uv: [
@@ -542,7 +562,7 @@ pub fn strip_quads(
                         (r, r),
                     ));
                 }
-                let g = router.route('+', GlyphStyle::PLAIN);
+                let g = ui.route('+', GlyphStyle::PLAIN);
                 out.push(CellInstance {
                     pos_uv: [
                         x + (sm.plus_w - g.size_px[0]) / 2.0,
@@ -567,7 +587,7 @@ pub fn strip_quads(
         } else {
             palette.colors[1]
         };
-        let text_y = (sm.h - metrics.line_height).max(0.0) / 2.0;
+        let text_y = (sm.h - ui_m.line_height).max(0.0) / 2.0;
         let end_x = caption_x.map(|cx| cx - 24.0 * k).unwrap_or(total_w);
         let start = end_x - label.chars().count() as f32 * metrics.cell_width;
         for (ci, ch) in label.chars().enumerate() {
@@ -652,7 +672,7 @@ pub fn strip_quads(
                     bg: bg_of(face),
                 });
             }
-            let g = router.route(*glyph, GlyphStyle::PLAIN);
+            let g = ui.route(*glyph, GlyphStyle::PLAIN);
             if g.size_px[0] > 0.0 {
                 out.push(CellInstance {
                     pos_uv: [
@@ -1171,13 +1191,15 @@ mod tests {
 
     #[test]
     fn strip_exit_dot_octagon_and_colors() {
-        let mut r = FakeRouter {
-            atlas_w: 64.0,
+        let mk = |n: f32| FakeRouter {
+            atlas_w: n,
             atlas_h: 64.0,
             glyph_w: 4.0,
             glyph_h: 8.0,
             wide: |_| false,
         };
+        let mut r = mk(64.0);
+        let mut r2 = mk(64.0);
         let titles = vec![("t".to_string(), true)];
         let palette = Palette::DEFAULT;
         let none_len = strip_quads(
@@ -1186,6 +1208,10 @@ mod tests {
             &metrics_8x16(),
             &palette,
             &StripMetrics::default(),
+            StripUi {
+                router: &mut r2,
+                metrics: &metrics_8x16(),
+            },
             Default::default(),
         )
         .len();
@@ -1195,6 +1221,10 @@ mod tests {
             &metrics_8x16(),
             &palette,
             &StripMetrics::default(),
+            StripUi {
+                router: &mut r2,
+                metrics: &metrics_8x16(),
+            },
             StripExtras {
                 exit_dot: Some(ExitDot::Green),
                 ..Default::default()
@@ -1241,6 +1271,13 @@ mod tests {
             glyph_h: 8.0,
             wide: |_| false,
         };
+        let mut r2 = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
         let titles = vec![("a".to_string(), false), ("b".to_string(), true)];
         let out = strip_quads(
             &titles,
@@ -1248,6 +1285,10 @@ mod tests {
             &metrics_8x16(),
             &Palette::DEFAULT,
             &StripMetrics::default(),
+            StripUi {
+                router: &mut r2,
+                metrics: &metrics_8x16(),
+            },
             StripExtras {
                 caption_x: Some(400.0),
                 layout: StripLayout {
@@ -1294,6 +1335,13 @@ mod tests {
             glyph_h: 8.0,
             wide: |_| false,
         };
+        let mut r2 = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
         let one = vec![("solo".to_string(), true)];
         let two = vec![("a".to_string(), true), ("b".to_string(), false)];
         let extras = StripExtras {
@@ -1306,6 +1354,10 @@ mod tests {
             &metrics_8x16(),
             &Palette::DEFAULT,
             &StripMetrics::default(),
+            StripUi {
+                router: &mut r2,
+                metrics: &metrics_8x16(),
+            },
             extras,
         );
         let multi = strip_quads(
@@ -1314,6 +1366,10 @@ mod tests {
             &metrics_8x16(),
             &Palette::DEFAULT,
             &StripMetrics::default(),
+            StripUi {
+                router: &mut r2,
+                metrics: &metrics_8x16(),
+            },
             extras,
         );
         assert!(

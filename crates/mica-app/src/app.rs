@@ -222,6 +222,11 @@ struct Terminal {
     row_insts: Vec<RowInst>,
     /// 重开用(M5b/T3):pane 的 shell 命令串(profile 出处不存,重启等价)
     shell: String,
+    /// strip UI 字体路由(2026-10-12 共享图集重构):Segoe UI 9.5pt,
+    /// 惰性建(首次画 strip 时),与终端路由共写同一图集——标签栏文字
+    /// 不再用终端等宽字体(Ghostty 用系统 UI 字体)。放 Terminal 是渲染
+    /// 借用拓扑需要(draw 时与 router 同一借用链)
+    strip_router: Option<DwriteRouter>,
     /// 上次消费的图集布局版本(grow 重排即变)——变了必须 force_full
     /// 重建行实例,否则旧 UV 指向重排后的错误条目(一块一块根因)
     last_atlas_ver: u64,
@@ -1410,6 +1415,7 @@ unsafe fn create_pane_with_size(
         force_full: true,      // 首帧显式全量,不依赖哨兵的先后
         shell: shell_command.to_string(),
         exited: None,
+        strip_router: None, // 惰性建(首次画 strip)与终端路由共享图集
         last_atlas_ver: 0,
     };
     let pane_id = NEXT_TAB_ID.with(|n| n.replace(n.get() + 1));
@@ -1721,12 +1727,36 @@ fn draw_frame() {
             None => mica_render::frame::ExitDot::Gray,
         });
         let sm = strip_metrics();
+        // strip UI 路由(共享图集):Segoe UI 9.5pt,与终端路由共写同一
+        // 图集——单 draw 单纹理的硬约束下,标签文字终于能是系统 UI 字体
+        if t.strip_router.is_none() {
+            let atlas = t.router.shared_atlas();
+            t.strip_router = DwriteRouter::new_with_atlas(
+                scaled_pt(9.5),
+                &[
+                    "Segoe UI",
+                    "Segoe UI Emoji",
+                    "Segoe Fluent Icons",
+                    "Microsoft YaHei",
+                ],
+                atlas,
+            )
+            .ok();
+        }
+        let Some(strip_r) = t.strip_router.as_mut() else {
+            return; // 惰性建失败(None):本帧放弃,下帧重试
+        };
+        let ui_m = strip_r.metrics();
         let mut strip = mica_render::frame::strip_quads(
             &titles,
             &mut t.router,
             &t.metrics,
             &t.palette,
             &sm,
+            mica_render::frame::StripUi {
+                router: strip_r,
+                metrics: &ui_m,
+            },
             mica_render::frame::StripExtras {
                 exit_dot,
                 // 系统按钮区(T8):NCHITTEST 的 CAPTION_BTN_W 同几何
@@ -1776,7 +1806,7 @@ fn draw_frame() {
                 return;
             };
             if gpu.atlas_owner != Some((focused_pane_id, revision)) {
-                gpu.renderer.set_atlas(atlas);
+                gpu.renderer.set_atlas(&atlas);
                 gpu.atlas_owner = Some((focused_pane_id, revision));
             }
             gpu.renderer.draw(&gpu.wgpu_surface, &gpu.config, &strip);
