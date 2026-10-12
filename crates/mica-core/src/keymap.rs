@@ -82,6 +82,13 @@ impl Keymap {
             TriggerKey::Letter('T'),
             Action::NewTab,
         );
+        // Ctrl+T 同绑(浏览器直觉,2026-10-12 用户实报"新建标签没用了"
+        // ——WT 系默认只有 Ctrl+Shift+T,裸 Ctrl+T 透传 shell 无反馈)
+        push(
+            m(true, false, false),
+            TriggerKey::Letter('T'),
+            Action::NewTab,
+        );
         push(
             m(true, true, false),
             TriggerKey::Letter('N'),

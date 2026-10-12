@@ -422,6 +422,9 @@ pub fn strip_quads(
         palette.colors[7].b,
     ];
     let white = [palette.fg.r, palette.fg.g, palette.fg.b];
+    // strip 次级墨色(2026-10-12):条底改浅灰后,旧 dim(C5C8C6)在灰上
+    // 对比度崩(+/—□× 实测不可见)——向白提亮,压着条底仍有层次
+    let ink2 = mix(white, bar, 0.35);
     let k = sm.k;
     let cw = metrics.cell_width;
     // 等宽格步进的字符步长:宽字形(CJK)按墨宽推进,窄字符不小于格宽
@@ -470,7 +473,7 @@ pub fn strip_quads(
         text_w += adv(&ell);
     }
     let mut tx = ((title_avail - text_w) / 2.0).max(0.0);
-    let title_ink = if focused { white } else { dim };
+    let title_ink = if focused { white } else { ink2 };
     for g in routed.iter().take(n_take) {
         if g.size_px[0] > 0.0 {
             out.push(CellInstance {
@@ -526,7 +529,7 @@ pub fn strip_quads(
             let (face, ink) = match (hovered, i) {
                 (true, 2) => (red, white),     // close hover:红底白字
                 (true, _) => (lighten, white), // min/max hover:轻亮块
-                (false, _) => (bar, dim),
+                (false, _) => (bar, ink2),
             };
             if hovered {
                 out.push(CellInstance {
@@ -573,9 +576,9 @@ pub fn strip_quads(
             let (backdrop, ink) = if *active {
                 (active_face, white)
             } else if hovered {
-                (hover_face, dim)
+                (hover_face, white)
             } else {
-                (bar, dim)
+                (bar, ink2)
             };
             // 标签块:上圆下方——活跃块 = 终端底色,下缘直抵内容区无缝
             // 相接(macOS 原生标签形制);非活跃悬停轻提亮
@@ -629,7 +632,7 @@ pub fn strip_quads(
             // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
             // 悬停浮现(主色);胶囊内双向居中,点区在 WM_LBUTTONDOWN 同几何
             if *active || hovered {
-                let kink = if *active { dim } else { white };
+                let kink = if *active { ink2 } else { white };
                 let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
                 if g.size_px[0] > 0.0 {
                     out.push(CellInstance {
@@ -652,7 +655,8 @@ pub fn strip_quads(
             let x = plus_x(strip_w, sm);
             let hovered = hover.plus;
             let face = mix(bar, white, 0.05);
-            let (glyph_bg, ink) = if hovered { (face, dim) } else { (bar, dim) };
+            // "+":开标签的主入口,恒白(旧 dim 在浅灰条上实测不可见)
+            let (glyph_bg, ink) = if hovered { (face, white) } else { (bar, white) };
             if hovered {
                 let r = tab_d / 2.0;
                 out.push(rounded(
