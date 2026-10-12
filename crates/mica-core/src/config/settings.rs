@@ -3,7 +3,9 @@
 //! 错误哲学与解析器一致:收集而非中断,任何 parse/value 错误都让
 //! `resolve` 返回 Err——调用方保旧配置继续跑,不让一行坏配置炸掉终端。
 
-use crate::config::palette::Palette;
+use alacritty_terminal::vte::ansi::Rgb;
+
+use crate::config::palette::{Palette, parse_hex};
 use crate::config::parse::{self, ParseError};
 use crate::config::theme;
 use crate::keymap::{self, Keymap};
@@ -31,6 +33,58 @@ pub const DEFAULT_FAMILIES: &[&str] = &[
 
 pub const DEFAULT_FONT_SIZE_PT: f32 = 12.0;
 
+/// 标签栏(双行条)外观全量可配(2026-10-12)。默认值 = 源码对标定档
+/// 的观感;颜色键写 `auto`(或不写)= 从调色板推导。
+/// 键集:`strip-font-family`(空=跟终端链)、`strip-font-size`、
+/// `strip-title-height`、`strip-tab-height`、`strip-tab-min-width`、
+/// `strip-tab-corner-radius`、`strip-wide-tabs`(Ghostty `gtk-wide-tabs`
+/// 同义)、`strip-hide-single-tab`、`strip-bar-color`/`-active-tab-color`/
+/// `-text-color`/`-dim-color`(auto|#rrggbb)、`strip-bar-wash`/
+/// `-unfocused`(0..1,auto 条底的提亮比例)、
+/// `strip-animation-duration`/`-focus`(ms,0=关)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct StripCfg {
+    pub font_family: Option<String>,
+    pub font_size_pt: f32,
+    pub title_h: f32,
+    pub tab_h: f32,
+    pub tab_min_w: f32,
+    pub tab_corner_r: f32,
+    pub wide_tabs: bool,
+    pub hide_single: bool,
+    pub bar: Option<Rgb>,
+    pub bar_wash: f32,
+    pub bar_wash_unfocused: f32,
+    pub active_tab: Option<Rgb>,
+    pub text: Option<Rgb>,
+    pub dim: Option<Rgb>,
+    pub anim_ms: f32,
+    pub focus_ms: f32,
+}
+
+impl Default for StripCfg {
+    fn default() -> Self {
+        Self {
+            font_family: None,
+            font_size_pt: 9.5,
+            title_h: 32.0,
+            tab_h: 36.0,
+            tab_min_w: 88.0,
+            tab_corner_r: 8.0,
+            wide_tabs: true,
+            hide_single: true,
+            bar: None,
+            bar_wash: 0.18,
+            bar_wash_unfocused: 0.30,
+            active_tab: None,
+            text: None,
+            dim: None,
+            anim_ms: 120.0,
+            focus_ms: 150.0,
+        }
+    }
+}
+
 /// 合成产物:app 据此建 DwriteRouter 与 Palette,渲染与应答同源。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -51,6 +105,8 @@ pub struct Settings {
     /// 程序发的 OSC 0/2 标题被忽略;空串 = 解除锁定回落 shell 标题。
     /// 想视觉隐藏标题写单空格(Ghostty 文档同法)。
     pub title: Option<String>,
+    /// 标签栏外观(2026-10-12 全量可配)
+    pub strip: StripCfg,
 }
 
 impl Default for Settings {
@@ -65,6 +121,7 @@ impl Default for Settings {
             keymap: Keymap::wt_default(),
             cursor_blink: false,
             quick_terminal_key: Some("win+oem_3".into()),
+            strip: StripCfg::default(),
         }
     }
 }
@@ -215,6 +272,103 @@ fn apply_pairs(
                     explicit[2] = true;
                 }
             }
+            // strip 外观(2026-10-12 全量可配);gtk-wide-tabs 是 Ghostty
+            // 同义键,两键同槽
+            "gtk-wide-tabs" | "strip-wide-tabs" | "strip-hide-single-tab" => {
+                let v = match value.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => {
+                        err.values
+                            .push(format!("{key} 应为 true/false,得 `{value}`"));
+                        continue;
+                    }
+                };
+                if key == "strip-hide-single-tab" {
+                    settings.strip.hide_single = v;
+                } else {
+                    settings.strip.wide_tabs = v;
+                }
+            }
+            "strip-font-family" => {
+                settings.strip.font_family =
+                    (!value.trim().is_empty()).then(|| value.trim().to_string());
+            }
+            "strip-font-size" => match value.parse::<f32>() {
+                Ok(n) if n.is_finite() && (4.0..=24.0).contains(&n) => {
+                    settings.strip.font_size_pt = n
+                }
+                _ => err
+                    .values
+                    .push(format!("strip-font-size 应为 4-24 的数字,得 `{value}`")),
+            },
+            "strip-title-height"
+            | "strip-tab-height"
+            | "strip-tab-min-width"
+            | "strip-tab-corner-radius" => match value.parse::<f32>() {
+                Ok(n) if n.is_finite() && (0.0..=400.0).contains(&n) => match key.as_str() {
+                    "strip-title-height" => settings.strip.title_h = n,
+                    "strip-tab-height" => settings.strip.tab_h = n,
+                    "strip-tab-min-width" => settings.strip.tab_min_w = n,
+                    _ => settings.strip.tab_corner_r = n,
+                },
+                _ => err
+                    .values
+                    .push(format!("{key} 应为 0-400 的数字,得 `{value}`")),
+            },
+            "strip-bar-color"
+            | "strip-active-tab-color"
+            | "strip-text-color"
+            | "strip-dim-color" => {
+                if value.eq_ignore_ascii_case("auto") || value.trim().is_empty() {
+                    let slot = match key.as_str() {
+                        "strip-bar-color" => &mut settings.strip.bar,
+                        "strip-active-tab-color" => &mut settings.strip.active_tab,
+                        "strip-text-color" => &mut settings.strip.text,
+                        _ => &mut settings.strip.dim,
+                    };
+                    *slot = None;
+                } else {
+                    match parse_hex(&value) {
+                        Ok(c) => {
+                            let slot = match key.as_str() {
+                                "strip-bar-color" => &mut settings.strip.bar,
+                                "strip-active-tab-color" => &mut settings.strip.active_tab,
+                                "strip-text-color" => &mut settings.strip.text,
+                                _ => &mut settings.strip.dim,
+                            };
+                            *slot = Some(c);
+                        }
+                        Err(reason) => err.values.push(format!("{key}: {reason}")),
+                    }
+                }
+            }
+            "strip-bar-wash" | "strip-bar-wash-unfocused" => match value.parse::<f32>() {
+                Ok(n) if n.is_finite() && (0.0..=1.0).contains(&n) => {
+                    if key == "strip-bar-wash" {
+                        settings.strip.bar_wash = n;
+                    } else {
+                        settings.strip.bar_wash_unfocused = n;
+                    }
+                }
+                _ => err
+                    .values
+                    .push(format!("{key} 应为 0-1 的比例,得 `{value}`")),
+            },
+            "strip-animation-duration" | "strip-focus-animation-duration" => {
+                match value.parse::<f32>() {
+                    Ok(n) if n.is_finite() && (0.0..=2000.0).contains(&n) => {
+                        if key == "strip-animation-duration" {
+                            settings.strip.anim_ms = n;
+                        } else {
+                            settings.strip.focus_ms = n;
+                        }
+                    }
+                    _ => err
+                        .values
+                        .push(format!("{key} 应为 0-2000 的毫秒数,得 `{value}`")),
+                }
+            }
             "selection-foreground" | "selection-background" => {
                 if let Err(reason) = settings.palette.apply_pair(&key, &value) {
                     err.values.push(format!("{key}: {reason}"));
@@ -230,6 +384,47 @@ fn apply_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// strip-* 全量可配(2026-10-12):键解析/范围/auto 语义/gtk-wide-tabs 同义
+    #[test]
+    fn strip_keys_parse_and_apply() {
+        let s = resolve(
+            "strip-font-family = Sarasa Mono SC\n\
+             strip-font-size = 10\n\
+             strip-title-height = 36\n\
+             strip-tab-height = 40\n\
+             strip-tab-min-width = 120\n\
+             strip-tab-corner-radius = 12\n\
+             gtk-wide-tabs = false\n\
+             strip-hide-single-tab = false\n\
+             strip-bar-color = #123456\n\
+             strip-active-tab-color = auto\n\
+             strip-text-color = #ffffff\n\
+             strip-bar-wash = 0.25\n\
+             strip-animation-duration = 0\n\
+             strip-focus-animation-duration = 300\n",
+        )
+        .unwrap();
+        let c = &s.strip;
+        assert_eq!(c.font_family.as_deref(), Some("Sarasa Mono SC"));
+        assert_eq!(c.font_size_pt, 10.0);
+        assert_eq!(c.title_h, 36.0);
+        assert_eq!(c.tab_h, 40.0);
+        assert_eq!(c.tab_min_w, 120.0);
+        assert_eq!(c.tab_corner_r, 12.0);
+        assert!(!c.wide_tabs, "gtk-wide-tabs 同义");
+        assert!(!c.hide_single);
+        assert_eq!(c.bar.map(|r| r.r), Some(0x12));
+        assert_eq!(c.active_tab, None, "auto = 推导");
+        assert_eq!(c.text.map(|r| r.b), Some(0xff));
+        assert_eq!(c.bar_wash, 0.25);
+        assert_eq!(c.anim_ms, 0.0, "动画关");
+        assert_eq!(c.focus_ms, 300.0);
+
+        // 坏值收集不中断
+        let e = resolve("strip-font-size = 99\nstrip-bar-wash = 7\n").unwrap_err();
+        assert!(e.values.len() >= 2, "范围外值都报错");
+    }
 
     #[test]
     fn empty_source_is_all_defaults() {

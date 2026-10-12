@@ -66,18 +66,23 @@ use windows::core::{HSTRING, PCWSTR, w};
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
 
-/// strip/顶栏运行时几何(DPI 缩放单源,渲染与 hit-test 同取):
-/// 150% 屏上物理常量曾致条高/× 与字体错位(2026-10-06 用户实测)
+/// strip/顶栏运行时几何(DPI 缩放 + 用户配置单源,渲染与 hit-test 同取):
+/// 150% 屏上物理常量曾致条高/× 与字体错位(2026-10-06 用户实测);
+/// strip-* 配置键热重载时经 STRIP_CFG 生效(2026-10-12 全量可配)
 fn strip_metrics() -> mica_render::frame::StripMetrics {
-    mica_render::frame::StripMetrics::from_scale(DPI_SCALE.with(std::cell::Cell::get))
+    mica_render::frame::StripMetrics::from_scale_cfg(
+        DPI_SCALE.with(std::cell::Cell::get),
+        &STRIP_CFG.with(|c| c.borrow().clone()),
+    )
 }
 
-/// 条总高(动态,2026-10-12):单标签隐藏第二行(上游 hasTabBar 同款)
-/// ——终端区起点/命中上界都取此值;标签数跨 1↔2 时 draw_frame 的
-/// 网格兜底重排自然跟进。读 TAB_COUNT Cell(无借用):任意路径安全可调
+/// 条总高(动态,2026-10-12):单标签隐藏第二行(上游 hasTabBar 同款;
+/// strip-hide-single-tab = false 恒显)——终端区起点/命中上界都取此值;
+/// 标签数跨 1↔2 时 draw_frame 的网格兜底重排自然跟进。读 TAB_COUNT
+/// Cell(无借用):任意路径安全可调
 fn strip_h() -> f32 {
     let sm = strip_metrics();
-    if TAB_COUNT.with(std::cell::Cell::get) <= 1 {
+    if TAB_COUNT.with(std::cell::Cell::get) <= 1 && sm.hide_single {
         sm.title_h
     } else {
         sm.h
@@ -100,28 +105,30 @@ fn now_secs() -> f64 {
     })
 }
 
-/// 活跃标签胶囊当前横移量(动画值):120ms ease-out,cubic;过期 = 0
+/// 活跃标签胶囊当前横移量(动画值):ease-out cubic;时长可配
+/// (strip-animation-duration,0 = 关);过期 = 0
 fn capsule_dx_now() -> f32 {
     let t0 = CAPS_T0.with(std::cell::Cell::get);
     if t0 < 0.0 {
         return 0.0;
     }
-    let k = (((now_secs() - t0) as f32) / 0.120).clamp(0.0, 1.0);
+    let dur = STRIP_CFG.with(|c| c.borrow().anim_ms).max(1.0) / 1000.0;
+    let k = (((now_secs() - t0) as f32) / dur).clamp(0.0, 1.0);
     let ease = 1.0 - (1.0 - k).powi(3);
     CAPS_START.with(std::cell::Cell::get) * (1.0 - ease)
 }
 
 /// 起一次胶囊滑动(切换/新建/关闭标签后调用):从旧活跃位滑到新活跃位
 fn prime_capsule_slide(old_idx: usize, new_idx: usize) {
-    if old_idx == new_idx {
-        return;
+    if old_idx == new_idx || STRIP_CFG.with(|c| c.borrow().anim_ms) <= 0.0 {
+        return; // 动画关闭(strip-animation-duration = 0)
     }
     let sm = strip_metrics();
     let area_w = GPU
         .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
         .unwrap_or(0.0);
     let n = TAB_COUNT.with(std::cell::Cell::get).max(1);
-    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+    let w = mica_render::frame::tab_w_now(n, area_w, &sm);
     let dx = (old_idx as f32 - new_idx as f32) * (w + sm.tab_gap);
     CAPS_START.with(|c| c.set(dx));
     CAPS_T0.with(|t| t.set(now_secs()));
@@ -148,11 +155,12 @@ fn ensure_anim_timer() {
 /// 返回 true = 还有动画在跑(timer 续命),false = 全部到位(可停表)
 fn strip_anim_step() -> bool {
     let mut busy = false;
-    // focus:150ms 线性渐近
+    // focus 渐近(默认 150ms;strip-focus-animation-duration 可配,0 = 直达)
     let fp = FOCUS_PHASE.with(std::cell::Cell::get);
     let ft = FOCUS_TARGET.with(std::cell::Cell::get);
-    if (fp - ft).abs() > 0.004 {
-        let step = 0.015 / 0.150;
+    let ms = STRIP_CFG.with(|c| c.borrow().focus_ms);
+    if (fp - ft).abs() > 0.004 && ms > 0.0 {
+        let step = 0.015 / (ms / 1000.0);
         let nf = if fp < ft {
             (fp + step).min(ft)
         } else {
@@ -260,6 +268,10 @@ thread_local! {
     /// panic = 进程崩(2026-10-12 闪退实证)。标签数只在建/关标签时变,
     /// 建/关两处同步维护此 Cell
     static TAB_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// strip 外观配置快照(load_settings;热重载时整表替换)——几何/
+    /// 颜色/字体/动画全从这里走(2026-10-12 全量可配)
+    static STRIP_CFG: RefCell<mica_core::config::settings::StripCfg> =
+        RefCell::new(mica_core::config::settings::StripCfg::default());
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -554,6 +566,7 @@ pub fn run() {
         SHARED_HWND.with(|s| *s.borrow_mut() = Some(Arc::clone(&hwnd_slot)));
         TAB_SEED
             .with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+        STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
         CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
         let gpu = init_window_gpu(hwnd);
         GPU.with(|g| *g.borrow_mut() = Some(gpu));
@@ -744,6 +757,7 @@ fn spawn_window(profile: Option<String>) {
                 TAB_SEED.with(|s| {
                     *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt)
                 });
+                STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
                 CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
                 let gpu = init_window_gpu(hwnd);
                 GPU.with(|g| *g.borrow_mut() = Some(gpu));
@@ -1000,6 +1014,9 @@ unsafe fn reload_config(hwnd: HWND) {
                 let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
                 let rows = ((term_h as f32 / metrics.line_height).max(1.0)) as u16;
                 t.router = router;
+                // strip 字体/几何随配置(STRIP_CFG 已在上方更新):惰性建
+                // 置空强制下一帧按新配置重建
+                t.strip_router = None;
                 t.metrics = metrics;
                 t.cols = cols;
                 t.rows = rows;
@@ -1028,6 +1045,7 @@ unsafe fn reload_config(hwnd: HWND) {
     TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
     MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+    STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
     // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
     if reloaded {
@@ -1854,16 +1872,24 @@ fn draw_frame() {
         // strip 文字走小号等宽路由(9.5pt,族链随配置 + Emoji/Fluent 兜底,
         // 与终端路由共享图集):终端字号字形会挤出 × 关闭区(用户实报)
         if t.strip_router.is_none() {
-            let (seed, _) = TAB_SEED.with(|s| s.borrow().clone());
-            let mut fams: Vec<String> = seed;
+            // strip-font-family/size 可配(默认:跟终端族链 9.5pt)
+            let cfg = STRIP_CFG.with(|c| c.borrow().clone());
+            let mut fams: Vec<String> = match &cfg.font_family {
+                Some(f) => vec![f.clone()],
+                None => TAB_SEED.with(|s| s.borrow().clone()).0,
+            };
             for fb in ["Segoe UI Emoji", "Segoe Fluent Icons"] {
                 if !fams.iter().any(|f| f.eq_ignore_ascii_case(fb)) {
                     fams.push(fb.to_string());
                 }
             }
             let fams: Vec<&str> = fams.iter().map(String::as_str).collect();
-            t.strip_router =
-                DwriteRouter::new_with_atlas(scaled_pt(9.5), &fams, t.router.shared_atlas()).ok();
+            t.strip_router = DwriteRouter::new_with_atlas(
+                scaled_pt(cfg.font_size_pt),
+                &fams,
+                t.router.shared_atlas(),
+            )
+            .ok();
         }
         let Some(strip_r) = t.strip_router.as_mut() else {
             return; // 惰性建失败:本帧放弃,下帧重试
@@ -2219,7 +2245,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let area_w = GPU
                         .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
                         .unwrap_or(0.0);
-                    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+                    let w = mica_render::frame::tab_w_now(n, area_w, &sm);
                     let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
                     let local = px as f32 + shift
                         - mica_render::frame::tabs_x0(&sm)
@@ -2870,7 +2896,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
                     .unwrap_or(0.0);
                 let n = TABS.with(|t| t.borrow().len());
-                let w_tab = mica_render::frame::equal_tab_w(n, area_w, &sm);
+                let w_tab = mica_render::frame::tab_w_now(n, area_w, &sm);
                 let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
                 let cf = cx as f32 + shift;
                 let tabs_end = mica_render::frame::tabs_x0(&sm) + n as f32 * (w_tab + sm.tab_gap);
@@ -3090,7 +3116,7 @@ fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
     if local >= p_x && local < p_x + sm.plus_w {
         return Some(None);
     }
-    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+    let w = mica_render::frame::tab_w_now(n, area_w, &sm);
     let idx = ((local - mica_render::frame::tabs_x0(&sm)) / w).floor();
     if idx >= 0.0 && (idx as usize) < n {
         Some(Some(idx as usize))
@@ -3205,7 +3231,7 @@ fn tab_scroll_adjust(delta: i32) -> bool {
         .unwrap_or(0.0);
     let sm = strip_metrics();
     let n = TABS.with(|tabs| tabs.borrow().len());
-    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+    let w = mica_render::frame::tab_w_now(n, area_w, &sm);
     let need = mica_render::frame::tabs_x0(&sm) + n as f32 * (w + sm.tab_gap);
     let right = mica_render::frame::tabs_right(area_w, &sm);
     let max = if area_w <= 0.0 || need <= right {
@@ -3230,7 +3256,7 @@ fn tab_follow_active() {
         .unwrap_or(0.0);
     let sm = strip_metrics();
     let n = TABS.with(|tabs| tabs.borrow().len());
-    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+    let w = mica_render::frame::tab_w_now(n, area_w, &sm);
     let right = mica_render::frame::tabs_right(area_w, &sm);
     let visible = if area_w <= 0.0 {
         i32::MAX

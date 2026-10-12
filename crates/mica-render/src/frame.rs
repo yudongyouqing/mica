@@ -7,7 +7,10 @@ use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::Cell;
 use alacritty_terminal::term::cell::Flags;
 
+use alacritty_terminal::vte::ansi::Rgb;
+
 use mica_core::config::palette::Palette;
+use mica_core::config::settings::StripCfg;
 use mica_core::surface::{CursorShape, Damage, Surface};
 
 use crate::color::resolve;
@@ -201,20 +204,12 @@ pub fn build_instances(
     out
 }
 
-/// tab strip 基准几何(96dpi 逻辑值),**双行形制**(2026-10-12 用户裁定):
-/// 第一行 = 窗口标题 + caption 三键,第二行 = 标签 + 右端 "+"。运行时一律
-/// 经 [`StripMetrics::from_scale`] 按 DPI 缩放——物理常量在 150% 屏上不
-/// 缩放,曾致条高/×/内边距与 150% 字体错位且视觉偏小(2026-10-06 用户
-/// 实测)。app 层 hit-test 同源取值。
-pub const STRIP_H_BASE: f32 = 68.0;
-/// 第一行高(标题 + caption)
-pub const STRIP_TITLE_H_BASE: f32 = 32.0;
-/// 第二行高(标签 + "+")
-pub const STRIP_TAB_H_BASE: f32 = 36.0;
-/// 单标签宽与 "+" 按钮宽基准。
+/// strip 基准几何(96dpi 逻辑值)——**全量可配**(2026-10-12,StripCfg
+/// 键集见 mica-core settings);此处常量是未配置时的兜底默认。运行时一律
+/// 经 [`StripMetrics::from_scale_cfg`] 按配置 + DPI 合成——物理常量在
+/// 150% 屏上不缩放,曾致条高/×/内边距与 150% 字体错位(2026-10-06 实测)。
+/// app 层 hit-test 同源取值。
 pub const TAB_PLUS_W_BASE: f32 = 36.0;
-/// 标签内容自适应宽的夹逼(Adwaita/Ghostty 形制:标签按标题定宽,
-/// 固定宽一律退役,2026-10-12 用户裁定旧条"太烂"整体重做)
 pub const TAB_MIN_W_BASE: f32 = 88.0;
 pub const TAB_MAX_W_BASE: f32 = 220.0;
 /// 标签间缝与左右内边距(逻辑 px)
@@ -224,7 +219,7 @@ pub const TAB_PAD_BASE: f32 = 10.0;
 pub const TAB_CLOSE_W_BASE: f32 = 24.0;
 
 /// 缩放后的 strip 运行时几何(单源:渲染与 hit-test 都从这里取)。
-/// scale = 窗口 DPI/96(M5b 的 DPI_SCALE)。
+/// scale = 窗口 DPI/96(M5b 的 DPI_SCALE);cfg = 用户配置。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StripMetrics {
     /// 条总高(两行;客户区顶部,终端区下移此值)
@@ -253,30 +248,58 @@ pub struct StripMetrics {
     pub dot_d: f32,
     /// 标题左内边距(亦为 × 区的视觉基准)
     pub pad: f32,
+    /// 标签占满第二行(宽标签);false = 恒 min_w(窄标签)
+    pub wide: bool,
+    /// 单标签隐藏第二行(false = 恒显)
+    pub hide_single: bool,
+    /// 条底色覆盖(None = auto:bg 提亮 wash)
+    pub bar_c: Option<[u8; 3]>,
+    /// auto 条底的提亮比例(聚焦/失焦两档,聚焦位)
+    pub bar_wash: f32,
+    pub bar_wash_unfocused: f32,
+    /// 活跃标签面色覆盖(None = auto:聚焦 = bg 原样)
+    pub active_c: Option<[u8; 3]>,
+    /// 主文字色覆盖(None = auto:调色板 fg)
+    pub text_c: Option<[u8; 3]>,
+    /// 次级墨色覆盖(None = auto:mix(白,条底,0.35))
+    pub dim_c: Option<[u8; 3]>,
 }
 
 impl StripMetrics {
-    pub fn from_scale(scale: f32) -> Self {
+    /// 配置 + DPI 合成(app 层唯一入口)
+    pub fn from_scale_cfg(scale: f32, cfg: &StripCfg) -> Self {
         let s = scale.max(1.0);
+        let c = |v: Option<Rgb>| v.map(|r| [r.r, r.g, r.b]);
         Self {
-            h: STRIP_H_BASE * s,
-            title_h: STRIP_TITLE_H_BASE * s,
-            tab_h: STRIP_TAB_H_BASE * s,
+            title_h: cfg.title_h * s,
+            tab_h: cfg.tab_h * s,
+            h: (cfg.title_h + cfg.tab_h) * s,
             k: s,
-            tab_w: TAB_MIN_W_BASE * s,
-            tab_min_w: TAB_MIN_W_BASE * s,
+            tab_w: cfg.tab_min_w * s,
+            tab_min_w: cfg.tab_min_w * s,
             tab_max_w: TAB_MAX_W_BASE * s,
             tab_gap: TAB_GAP_BASE * s,
             tab_pad: TAB_PAD_BASE * s,
             tab_close_w: TAB_CLOSE_W_BASE * s,
             plus_w: TAB_PLUS_W_BASE * s,
             caption_w: 46.0 * s,
-            // 标签块上圆角(macOS 原生标签形制,下缘直抵内容区)
-            tab_top_r: 8.0 * s,
+            tab_top_r: cfg.tab_corner_r * s,
             chip_r: 6.0 * s,
             dot_d: 7.0 * s,
             pad: 8.0 * s,
+            wide: cfg.wide_tabs,
+            hide_single: cfg.hide_single,
+            bar_c: c(cfg.bar),
+            bar_wash: cfg.bar_wash,
+            bar_wash_unfocused: cfg.bar_wash_unfocused,
+            active_c: c(cfg.active_tab),
+            text_c: c(cfg.text),
+            dim_c: c(cfg.dim),
         }
+    }
+    /// 默认配置(测试/旧路径)
+    pub fn from_scale(scale: f32) -> Self {
+        Self::from_scale_cfg(scale, &StripCfg::default())
     }
 }
 
@@ -311,9 +334,9 @@ pub fn tabs_right(total_w: f32, sm: &StripMetrics) -> f32 {
 }
 
 /// 标签宽(均分填充):标签占满第二行可用宽(用户 2026-10-12 裁定
-/// "占满没事");可用域 = tabs_x0 到 tabs_right(右端 "+" 左缘)。放不下
-/// (min_w × n > 可用域)则固定 min_w 由溢出滚动兜底。等宽单值,
-/// 渲染与 hit-test 同源。
+/// "占满没事";Ghostty `gtk-wide-tabs` 默认 true 同义);可用域 =
+/// tabs_x0 到 tabs_right(右端 "+" 左缘)。放不下(min_w × n > 可用域)
+/// 则固定 min_w 由溢出滚动兜底。等宽单值,渲染与 hit-test 同源。
 pub fn equal_tab_w(n: usize, avail_w: f32, sm: &StripMetrics) -> f32 {
     if n == 0 {
         return sm.tab_min_w;
@@ -321,6 +344,16 @@ pub fn equal_tab_w(n: usize, avail_w: f32, sm: &StripMetrics) -> f32 {
     let gaps = sm.tab_gap * n as f32;
     let body = (tabs_right(avail_w, sm) - tabs_x0(sm) - gaps).max(0.0);
     (body / n as f32).max(sm.tab_min_w)
+}
+
+/// 当前标签宽策略(2026-10-12 全量可配):wide = 均分占满,窄标签 =
+/// 恒 min_w——渲染与 hit-test 都取此单源
+pub fn tab_w_now(n: usize, avail_w: f32, sm: &StripMetrics) -> f32 {
+    if sm.wide {
+        equal_tab_w(n, avail_w, sm)
+    } else {
+        sm.tab_min_w
+    }
 }
 
 /// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数。
@@ -412,24 +445,30 @@ pub fn strip_quads(
     };
     let bg3 = [palette.bg.r, palette.bg.g, palette.bg.b];
     // 条底 = 常态浅灰(上游实测:标签栏比终端底亮;Ventura 版 14% 提亮同族,
-    // Mica 取 18%),失焦再洗至 30%(Tahoe becomeMain/resignMain 同款)。
+    // 默认 18%),失焦再洗一档(默认 30%;Tahoe becomeMain/resignMain 同款)。
     // focus 是 0..1 的动画相位(app 侧 WM_TIMER 渐进),切换不再跳变——
-    // 这是"丝滑"的一半;另一半是活跃块滑动(capsule_dx)
+    // 这是"丝滑"的一半;另一半是活跃块滑动(capsule_dx)。
+    // 全部颜色/比例可配(strip-* 键):显式色直通,auto 才走提亮推导
     let focus = focus.clamp(0.0, 1.0);
-    let wash = 0.30 - 0.12 * focus; // 1.0 → 18%,0.0 → 30%
-    let bar = mix(bg3, [255, 255, 255], wash);
+    let wash = sm.bar_wash + (sm.bar_wash_unfocused - sm.bar_wash) * (1.0 - focus);
+    let bar = sm.bar_c.unwrap_or_else(|| mix(bg3, [255, 255, 255], wash));
     // 活跃标签面色:聚焦 = 终端底原样(与内容一体);失焦同样洗白一档
-    let active_face = mix(bg3, [255, 255, 255], 0.18 * (1.0 - focus));
-    let white = [palette.fg.r, palette.fg.g, palette.fg.b];
+    let active_face = sm
+        .active_c
+        .unwrap_or_else(|| mix(bg3, [255, 255, 255], 0.18 * (1.0 - focus)));
+    let white = sm
+        .text_c
+        .unwrap_or([palette.fg.r, palette.fg.g, palette.fg.b]);
     // strip 次级墨色(2026-10-12):条底改浅灰后,旧 dim(C5C8C6)在灰上
     // 对比度崩(+/—□× 实测不可见)——向白提亮,压着条底仍有层次
-    let ink2 = mix(white, bar, 0.35);
+    let ink2 = sm.dim_c.unwrap_or_else(|| mix(white, bar, 0.35));
     let k = sm.k;
     let cw = metrics.cell_width;
     // 等宽格步进的字符步长:宽字形(CJK)按墨宽推进,窄字符不小于格宽
     let adv = |g: &crate::font::router::GlyphInfo| g.size_px[0].max(cw);
-    // 单标签 = 无第二行(上游 hasTabBar 同款):条高只余标题行
-    let single = titles.len() <= 1;
+    // 单标签 = 无第二行(上游 hasTabBar 同款;strip-hide-single-tab = false
+    // 可恒显):条高只余标题行
+    let single = sm.hide_single && titles.len() <= 1;
     let eff_h = if single { sm.title_h } else { sm.h };
     // 全条底(两行同色;发丝线退役——活跃块要与内容区无缝相接)
     let strip_w = caption_x
@@ -560,7 +599,7 @@ pub fn strip_quads(
         let tab_y = sm.title_h;
         let tab_d = sm.h - sm.title_h;
         let text_y = sm.title_h + (tab_d - metrics.line_height).max(0.0) / 2.0;
-        let w = equal_tab_w(titles.len(), strip_w, sm);
+        let w = tab_w_now(titles.len(), strip_w, sm);
         let shift = layout.tab_scroll as f32 * sm.tab_min_w;
         let right = tabs_right(strip_w, sm);
         let mut x = tabs_x0(sm) - shift;
