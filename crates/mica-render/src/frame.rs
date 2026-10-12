@@ -416,11 +416,6 @@ pub fn strip_quads(
     } else {
         mix(bg3, [255, 255, 255], 0.18)
     };
-    let dim = [
-        palette.colors[7].r,
-        palette.colors[7].g,
-        palette.colors[7].b,
-    ];
     let white = [palette.fg.r, palette.fg.g, palette.fg.b];
     // strip 次级墨色(2026-10-12):条底改浅灰后,旧 dim(C5C8C6)在灰上
     // 对比度崩(+/—□× 实测不可见)——向白提亮,压着条底仍有层次
