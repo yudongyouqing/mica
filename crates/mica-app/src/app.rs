@@ -74,12 +74,14 @@ fn strip_metrics() -> mica_render::frame::StripMetrics {
 
 /// 条总高(动态,2026-10-12):单标签隐藏第二行(上游 hasTabBar 同款)
 /// ——终端区起点/命中上界都取此值;标签数跨 1↔2 时 draw_frame 的
-/// 网格兜底重排自然跟进。**含 TABS 借用**:TABS.with 持 guard 时调用
-/// 会双借 panic,须在外层先取局部(draw_frame/focus_neighbor 即此)
+/// 网格兜底重排自然跟进。读 TAB_COUNT Cell(无借用):任意路径安全可调
 fn strip_h() -> f32 {
     let sm = strip_metrics();
-    let n = TABS.with(|t| t.borrow().len());
-    if n <= 1 { sm.title_h } else { sm.h }
+    if TAB_COUNT.with(std::cell::Cell::get) <= 1 {
+        sm.title_h
+    } else {
+        sm.h
+    }
 }
 
 /// 字号随 DPI:DWrite 光栅按 96dpi 像素出图,pt×scale 才与屏幕物理一致。
@@ -157,6 +159,11 @@ thread_local! {
     /// 窗口聚焦(2026-10-12):失焦整条洗白一档(上游 Tahoe becomeMain/
     /// resignMain 同款);WM_ACTIVATE 维护
     static WINDOW_FOCUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// 标签数缓存(strip_h 用):TABS 是 RefCell,持 borrow_mut 的路径
+    /// (拖选坐标换算/分屏建 pane)再借 TABS 会双借 panic——wndproc 内
+    /// panic = 进程崩(2026-10-12 闪退实证)。标签数只在建/关标签时变,
+    /// 建/关两处同步维护此 Cell
+    static TAB_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -1495,7 +1502,11 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>, font_size: O
     };
     let id = tab.panes[0].id; // WPARAM 按 pane 寻址(T7)
     let pty_buf = Arc::clone(&tab.panes[0].terminal.pty_buf);
-    TABS.with(|tabs| tabs.borrow_mut().push(tab));
+    TABS.with(|tabs| {
+        let mut guard = tabs.borrow_mut();
+        guard.push(tab);
+        TAB_COUNT.with(|c| c.set(guard.len()));
+    });
     ACTIVE.with(|a| a.set(TABS.with(|tabs| tabs.borrow().len() - 1)));
     tab_follow_active(); // T8:新标签滚入可视区(溢出时)
     if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
@@ -2919,6 +2930,7 @@ fn close_tab(idx: usize) {
         }
         std::mem::forget(removed);
         let len = guard.len();
+        TAB_COUNT.with(|c| c.set(len));
         if len == 0 {
             quit = true;
             return;
