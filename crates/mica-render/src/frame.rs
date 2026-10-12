@@ -579,10 +579,13 @@ pub fn strip_quads(
             }
             let g = router.route(*glyph, GlyphStyle::PLAIN);
             if g.size_px[0] > 0.0 {
+                // 图标双向真居中(2026-10-12 用户实测纠偏):pos 即墨盒左上,
+                // 居中 = 容器 ±(容器尺寸-墨尺寸)/2,**不带 offset_px**——
+                // 那是基线相关量,带上会双重偏移(× 曾偏下、caption 曾斜)
                 out.push(CellInstance {
                     pos_uv: [
-                        bx + (sm.caption_w - g.size_px[0]) / 2.0 + g.offset_px[0],
-                        (sm.title_h - g.size_px[1]) / 2.0 + g.offset_px[1],
+                        bx + (sm.caption_w - g.size_px[0]) / 2.0,
+                        (sm.title_h - g.size_px[1]) / 2.0,
                         g.uv[0],
                         g.uv[1],
                     ],
@@ -668,15 +671,16 @@ pub fn strip_quads(
                 tx += adv(&g);
             }
             // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
-            // 悬停浮现(主色);胶囊内双向居中,点区在 WM_LBUTTONDOWN 同几何
+            // 悬停浮现(主色);胶囊内双向真居中(不带 offset,见 caption 注),
+            // 点区在 WM_LBUTTONDOWN 同几何
             if *active || hovered {
                 let kink = if *active { ink2 } else { white };
                 let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
                 if g.size_px[0] > 0.0 {
                     out.push(CellInstance {
                         pos_uv: [
-                            close_x + (sm.tab_close_w - g.size_px[0]) / 2.0 + g.offset_px[0],
-                            tab_y + (tab_d - g.size_px[1]) / 2.0 + g.offset_px[1],
+                            close_x + (sm.tab_close_w - g.size_px[0]) / 2.0,
+                            tab_y + (tab_d - g.size_px[1]) / 2.0,
                             g.uv[0],
                             g.uv[1],
                         ],
@@ -712,7 +716,7 @@ pub fn strip_quads(
                 out.push(CellInstance {
                     pos_uv: [
                         x + (sm.plus_w - g.size_px[0]) / 2.0,
-                        tab_y + (tab_d - g.size_px[1]) / 2.0 + g.offset_px[1],
+                        tab_y + (tab_d - g.size_px[1]) / 2.0,
                         g.uv[0],
                         g.uv[1],
                     ],

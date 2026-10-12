@@ -272,6 +272,9 @@ thread_local! {
     /// 颜色/字体/动画全从这里走(2026-10-12 全量可配)
     static STRIP_CFG: RefCell<mica_core::config::settings::StripCfg> =
         RefCell::new(mica_core::config::settings::StripCfg::default());
+    /// 标签拖拽换序(2026-10-12):按下标签置 Some(idx) + 捕获鼠标,
+    /// MOVE 跨过邻位即换位(Chrome 语义);抬起清空
+    static DRAG_TAB: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -2256,6 +2259,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         return LRESULT(0);
                     }
                     switch_tab(idx);
+                    // 按下即捕获,横拖换序(Chrome/Ghostty 语义;× 区不进)
+                    if n > 1 {
+                        DRAG_TAB.with(|d| d.set(Some(idx)));
+                        let _ = SetCapture(hwnd);
+                    }
                     return LRESULT(0);
                 }
                 Some(None) => {
@@ -2341,6 +2349,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe {
                     let _ = windows::Win32::UI::WindowsAndMessaging::ShowCursor(true);
                 }
+            }
+            // 标签拖拽换序:跨过邻位即换(带捕获,窗内外都收 MOVE)
+            if let Some(di) = DRAG_TAB.with(std::cell::Cell::get) {
+                let px = (lparam.0 & 0xffff) as u16 as i16 as i32;
+                let sm = strip_metrics();
+                let area_w = GPU
+                    .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
+                    .unwrap_or(0.0);
+                let n = TAB_COUNT.with(std::cell::Cell::get);
+                if n < 2 {
+                    return LRESULT(0);
+                }
+                let w = mica_render::frame::tab_w_now(n, area_w, &sm);
+                let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
+                let local = px.max(0) as f32 + shift;
+                let span = w + sm.tab_gap;
+                let tj = (((local - mica_render::frame::tabs_x0(&sm)) / span).floor() as i64)
+                    .clamp(0, n as i64 - 1) as usize;
+                if tj != di {
+                    TABS.with(|tabs| {
+                        let mut guard = tabs.borrow_mut();
+                        if tj < guard.len() && di < guard.len() {
+                            guard.swap(di, tj);
+                        }
+                    });
+                    ACTIVE.with(|a| a.set(tj));
+                    DRAG_TAB.with(|d| d.set(Some(tj)));
+                    draw_frame();
+                }
+                return LRESULT(0);
             }
             if !MOUSE_DOWN.with(std::cell::Cell::get) {
                 // D28 hover:非拖选时武装悬停追踪(每会话一次,HOVER/LEAVE 都会重置)
@@ -2477,6 +2515,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONUP => {
             MOUSE_DOWN.with(|m| m.set(false));
+            DRAG_TAB.with(|d| d.set(None)); // 拖拽换序结束
             let _ = ReleaseCapture();
             if MOUSE_CAPTURED.with(std::cell::Cell::take) {
                 let (px, py) = mouse_xy(lparam);
