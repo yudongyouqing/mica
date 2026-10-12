@@ -84,6 +84,95 @@ fn strip_h() -> f32 {
     }
 }
 
+// 单调时钟(动画用):线程本地原点,CAPS_T0 存相对此刻的秒数,取差即
+// 经过时间——Instant 不能进 const Cell,这是等价物
+thread_local! {
+    static CLOCK0: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+fn now_secs() -> f64 {
+    CLOCK0.with(|c| {
+        let t0 = c.get().unwrap_or_else(|| {
+            let n = std::time::Instant::now();
+            c.set(Some(n));
+            n
+        });
+        t0.elapsed().as_secs_f64()
+    })
+}
+
+/// 活跃标签胶囊当前横移量(动画值):120ms ease-out,cubic;过期 = 0
+fn capsule_dx_now() -> f32 {
+    let t0 = CAPS_T0.with(std::cell::Cell::get);
+    if t0 < 0.0 {
+        return 0.0;
+    }
+    let k = (((now_secs() - t0) as f32) / 0.120).clamp(0.0, 1.0);
+    let ease = 1.0 - (1.0 - k).powi(3);
+    CAPS_START.with(std::cell::Cell::get) * (1.0 - ease)
+}
+
+/// 起一次胶囊滑动(切换/新建/关闭标签后调用):从旧活跃位滑到新活跃位
+fn prime_capsule_slide(old_idx: usize, new_idx: usize) {
+    if old_idx == new_idx {
+        return;
+    }
+    let sm = strip_metrics();
+    let area_w = GPU
+        .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
+        .unwrap_or(0.0);
+    let n = TAB_COUNT.with(std::cell::Cell::get).max(1);
+    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+    let dx = (old_idx as f32 - new_idx as f32) * (w + sm.tab_gap);
+    CAPS_START.with(|c| c.set(dx));
+    CAPS_T0.with(|t| t.set(now_secs()));
+}
+
+/// 武装 strip 动画定时器(timer 5,15ms):有动画在跑时反复调用无害
+fn ensure_anim_timer() {
+    if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone())
+        && let Some(raw) = *slot.lock().unwrap_or_else(|e| e.into_inner())
+    {
+        // SAFETY: 哨兵非空即窗口存活(run() 退出序先置 None)
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                Some(windows::Win32::Foundation::HWND(raw as _)),
+                5,
+                15,
+                None,
+            );
+        }
+    }
+}
+
+/// strip 动推进一步(timer 5,15ms):focus 相位渐近 + 胶囊滑移衰减;
+/// 返回 true = 还有动画在跑(timer 续命),false = 全部到位(可停表)
+fn strip_anim_step() -> bool {
+    let mut busy = false;
+    // focus:150ms 线性渐近
+    let fp = FOCUS_PHASE.with(std::cell::Cell::get);
+    let ft = FOCUS_TARGET.with(std::cell::Cell::get);
+    if (fp - ft).abs() > 0.004 {
+        let step = 0.015 / 0.150;
+        let nf = if fp < ft {
+            (fp + step).min(ft)
+        } else {
+            (fp - step).max(ft)
+        };
+        FOCUS_PHASE.with(|f| f.set(nf));
+        busy = true;
+    } else if fp != ft {
+        FOCUS_PHASE.with(|f| f.set(ft));
+    }
+    // 胶囊:由时间驱动,只在未到期时算忙
+    let t0 = CAPS_T0.with(std::cell::Cell::get);
+    if t0 >= 0.0 && capsule_dx_now().abs() > 0.5 {
+        busy = true;
+    } else if t0 >= 0.0 {
+        CAPS_T0.with(|t| t.set(-1.0));
+    }
+    busy
+}
+
 /// 字号随 DPI:DWrite 光栅按 96dpi 像素出图,pt×scale 才与屏幕物理一致。
 /// reload_dpi 一直这么乘,其余建 router 站点曾全漏(单 150% 屏无
 /// WM_DPICHANGED,字体永远 ×1.0)——2026-10-06 统一单源
@@ -156,9 +245,16 @@ thread_local! {
     /// 不误——曾致 Ctrl+Shift+T 开新标签的同时给 shell 送去 ^T
     static KEYMAP_ATE_CHAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CURSOR_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// 窗口聚焦(2026-10-12):失焦整条洗白一档(上游 Tahoe becomeMain/
-    /// resignMain 同款);WM_ACTIVATE 维护
-    static WINDOW_FOCUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// strip 动画相位(2026-10-12"丝滑"工程):focus 0..1 连续(1=聚焦,
+    /// 条色/标题墨随相位混合,WM_ACTIVATE 设目标 timer 5 渐近 150ms);
+    /// CAPS_* 是活跃标签胶囊横移(切/建/关标签时置初值,120ms ease-out
+    /// 衰减到 0——Tahoe NSTabBar 切换滑动的移植;上游源码实证:Ghostty
+    /// 自身零动画代码,丝滑全靠系统组件,Mica 用 timer 重画逼近)
+    static FOCUS_PHASE: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+    static FOCUS_TARGET: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+    static CAPS_START: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    /// 动画起点(Instant 秒);负值 = 无动画
+    static CAPS_T0: std::cell::Cell<f64> = const { std::cell::Cell::new(-1.0) };
     /// 标签数缓存(strip_h 用):TABS 是 RefCell,持 borrow_mut 的路径
     /// (拖选坐标换算/分屏建 pane)再借 TABS 会双借 panic——wndproc 内
     /// panic = 进程崩(2026-10-12 闪退实证)。标签数只在建/关标签时变,
@@ -1484,6 +1580,7 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>, font_size: O
             .and_then(|tab| tab.active_pane_ref())
             .and_then(|t| t.term.cwd().map(str::to_string))
     });
+    let old_active = ACTIVE.get(); // 胶囊滑动动画的起点(旧活跃位)
     let (pane, reader) = match create_pane_with_size(hwnd, &shell, font_size, inherit.as_deref()) {
         Ok(pair) => pair,
         Err(e) => {
@@ -1508,6 +1605,8 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>, font_size: O
         TAB_COUNT.with(|c| c.set(guard.len()));
     });
     ACTIVE.with(|a| a.set(TABS.with(|tabs| tabs.borrow().len() - 1)));
+    prime_capsule_slide(old_active, ACTIVE.get()); // 新标签从旧活跃位滑入
+    ensure_anim_timer();
     tab_follow_active(); // T8:新标签滚入可视区(溢出时)
     if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
         spawn_render_forwarder(reader, pty_buf, slot, id);
@@ -1794,8 +1893,9 @@ fn draw_frame() {
                         )
                         .as_bool()
                     }),
-                // 失焦洗白(上游 becomeMain/resignMain 同款)
-                focused: WINDOW_FOCUSED.with(std::cell::Cell::get),
+                // 失焦洗白(上游 becomeMain/resignMain 同款,动画相位驱动)
+                focus: FOCUS_PHASE.with(std::cell::Cell::get),
+                capsule_dx: capsule_dx_now(),
             },
         );
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
@@ -1855,13 +1955,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_ACTIVATE => {
-            // 聚焦态(2026-10-12):失焦整条洗白一档(上游 becomeMain/
-            // resignMain 同款);wparam 低 16 位 0 = WA_INACTIVE。
-            // Cell::replace 返回旧值,变化才重绘
+            // 聚焦相位(2026-10-12):失焦洗白不再跳变——设目标后由
+            // timer 5 以 150ms 渐近(wparam 低 16 位 0 = WA_INACTIVE)
             let active = (wparam.0 & 0xffff) != 0;
-            if WINDOW_FOCUSED.with(|f| f.replace(active)) != active {
-                draw_frame();
-            }
+            FOCUS_TARGET.with(|t| t.set(if active { 1.0 } else { 0.0 }));
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 5, 15, None);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_CHAR => {
@@ -2653,12 +2751,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_TIMER => {
             // id 分流:2 = 2026 同步安全阀(D29);1 = 光标闪烁(D20);
-            // 3 = 子进程退出轮询(M5b/T3);4 = 合帧去抖到期(WM_APP_RENDER)
+            // 3 = 子进程退出轮询(M5b/T3);4 = 合帧去抖到期(WM_APP_RENDER);
+            // 5 = strip 动画步进(focus 相位/胶囊滑移,2026-10-12)
             if wparam.0 == 3 && poll_exits() {
                 draw_frame();
                 return LRESULT(0);
             }
             match wparam.0 {
+                5 => {
+                    if strip_anim_step() {
+                        ensure_anim_timer();
+                    } else {
+                        windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 5).ok();
+                    }
+                    draw_frame();
+                }
                 4 => {
                     windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 4).ok();
                     draw_frame();
@@ -2895,6 +3002,7 @@ fn vk_to_trigger(vk: u32) -> Option<TriggerKey> {
 
 /// 切到指定下标的标签:置活跃 + force_full(strip 也要换高亮)+ 重绘。
 fn switch_tab(idx: usize) {
+    let old = ACTIVE.get();
     TABS.with(|tabs| {
         let mut guard = tabs.borrow_mut();
         if idx >= guard.len() {
@@ -2907,6 +3015,8 @@ fn switch_tab(idx: usize) {
             }
         }
     });
+    prime_capsule_slide(old, idx); // 胶囊从旧位滑到新位(Tahoe 切换动画)
+    ensure_anim_timer();
     tab_follow_active(); // T8:溢出时活跃标签滚入可视区
     draw_frame();
 }
@@ -2915,6 +3025,8 @@ fn switch_tab(idx: usize) {
 /// 关的是活跃标签则邻位顶上;池空 → 退出应用。
 fn close_tab(idx: usize) {
     let mut quit = false;
+    let old_active = ACTIVE.get();
+    let mut new_active: Option<usize> = None;
     TABS.with(|tabs| {
         let mut guard = tabs.borrow_mut();
         if idx >= guard.len() {
@@ -2937,6 +3049,7 @@ fn close_tab(idx: usize) {
         }
         let active = ACTIVE.get().min(len - 1);
         ACTIVE.with(|a| a.set(active));
+        new_active = Some(active);
         if let Some(tab) = guard.get_mut(active) {
             for p in tab.panes.iter_mut() {
                 p.terminal.force_full = true;
@@ -2945,9 +3058,13 @@ fn close_tab(idx: usize) {
     });
     if quit {
         unsafe { PostQuitMessage(0) };
-    } else {
-        draw_frame();
+        return;
     }
+    if let Some(na) = new_active {
+        prime_capsule_slide(old_active, na); // 邻位胶囊滑入聚焦
+        ensure_anim_timer();
+    }
+    draw_frame();
 }
 
 /// strip 命中(双行形制):Some(Some(idx)) = 第二行标签;Some(None) =

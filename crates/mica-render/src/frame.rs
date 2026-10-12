@@ -344,9 +344,13 @@ pub struct StripExtras {
     pub hover: StripHover,
     /// 最大化态(2026-10-07):true 时最大化钮显还原图标(E923)
     pub zoomed: bool,
-    /// 窗口聚焦(2026-10-12):失焦整条洗白一档(上游 Tahoe
-    /// becomeMain/resignMain 同款语义)
-    pub focused: bool,
+    /// 窗口聚焦相位(2026-10-12):1.0 = 聚焦(条底 18% 提亮),0.0 = 失焦
+    /// (洗白至 30%)——**连续值**,app 侧动画驱动(WM_TIMER 渐进),
+    /// 切换不跳变(上游 becomeMain/resignMain 语义的动画化)
+    pub focus: f32,
+    /// 活跃标签胶囊横移量(动画中):非零时活跃标签 x0 偏移此值,衰减到
+    /// 0 即完成——切换/新建/关闭时 app 侧置初值,标签切换的滑动即此
+    pub capsule_dx: f32,
 }
 
 /// strip 悬停命中(与 app 层 hit-test 同几何单源;命中区互斥)。
@@ -393,7 +397,8 @@ pub fn strip_quads(
         pane_exit,
         hover,
         zoomed,
-        focused,
+        focus,
+        capsule_dx,
     } = extras;
     let mut out = Vec::new();
     let total_w = titles.len() as f32 * sm.tab_min_w + sm.plus_w;
@@ -406,16 +411,15 @@ pub fn strip_quads(
         ]
     };
     let bg3 = [palette.bg.r, palette.bg.g, palette.bg.b];
-    // 条底 = 常态浅灰(2026-10-12 用户实测 Ghostty:标签栏比终端底亮),
-    // 聚焦 18% 提亮、失焦 30% 再洗一档(上游 Tahoe becomeMain/resignMain
-    // 驱动 isActive 同款语义);活跃标签块 = 终端底色,与内容区无缝相接
-    let bar = mix(bg3, [255, 255, 255], if focused { 0.18 } else { 0.30 });
+    // 条底 = 常态浅灰(上游实测:标签栏比终端底亮;Ventura 版 14% 提亮同族,
+    // Mica 取 18%),失焦再洗至 30%(Tahoe becomeMain/resignMain 同款)。
+    // focus 是 0..1 的动画相位(app 侧 WM_TIMER 渐进),切换不再跳变——
+    // 这是"丝滑"的一半;另一半是活跃块滑动(capsule_dx)
+    let focus = focus.clamp(0.0, 1.0);
+    let wash = 0.30 - 0.12 * focus; // 1.0 → 18%,0.0 → 30%
+    let bar = mix(bg3, [255, 255, 255], wash);
     // 活跃标签面色:聚焦 = 终端底原样(与内容一体);失焦同样洗白一档
-    let active_face = if focused {
-        bg3
-    } else {
-        mix(bg3, [255, 255, 255], 0.18)
-    };
+    let active_face = mix(bg3, [255, 255, 255], 0.18 * (1.0 - focus));
     let white = [palette.fg.r, palette.fg.g, palette.fg.b];
     // strip 次级墨色(2026-10-12):条底改浅灰后,旧 dim(C5C8C6)在灰上
     // 对比度崩(+/—□× 实测不可见)——向白提亮,压着条底仍有层次
@@ -468,7 +472,7 @@ pub fn strip_quads(
         text_w += adv(&ell);
     }
     let mut tx = ((title_avail - text_w) / 2.0).max(0.0);
-    let title_ink = if focused { white } else { ink2 };
+    let title_ink = mix(ink2, white, focus);
     for g in routed.iter().take(n_take) {
         if g.size_px[0] > 0.0 {
             out.push(CellInstance {
@@ -561,7 +565,7 @@ pub fn strip_quads(
         let right = tabs_right(strip_w, sm);
         let mut x = tabs_x0(sm) - shift;
         for (i, (title, active)) in titles.iter().enumerate() {
-            let x0 = x;
+            let x0 = if *active { x + capsule_dx } else { x };
             x += w + sm.tab_gap;
             if x0 + w <= 0.0 || x0 >= right {
                 continue; // 滚出可视区的标签不发射(右缘止于 "+" 左邻)
@@ -1309,7 +1313,7 @@ mod tests {
             &StripMetrics::default(),
             StripExtras {
                 caption_x: Some(400.0),
-                focused: true,
+                focus: 1.0,
                 ..Default::default()
             },
         );
@@ -1368,7 +1372,7 @@ mod tests {
             &StripMetrics::default(),
             StripExtras {
                 caption_x: Some(400.0),
-                focused: true,
+                focus: 1.0,
                 ..Default::default()
             },
         );
