@@ -197,7 +197,6 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         force_full: true,
         shell: "powershell.exe -NoLogo".into(),
         exited: None,
-        strip_router: None,
         last_atlas_ver: 0,
     };
     QT.with(|q| {
