@@ -245,8 +245,8 @@ pub struct StripMetrics {
     pub tab_close_w: f32,
     /// caption 单键宽(— □ ×)
     pub caption_w: f32,
-    /// 激活/悬停标签块的上圆角半径
-    pub tab_r: f32,
+    /// 标签块上圆角半径(下缘直角:活跃块与终端区无缝相接)
+    pub tab_top_r: f32,
     /// tooltip 圆角半径
     pub chip_r: f32,
     /// exit 状态点直径
@@ -271,9 +271,8 @@ impl StripMetrics {
             tab_close_w: TAB_CLOSE_W_BASE * s,
             plus_w: TAB_PLUS_W_BASE * s,
             caption_w: 46.0 * s,
-            // 胶囊半径 = 块高一半(macOS Tahoe 原生标签形制,Ghostty
-            // Tahoe 实现劫持 NSTabBar 视觉即 Apple 胶囊)
-            tab_r: (STRIP_TAB_H_BASE * s - 4.0 * s) / 2.0,
+            // 标签块上圆角(macOS 原生标签形制,下缘直抵内容区)
+            tab_top_r: 8.0 * s,
             chip_r: 6.0 * s,
             dot_d: 7.0 * s,
             pad: 8.0 * s,
@@ -311,23 +310,17 @@ pub fn tabs_right(total_w: f32, sm: &StripMetrics) -> f32 {
     plus_x(total_w, sm) - 2.0 * sm.k
 }
 
-/// 单标签宽(内容自适应,macOS Tahoe 形制):等宽估宽(CJK 双宽,与终端
-/// [`crate::font::char_width`] 同源)+ 左右内边距 + × 预留,夹逼
-/// [min_w, max_w]。均分填充(gtk-wide-tabs)2026-10-12 晚弃——双行下
-/// 标签行被标签占满、无拖拽区(用户实报"拖动不了窗口");自适应让标签
-/// 行尾部空档可拖。胶囊宽度与 hit-test 同取此值;标题墨宽以真字形
-/// 逐字截断(与估宽略异,截断兜底)。
-pub fn tab_w(title: &str, cw: f32, sm: &StripMetrics) -> f32 {
-    let cells: f32 = title
-        .chars()
-        .map(|c| crate::font::char_width(c).max(1) as f32)
-        .sum();
-    (cells * cw + 2.0 * sm.tab_pad + sm.tab_close_w).clamp(sm.tab_min_w, sm.tab_max_w)
-}
-
-/// 标签总占宽(含缝);hit-test 与溢出滚动共用
-pub fn tabs_span(widths: &[f32], sm: &StripMetrics) -> f32 {
-    widths.iter().sum::<f32>() + sm.tab_gap * widths.len().saturating_sub(1) as f32
+/// 标签宽(均分填充):标签占满第二行可用宽(用户 2026-10-12 裁定
+/// "占满没事");可用域 = tabs_x0 到 tabs_right(右端 "+" 左缘)。放不下
+/// (min_w × n > 可用域)则固定 min_w 由溢出滚动兜底。等宽单值,
+/// 渲染与 hit-test 同源。
+pub fn equal_tab_w(n: usize, avail_w: f32, sm: &StripMetrics) -> f32 {
+    if n == 0 {
+        return sm.tab_min_w;
+    }
+    let gaps = sm.tab_gap * n as f32;
+    let body = (tabs_right(avail_w, sm) - tabs_x0(sm) - gaps).max(0.0);
+    (body / n as f32).max(sm.tab_min_w)
 }
 
 /// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数。
@@ -351,6 +344,9 @@ pub struct StripExtras {
     pub hover: StripHover,
     /// 最大化态(2026-10-07):true 时最大化钮显还原图标(E923)
     pub zoomed: bool,
+    /// 窗口聚焦(2026-10-12):失焦整条洗白一档(上游 Tahoe
+    /// becomeMain/resignMain 同款语义)
+    pub focused: bool,
 }
 
 /// strip 悬停命中(与 app 层 hit-test 同几何单源;命中区互斥)。
@@ -373,11 +369,12 @@ pub enum CaptionBtn {
 
 /// tab strip 的 UI 实例(T7,spec §3 同管线),**双行形制**(2026-10-12
 /// 用户裁定):第一行 = 窗口标题(活跃标签名,居中)+ 右端 caption 三键
-/// (— □ ×);第二行 = 内容自适应标签 + 右端 "+" 开新标签(标签行尾部
-/// 空档是拖拽区);再下才是终端主体。
-/// 条底 = 终端背景原样(macOS Ghostty titlebarColor 同义),底缘 1px 发丝线。
-/// strip 文字走终端路由(等宽字、格步进)——Segoe UI 比例试验同日被用户
-/// 否决("还不如原来那个"),回滚。
+/// (— □ ×);第二行 = 均分标签占满 + 右端 "+" 开新标签;再下才是终端
+/// 主体。单标签时第二行整行隐藏(上游 hasTabBar 同款)。
+/// 条底 = 常态浅灰(终端底提亮 18%;失焦再洗至 30%,上游 becomeMain/
+/// resignMain 同款),活跃标签块 = 终端底色原样、上圆下方与内容区无缝
+/// 相接。strip 文字走**小号等宽路由**(9.5pt 共享图集,app 侧注入;
+/// 字号 12pt 的终端路由出的大字形会挤出 × 关闭区,用户实报)。
 /// exit_dot(D37):活跃标签命令状态点,"+" 左邻固定锚。
 /// pane_exit(M5b/T3):[exit N] 文本,状态点左侧。
 /// layout(T8):溢出滚动——越界标签不发射,滚轮驱动,箭头命中区暂缓。
@@ -396,6 +393,7 @@ pub fn strip_quads(
         pane_exit,
         hover,
         zoomed,
+        focused,
     } = extras;
     let mut out = Vec::new();
     let total_w = titles.len() as f32 * sm.tab_min_w + sm.plus_w;
@@ -408,9 +406,16 @@ pub fn strip_quads(
         ]
     };
     let bg3 = [palette.bg.r, palette.bg.g, palette.bg.b];
-    // 条底 = 终端底色**原样**(macOS Ghostty:titlebarColor =
-    // backgroundColor,条与终端同色一体;三稿定档,用户已认总体 UI)
-    let bar = bg3;
+    // 条底 = 常态浅灰(2026-10-12 用户实测 Ghostty:标签栏比终端底亮),
+    // 聚焦 18% 提亮、失焦 30% 再洗一档(上游 Tahoe becomeMain/resignMain
+    // 驱动 isActive 同款语义);活跃标签块 = 终端底色,与内容区无缝相接
+    let bar = mix(bg3, [255, 255, 255], if focused { 0.18 } else { 0.30 });
+    // 活跃标签面色:聚焦 = 终端底原样(与内容一体);失焦同样洗白一档
+    let active_face = if focused {
+        bg3
+    } else {
+        mix(bg3, [255, 255, 255], 0.18)
+    };
     let dim = [
         palette.colors[7].r,
         palette.colors[7].g,
@@ -421,24 +426,19 @@ pub fn strip_quads(
     let cw = metrics.cell_width;
     // 等宽格步进的字符步长:宽字形(CJK)按墨宽推进,窄字符不小于格宽
     let adv = |g: &crate::font::router::GlyphInfo| g.size_px[0].max(cw);
-    // 全条底(两行同色)+ 底缘发丝线(1px,比条再暗一档;blend:None 下
-    // 1px 不做 AA,该线本身就是 hairline 语义)
+    // 单标签 = 无第二行(上游 hasTabBar 同款):条高只余标题行
+    let single = titles.len() <= 1;
+    let eff_h = if single { sm.title_h } else { sm.h };
+    // 全条底(两行同色;发丝线退役——活跃块要与内容区无缝相接)
     let strip_w = caption_x
         .map(|cx| cx + 3.0 * sm.caption_w)
         .unwrap_or(total_w)
         .max(total_w);
     out.push(CellInstance {
         pos_uv: [0.0, 0.0, 0.0, 0.0],
-        size_uv: [strip_w, sm.h, 0.0, 0.0],
+        size_uv: [strip_w, eff_h, 0.0, 0.0],
         fg: bg_of(bar),
         bg: bg_of(bar),
-    });
-    let hair = mix(bar, [0, 0, 0], 0.30);
-    out.push(CellInstance {
-        pos_uv: [0.0, sm.h - 1.0, 0.0, 0.0],
-        size_uv: [strip_w, 1.0, 0.0, 0.0],
-        fg: bg_of(hair),
-        bg: bg_of(hair),
     });
 
     // ---- 第一行:窗口标题(活跃标签名,居中;caption 左界内,超宽省略号)
@@ -470,6 +470,7 @@ pub fn strip_quads(
         text_w += adv(&ell);
     }
     let mut tx = ((title_avail - text_w) / 2.0).max(0.0);
+    let title_ink = if focused { white } else { dim };
     for g in routed.iter().take(n_take) {
         if g.size_px[0] > 0.0 {
             out.push(CellInstance {
@@ -480,7 +481,7 @@ pub fn strip_quads(
                     g.uv[1],
                 ],
                 size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: bg_of(white),
+                fg: bg_of(title_ink),
                 bg: bg_of(bar),
             });
         }
@@ -495,7 +496,7 @@ pub fn strip_quads(
                 ell.uv[1],
             ],
             size_uv: [ell.size_px[0], ell.size_px[1], ell.uv[2], ell.uv[3]],
-            fg: bg_of(white),
+            fg: bg_of(title_ink),
             bg: bg_of(bar),
         });
     }
@@ -552,179 +553,182 @@ pub fn strip_quads(
         }
     }
 
-    // ---- 第二行:内容自适应标签(从 tabs_x0 起,右止 tabs_right)+ 右端 "+"
-    let tab_y = sm.title_h + 2.0 * k;
-    let tab_d = sm.tab_h - 4.0 * k;
-    let text_y = sm.title_h + (sm.tab_h - metrics.line_height).max(0.0) / 2.0;
-    let shift = layout.tab_scroll as f32 * sm.tab_min_w;
-    let right = tabs_right(strip_w, sm);
-    let mut x = tabs_x0(sm) - shift;
-    for (i, (title, active)) in titles.iter().enumerate() {
-        let w = tab_w(title, cw, sm);
-        let x0 = x;
-        x += w + sm.tab_gap;
-        if x0 + w <= 0.0 || x0 >= right {
-            continue; // 滚出可视区的标签不发射(右缘止于 "+" 左邻)
-        }
-        let hovered = hover.tab == Some(i);
-        let hover_face = mix(bar, white, 0.04);
-        let (backdrop, ink) = if *active {
-            (mix(bg3, white, 0.08), white)
-        } else if hovered {
-            (hover_face, dim)
-        } else {
-            (bar, dim)
-        };
-        // 胶囊(Tahoe):四角全圆、上下各离 2k 悬浮于第二行
-        if *active || hovered {
-            out.push(rounded(
-                x0,
-                tab_y,
-                w,
-                tab_d,
-                backdrop,
-                bar,
-                (sm.tab_r, sm.tab_r),
-            ));
-        }
-        // 标题:等宽格步进,超宽以省略号截断(× 区前留呼吸)
-        let close_x = x0 + w - sm.tab_close_w;
-        let mut tx = x0 + sm.tab_pad;
-        for ch in title.chars() {
-            let g = router.route(ch, GlyphStyle::PLAIN);
-            if tx + adv(&g) + adv(&ell) > close_x - 6.0 * k {
-                if ell.size_px[0] > 0.0 {
+    // ---- 第二行:均分标签占满 + 右端 "+"(单标签时整行隐藏,不发射)
+    if !single {
+        let tab_y = sm.title_h;
+        let tab_d = sm.h - sm.title_h;
+        let text_y = sm.title_h + (tab_d - metrics.line_height).max(0.0) / 2.0;
+        let w = equal_tab_w(titles.len(), strip_w, sm);
+        let shift = layout.tab_scroll as f32 * sm.tab_min_w;
+        let right = tabs_right(strip_w, sm);
+        let mut x = tabs_x0(sm) - shift;
+        for (i, (title, active)) in titles.iter().enumerate() {
+            let x0 = x;
+            x += w + sm.tab_gap;
+            if x0 + w <= 0.0 || x0 >= right {
+                continue; // 滚出可视区的标签不发射(右缘止于 "+" 左邻)
+            }
+            let hovered = hover.tab == Some(i);
+            let hover_face = mix(bar, white, 0.05);
+            let (backdrop, ink) = if *active {
+                (active_face, white)
+            } else if hovered {
+                (hover_face, dim)
+            } else {
+                (bar, dim)
+            };
+            // 标签块:上圆下方——活跃块 = 终端底色,下缘直抵内容区无缝
+            // 相接(macOS 原生标签形制);非活跃悬停轻提亮
+            if *active || hovered {
+                out.push(rounded(
+                    x0,
+                    tab_y,
+                    w,
+                    tab_d,
+                    backdrop,
+                    bar,
+                    (sm.tab_top_r, 0.0),
+                ));
+            }
+            // 标题:等宽格步进,超宽以省略号截断(× 区前留呼吸)
+            let close_x = x0 + w - sm.tab_close_w;
+            let mut tx = x0 + sm.tab_pad;
+            for ch in title.chars() {
+                let g = router.route(ch, GlyphStyle::PLAIN);
+                if tx + adv(&g) + adv(&ell) > close_x - 6.0 * k {
+                    if ell.size_px[0] > 0.0 {
+                        out.push(CellInstance {
+                            pos_uv: [
+                                tx + ell.offset_px[0],
+                                text_y + ell.offset_px[1],
+                                ell.uv[0],
+                                ell.uv[1],
+                            ],
+                            size_uv: [ell.size_px[0], ell.size_px[1], ell.uv[2], ell.uv[3]],
+                            fg: bg_of(ink),
+                            bg: bg_of(backdrop),
+                        });
+                    }
+                    break;
+                }
+                if g.size_px[0] > 0.0 {
                     out.push(CellInstance {
                         pos_uv: [
-                            tx + ell.offset_px[0],
-                            text_y + ell.offset_px[1],
-                            ell.uv[0],
-                            ell.uv[1],
+                            tx + g.offset_px[0],
+                            text_y + g.offset_px[1],
+                            g.uv[0],
+                            g.uv[1],
                         ],
-                        size_uv: [ell.size_px[0], ell.size_px[1], ell.uv[2], ell.uv[3]],
+                        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
                         fg: bg_of(ink),
                         bg: bg_of(backdrop),
                     });
                 }
-                break;
+                tx += adv(&g);
             }
-            if g.size_px[0] > 0.0 {
-                out.push(CellInstance {
-                    pos_uv: [
-                        tx + g.offset_px[0],
-                        text_y + g.offset_px[1],
-                        g.uv[0],
-                        g.uv[1],
-                    ],
-                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                    fg: bg_of(ink),
-                    bg: bg_of(backdrop),
-                });
+            // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
+            // 悬停浮现(主色);胶囊内双向居中,点区在 WM_LBUTTONDOWN 同几何
+            if *active || hovered {
+                let kink = if *active { dim } else { white };
+                let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
+                if g.size_px[0] > 0.0 {
+                    out.push(CellInstance {
+                        pos_uv: [
+                            close_x + (sm.tab_close_w - g.size_px[0]) / 2.0 + g.offset_px[0],
+                            tab_y + (tab_d - g.size_px[1]) / 2.0 + g.offset_px[1],
+                            g.uv[0],
+                            g.uv[1],
+                        ],
+                        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                        fg: bg_of(kink),
+                        bg: bg_of(backdrop),
+                    });
+                }
             }
-            tx += adv(&g);
         }
-        // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
-        // 悬停浮现(主色);胶囊内双向居中,点区在 WM_LBUTTONDOWN 同几何
-        if *active || hovered {
-            let kink = if *active { dim } else { white };
-            let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
+        // "+" 开新标签(第二行右端;Chrome/WT/Tahoe 都在标签行右端,
+        // 2026-10-12 双行重排时用户点名"最右边")
+        {
+            let x = plus_x(strip_w, sm);
+            let hovered = hover.plus;
+            let face = mix(bar, white, 0.05);
+            let (glyph_bg, ink) = if hovered { (face, dim) } else { (bar, dim) };
+            if hovered {
+                let r = tab_d / 2.0;
+                out.push(rounded(
+                    x + (sm.plus_w - tab_d) / 2.0,
+                    tab_y,
+                    tab_d,
+                    tab_d,
+                    face,
+                    bar,
+                    (r, r),
+                ));
+            }
+            let g = router.route('+', GlyphStyle::PLAIN);
             if g.size_px[0] > 0.0 {
                 out.push(CellInstance {
                     pos_uv: [
-                        close_x + (sm.tab_close_w - g.size_px[0]) / 2.0 + g.offset_px[0],
+                        x + (sm.plus_w - g.size_px[0]) / 2.0,
                         tab_y + (tab_d - g.size_px[1]) / 2.0 + g.offset_px[1],
                         g.uv[0],
                         g.uv[1],
                     ],
                     size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                    fg: bg_of(kink),
-                    bg: bg_of(backdrop),
+                    fg: bg_of(ink),
+                    bg: bg_of(glyph_bg),
                 });
             }
         }
-    }
-    // "+" 开新标签(第二行右端;Chrome/WT/Tahoe 都在标签行右端,
-    // 2026-10-12 双行重排时用户点名"最右边")
-    {
-        let x = plus_x(strip_w, sm);
-        let hovered = hover.plus;
-        let face = mix(bar, white, 0.04);
-        let (glyph_bg, ink) = if hovered { (face, dim) } else { (bar, dim) };
-        if hovered {
-            let r = tab_d / 2.0;
+        // pane 退出态(M5b/T3):第二行右端、"+" 左邻(标签标题截断吃不到);
+        // 0 绿/非 0 红,文本止于状态点左
+        if let Some(code) = pane_exit {
+            let label = format!("[exit {code}]");
+            let slot = if code == 0 {
+                palette.colors[2]
+            } else {
+                palette.colors[1]
+            };
+            let end_x = plus_x(strip_w, sm) - 12.0 * k - sm.dot_d - 8.0 * k;
+            let start = end_x - label.chars().count() as f32 * cw;
+            for (ci, ch) in label.chars().enumerate() {
+                let g = router.route(ch, GlyphStyle::PLAIN);
+                if g.size_px[0] <= 0.0 {
+                    continue;
+                }
+                out.push(CellInstance {
+                    pos_uv: [
+                        start + ci as f32 * cw + g.offset_px[0],
+                        text_y + g.offset_px[1],
+                        g.uv[0],
+                        g.uv[1],
+                    ],
+                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                    fg: bg_of([slot.r, slot.g, slot.b]),
+                    bg: bg_of(bar),
+                });
+            }
+        }
+        // D37 exit 状态点:第二行右端、"+" 左邻(固定锚),真圆(半径 = 半宽)
+        if let Some(dot) = exit_dot {
+            let slot = match dot {
+                ExitDot::Green => palette.colors[2],
+                ExitDot::Red => palette.colors[1],
+                ExitDot::Gray => palette.colors[8],
+            };
+            let dx = plus_x(strip_w, sm) - 12.0 * k - sm.dot_d;
+            let cy = sm.title_h + sm.tab_h / 2.0;
+            let d = sm.dot_d;
             out.push(rounded(
-                x + (sm.plus_w - tab_d) / 2.0,
-                tab_y,
-                tab_d,
-                tab_d,
-                face,
+                dx,
+                cy - d / 2.0,
+                d,
+                d,
+                [slot.r, slot.g, slot.b],
                 bar,
-                (r, r),
+                (d / 2.0, d / 2.0),
             ));
         }
-        let g = router.route('+', GlyphStyle::PLAIN);
-        if g.size_px[0] > 0.0 {
-            out.push(CellInstance {
-                pos_uv: [
-                    x + (sm.plus_w - g.size_px[0]) / 2.0,
-                    tab_y + (tab_d - g.size_px[1]) / 2.0 + g.offset_px[1],
-                    g.uv[0],
-                    g.uv[1],
-                ],
-                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: bg_of(ink),
-                bg: bg_of(glyph_bg),
-            });
-        }
-    }
-    // pane 退出态(M5b/T3):第二行右端、"+" 左邻(标签标题截断吃不到);
-    // 0 绿/非 0 红,文本止于状态点左
-    if let Some(code) = pane_exit {
-        let label = format!("[exit {code}]");
-        let slot = if code == 0 {
-            palette.colors[2]
-        } else {
-            palette.colors[1]
-        };
-        let end_x = plus_x(strip_w, sm) - 12.0 * k - sm.dot_d - 8.0 * k;
-        let start = end_x - label.chars().count() as f32 * cw;
-        for (ci, ch) in label.chars().enumerate() {
-            let g = router.route(ch, GlyphStyle::PLAIN);
-            if g.size_px[0] <= 0.0 {
-                continue;
-            }
-            out.push(CellInstance {
-                pos_uv: [
-                    start + ci as f32 * cw + g.offset_px[0],
-                    text_y + g.offset_px[1],
-                    g.uv[0],
-                    g.uv[1],
-                ],
-                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                fg: bg_of([slot.r, slot.g, slot.b]),
-                bg: bg_of(bar),
-            });
-        }
-    }
-    // D37 exit 状态点:第二行右端、"+" 左邻(固定锚),真圆(半径 = 半宽)
-    if let Some(dot) = exit_dot {
-        let slot = match dot {
-            ExitDot::Green => palette.colors[2],
-            ExitDot::Red => palette.colors[1],
-            ExitDot::Gray => palette.colors[8],
-        };
-        let dx = plus_x(strip_w, sm) - 12.0 * k - sm.dot_d;
-        let cy = sm.title_h + sm.tab_h / 2.0;
-        let d = sm.dot_d;
-        out.push(rounded(
-            dx,
-            cy - d / 2.0,
-            d,
-            d,
-            [slot.r, slot.g, slot.b],
-            bar,
-            (d / 2.0, d / 2.0),
-        ));
     }
     out
 }
@@ -1234,7 +1238,8 @@ mod tests {
             glyph_h: 8.0,
             wide: |_| false,
         };
-        let titles = vec![("t".to_string(), true)];
+        // 双标签:状态点属第二行,单标签整行隐藏
+        let titles = vec![("a".to_string(), true), ("b".to_string(), false)];
         let palette = Palette::DEFAULT;
         let none_len = strip_quads(
             &titles,
@@ -1273,25 +1278,18 @@ mod tests {
         );
     }
 
-    /// 内容自适应契约:短标题 min 兜底、长标题 max 封顶、CJK 双宽
+    /// 均分填充契约:等宽、随可用宽放大、min 兜底;可用域到 "+" 左缘
     #[test]
-    fn tab_w_is_content_adaptive_and_clamped() {
+    fn equal_tab_w_fills_and_clamps() {
         let sm = StripMetrics::default();
-        let cw = 8.0;
-        assert_eq!(tab_w("ab", cw, &sm), sm.tab_min_w, "短标题 = min 兜底");
+        assert_eq!(equal_tab_w(0, 400.0, &sm), sm.tab_min_w, "无标签 = min");
         assert_eq!(
-            tab_w(&"x".repeat(60), cw, &sm),
-            sm.tab_max_w,
-            "超长标题 = max 封顶"
+            equal_tab_w(3, 40.0, &sm),
+            sm.tab_min_w,
+            "极窄可用 = min 兜底(溢出滚动接管)"
         );
-        // 内容宽 = 格数 × cw + 左右内边距 + × 预留
-        let mid = "x".repeat(20);
-        assert_eq!(
-            tab_w(&mid, cw, &sm),
-            20.0 * cw + 2.0 * sm.tab_pad + sm.tab_close_w
-        );
-        // CJK 双宽:10 个汉字 = 20 格,与 20 个 ASCII 同宽
-        assert_eq!(tab_w(&"中".repeat(10), cw, &sm), tab_w(&mid, cw, &sm));
+        let body = 900.0 - sm.plus_w - 14.0 * sm.k - sm.tab_gap * 2.0;
+        assert_eq!(equal_tab_w(2, 900.0, &sm), body / 2.0, "两标签均分");
     }
 
     #[test]
@@ -1312,26 +1310,36 @@ mod tests {
             &StripMetrics::default(),
             StripExtras {
                 caption_x: Some(400.0),
+                focused: true,
                 ..Default::default()
             },
         );
         let sm = StripMetrics::default();
-        // 活动标签胶囊:第二行(title_h+2k 起,tab_h-4k 高)、四角全圆
-        let k = sm.k;
-        let want_w = tab_w("b", metrics_8x16().cell_width, &sm);
+        // 活动标签块:第二行整高(title_h 起)、上圆下方、面色 = 终端底
+        let want_w = equal_tab_w(2, 400.0 + 3.0 * sm.caption_w, &sm);
         assert!(
             out.iter().any(|q| q.size_uv[0] == want_w
-                && q.size_uv[1] == sm.tab_h - 4.0 * k
-                && q.pos_uv[1] == sm.title_h + 2.0 * k
-                && q.bg[3] == sm.tab_r
-                && q.fg[3] == sm.tab_r),
-            "活动标签胶囊(第二行,全圆,等宽 {want_w})"
+                && q.size_uv[1] == sm.h - sm.title_h
+                && q.pos_uv[1] == sm.title_h
+                && q.bg[3] == sm.tab_top_r
+                && q.fg[3] == 0.0),
+            "活动标签块(第二行整高,上圆下方,等宽 {want_w})"
         );
-        // 发丝线:条底 1px
+        // 条底浅灰:聚焦态 = 终端底 18% 提亮
+        let p = Palette::DEFAULT;
+        let want_bar = [
+            p.bg.r + ((255 - p.bg.r) as f32 * 0.18 + 0.5) as u8,
+            p.bg.g + ((255 - p.bg.g) as f32 * 0.18 + 0.5) as u8,
+            p.bg.b + ((255 - p.bg.b) as f32 * 0.18 + 0.5) as u8,
+        ];
         assert!(
-            out.iter()
-                .any(|q| q.size_uv[1] == 1.0 && q.pos_uv[1] == sm.h - 1.0),
-            "条底发丝线存在"
+            out.iter().any(
+                |q| q.size_uv == [400.0 + 3.0 * sm.caption_w, sm.h, 0.0, 0.0]
+                    && q.bg[0] == want_bar[0] as f32 / 255.0
+                    && q.bg[1] == want_bar[1] as f32 / 255.0
+                    && q.bg[2] == want_bar[2] as f32 / 255.0
+            ),
+            "条底 = 浅灰(18% 提亮)"
         );
         // 关闭钮字形(E8BB)在:active 恒显(第二行)
         assert!(
@@ -1341,9 +1349,10 @@ mod tests {
         );
     }
 
-    /// 双行形制:单标签也恒显标签行(胶囊 + 右端 "+"),窗口标题在第一行
+    /// 单标签 = 第二行整行隐藏(上游 hasTabBar 同款):无标签块、无 "+",
+    /// 条高只余标题行
     #[test]
-    fn strip_single_tab_keeps_tab_row() {
+    fn strip_single_tab_hides_tab_row() {
         let mut r = FakeRouter {
             atlas_w: 64.0,
             atlas_h: 64.0,
@@ -1360,24 +1369,30 @@ mod tests {
             &StripMetrics::default(),
             StripExtras {
                 caption_x: Some(400.0),
+                focused: true,
                 ..Default::default()
             },
         );
         let sm = StripMetrics::default();
+        // 条底只到标题行底
         assert!(
             out.iter()
-                .any(|q| q.bg[3] == sm.tab_r && q.size_uv[1] == sm.tab_h - 4.0 * sm.k),
-            "单标签仍有胶囊(标签行恒显)"
+                .any(|q| q.size_uv == [400.0 + 3.0 * sm.caption_w, sm.title_h, 0.0, 0.0]),
+            "单标签:条高 = 标题行"
+        );
+        assert!(
+            !out.iter().any(|q| q.bg[3] > 0.0 && q.size_uv[1] > 1.0),
+            "无标签块/胶囊"
         );
         assert!(
             out.iter()
                 .any(|q| q.size_uv[2] > 0.0 && q.pos_uv[1] < sm.title_h),
-            "第一行有窗口标题字形"
+            "标题字形在第一行"
         );
         assert!(
-            out.iter()
+            !out.iter()
                 .any(|q| q.size_uv[2] > 0.0 && q.pos_uv[1] >= sm.title_h),
-            "第二行有标签文字/加号"
+            "第二行无任何字形(隐藏)"
         );
     }
 

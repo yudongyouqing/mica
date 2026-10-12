@@ -50,8 +50,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
     DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG,
     MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowTextW,
-    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
+    TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CHAR, WM_DESTROY, WM_DPICHANGED,
+    WM_ERASEBKGND, WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMOUSEMOVE, WM_PAINT,
     WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
@@ -70,6 +70,16 @@ const ROWS: u16 = 30;
 /// 150% 屏上物理常量曾致条高/× 与字体错位(2026-10-06 用户实测)
 fn strip_metrics() -> mica_render::frame::StripMetrics {
     mica_render::frame::StripMetrics::from_scale(DPI_SCALE.with(std::cell::Cell::get))
+}
+
+/// 条总高(动态,2026-10-12):单标签隐藏第二行(上游 hasTabBar 同款)
+/// ——终端区起点/命中上界都取此值;标签数跨 1↔2 时 draw_frame 的
+/// 网格兜底重排自然跟进。**含 TABS 借用**:TABS.with 持 guard 时调用
+/// 会双借 panic,须在外层先取局部(draw_frame/focus_neighbor 即此)
+fn strip_h() -> f32 {
+    let sm = strip_metrics();
+    let n = TABS.with(|t| t.borrow().len());
+    if n <= 1 { sm.title_h } else { sm.h }
 }
 
 /// 字号随 DPI:DWrite 光栅按 96dpi 像素出图,pt×scale 才与屏幕物理一致。
@@ -144,6 +154,9 @@ thread_local! {
     /// 不误——曾致 Ctrl+Shift+T 开新标签的同时给 shell 送去 ^T
     static KEYMAP_ATE_CHAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CURSOR_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 窗口聚焦(2026-10-12):失焦整条洗白一档(上游 Tahoe becomeMain/
+    /// resignMain 同款);WM_ACTIVATE 维护
+    static WINDOW_FOCUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -222,6 +235,11 @@ struct Terminal {
     row_insts: Vec<RowInst>,
     /// 重开用(M5b/T3):pane 的 shell 命令串(profile 出处不存,重启等价)
     shell: String,
+    /// strip 小号字体路由(2026-10-12):终端字号字形会挤出 × 关闭区
+    /// (用户实报),strip 文字改 9.5pt 等宽(族链仍随配置)——与终端
+    /// 路由共享图集(单 draw 单纹理约束)。放 Terminal 是渲染借用拓扑
+    /// 需要(draw 时与 router 同一借用链)
+    strip_router: Option<DwriteRouter>,
     /// 上次消费的图集布局版本(grow 重排即变)——变了必须 force_full
     /// 重建行实例,否则旧 UV 指向重排后的错误条目(一块一块根因)
     last_atlas_ver: u64,
@@ -863,7 +881,7 @@ unsafe fn reload_config(hwnd: HWND) {
     GetClientRect(hwnd, &mut rect).expect("GetClientRect");
     let width = rect.right.max(1) as u32;
     let term_h = (rect.bottom.max(1) as u32)
-        .saturating_sub(strip_metrics().h as u32)
+        .saturating_sub(strip_h() as u32)
         .max(1);
 
     let mut reloaded = false;
@@ -1100,7 +1118,7 @@ unsafe fn reload_dpi(hwnd: HWND, dpi: u32) {
     GetClientRect(hwnd, &mut rect).expect("GetClientRect");
     let width = rect.right.max(1) as u32;
     let term_h = (rect.bottom.max(1) as u32)
-        .saturating_sub(strip_metrics().h as u32)
+        .saturating_sub(strip_h() as u32)
         .max(1);
     eprintln!("[dpi] {dpi} (x{scale:.2}) → pt {base_pt}→{size_pt}");
     TABS.with(|tabs| {
@@ -1191,12 +1209,12 @@ fn active_pane_rects() -> Vec<(u64, mica_core::layout::Rect)> {
             g.borrow().as_ref().map(|gpu| {
                 (
                     gpu.config.width as f32,
-                    gpu.config.height as f32 - strip_metrics().h,
+                    gpu.config.height as f32 - strip_h(),
                 )
             })
         })
         .unwrap_or((1.0, 1.0));
-    let area = mica_core::layout::Rect::new(0.0, strip_metrics().h, aw.max(1.0), ah.max(1.0));
+    let area = mica_core::layout::Rect::new(0.0, strip_h(), aw.max(1.0), ah.max(1.0));
     TABS.with(|tabs| {
         tabs.borrow()
             .get(ACTIVE.get())
@@ -1209,6 +1227,8 @@ fn active_pane_rects() -> Vec<(u64, mica_core::layout::Rect)> {
 /// 点积最大且分量同向)——Alt+方向跳焦点(spec §6)。
 fn focus_neighbor(dir: input::Key) {
     use mica_core::layout::Rect;
+    // 条高先取(动态,含 TABS 借用)——with 内 guard 常驻,再借会 panic
+    let sh = strip_h();
     TABS.with(|tabs| {
         let mut guard = tabs.borrow_mut();
         let Some(tab) = guard.get_mut(ACTIVE.get()) else {
@@ -1220,15 +1240,12 @@ fn focus_neighbor(dir: input::Key) {
         // 面积与 draw_frame 同源重算
         let (aw, ah) = GPU
             .with(|g| {
-                g.borrow().as_ref().map(|gpu| {
-                    (
-                        gpu.config.width as f32,
-                        gpu.config.height as f32 - strip_metrics().h,
-                    )
-                })
+                g.borrow()
+                    .as_ref()
+                    .map(|gpu| (gpu.config.width as f32, gpu.config.height as f32 - sh))
             })
             .unwrap_or((1.0, 1.0));
-        let area = Rect::new(0.0, strip_metrics().h, aw.max(1.0), ah.max(1.0));
+        let area = Rect::new(0.0, sh, aw.max(1.0), ah.max(1.0));
         let rects = tab.layout.rects(area);
         let Some((_, cur)) = rects.iter().find(|(id, _)| *id == cur_id) else {
             return;
@@ -1369,7 +1386,7 @@ unsafe fn create_pane_with_size(
     GetClientRect(hwnd, &mut rect).expect("GetClientRect");
     let width = rect.right.max(1) as u32;
     let height = (rect.bottom.max(1) as u32)
-        .saturating_sub(strip_metrics().h as u32)
+        .saturating_sub(strip_h() as u32)
         .max(1);
 
     let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
@@ -1410,6 +1427,7 @@ unsafe fn create_pane_with_size(
         force_full: true,      // 首帧显式全量,不依赖哨兵的先后
         shell: shell_command.to_string(),
         exited: None,
+        strip_router: None, // 惰性建(首次画 strip)与终端路由共享图集
         last_atlas_ver: 0,
     };
     let pane_id = NEXT_TAB_ID.with(|n| n.replace(n.get() + 1));
@@ -1591,6 +1609,8 @@ fn draw_frame() {
     if GPU_LOST.swap(false, std::sync::atomic::Ordering::SeqCst) {
         rebuild_gpu_after_loss();
     }
+    // 条高先取(动态:单标签隐藏第二行;取值含 TABS 借用,须在 guard 外)
+    let sh = strip_h();
     TABS.with(|tabs| {
         let mut guard = tabs.borrow_mut();
         // titles 先行收集(不可变借用),再取活跃标签可变借用
@@ -1632,11 +1652,11 @@ fn draw_frame() {
         let area_h = GPU
             .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.height as f32))
             .unwrap_or(0.0)
-            - strip_metrics().h;
+            - sh;
         use mica_core::layout::Rect;
         let area = Rect::new(
             pad(),
-            strip_metrics().h,
+            sh,
             (area_w - 2.0 * pad()).max(1.0),
             (area_h - pad()).max(1.0),
         );
@@ -1721,12 +1741,28 @@ fn draw_frame() {
             None => mica_render::frame::ExitDot::Gray,
         });
         let sm = strip_metrics();
-        // strip 文字走终端路由(等宽;Segoe UI 试验 2026-10-12 当日被用户
-        // 否决回滚),双行条渲染同帧同图集
+        // strip 文字走小号等宽路由(9.5pt,族链随配置 + Emoji/Fluent 兜底,
+        // 与终端路由共享图集):终端字号字形会挤出 × 关闭区(用户实报)
+        if t.strip_router.is_none() {
+            let (seed, _) = TAB_SEED.with(|s| s.borrow().clone());
+            let mut fams: Vec<String> = seed;
+            for fb in ["Segoe UI Emoji", "Segoe Fluent Icons"] {
+                if !fams.iter().any(|f| f.eq_ignore_ascii_case(fb)) {
+                    fams.push(fb.to_string());
+                }
+            }
+            let fams: Vec<&str> = fams.iter().map(String::as_str).collect();
+            t.strip_router =
+                DwriteRouter::new_with_atlas(scaled_pt(9.5), &fams, t.router.shared_atlas()).ok();
+        }
+        let Some(strip_r) = t.strip_router.as_mut() else {
+            return; // 惰性建失败:本帧放弃,下帧重试
+        };
+        let ui_m = strip_r.metrics();
         let mut strip = mica_render::frame::strip_quads(
             &titles,
-            &mut t.router,
-            &t.metrics,
+            strip_r,
+            &ui_m,
             &t.palette,
             &sm,
             mica_render::frame::StripExtras {
@@ -1747,6 +1783,8 @@ fn draw_frame() {
                         )
                         .as_bool()
                     }),
+                // 失焦洗白(上游 becomeMain/resignMain 同款)
+                focused: WINDOW_FOCUSED.with(std::cell::Cell::get),
             },
         );
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
@@ -1803,6 +1841,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 光标格下缘;默认链(DefWindowProc)负责上下文与结果字符——
             // 提交文本经 WM_IME_CHAR→WM_CHAR 到达,既有 WM_CHAR 路径接管
             position_ime(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_ACTIVATE => {
+            // 聚焦态(2026-10-12):失焦整条洗白一档(上游 becomeMain/
+            // resignMain 同款);wparam 低 16 位 0 = WA_INACTIVE。
+            // Cell::replace 返回旧值,变化才重绘
+            let active = (wparam.0 & 0xffff) != 0;
+            if WINDOW_FOCUSED.with(|f| f.replace(active)) != active {
+                draw_frame();
+            }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_CHAR => {
@@ -2055,15 +2103,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // strip 区(T7):命中标签则切换、命中 + 则新建,不走选择
             match strip_hit(px, py) {
                 Some(Some(idx)) => {
-                    // × 关闭区(与渲染同几何):标签尾部 close_w;
+                    // × 关闭区(与渲染同几何,均分等宽):标签尾部 close_w;
                     // 单标签无 ×(整窗关闭走 caption),退回切换
                     let sm = strip_metrics();
                     let n = TABS.with(|t| t.borrow().len());
-                    let widths = tab_widths(&sm);
+                    let area_w = GPU
+                        .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
+                        .unwrap_or(0.0);
+                    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
                     let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
-                    let before = widths.iter().take(idx).sum::<f32>() + sm.tab_gap * idx as f32;
-                    let local = px as f32 + shift - mica_render::frame::tabs_x0(&sm) - before;
-                    let w = widths.get(idx).copied().unwrap_or(sm.tab_min_w);
+                    let local = px as f32 + shift
+                        - mica_render::frame::tabs_x0(&sm)
+                        - idx as f32 * (w + sm.tab_gap);
                     if n > 1 && local >= w - sm.tab_close_w {
                         close_tab(idx);
                         draw_frame();
@@ -2358,7 +2409,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 unsafe {
                     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
                 }
-                if pt.y >= 0 && (pt.y as f32) < strip_metrics().h {
+                if pt.y >= 0 && (pt.y as f32) < strip_h() {
                     // 滚轮向上 = 看左侧标签
                     if tab_scroll_adjust(if delta > 0 { 1 } else { -1 }) {
                         draw_frame();
@@ -2449,7 +2500,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             let mut resized = false;
             // surface 是整窗的(含 strip);终端网格按客户区减 strip 高
-            let term_h = height.saturating_sub(strip_metrics().h as u32).max(1);
+            let term_h = height.saturating_sub(strip_h() as u32).max(1);
             TABS.with(|tabs| {
                 // 全部标签一起重排(T7):后台标签的 pty/网格也必须跟新几何,
                 // 切换时才不重排跳变
@@ -2650,7 +2701,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let (cx, cy) = (px - wr.left, py - wr.top);
             let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
             let sm = strip_metrics();
-            let strip_h = sm.h as i32;
+            let sh = strip_h() as i32; // 动态:单标签 = 仅标题行高
             // 边缘 8 向 resize(优先于一切)
             let rb = resize_border();
             let (near_l, near_r) = (cx < rb, cx >= w - rb);
@@ -2683,7 +2734,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 其余 = 拖拽);第二行 = 标签与右端 "+"(HTCLIENT,点击走
             // WM_LBUTTONDOWN 的切换/新建/× 分支),空档 = 拖拽区——
             // T8 教训:整条判 HTCAPTION 会把标签点击变成拖窗
-            if cy < strip_h {
+            if cy < sh {
                 if cy < sm.title_h as i32 {
                     let btn_left = w - (sm.caption_w * 3.0) as i32;
                     if cx >= btn_left {
@@ -2700,10 +2751,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let area_w = GPU
                     .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
                     .unwrap_or(0.0);
+                let n = TABS.with(|t| t.borrow().len());
+                let w_tab = mica_render::frame::equal_tab_w(n, area_w, &sm);
                 let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
                 let cf = cx as f32 + shift;
-                let tabs_end = mica_render::frame::tabs_x0(&sm)
-                    + mica_render::frame::tabs_span(&tab_widths(&sm), &sm);
+                let tabs_end = mica_render::frame::tabs_x0(&sm) + n as f32 * (w_tab + sm.tab_gap);
                 let p_x = mica_render::frame::plus_x(area_w, &sm);
                 if cf < tabs_end || (cf >= p_x && cf < p_x + sm.plus_w) {
                     return LRESULT(HTCLIENT as isize);
@@ -2886,53 +2938,36 @@ fn close_tab(idx: usize) {
     }
 }
 
-/// 标签逐个宽度(渲染/命中/滚动同源):cw 取活跃 pane 度量。
-/// 内容自适应(2026-10-12 晚):均分填充把标签行占满、无拖拽区,弃。
-fn tab_widths(sm: &mica_render::frame::StripMetrics) -> Vec<f32> {
-    let (cw, titles): (f32, Vec<String>) = TABS.with(|tabs| {
-        let guard = tabs.borrow();
-        let cw = guard
-            .get(ACTIVE.get())
-            .and_then(|tab| tab.active_pane_ref())
-            .map(|t| t.metrics.cell_width)
-            .unwrap_or(8.0);
-        (cw, guard.iter().map(|t| t.title.clone()).collect())
-    });
-    titles
-        .iter()
-        .map(|t| mica_render::frame::tab_w(t, cw, sm))
-        .collect()
-}
-
 /// strip 命中(双行形制):Some(Some(idx)) = 第二行标签;Some(None) =
-/// 第二行右端 "+";None = 第一行(标题/caption = 拖拽或系统钮)或终端区。
-/// 布局常量单源在 frame(tabs_x0/plus_x/tab_w)。
+/// 第二行右端 "+";None = 第一行(标题/caption = 拖拽或系统钮)或终端区
+/// (单标签时第二行整行隐藏,上界取动态 strip_h)。
+/// 布局常量单源在 frame(tabs_x0/plus_x/equal_tab_w)。
 fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
     let sm = strip_metrics();
-    if py < 0 || py as f32 >= sm.h {
+    if py < 0 || py as f32 >= strip_h() {
         return None; // 不在 strip 区
     }
     if (py as f32) < sm.title_h {
         return None; // 第一行:标题/caption(点击 = 拖拽或系统钮,非客户区)
     }
-    // 第二行:右端 "+" 优先,左起内容自适应标签逐个定位
+    // 第二行:右端 "+" 优先,左起均分等宽标签
     let area_w = GPU
         .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
         .unwrap_or(0.0);
+    let n = TABS.with(|tabs| tabs.borrow().len());
     let shift = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm.tab_min_w;
     let local = px.max(0) as f32 + shift;
     let p_x = mica_render::frame::plus_x(area_w, &sm);
     if local >= p_x && local < p_x + sm.plus_w {
         return Some(None);
     }
-    let mut x = mica_render::frame::tabs_x0(&sm);
-    for (i, w) in tab_widths(&sm).into_iter().enumerate() {
-        if local >= x && local < x + w {
-            return Some(Some(i));
-        }
-        x += w + sm.tab_gap;
+    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+    let idx = ((local - mica_render::frame::tabs_x0(&sm)) / w).floor();
+    if idx >= 0.0 && (idx as usize) < n {
+        Some(Some(idx as usize))
+    } else {
+        None
     }
-    None
 }
 
 /// 鼠标上报路由(DECSET 1000/1002/1003 + 1006,2026-10-07):应用捕获
@@ -2993,7 +3028,7 @@ fn strip_hover_at(px: i32, py: i32) -> mica_render::frame::StripHover {
     use mica_render::frame::{CaptionBtn, StripHover};
     let mut h = StripHover::default();
     let sm = strip_metrics();
-    if py < 0 || py as f32 >= sm.h {
+    if py < 0 || py as f32 >= strip_h() {
         return h;
     }
     if (py as f32) < sm.title_h {
@@ -3040,8 +3075,9 @@ fn tab_scroll_adjust(delta: i32) -> bool {
         .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
         .unwrap_or(0.0);
     let sm = strip_metrics();
-    let need =
-        mica_render::frame::tabs_x0(&sm) + mica_render::frame::tabs_span(&tab_widths(&sm), &sm);
+    let n = TABS.with(|tabs| tabs.borrow().len());
+    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
+    let need = mica_render::frame::tabs_x0(&sm) + n as f32 * (w + sm.tab_gap);
     let right = mica_render::frame::tabs_right(area_w, &sm);
     let max = if area_w <= 0.0 || need <= right {
         0
@@ -3064,17 +3100,13 @@ fn tab_follow_active() {
         .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
         .unwrap_or(0.0);
     let sm = strip_metrics();
-    let widths = tab_widths(&sm);
-    let avg = if widths.is_empty() {
-        sm.tab_min_w
-    } else {
-        widths.iter().sum::<f32>() / widths.len() as f32
-    };
+    let n = TABS.with(|tabs| tabs.borrow().len());
+    let w = mica_render::frame::equal_tab_w(n, area_w, &sm);
     let right = mica_render::frame::tabs_right(area_w, &sm);
     let visible = if area_w <= 0.0 {
         i32::MAX
     } else {
-        (((right - mica_render::frame::tabs_x0(&sm)) / (avg + sm.tab_gap)).floor() as i32).max(1)
+        (((right - mica_render::frame::tabs_x0(&sm)) / (w + sm.tab_gap)).floor() as i32).max(1)
     };
     let active = ACTIVE.get() as i32;
     let cur = TAB_SCROLL.with(std::cell::Cell::get);
@@ -3224,7 +3256,7 @@ fn px_to_buffer_point(
         Side::Right
     };
     // y 是全客户区坐标:终端内容从 STRIP_H 起(窗口级布局,T7)
-    let py = py - strip_metrics().h as i32;
+    let py = py - strip_h() as i32;
     let view_line = (py.max(0) as f32 / metrics.line_height).max(0.0) as usize;
     (
         Point::new(Line(view_line as i32 + display_offset as i32), Column(col)),
