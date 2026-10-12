@@ -2278,6 +2278,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // strip 区(T7):命中标签则切换、命中 + 则新建,不走选择
             match strip_hit(px, py) {
                 Some(Some(idx)) => {
+                    // 悬停态即刻同步到按下位(点击后旧高亮不再闪别的标签)
+                    HOVER_STRIP.with(|s| s.set(strip_hover_at(px, py)));
                     // × 关闭区(与渲染同几何,均分等宽):标签尾部 close_w;
                     // 单标签无 ×(整窗关闭走 caption),退回切换
                     let sm = strip_metrics();
@@ -2451,6 +2453,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // D28 hover:非拖选时武装悬停追踪(每会话一次,HOVER/LEAVE 都会重置)
                 if !HOVER_ARMED.with(|a| a.replace(true)) {
                     arm_hover(hwnd);
+                }
+                // strip 悬停实时跟随(2026-10-12):悬停高亮曾只在 300ms
+                // 停留事件里更新——扫过别的标签后旧高亮挂着,点标签时
+                // 那个无关标签"亮一下"再灭(用户实测)。每 MOVE 刷新即除
+                let (hx, hy) = mouse_xy(lparam);
+                let hover = strip_hover_at(hx, hy);
+                let changed = HOVER_STRIP.with(|s| {
+                    let old = s.get();
+                    if old != hover {
+                        s.set(hover);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if changed {
+                    draw_frame();
                 }
                 return LRESULT(0);
             }
