@@ -242,6 +242,8 @@ pub struct StripMetrics {
     pub caption_w: f32,
     /// 标签块上圆角半径(下缘直角:活跃块与终端区无缝相接)
     pub tab_top_r: f32,
+    /// 溢出滚动箭头钮宽(左右各一,#39)
+    pub arrow_w: f32,
     /// tooltip 圆角半径
     pub chip_r: f32,
     /// exit 状态点直径
@@ -284,6 +286,7 @@ impl StripMetrics {
             plus_w: TAB_PLUS_W_BASE * s,
             caption_w: 46.0 * s,
             tab_top_r: cfg.tab_corner_r * s,
+            arrow_w: 24.0 * s,
             chip_r: 6.0 * s,
             dot_d: 7.0 * s,
             pad: 8.0 * s,
@@ -400,8 +403,20 @@ pub struct StripHover {
     /// 悬停的非激活标签(激活标签无反馈必要)
     pub tab: Option<usize>,
     pub plus: bool,
+    /// 溢出滚动箭头(#39;仅溢出时有效)
+    pub arrow_l: bool,
+    pub arrow_r: bool,
     /// caption 三键(— □ ×)
     pub caption: Option<CaptionBtn>,
+}
+
+/// 第二行命中(与渲染几何同源):标签 / "+" / 溢出箭头(#39)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StripTabHit {
+    Tab(usize),
+    Plus,
+    ArrowLeft,
+    ArrowRight,
 }
 
 /// caption 按钮序(与 NCHITTEST 的从左到右一致)。
@@ -755,6 +770,37 @@ pub fn strip_quads(
                     fg: bg_of(ink),
                     bg: bg_of(glyph_bg),
                 });
+            }
+        }
+        // 溢出滚动箭头(#39):总占宽超右缘即显(左右缘各一,条底垫背
+        // 遮住下层标签);点击步进 = tab_scroll_adjust(±1),hover 提亮
+        let span = w + sm.tab_gap;
+        if tabs_x0(sm) + n as f32 * span > right + 0.5 {
+            for (glyph, ax, hov) in [
+                ('\u{E76B}', 2.0 * k, hover.arrow_l),
+                ('\u{E76C}', right - sm.arrow_w, hover.arrow_r),
+            ] {
+                out.push(CellInstance {
+                    pos_uv: [ax, tab_y, 0.0, 0.0],
+                    size_uv: [sm.arrow_w, tab_d, 0.0, 0.0],
+                    fg: bg_of(bar),
+                    bg: bg_of(bar),
+                });
+                let g = router.route(glyph, GlyphStyle::PLAIN);
+                if g.size_px[0] > 0.0 {
+                    let ink = if hov { white } else { ink2 };
+                    out.push(CellInstance {
+                        pos_uv: [
+                            ax + (sm.arrow_w - g.size_px[0]) / 2.0,
+                            tab_y + (tab_d - g.size_px[1]) / 2.0,
+                            g.uv[0],
+                            g.uv[1],
+                        ],
+                        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                        fg: bg_of(ink),
+                        bg: bg_of(bar),
+                    });
+                }
             }
         }
         // pane 退出态(M5b/T3):第二行右端、"+" 左邻(标签标题截断吃不到);
