@@ -59,7 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
     HTMINBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, MB_ICONWARNING, MB_OK, SC_MAXIMIZE,
-    SC_MINIMIZE,
+    SC_MINIMIZE, SC_RESTORE,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -335,6 +335,8 @@ thread_local! {
         std::cell::Cell::new(mica_render::frame::StripHover {
             tab: None,
             plus: false,
+            arrow_l: false,
+            arrow_r: false,
             caption: None,
         })
     };
@@ -568,6 +570,13 @@ pub fn run() {
                 .expect("no fonts resolved");
             eprintln!("font families in use: {:?}", router.families_in_use());
             let metrics = router.metrics();
+            eprintln!(
+                "[dpi] 初始网格 cw={} lh={}(pt={} ×{})",
+                metrics.cell_width,
+                metrics.line_height,
+                settings.font_size_pt,
+                DPI_SCALE.with(std::cell::Cell::get)
+            );
             let mut rect = RECT {
                 left: 0,
                 top: 0,
@@ -585,6 +594,11 @@ pub fn run() {
                 windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
                     | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
                     | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+            );
+            eprintln!(
+                "[dpi] 落位窗口 {}x{}",
+                rect.right - rect.left,
+                rect.bottom - rect.top
             );
         }
         if CURSOR_BLINK.with(std::cell::Cell::get) {
@@ -676,9 +690,19 @@ pub fn run() {
 /// profile:Some = IPC new-window 的 profile(暂走默认 shell,预留)。
 fn spawn_window(profile: Option<String>) {
     let _ = profile; // 预留
+    spawn_window_impl(None);
+}
+
+/// #35 tear-off:带种子(shell/cwd/标题)开独立窗——软撕开:进程不迁移
+/// (COM/线程本地架构 !Send),同 shell 同目录重开续工作流
+fn spawn_window_tear(shell: String, cwd: Option<String>, title: String) {
+    spawn_window_impl(Some((shell, cwd, title)));
+}
+
+fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
     std::thread::Builder::new()
         .name("mica-window".into())
-        .spawn(|| {
+        .spawn(move || {
             WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             unsafe {
                 // 配置种子:副窗线程的 TLS 全新,按当前配置文件重播
@@ -797,7 +821,13 @@ fn spawn_window(profile: Option<String>) {
                 if start_profile.is_some() {
                     std::env::remove_var("MICA_START_PROFILE");
                 }
-                start_tab_with_profile(hwnd, start_profile.as_deref(), None);
+                // 首标签:tear-off 种子优先(#35),否则 profile/默认
+                match seed {
+                    Some((shell, cwd, title)) => {
+                        start_tab_with_shell(hwnd, &shell, None, cwd.as_deref(), title)
+                    }
+                    None => start_tab_with_profile(hwnd, start_profile.as_deref(), None),
+                }
                 GPU.with(|g| {
                     if let Some(gpu) = g.borrow_mut().as_mut() {
                         gpu.renderer.set_clear_color(&settings.palette);
@@ -1630,8 +1660,20 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>, font_size: O
             .and_then(|tab| tab.active_pane_ref())
             .and_then(|t| t.term.cwd().map(str::to_string))
     });
+    start_tab_with_shell(hwnd, &shell, font_size, inherit.as_deref(), title);
+}
+
+/// 带 shell/cwd/标题的建标签(#35 tear-off 与 profile 路径的公共底):
+/// tear-off 时 cwd 用原 pane 的 cwd 快照,不再二次继承
+unsafe fn start_tab_with_shell(
+    hwnd: HWND,
+    shell: &str,
+    font_size: Option<f32>,
+    cwd: Option<&str>,
+    title: String,
+) {
     let old_active = ACTIVE.get(); // 胶囊滑动动画的起点(旧活跃位)
-    let (pane, reader) = match create_pane_with_size(hwnd, &shell, font_size, inherit.as_deref()) {
+    let (pane, reader) = match create_pane_with_size(hwnd, shell, font_size, cwd) {
         Ok(pair) => pair,
         Err(e) => {
             // P1(1.0.9):新标签 spawn 失败——提示而非闪退(保活既有标签)
@@ -2275,9 +2317,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDOWN => {
             let (px, py) = mouse_xy(lparam);
-            // strip 区(T7):命中标签则切换、命中 + 则新建,不走选择
+            // strip 区(T7):命中标签则切换、+ 新建、箭头步进滚动(#39)
             match strip_hit(px, py) {
-                Some(Some(idx)) => {
+                Some(mica_render::frame::StripTabHit::Tab(idx)) => {
                     // 悬停态即刻同步到按下位(点击后旧高亮不再闪别的标签)
                     HOVER_STRIP.with(|s| s.set(strip_hover_at(px, py)));
                     // × 关闭区(与渲染同几何,均分等宽):标签尾部 close_w;
@@ -2311,9 +2353,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     return LRESULT(0);
                 }
-                Some(None) => {
+                Some(mica_render::frame::StripTabHit::Plus) => {
                     unsafe { start_tab(hwnd) };
                     draw_frame();
+                    return LRESULT(0);
+                }
+                Some(mica_render::frame::StripTabHit::ArrowLeft)
+                | Some(mica_render::frame::StripTabHit::ArrowRight) => {
+                    let dir = matches!(
+                        strip_hit(px, py),
+                        Some(mica_render::frame::StripTabHit::ArrowLeft)
+                    )
+                    .then_some(1)
+                    .unwrap_or(-1);
+                    if tab_scroll_adjust(dir) {
+                        draw_frame();
+                    }
                     return LRESULT(0);
                 }
                 None => {}
@@ -2399,6 +2454,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 让位由渲染层按槽位序实时完成;顺序只在松手时提交
             if let Some(di) = DRAG_TAB.with(std::cell::Cell::get) {
                 let px = (lparam.0 & 0xffff) as u16 as i16 as i32;
+                let py = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+                // #35 tear-off(软):拖出标签行(上越窗顶 / 下入内容区)即
+                // 撕开——原标签关、独立新窗(同 shell/cwd/标题)。进程不
+                // 迁移(COM/TLS !Send),软撕开续工作流
+                if py < -20 || py > strip_h() as i32 + 40 {
+                    let seed = TABS.with(|tabs| {
+                        tabs.borrow().get(di).map(|t| {
+                            (
+                                t.panes
+                                    .first()
+                                    .map(|p| p.terminal.shell.clone())
+                                    .unwrap_or_else(|| "powershell.exe -NoLogo".into()),
+                                t.panes
+                                    .first()
+                                    .and_then(|p| p.terminal.term.cwd().map(str::to_string)),
+                                t.title.clone(),
+                            )
+                        })
+                    });
+                    DRAG_TAB.with(|d| d.set(None));
+                    let _ = ReleaseCapture();
+                    if let Some((shell, cwd, title)) = seed {
+                        close_tab(di);
+                        spawn_window_tear(shell, cwd, title);
+                        return LRESULT(0);
+                    }
+                }
                 let sm = strip_metrics();
                 let area_w = GPU
                     .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
@@ -2594,7 +2676,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if strip_hit(px, py).is_none() && forward_mouse(px, py, 1, true, false) {
                 return LRESULT(0);
             }
-            if let Some(Some(idx)) = strip_hit(px, py) {
+            if let Some(mica_render::frame::StripTabHit::Tab(idx)) = strip_hit(px, py) {
                 close_tab(idx);
             }
             LRESULT(0)
@@ -3050,6 +3132,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(HTCLIENT as isize)
         }
         WM_NCLBUTTONDOWN => {
+            // 最大化态拖 caption = 还原并继续拖(#34):无边框窗 DefWindowProc
+            // 不自动还原,手动 SC_RESTORE 后进入移动循环(SC_MOVE|HTCAPTION,
+            // Chrome 同款手法)。还原位置暂取旧矩形(光标跟随重定位留打磨)
+            if wparam.0 as u32 == HTCAPTION
+                && windows::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd).as_bool()
+            {
+                let _ = SendMessageW(
+                    hwnd,
+                    WM_SYSCOMMAND,
+                    Some(WPARAM(SC_RESTORE as usize)),
+                    Some(LPARAM(0)),
+                );
+                let _ = SendMessageW(hwnd, WM_SYSCOMMAND, Some(WPARAM(0xF012)), Some(lparam));
+                return LRESULT(0);
+            }
             // 系统按钮(T8):SC 命令驱动最小化/最大化;关闭走销毁路径
             match wparam.0 as u32 {
                 HTMINBUTTON => {
@@ -3234,11 +3331,12 @@ fn close_tab(idx: usize) {
     draw_frame();
 }
 
-/// strip 命中(双行形制):Some(Some(idx)) = 第二行标签;Some(None) =
-/// 第二行右端 "+";None = 第一行(标题/caption = 拖拽或系统钮)或终端区
+/// strip 命中(双行形制,#39 起含溢出箭头):Some(StripTabHit) = 第二行
+/// 的标签/加号/箭头;None = 第一行(标题/caption = 拖拽或系统钮)或终端区
 /// (单标签时第二行整行隐藏,上界取动态 strip_h)。
-/// 布局常量单源在 frame(tabs_x0/plus_x/equal_tab_w)。
-fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
+/// 布局常量单源在 frame(tabs_x0/plus_x/tab_w_now/arrow_w)。
+fn strip_hit(px: i32, py: i32) -> Option<mica_render::frame::StripTabHit> {
+    use mica_render::frame::StripTabHit;
     let sm = strip_metrics();
     if py < 0 || py as f32 >= strip_h() {
         return None; // 不在 strip 区
@@ -3246,7 +3344,7 @@ fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
     if (py as f32) < sm.title_h {
         return None; // 第一行:标题/caption(点击 = 拖拽或系统钮,非客户区)
     }
-    // 第二行:右端 "+" 优先,左起均分等宽标签
+    // 第二行:加号 / 溢出箭头(仅溢出时)优先,左起均分等宽标签
     let area_w = GPU
         .with(|g| g.borrow().as_ref().map(|gpu| gpu.config.width as f32))
         .unwrap_or(0.0);
@@ -3255,12 +3353,24 @@ fn strip_hit(px: i32, py: i32) -> Option<Option<usize>> {
     let local = px.max(0) as f32 + shift;
     let p_x = mica_render::frame::plus_x(area_w, &sm);
     if local >= p_x && local < p_x + sm.plus_w {
-        return Some(None);
+        return Some(StripTabHit::Plus);
     }
     let w = mica_render::frame::tab_w_now(n, area_w, &sm);
+    let span = w + sm.tab_gap;
+    let right = mica_render::frame::tabs_right(area_w, &sm);
+    // 溢出才显箭头(与渲染同判据);命中区取条缘 [2k, 2k+arrow_w) /
+    // [right-arrow_w, right),局部(含 shift)对齐
+    if mica_render::frame::tabs_x0(&sm) + n as f32 * span > right + 0.5 {
+        if local < 2.0 * sm.k + sm.arrow_w {
+            return Some(StripTabHit::ArrowLeft);
+        }
+        if local >= right - sm.arrow_w && local < right {
+            return Some(StripTabHit::ArrowRight);
+        }
+    }
     let idx = ((local - mica_render::frame::tabs_x0(&sm)) / w).floor();
     if idx >= 0.0 && (idx as usize) < n {
-        Some(Some(idx as usize))
+        Some(StripTabHit::Tab(idx as usize))
     } else {
         None
     }
@@ -3342,8 +3452,10 @@ fn strip_hover_at(px: i32, py: i32) -> mica_render::frame::StripHover {
         return h;
     }
     match strip_hit(px, py) {
-        Some(Some(i)) => h.tab = Some(i),
-        Some(None) => h.plus = true,
+        Some(mica_render::frame::StripTabHit::Tab(i)) => h.tab = Some(i),
+        Some(mica_render::frame::StripTabHit::Plus) => h.plus = true,
+        Some(mica_render::frame::StripTabHit::ArrowLeft) => h.arrow_l = true,
+        Some(mica_render::frame::StripTabHit::ArrowRight) => h.arrow_r = true,
         None => {}
     }
     h

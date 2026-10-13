@@ -23,8 +23,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW,
     PostQuitMessage, RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP,
-    WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WNDCLASSEXW,
-    WS_POPUP, WS_VISIBLE,
+    WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
@@ -215,8 +215,40 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     if let Some(slot) = crate::app::shared_hwnd_for_quickterm() {
         crate::app::spawn_qt_forwarder(reader, pty_buf, slot);
     }
+    // #37:会话退出轮询(1s;命中即停表)——QT 无 strip,主窗的
+    // poll_exits 轮不到它
+    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd_qt), 6, 1000, None);
     let _ = class_name; // 注册已用 w! 字面量
     Ok(())
+}
+
+/// 重开 QT 会话(#37):同 shell 新 pty + 干净 Surface(复用 pane 槽),
+/// 挂新转发线程 + 重启退出轮询。调用前须已 kill 旧子
+unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
+    let (cols, rows) = (t.cols, t.rows);
+    match mica_core::pty::PtySession::spawn(mica_core::pty::command_from_str(&t.shell), cols, rows)
+    {
+        Ok((session, reader)) => {
+            let old = std::mem::replace(&mut t.session, session);
+            std::mem::forget(old); // 脏退出哲学:不 drop(坏驱动栈会卡)
+            t.exited = None;
+            let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
+            term.set_cell_metrics(
+                t.metrics.cell_width.round() as u16,
+                t.metrics.line_height.round() as u16,
+            );
+            term.set_palette(&t.palette);
+            t.term = term;
+            t.row_insts.clear();
+            t.force_full = true;
+            t.pty_buf.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            if let Some(slot) = crate::app::shared_hwnd_for_quickterm() {
+                crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), slot);
+            }
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 6, 1000, None);
+        }
+        Err(e) => eprintln!("[qt] 重开失败:{e}"),
+    }
 }
 
 /// 退出序取走 QT 状态(调用方 mem::forget——故意泄漏换可靠退出,见
@@ -247,6 +279,15 @@ pub unsafe fn toggle() {
     if visible {
         let _ = ShowWindow(hwnd, SW_HIDE);
     } else {
+        // #37:上次会话已退出 → 重开(同 shell 新会话)再显示
+        QT.with(|q| {
+            let mut guard = q.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            if st.terminal.exited.is_some() {
+                st.terminal.session.kill_child();
+                qt_respawn(&mut st.terminal, hwnd);
+            }
+        });
         let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
             hwnd,
             Some(windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST),
@@ -279,6 +320,29 @@ unsafe extern "system" fn qt_wndproc(
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_TIMER => {
+            // id 6(#37):会话退出轮询——主窗 poll_exits 轮 TABS,QT 在此
+            // 自轮;命中记码 + 横幅重绘 + 停表(重开时 toggle 再起)
+            if wparam.0 == 6 {
+                let mut hit = false;
+                QT.with(|q| {
+                    let mut guard = q.borrow_mut();
+                    let Some(st) = guard.as_mut() else { return };
+                    let t = &mut st.terminal;
+                    if t.exited.is_none()
+                        && let Ok(Some(s)) = t.session.try_wait()
+                    {
+                        t.exited = Some(s.exit_code());
+                        hit = true;
+                        qt_draw(st);
+                    }
+                });
+                if hit {
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 6).ok();
+                }
+            }
+            LRESULT(0)
         }
         WM_APP => {
             // QT 数据到达(id 0xFF00):drain → feed → 应答 → draw
@@ -422,12 +486,50 @@ fn qt_draw(st: &mut QtState) {
         &damage,
         &mut t.row_insts,
     );
+    let mut instances = repack(&t.row_insts);
+    // #37:退出横幅(顶行,后发先至盖在内容上):色板红/绿槽 + 白字,
+    // 提示收起后重开。先于图集装载段(路由要可变借 router)
+    if let Some(code) = t.exited {
+        let slot = if code == 0 {
+            t.palette.colors[2]
+        } else {
+            t.palette.colors[1]
+        };
+        let label = format!("[exit {code}] 会话已结束——按热键收起,再按即重开");
+        let w = st.config.width as f32;
+        let h = t.metrics.line_height;
+        let c = |v: u8| v as f32 / 255.0;
+        let bg = [c(slot.r), c(slot.g), c(slot.b), 0.0];
+        let fg = [1.0, 1.0, 1.0, 0.0];
+        instances.push(mica_render::frame::CellInstance {
+            pos_uv: [0.0, 0.0, 0.0, 0.0],
+            size_uv: [w, h, 0.0, 0.0],
+            fg: bg,
+            bg,
+        });
+        let mut x = 4.0;
+        for ch in label.chars() {
+            let g = <DwriteRouter as mica_render::font::router::GlyphRouter>::route(
+                &mut t.router,
+                ch,
+                mica_render::font::GlyphStyle::PLAIN,
+            );
+            if g.size_px[0] > 0.0 {
+                instances.push(mica_render::frame::CellInstance {
+                    pos_uv: [x + g.offset_px[0], g.offset_px[1], g.uv[0], g.uv[1]],
+                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                    fg,
+                    bg,
+                });
+            }
+            x += t.metrics.cell_width;
+        }
+    }
     let revision = t.router.atlas_revision();
     let atlas = t.router.atlas();
     if st.atlas_revision != revision {
         st.renderer.set_atlas(&atlas);
         st.atlas_revision = revision;
     }
-    let instances = repack(&t.row_insts);
     st.renderer.draw(&st.wgpu_surface, &st.config, &instances);
 }
