@@ -49,6 +49,9 @@ architecture; not affiliated with it.
 - **溢出滚动**:标签放不下时两端箭头 + 滚轮滚动,活跃标签自动跟随
 - **Quick Terminal**:Win+\` 顶部下拉,失焦收起,exit 后横幅提示、
   唤出即重开
+- **程序化驱动**:`mica send` 向任意标签 / Quick Terminal 注入输入
+  (tmux `send-keys` 同义)——外部工具即可驱动跑在 Mica 里的
+  Claude Code / Codex 等 agent
 
 ## 常用键位(Windows Terminal 兼容 + 浏览器直觉)
 
@@ -62,6 +65,17 @@ architecture; not affiliated with it.
 | `Alt+方向` | 分屏间跳焦点 |
 | `Ctrl+Shift+R` | 重开 shell(保留 cwd) |
 | `Ctrl+Shift+↑/↓` | 上一/下一 prompt(OSC 133) |
+
+## 程序化驱动 / Scripting
+
+```bash
+mica send --tab=0 "echo IPC_OK"      # 指定标签注入 + 回车
+mica send --qt "claude 帮我看看这个"    # 注入 Quick Terminal
+mica send --literal "C:aw\path"     # 关闭转义( \e \)
+```
+
+pane 开了 bracketed paste 会自动包边界——多行 prompt 注入
+coding agent 不会炸。连不上实例时报错退出,绝不误启新窗。
 
 ## 配置
 
@@ -84,8 +98,9 @@ strip-animation-duration = 120 # ms,0 = 关动画
 
 ## 状态 / Status
 
-1.0 已发布(main = v1.0.0,Release 附 CI 产出的 MSI);1.1 打磨批次
-进行中(标签栏重构 / 多窗口 / tear-off / 全量可配,见 #32)。
+**1.1 已发布**(tag [v1.1.0](https://github.com/yudongyouqing/mica/releases/tag/v1.1.0),
+Release 附 MSI):标签栏重制、多窗口、tear-off、拖拽换序、动画、
+QT 闭环、strip-* 全量可配、`mica send` 程序化驱动。
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
@@ -95,12 +110,13 @@ strip-animation-duration = 120 # ms,0 = 关动画
 | M3 系统集成 | Profile/IPC/WSL、Quick Terminal、安装包 | ✅ |
 | M4 协议 | kitty keyboard、OSC 8/133、2026、graphics 预研 | ✅ |
 | M5 1.0 | 健壮性(崩溃档案/DPI v2/IME)、发布 | ✅ |
-| 1.1 打磨 | 标签栏/多窗口/tear-off/动画/全量可配 | 🚧 |
+| 1.1 打磨 | 标签栏/多窗口/tear-off/动画/全量可配/send | ✅ |
 
 ## 安装 / Install
 
-- **MSI**:GitHub Releases 的 `mica.msi`(CI 产出,未签名——
-  SmartScreen 提示选"仍要运行";个人项目暂不购代码签名证书)
+- **MSI**:GitHub [Releases](https://github.com/yudongyouqing/mica/releases)
+  的 `mica.msi`(CI 产出,未签名——SmartScreen 提示选"仍要运行";
+  个人项目暂不购代码签名证书)
 - **winget**:清单投递待做(#36)
 - **源码**:`cargo build --release`(Rust stable + Windows;
   `cargo run --bin mica` 直接跑)
