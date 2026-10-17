@@ -79,6 +79,46 @@ pub fn handle_cli() -> i32 {
             )
         }
         Some("new-window") => dispatch_ipc(IpcMessage::new_window(), String::new()),
+        // #44:向运行中的实例注入输入(tmux send-keys 同义)。
+        // `mica send [--tab=N | --qt] [--literal] 文本...`;默认展开转义
+        // (\r=回车 \e=Esc \\=反斜杠);连不上实例 = 错误退出,绝不自启
+        Some("send") => {
+            let mut tab: Option<i64> = None;
+            let mut literal = false;
+            let mut words: Vec<&str> = Vec::new();
+            for a in args.iter().skip(1) {
+                match a.as_str() {
+                    "--qt" => tab = Some(-1),
+                    "--literal" => literal = true,
+                    s if s.starts_with("--tab=") => match s[6..].parse::<i64>() {
+                        Ok(n) => tab = Some(n),
+                        Err(_) => {
+                            eprintln!("mica send: --tab 后应为标签序号(0 起),得 `{}`", &s[6..]);
+                            return 2;
+                        }
+                    },
+                    s => words.push(s),
+                }
+            }
+            if words.is_empty() {
+                eprintln!("用法: mica send [--tab=N | --qt] [--literal] 文本...");
+                eprintln!("  \\r 回车  \\e Esc  \\\\ 反斜杠(--literal 关闭转义)");
+                return 2;
+            }
+            let joined = words.join(" ");
+            let text = if literal {
+                joined
+            } else {
+                String::from_utf8_lossy(&mica_core::ipc::unescape_send(&joined)).into_owned()
+            };
+            match app::ipc::send(&IpcMessage::send_text(text, tab), 3_000) {
+                Ok(()) => 0,
+                Err(_) => {
+                    eprintln!("mica send: 无运行中的 mica 实例(IPC 不通)");
+                    1
+                }
+            }
+        }
         // 开发旗标:跳过单实例分流强制起独立 GUI(隔离调试用,2026-10-13
         // #38 排查落地——单实例门使第二实例永远量不到首窗行为)。
         // 必须排在 Some(other) 兜底之前
