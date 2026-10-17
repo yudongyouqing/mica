@@ -220,6 +220,32 @@ fn resize_border() -> i32 {
     (6.0 * DPI_SCALE.with(std::cell::Cell::get)) as i32
 }
 
+/// 光标所在显示器工作区的左上偏移(#41 落位锚):混合 DPI 多屏下
+/// CW_USEDEFAULT 可能落在边界另一侧,大窗口 majority 跨屏被系统重派
+/// → WM_DPICHANGED 按建议矩形缩水;锚定光标屏创建则全程同屏。
+/// 失败(极小概率 API 挂)回落 CW_USEDEFAULT 语义(返回原值)
+fn cursor_workarea_origin() -> (i32, i32) {
+    // SAFETY: 只读查询;失败走 CW_USEDEFAULT 兜底
+    unsafe {
+        let mut pt = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+        if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).is_err() {
+            return (CW_USEDEFAULT, CW_USEDEFAULT);
+        }
+        let mon = windows::Win32::Graphics::Gdi::MonitorFromPoint(
+            pt,
+            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+        );
+        let mut mi = windows::Win32::Graphics::Gdi::MONITORINFO {
+            cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if windows::Win32::Graphics::Gdi::GetMonitorInfoW(mon, &mut mi) == false {
+            return (CW_USEDEFAULT, CW_USEDEFAULT);
+        }
+        (mi.rcWork.left + 60, mi.rcWork.top + 60)
+    }
+}
+
 /// WM_APP 用户消息区(0x8000 起):
 /// +1 = WM_APP_RENDER(T7,pty 转发线程唤醒渲染);+2 = WM_APP_CONFIG(T5,热重载)
 const WM_APP_RENDER: u32 = 0x8000 + 1;
@@ -472,7 +498,12 @@ pub fn run() {
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
         // 乘 DPI_SCALE——三者顺序曾为 router→窗口→播种,单 150% 屏(无
         // WM_DPICHANGED)字体永远 ×1.0 而 strip ×1.5,比例崩坏
-        // (2026-10-06 用户实测);精确网格尺寸在播种后 SetWindowPos 定
+        // (2026-10-06 用户实测);精确网格尺寸在播种后 SetWindowPos 定。
+        // 落位锚定光标所在屏(#41):CW_USEDEFAULT 在混合 DPI 双屏可能
+        // 落在边界另一侧,窗口长大后 majority 跨屏被重派 → WM_DPICHANGED
+        // 按建议矩形缩水(1462→975,逻辑尺寸保持物理变小)。锚定光标屏
+        // 后创建→播种→定尺寸全程同屏,不再触发重派
+        let (wx, wy) = cursor_workarea_origin();
         let class_name = HSTRING::from("mica_app_class"); // Param<PCWSTR> 的已证实实现
         let title = HSTRING::from("Mica");
         let hwnd = CreateWindowExW(
@@ -480,8 +511,8 @@ pub fn run() {
             &class_name,
             &title,
             WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            wx,
+            wy,
             900,
             560,
             None,
@@ -713,14 +744,16 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
                 let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
                 let title = HSTRING::from("Mica");
-                // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位)
+                // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
+                // 落位同样锚定光标屏(#41,混合 DPI 重派缩水)
+                let (wx, wy) = cursor_workarea_origin();
                 let hwnd = CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
                     w!("mica_app_class"),
                     &title,
                     WS_OVERLAPPEDWINDOW,
-                    CW_USEDEFAULT,
-                    CW_USEDEFAULT,
+                    wx,
+                    wy,
                     900,
                     560,
                     None,
@@ -2832,6 +2865,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let dpi = ((wparam.0 >> 16) & 0xffff) as u32;
             // SAFETY: lparam 指向系统栈上的 RECT,本消息期间有效
             let suggested: &RECT = unsafe { &*(lparam.0 as *const RECT) };
+            eprintln!(
+                "[dpi] CHANGED →{dpi} suggested {}x{} @{},{}",
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                suggested.left,
+                suggested.top
+            );
             // SAFETY: 按建议矩形重定尺寸(无激活无置顶)
             unsafe {
                 let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
@@ -2853,6 +2893,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // lparam 低位 = 客户区宽,高位 = 客户区高(像素)
             let width = (lparam.0 & 0xffff) as u32;
             let height = ((lparam.0 >> 16) & 0xffff) as u32;
+            if std::env::var_os("MICA_DEBUG_DPI").is_some() {
+                eprintln!("[dpi] WM_SIZE {width}x{height} wparam={}", wparam.0);
+            }
             if width == 0 || height == 0 {
                 return LRESULT(0); // 最小化
             }
@@ -3197,6 +3240,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if msg.op == "new-window" {
                     spawn_window(None);
+                }
+                // #44 send-text(tmux send-keys 同义):向目标 pane 的 pty
+                // 输入流写字节;pane 开了 bracketed paste 自动包边界
+                // (多行 prompt 进 Claude Code 不炸)
+                if msg.op == "send-text" {
+                    let bytes = msg.text.unwrap_or_default().into_bytes();
+                    let target = |t: &mut Terminal| {
+                        let payload = if t.term.bracketed_paste_active() {
+                            let mut w = b"\x1b[200~".to_vec();
+                            w.extend_from_slice(&bytes);
+                            w.extend_from_slice(b"\x1b[201~");
+                            w
+                        } else {
+                            bytes.clone()
+                        };
+                        let _ = t.session.write(&payload);
+                    };
+                    match msg.tab {
+                        Some(-1) => quickterm::send_text(&bytes),
+                        Some(n) if n >= 0 => {
+                            TABS.with(|tabs| {
+                                if let Some(t) = tabs
+                                    .borrow_mut()
+                                    .get_mut(n as usize)
+                                    .and_then(|tab| tab.active_pane())
+                                {
+                                    target(t);
+                                }
+                            });
+                        }
+                        _ => {
+                            TABS.with(|tabs| {
+                                if let Some(t) = tabs
+                                    .borrow_mut()
+                                    .get_mut(ACTIVE.get())
+                                    .and_then(|tab| tab.active_pane())
+                                {
+                                    target(t);
+                                }
+                            });
+                        }
+                    }
                 }
             }
             // activate 语义(两条消息共用):前置既有窗口
