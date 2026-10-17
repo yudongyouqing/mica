@@ -3241,6 +3241,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if msg.op == "new-window" {
                     spawn_window(None);
                 }
+                // #44 send-text(tmux send-keys 同义):向目标 pane 的 pty
+                // 输入流写字节;pane 开了 bracketed paste 自动包边界
+                // (多行 prompt 进 Claude Code 不炸)
+                if msg.op == "send-text" {
+                    let bytes = msg.text.unwrap_or_default().into_bytes();
+                    let target = |t: &mut Terminal| {
+                        let payload = if t.term.bracketed_paste_active() {
+                            let mut w = b"\x1b[200~".to_vec();
+                            w.extend_from_slice(&bytes);
+                            w.extend_from_slice(b"\x1b[201~");
+                            w
+                        } else {
+                            bytes.clone()
+                        };
+                        let _ = t.session.write(&payload);
+                    };
+                    match msg.tab {
+                        Some(-1) => quickterm::send_text(&bytes),
+                        Some(n) if n >= 0 => {
+                            TABS.with(|tabs| {
+                                if let Some(t) = tabs
+                                    .borrow_mut()
+                                    .get_mut(n as usize)
+                                    .and_then(|tab| tab.active_pane())
+                                {
+                                    target(t);
+                                }
+                            });
+                        }
+                        _ => {
+                            TABS.with(|tabs| {
+                                if let Some(t) = tabs
+                                    .borrow_mut()
+                                    .get_mut(ACTIVE.get())
+                                    .and_then(|tab| tab.active_pane())
+                                {
+                                    target(t);
+                                }
+                            });
+                        }
+                    }
+                }
             }
             // activate 语义(两条消息共用):前置既有窗口
             let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd) };

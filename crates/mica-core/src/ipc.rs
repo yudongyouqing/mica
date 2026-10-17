@@ -16,6 +16,13 @@ pub struct IpcMessage {
     pub profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f32>,
+    /// #44 send-text:注入的文本(CLI 侧已做转义展开)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// #44 send-text 目标:None = 活跃标签,Some(n) = 第 n 标签,
+    /// Some(-1) = Quick Terminal
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<i64>,
 }
 
 impl IpcMessage {
@@ -24,6 +31,8 @@ impl IpcMessage {
             op: "activate".into(),
             profile: None,
             font_size: None,
+            text: None,
+            tab: None,
         }
     }
 
@@ -45,8 +54,49 @@ impl IpcMessage {
             op: "new-tab".into(),
             profile,
             font_size,
+            text: None,
+            tab: None,
         }
     }
+
+    /// #44:向目标 pane 注入输入(tmux send-keys 同义)
+    pub fn send_text(text: String, tab: Option<i64>) -> Self {
+        Self {
+            op: "send-text".into(),
+            text: Some(text),
+            tab,
+            ..Self::activate()
+        }
+    }
+}
+
+/// #44 CLI 转义展开(`mica send` 默认模式,--literal 跳过):
+/// 反斜杠+r/n 输出 CR(回车),反斜杠+e 输出 ESC,双反斜杠输出反斜杠;
+/// 未知转义原样保留,其余 UTF-8 原样。纯函数零 IO,在此 TDD。
+pub fn unescape_send(text: &str) -> Vec<u8> {
+    let bs = '\\';
+    let mut out = Vec::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != bs {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('r') | Some('n') => out.push(b'\r'),
+            Some('e') => out.push(0x1B),
+            Some('\\') => out.push(bs as u8),
+            // 未知转义:反斜杠原样保留 + 该字符本身
+            Some(other) => {
+                out.push(bs as u8);
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+            }
+            None => out.push(bs as u8), // 尾随孤立反斜杠
+        }
+    }
+    out
 }
 
 /// 编码帧:4 字节 LE 长度 + JSON。
@@ -123,6 +173,32 @@ mod tests {
                 .any(|w| w == b"\"profile\""),
             "None 不上线路减少字节:{json:?}"
         );
+    }
+
+    /// #44:send-text 帧往返 + 转义展开契约
+    #[test]
+    fn send_text_roundtrip_and_unescape() {
+        let bs = '\\';
+        let hi_cr = format!("hi{bs}r");
+        let m = decode(&encode(&IpcMessage::send_text(hi_cr.clone(), Some(1)))).unwrap();
+        assert_eq!(m.op, "send-text");
+        assert_eq!(m.text.as_deref(), Some(hi_cr.as_str()));
+        assert_eq!(m.tab, Some(1));
+        // 老客户端兼容:无 text/tab 字段 → None
+        let payload = br#"{"op":"activate"}"#;
+        let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(payload);
+        let legacy = decode(&framed).unwrap();
+        assert_eq!((legacy.text, legacy.tab), (None, None));
+
+        // 转义展开:r/n→CR,e→ESC,双反斜杠→单,未知保留,UTF-8 原样
+        assert_eq!(unescape_send("a\\rb\\ec"), b"a\rb\x1bc".to_vec());
+        assert_eq!(unescape_send("C:\\\\path"), b"C:\\path".to_vec());
+        assert_eq!(unescape_send("w\\q"), b"w\\q".to_vec());
+        assert_eq!(unescape_send("end\\"), b"end\\".to_vec());
+        let mut want = "中文".as_bytes().to_vec();
+        want.push(b'\r');
+        assert_eq!(unescape_send("中文\\r"), want);
     }
 
     #[test]
