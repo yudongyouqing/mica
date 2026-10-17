@@ -69,9 +69,9 @@ architecture; not affiliated with it.
 ## 程序化驱动 / Scripting
 
 ```bash
-mica send --tab=0 "echo IPC_OK"      # 指定标签注入 + 回车
+mica send --tab=0 "echo IPC_OK\r"      # 指定标签注入 + 回车
 mica send --qt "claude 帮我看看这个"    # 注入 Quick Terminal
-mica send --literal "C:aw\path"     # 关闭转义( \e \)
+mica send --literal "C:\\raw\\path"     # 关闭转义(\r \e \)
 ```
 
 pane 开了 bracketed paste 会自动包边界——多行 prompt 注入
