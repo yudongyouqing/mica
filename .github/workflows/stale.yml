@@ -1,0 +1,21 @@
+# 过期看护:30 天无活动的 issue/PR 打 stale 标,再 14 天无响应自动关
+name: stale
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+permissions:
+  issues: write
+  pull-requests: write
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v10
+        with:
+          days-before-stale: 30
+          days-before-close: 14
+          stale-issue-message: "30 天无活动,标记 stale;14 天内无回复将自动关闭(可随时重开)。"
+          stale-pr-message: "30 天无活动,标记 stale;14 天内无更新将自动关闭。"
+          exempt-issue-labels: "pinned,release"
+          exempt-pr-labels: "release"

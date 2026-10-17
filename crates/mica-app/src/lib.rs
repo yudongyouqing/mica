@@ -79,6 +79,13 @@ pub fn handle_cli() -> i32 {
             )
         }
         Some("new-window") => dispatch_ipc(IpcMessage::new_window(), String::new()),
+        // 开发旗标:跳过单实例分流强制起独立 GUI(隔离调试用,2026-10-13
+        // #38 排查落地——单实例门使第二实例永远量不到首窗行为)。
+        // 必须排在 Some(other) 兜底之前
+        Some("--multi") => {
+            app::run();
+            0
+        }
         Some(other) => {
             eprintln!(
                 "mica [new-tab [profile] | new-window | wsl [distro] | list-profiles]

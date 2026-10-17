@@ -198,7 +198,8 @@ impl Palette {
 
 /// `#rrggbb`(大小写不敏感)。M1 只认 6 位十六进制——主题库全量是
 /// 该格式(金样本测试锁定);更短/rgb: 形态等真出现再扩。
-fn parse_hex(value: &str) -> Result<Rgb, String> {
+/// pub:settings 的 strip-* 颜色键复用同一口径(2026-10-12)。
+pub fn parse_hex(value: &str) -> Result<Rgb, String> {
     let hex = value
         .strip_prefix('#')
         .ok_or_else(|| format!("色值应为 #rrggbb,得 `{value}`"))?;
