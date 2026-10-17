@@ -62,7 +62,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-10-03-m5-1.0-design.md` — M5 1.0 设计(打磨/健壮/发布三切片,D32-D37;砍单 tear-off/defterm 二级/官网/连字引擎/签名;验收=winget 可装+崩溃有档+IME 跟随+1.0 tag)。
 - `docs/superpowers/plans/2026-10-03-m5c-release.md` — M5c 计划(发布五件;UiaRootObjectId=-25 判据三轮实证、perf 25% 门禁偏差注记)。
 - `docs/superpowers/plans/2026-10-03-m5b-robustness.md` — M5b 计划(健壮五件;wgpu lost 双钩子/DbgHelp/try_wait/Ime/winres-manifest API 全核实;冒烟抓到 restart 双借真 bug——T1 崩溃档案首秀定位)。
-- 里程碑:M0→M4(✅)→ **M5 1.0 发布完成(main=1c9a2d2,tag v1.0.0,release 附 MSI)**→ 后续按票箱滚动(winget 投递/1.1 打磨)。
+- 里程碑:M0→M4(✅)→ M5 1.0(tag v1.0.0)→ **1.1 发布完成(2026-10-13,tag v1.1.0)**:标签栏双行重制(浅灰条/聚焦渐变/切换滑移/挤压式拖拽换序/溢出箭头)、多窗口(Ctrl+Shift+N)、tear-off 软版、QT 退出闭环、strip-* 全量可配(17 键)、最大化拖动还原、--multi 隔离调试旗标。→ 票箱:#36 winget(挂起)/#41 混合 DPI 初始缩水。
 
 ## 当前边界(M3 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
@@ -72,16 +72,16 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - sidecar 快筛(M4b/D29 备胎,已启用):候选前缀深跑 + carry/open_seq 跨块续命;基准测试 `sidecar_throughput_budget`(#ignored,release 跑)预算 5%
 - 启动清理孤儿 ConPTY 宿主(M5c):强杀终端必留 OpenConsole 孤儿,管道断裂后 busy-loop——2026-10-03 冒烟事故实证 13 个孤儿各烧满 1 核;启动时按"父进程已死"清杀(真开着的 WT 父进程活着不受影响),与 minidump 崩溃恢复成对
 - UIA 撤线(1.0.8):深度查询(Narrator/FindAll)稳定触发 native crash(panic/SEH 均接不住,无 dmp)——自定义 provider 走系统 host provider 替代,Narrator 仍可读窗口标题;uia.rs 模块与 COM 闭环测试保留,崩溃根因修复后恢复分派
-- Quick Terminal 的 shell 退出无轮询(主窗 poll_exits 只轮 TABS):QT 里敲 exit 后无 [exit N] 提示、无重开入口——体验欠账(通道断 forwarder 自然退,不挂死)
 - kitty graphics:ConPTY 剥离 APC(M4c 字节级实证,与 2026/OSC 52 同类)——Windows 主路径不可达,不实现;金丝雀测试 `conpty_strips_apc_today_canary` 变红 = 边界移动,重估(预研文档含 M5 立项建议)
 - OSC 133(**边界随 OS build 走,2026-10-12 CI 实证修正**):≥26300(客户端实测)**完整透传**——jump/exit 状态点即刻可达;26100(CI Server 2025 实测)仍剥离。金丝雀按 `cmd /c ver` build 号分档断言,任一档翻向=边界移动。OSC 7 透传(新标签目录继承的数据源)
-- 标签溢出滚动:滚轮+活跃自动跟随已落,箭头命中区暂缓(计划偏差注记)
-- 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段);标签 tear-off 砍单(D32)
+- 标签溢出滚动:滚轮+左右箭头+活跃自动跟随齐备(1.1,#39)
+- 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段)
+- 标签 tear-off(1.1 软版,#35):拖出标签行即撕开独立窗,同 shell/cwd/标题重开——**进程不迁移**(COM/线程本地 !Send 架构),活进程迁移留后续增强
 - defterm 整体撤除(1.0.2):RRVA 一级注册实测是陷阱——装完即劫持默认终端且无 COM 实现接管,console 程序全弹 0xC0000142。真实现(ITerminalHandoff)完成前不再注册;winget 清单首提待做
 - Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M5c 观察;QT 输入已对齐主窗契约(M5a 修双发)
 - IME(M5b 已实现跟随:组合/候选窗定光标格下缘)——**2026-10-04 用户手验通过**(中文输入正常、候选框跟随、不崩);旧 6/10 崩账定性为坏驱动栈时代伪影(1.0.8 后复测无恙)
 - OSC 4 全域正确(16-231 立方/232-255 灰阶,M5a 落);SGR 下划线族已渲染(M5a,此前从未画)
-- DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始窗口物理尺寸在高 DPI 屏偏小(创建尺寸未乘 scale,打磨票)
+- DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始定尺寸链路已实证正确(#38 关账,**混合 DPI 跨屏初始落位仍缩水,#41**);`mica --multi` 起隔离实例是 DPI/首窗类排查的标准工具
 
 ## 提交规范
 
