@@ -316,6 +316,14 @@ thread_local! {
     /// panic = 进程崩(2026-10-12 闪退实证)。标签数只在建/关标签时变,
     /// 建/关两处同步维护此 Cell
     static TAB_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// #59 启动计时锚(主线程;timer 7 补做非关键初始化时输出分段)
+    static START_T0: std::cell::Cell<Option<std::time::Instant>> = const {
+        std::cell::Cell::new(None)
+    };
+    /// #59 延迟初始化只做一次(副窗线程不触发:timer 只挂在主窗 hwnd)
+    static DEFER_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #59 延迟建立的配置 watcher handle(退出序从这取;主窗线程 TLS)
+    static RELOAD_TAKE: RefCell<Option<ReloadHandle>> = const { RefCell::new(None) };
     /// strip 外观配置快照(load_settings;热重载时整表替换)——几何/
     /// 颜色/字体/动画全从这里走(2026-10-12 全量可配)
     static STRIP_CFG: RefCell<mica_core::config::settings::StripCfg> =
@@ -462,6 +470,8 @@ impl TabState {
 }
 
 pub fn run() {
+    // #59 启动计时锚(exec 起点近似;MICA_DEBUG_TIMING 门控输出分段)
+    let t0 = std::time::Instant::now();
     WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // ConPTY 宿主消毒(1.0.6):进程内剔除第三方 OpenConsole 目录,
     // 见 pty.rs 的 sanitize_conpty_host_path 文档——必须在一切 spawn
@@ -648,32 +658,14 @@ pub fn run() {
         let gpu = init_window_gpu(hwnd);
         GPU.with(|g| *g.borrow_mut() = Some(gpu));
 
-        // T5:热重载 watcher 在窗口创建后启动(投递 WM_APP_CONFIG 需要 hwnd);
-        // config 文件缺失(全默认启动)则不监听——首次创建配置需重启生效
-        let reload = spawn_config_watcher(Arc::clone(&hwnd_slot));
         // M3a:单实例 IPC 服务(管道被占说明已有实例——main 侧已分流,这里
-        // 只可能首实例到达;失败降级单开不致命)
+        // 只可能首实例到达;失败降级单开不致命)。必须在首帧前:晚于此,
+        // 启动窗口期内的 `mica new-tab` 会自启第二个实例
         match ipc::serve(Arc::clone(&hwnd_slot)) {
             Ok(rx) => IPC_RX.with(|slot| *slot.borrow_mut() = Some(rx)),
             Err(false) => {} // 建管道失败:已在 ipc::serve 记日志
             Err(true) => unreachable!("main 已分流,GUI 路径不会撞已占管道"),
         }
-        // 孤儿 ConPTY 清理(M5c/T1):趁自身还没 spawn pty,零误杀窗口
-        let orphans = orphan::sweep_orphaned_conhost(true);
-        if orphans > 0 {
-            eprintln!("[orphan] 清杀 {orphans} 个父进程已死的 ConPTY 宿主");
-        }
-
-        // M3a:AUMID + jump list(profile 任务直达)
-        jumplist::set_appuser_model_id();
-        let profiles: Vec<(String, String)> = mica_core::profile::scan_all()
-            .into_iter()
-            .map(|p| (p.name, p.command))
-            .collect();
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        jumplist::install(&exe, &profiles);
         // T7:首个标签与 GPU 就位(forwarder 由 start_tab 内部起;
         // handle 不 join——退出序由杀 pty 断源自然收尾,detach 可接受)。
         // M3a:CLI/IPC 自启动路径经 MICA_START_PROFILE 指定首标签 profile
@@ -696,14 +688,23 @@ pub fn run() {
         // 暴露整个启动序:GPU/jumplist/profile 扫描/首帧都在其后——
         // 2026-10-06 用户实测"启动大块白屏")
         draw_frame();
+        if std::env::var_os("MICA_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "[timing] run→首帧 {}ms(含窗口/GPU/首标签)",
+                t0.elapsed().as_millis()
+            );
+        }
         let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
             hwnd,
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
-        // M3b:Quick Terminal(热键 + 下拉窗;失败只记日志)
-        // QT 失败已内部记日志;Err = QT 禁用(主窗照常,增强件不炸主流程)
-        let _ = quickterm::init(hwnd);
-        message_loop(reload, hwnd_slot);
+
+        // #59 非关键初始化推迟:首帧已上屏,余下(COM/进程枚举/wsl.exe/
+        // 第二个 GPU surface/文件 watcher)经一拍定时器在主线程补做——
+        // TLS 安全(全主线程),用户感知 = 首帧即此前的全部等待
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 7, 100, None);
+        START_T0.with(|c| c.set(Some(t0)));
+        message_loop(None, hwnd_slot);
     }
 
     // 多窗口寿命(2026-10-12):主窗退出序已毕(其标签已拆、watcher 已停),
@@ -943,6 +944,52 @@ fn warn_box(text: &str) {
 /// 父目录并按路径过滤,原子替换/重建不失联)监听 config 文件,事件经 mpsc
 /// 交给去抖线程。None = 未监听(文件缺失或 watch 失败,热重载降级关闭)。
 /// 哨兵由 run() 统一建立后传入——与转发线程共用"窗口存活"这一个事实。
+/// #59 非关键初始化(首帧后一拍,主线程):孤儿清理 / jumplist COM /
+/// profile 扫描 / Quick Terminal / 配置 watcher。全在主线程执行——
+/// 这些件吃 TLS(GPU/SHARED_HWND),后台线程会撞双实例 TLS。
+/// DEFER_DONE 只在主窗线程置位(timer 挂主窗 hwnd),副窗天然不进
+unsafe fn deferred_init(hwnd: HWND) {
+    if DEFER_DONE.with(|c| c.replace(true)) {
+        return;
+    }
+    let t = std::time::Instant::now();
+    // 孤儿 ConPTY 清理(M5c/T1):此时首标签 pty 已起、活着,不误杀;
+    // "趁自身没 spawn 前零误杀窗口"的旧前提换成"父进程活着"同判据
+    let orphans = orphan::sweep_orphaned_conhost(true);
+    if orphans > 0 {
+        eprintln!("[orphan] 清杀 {orphans} 个父进程已死的 ConPTY 宿主");
+    }
+    // M3a:AUMID + jump list(profile 任务直达;COM 实例化是慢路径)
+    jumplist::set_appuser_model_id();
+    let profiles: Vec<(String, String)> = mica_core::profile::scan_all()
+        .into_iter()
+        .map(|p| (p.name, p.command))
+        .collect();
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    jumplist::install(&exe, &profiles);
+    // M3b:Quick Terminal(独立 GPU surface,重)
+    let _ = quickterm::init(hwnd);
+    // T5:配置 watcher(晚于首帧启动 = 首 100ms 内改配置不触发,可接受)
+    if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone())
+        && let Some(reload) = spawn_config_watcher(slot)
+    {
+        RELOAD_TAKE.with(|r| *r.borrow_mut() = Some(reload));
+    }
+    if std::env::var_os("MICA_DEBUG_TIMING").is_some() {
+        let total = START_T0
+            .with(std::cell::Cell::get)
+            .map(|t0| t0.elapsed().as_millis())
+            .unwrap_or_default();
+        eprintln!(
+            "[timing] 延迟段 {}ms(孤儿/COM/profile/QT/watcher),累计 {}ms",
+            t.elapsed().as_millis(),
+            total
+        );
+    }
+}
+
 fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle> {
     let path = config_path();
     if !path.exists() {
@@ -1785,7 +1832,7 @@ pub(crate) fn spawn_qt_forwarder(
         .expect("spawn qt forwarder");
 }
 
-unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
+unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     let mut msg = MSG::default();
     loop {
         let ret = GetMessageW(&mut msg, None, 0, 0);
@@ -1814,7 +1861,10 @@ unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     eprintln!("[exit] step1: sentinel None");
     *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
     eprintln!("[exit] step2: watcher drop + join");
-    if let Some(reload) = reload {
+    // #59 watcher 改由延迟初始化建立,teardown 从 TLS 收(handle 由
+    // deferred_init 存入,与重建序互斥:退出时未建 = None = 无可拆)
+    let reload = RELOAD_TAKE.with(|r| r.take());
+    if let Some(reload) = reload.or(reload_param) {
         drop(reload.watcher);
         let _ = reload.thread.join();
     }
@@ -3050,6 +3100,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             match wparam.0 {
+                7 => {
+                    // #59 非关键初始化补做(一拍定时器;主线程 = TLS 安全)
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 7).ok();
+                    unsafe { deferred_init(hwnd) };
+                }
                 5 => {
                     if strip_anim_step() {
                         ensure_anim_timer();
