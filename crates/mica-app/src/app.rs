@@ -2984,6 +2984,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .and_then(|tab| tab.active_pane())
                     && let Some(text) = t.term.selection_text()
                     && !text.is_empty()
+                    && COPY_ON_SELECT.with(std::cell::Cell::get)
                 {
                     clipboard::set_text(&text);
                 }
