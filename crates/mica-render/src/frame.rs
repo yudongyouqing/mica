@@ -427,6 +427,27 @@ pub enum CaptionBtn {
     Close,
 }
 
+/// 整行文本提取(#58 可点击路径 / 未来搜索共用):字符拼串 + 字符→格
+/// 下标映射(WIDE_CHAR 占 2 格)。line 为 buffer 行(i32,负 = 历史)。
+pub fn row_string(grid: &Grid<Cell>, line: i32) -> (String, Vec<usize>) {
+    let cols = grid.columns();
+    let mut text = String::with_capacity(cols);
+    let mut cell_of = Vec::with_capacity(cols);
+    for c in 0..cols {
+        let cell = &grid[Line(line)][Column(c)];
+        text.push(cell.c);
+        let w = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        for _ in 0..w {
+            cell_of.push(c);
+        }
+    }
+    (text, cell_of)
+}
+
 /// tab strip 的 UI 实例(T7,spec §3 同管线),**双行形制**(2026-10-12
 /// 用户裁定):第一行 = 窗口标题(活跃标签名,居中)+ 右端 caption 三键
 /// (— □ ×);第二行 = 均分标签占满 + 右端 "+" 开新标签;再下才是终端
