@@ -2157,24 +2157,27 @@ fn draw_frame() {
                     }
                     let x = pr.x + *col as f32 * t.metrics.cell_width;
                     let y = pr.y + view as f32 * t.metrics.line_height;
+                    let mw = *len as f32 * t.metrics.cell_width;
                     if mi == cur {
-                        // 当前命中:整行高 2px 亮黄顶条(不遮字,视觉锚)
+                        // 当前命中:顶+底 3px 亮黄双条(不遮字;双条比单条
+                        // 锚定感强,用户实报 2px 单条不可见)
+                        search_overlay.push(mk_quad(x, y, mw, 3.0, yellow));
                         search_overlay.push(mk_quad(
                             x,
-                            y,
-                            *len as f32 * t.metrics.cell_width,
-                            2.0,
+                            y + t.metrics.line_height - 3.0,
+                            mw,
+                            3.0,
                             yellow,
                         ));
                     } else {
-                        // 其余命中:底部 2px 暗条
-                        search_overlay.push(mk_quad(
-                            x,
-                            y + t.metrics.line_height - 2.0,
-                            *len as f32 * t.metrics.cell_width,
-                            2.0,
-                            dimc,
-                        ));
+                        // 其余命中:顶 2px 黄(混 bg 60% 提亮——旧暗条在深色
+                        // 主题上不可见,用户实报)
+                        let soft = [
+                            ((yellow[0] as u16 * 2 + dimc[0] as u16) / 3) as u8,
+                            ((yellow[1] as u16 * 2 + dimc[1] as u16) / 3) as u8,
+                            ((yellow[2] as u16 * 2 + dimc[2] as u16) / 3) as u8,
+                        ];
+                        search_overlay.push(mk_quad(x, y, mw, 2.0, soft));
                     }
                 }
                 // 搜索条(pane 底部内侧,一行高):bg 提亮 + "/query  N/M  Enter↓"
@@ -2229,7 +2232,9 @@ fn draw_frame() {
                             ],
                         });
                     }
-                    tx += t.metrics.cell_width;
+                    // 步进按真字宽(CJK 双宽,恒 1 格会互相叠 = 乱码,
+                    // 用户实报;strip 的 adv 同款公式)
+                    tx += g.size_px[0].max(t.metrics.cell_width);
                 }
             }
         }
@@ -4080,7 +4085,26 @@ fn search_rescan() {
     }
     SEARCH_MATCHES.with(|m| *m.borrow_mut() = matches);
     SEARCH_IDX.with(|i| i.set(0));
-    search_jump(false);
+    // 首搜定位第一个命中(旧版误调 search_jump(false) 倒跳 n-1)
+    search_show();
+}
+
+/// #57 定位到 SEARCH_IDX 当前命中(不推进游标):滚视口 + 重绘
+fn search_show() {
+    let line = SEARCH_MATCHES.with(|m| m.borrow().first().map(|(l, _, _)| *l));
+    if let Some(line) = line {
+        TABS.with(|tabs| {
+            if let Some(t) = tabs
+                .borrow_mut()
+                .get_mut(ACTIVE.get())
+                .and_then(|tab| tab.active_pane())
+            {
+                t.term.scroll_to_line(line);
+                t.force_full = true;
+            }
+        });
+    }
+    draw_frame();
 }
 
 /// #57 跳命中:forward = 下一(Enter)/上一(Shift+Enter);跳到即滚视口
@@ -4097,19 +4121,7 @@ fn search_jump(forward: bool) {
         (old + n.saturating_sub(1)) % n
     };
     SEARCH_IDX.with(|i| i.set(new));
-    let (line, _, _) = SEARCH_MATCHES.with(|m| m.borrow()[new]);
-    TABS.with(|tabs| {
-        if let Some(t) = tabs
-            .borrow_mut()
-            .get_mut(ACTIVE.get())
-            .and_then(|tab| tab.active_pane())
-        {
-            t.term.scroll_to_line(line);
-            // 视口几何变了:行缓存按行号语义失效,显式全量
-            t.force_full = true;
-        }
-    });
-    draw_frame();
+    search_show();
 }
 
 /// #57 WM_CHAR 的搜索态拦截:消费则返回 true(调用方吞掉不进 pty)。

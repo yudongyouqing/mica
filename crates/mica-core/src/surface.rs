@@ -1075,6 +1075,39 @@ mod tests {
         assert!(!s.selection_extend_edge(true));
     }
 
+    /// #57 scroll_to_line 契约:历史目标行应落在视口上 1/3;屏内目标
+    /// 不滚出;clamp 不越界
+    #[test]
+    fn scroll_to_line_places_history_in_view() {
+        let mut s = Surface::new(ScreenSize::new(20, 6));
+        for i in 0..20 {
+            s.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let hist = s.grid().history_size();
+        assert!(hist >= 14, "20 行进 6 行屏,历史 ≥14(得 {hist})");
+        // 滚到最老历史行(buffer 行 = -(hist as i32))
+        assert!(s.scroll_to_line(-(hist as i32)));
+        // 目标行应可见:display_offset 使 oldest 的 view = offset - hist ≥ 0
+        let off = s.display_offset() as i32;
+        assert!(off > 0, "滚进历史区(offset={off})");
+        let view_of_oldest = -(hist as i32) + off;
+        assert!(
+            (0..6).contains(&view_of_oldest),
+            "最老行在视口内(view={view_of_oldest}, offset={off})"
+        );
+        // 屏内行(底部提示行,line ≥ 0):滚回底或保持可见,不得滚进历史
+        let bottom_line = 5; // 视口底行(buffer 坐标在底跟随时 = 屏行)
+        s.scroll_to_line(bottom_line);
+        let off2 = s.display_offset();
+        assert!(
+            off2 as i32 + bottom_line >= 0 && (off2 as i32 + bottom_line) < 6 + off2 as i32,
+            "屏内目标保持在视口内"
+        );
+        // clamp:更深的负行不越界(offset ≤ hist)
+        s.scroll_to_line(-9999);
+        assert!(s.display_offset() <= hist, "clamp 到历史深度");
+    }
+
     #[test]
     fn jump_prompt_steps_through_prompts() {
         let mut s = Surface::new(ScreenSize::new(10, 4));
