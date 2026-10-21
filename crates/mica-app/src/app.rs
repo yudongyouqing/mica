@@ -3895,10 +3895,105 @@ fn link_at(px: i32, py: i32) -> Option<String> {
         let line =
             ((py as f32 - r.y) / t.metrics.line_height) as i32 + t.term.display_offset() as i32;
         let col = ((px as f32 - r.x) / t.metrics.cell_width) as usize;
-        t.term.grid()[Line(line)][Column(col)]
-            .hyperlink()
-            .map(|l| l.uri().to_string())
+        if let Some(l) = t.term.grid()[Line(line)][Column(col)].hyperlink() {
+            return Some(l.uri().to_string());
+        }
+        // #58:OSC 8 未命中 → 行文本路径检测(编译器输出裸路径可点击)
+        let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), line);
+        path_at_in_row(t, &text, &cell_of, col)
     })
+}
+
+/// 裸路径检测(#58):token 化 → 路径模式判定 → 定位剥离(:line[:col]),
+/// 命中要求:盘符绝对路径 / 点或斜杠起头的相对路径 / 含扩展名的
+/// 单斜杠路径(rustc 风格 src/main.rs:3:10)——纯单词不吃
+fn path_at_in_row(
+    t: &Terminal,
+    text: &str,
+    cell_of: &[usize],
+    cursor_col: usize,
+) -> Option<String> {
+    let bytes: Vec<char> = text.chars().collect();
+    let is_word = |c: char| {
+        c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word(bytes[i]) {
+            i += 1;
+        }
+        let token: String = bytes[start..i].iter().collect();
+        if let Some(path) = normalize_path_token(&token) {
+            // 光标落在 token 覆盖区(宽字符 token 的 cell 映射收缩)
+            let covered: std::collections::HashSet<usize> =
+                cell_of[start..i].iter().copied().collect();
+            if covered.contains(&cursor_col) {
+                // 相对路径 → OSC 7 的 cwd 补全
+                return Some(match path.chars().next() {
+                    Some('/') | Some('\\') => path,
+                    _ => {
+                        let c = path.as_str();
+                        if c.len() > 2 && c.as_bytes()[1] == b':' {
+                            path // 盘符绝对路径
+                        } else {
+                            match t.term.cwd() {
+                                Some(cwd) => format!("{}\\{}", cwd.trim_end_matches('\\'), path),
+                                None => path,
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+    None
+}
+
+/// token → 文件系统路径:剥离尾部 :line[:col],按模式判定是否路径。
+/// None = 不是路径(误报防线)
+fn normalize_path_token(token: &str) -> Option<String> {
+    // 剥离 :N[:N] 定位后缀(仅当剩余部分像路径)
+    let mut path = token;
+    let mut num = 0;
+    while let Some(idx) = path.rfind(':') {
+        let tail = &path[idx + 1..];
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            path = &path[..idx];
+            num += 1;
+        } else {
+            break;
+        }
+    }
+    if path.is_empty() {
+        return None;
+    }
+    let slashes = path.matches(['/']).count() + path.matches(['\\']).count();
+    let looks_abs = {
+        let b = path.as_bytes();
+        b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
+    };
+    let rel_start = path.starts_with("./")
+        || path.starts_with("../")
+        || path.starts_with(".\\")
+        || path.starts_with("..\\")
+        || path.starts_with('/')
+        || path.starts_with('\\');
+    let has_ext = path.rsplit(['/', '\\']).next().is_some_and(|f| {
+        let f = f.rsplit_once('.');
+        f.is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && ext.len() <= 8)
+    });
+    // 单斜杠无扩展名(a/b)太弱不吃;多斜杠(嵌套目录)放行
+    let is_path = looks_abs || rel_start || has_ext || slashes >= 2;
+    if !is_path || slashes == 0 && !looks_abs && !rel_start {
+        return None; // 无任何分隔符的裸词
+    }
+    let _ = num;
+    Some(path.replace('/', "\\"))
 }
 
 fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
@@ -3931,7 +4026,7 @@ fn current_mods() -> Mods {
 
 #[cfg(test)]
 mod tests {
-    use super::pretty_title;
+    use super::{normalize_path_token, pretty_title};
 
     /// 标题呈现:exe 路径 basename 去扩展(Ghostty direct-command argv[0]
     /// 的 Windows 适配);普通 OSC 标题原样(nvim / user@host:cwd)
@@ -3944,5 +4039,39 @@ mod tests {
         assert_eq!(pretty_title(r"C:\Windows\system32\cmd.exe"), "cmd");
         assert_eq!(pretty_title("nvim"), "nvim");
         assert_eq!(pretty_title("user@host: ~/mica"), "user@host: ~/mica");
+    }
+
+    /// #58 路径 token 判定:吃真路径、不吃纯词/时间戳/URL 前缀
+    #[test]
+    fn path_token_detection() {
+        // 真路径(绝对/相对/rustc 风格带行列)
+        assert_eq!(
+            normalize_path_token(r"C:\proj\src\main.rs:3:10"),
+            Some(r"C:\proj\src\main.rs".into())
+        );
+        assert_eq!(
+            normalize_path_token("src/main.rs:42"),
+            Some(r"src\main.rs".into())
+        );
+        assert_eq!(
+            normalize_path_token("./relative/file.txt"),
+            Some(r".\relative\file.txt".into())
+        );
+        assert_eq!(normalize_path_token("../up/dir"), Some(r"..\up\dir".into()));
+        assert_eq!(
+            normalize_path_token("/unix/abs/path"),
+            Some(r"\unix\abs\path".into())
+        );
+        // 误报防线:纯词 / 版本号 / 时间戳 / 单段文件名
+        assert_eq!(normalize_path_token("hello"), None);
+        assert_eq!(normalize_path_token("v1.2.3"), None);
+        assert_eq!(normalize_path_token("12:34:56"), None);
+        assert_eq!(
+            normalize_path_token("main.rs"),
+            None,
+            "无目录的单文件名不吃(太宽)"
+        );
+        assert_eq!(normalize_path_token("a/b"), None, "单斜杠无扩展名不吃");
+        assert_eq!(normalize_path_token("::"), None);
     }
 }
