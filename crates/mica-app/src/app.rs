@@ -2439,6 +2439,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 });
                 if copied {
+                    // 复制即消费:吞伴生 WM_CHAR(0x03 ETX)——否则复制完
+                    // 还给 shell 送中断(WT 语义:选中 Ctrl+C 只复制)
+                    KEYMAP_ATE_CHAR.with(|c| c.set(true));
                     draw_frame();
                     return LRESULT(0);
                 }
@@ -2446,6 +2449,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if (mods.ctrl && !mods.alt && !mods.shift && vk == 'V' as u32)
                 || (mods.shift && !mods.ctrl && vk == VK_INSERT.0 as u32)
             {
+                // 吞伴生 WM_CHAR(0x16):不置位则 SYN 泄给 pty,PSReadLine
+                // 把它当第二次 Ctrl+V 粘贴 → 文本双份(用户实报;与当年
+                // Ctrl+Shift+T 送 ^T 同类,keymap 分支修过硬编码漏了)
+                KEYMAP_ATE_CHAR.with(|c| c.set(true));
                 if let Some(text) = clipboard::get_text() {
                     let normalized = clipboard::normalize_paste(&text);
                     TABS.with(|tabs| {
