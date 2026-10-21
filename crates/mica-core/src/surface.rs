@@ -393,6 +393,13 @@ impl Surface {
         std::mem::take(&mut lock(&self.proxy.0).title)
     }
 
+    /// #57 搜索用尺寸打包:(历史行数, 视口行数, grid 引用)——app 层
+    /// 不 import alacritty trait 的取值捷径
+    pub fn grid_dims(&self) -> (usize, usize, &Grid<Cell>) {
+        let g = self.term.grid();
+        (g.history_size(), g.screen_lines(), g)
+    }
+
     pub fn grid(&self) -> &Grid<Cell> {
         self.term.grid()
     }
@@ -499,6 +506,27 @@ impl Surface {
     /// 当前滚动偏移(0 = 钉在屏幕底跟随输出)。
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
+    }
+
+    /// 视口滚到指定偏移(#57 搜索跳转用):目标行 buffer 坐标 → 置于
+    /// 视口上 1/3 处(首尾行留上下文)。line 为 buffer 行(负 = 历史)。
+    /// 返回是否滚动(需重绘)。jump 锚重置(与手动滚动同语义)。
+    pub fn scroll_to_line(&mut self, line: i32) -> bool {
+        let screen = self.term.grid().screen_lines() as i32;
+        // line 是视口顶的 buffer 坐标(负 = 历史)。目标 = 让该行出现在
+        // 视口上 1/3;clamp 到 [0, history]
+        let want_top = line - screen / 3;
+        let hist = self.term.grid().history_size() as i32;
+        let want = (-want_top).clamp(0, hist) as usize;
+        let cur = self.term.grid().display_offset() as i32;
+        let delta = want as i32 - cur;
+        if delta != 0 {
+            self.jump_ref = None;
+            self.term.scroll_display(Scroll::Delta(delta));
+            true
+        } else {
+            false
+        }
     }
 
     // ---- 选择(M2a/T3):状态与拼接全用上游成品,这里只做薄封装 ----

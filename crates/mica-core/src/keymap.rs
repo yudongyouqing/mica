@@ -51,6 +51,8 @@ pub enum Action {
     FocusNeighbor(Key),
     /// 重开 pane(M5b/T3):同 shell 新会话,退出态清零。
     RestartPane,
+    /// 滚动回看搜索(#57):开/关注入式搜索模式(窗口级,非 pane 级)
+    SearchScrollback,
     /// OSC 133 jump(D37):跳上一个 prompt 行。
     JumpPrevPrompt,
     /// OSC 133 jump(D37):跳下一个 prompt 行;越过最新 = 回底部跟随。
@@ -154,6 +156,12 @@ impl Keymap {
             m(true, true, false),
             TriggerKey::Letter('R'),
             Action::RestartPane,
+        );
+        // #57:回看搜索(浏览器查找直觉同款键位)
+        push(
+            m(true, true, false),
+            TriggerKey::Letter('F'),
+            Action::SearchScrollback,
         );
         push(
             m(true, true, false),
@@ -289,6 +297,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "split_down" => Some(Action::SplitDown),
         "close_pane" => Some(Action::ClosePane),
         "restart_pane" => Some(Action::RestartPane),
+        "search_scrollback" => Some(Action::SearchScrollback),
         "focus_left" => Some(Action::FocusNeighbor(Key::Left)),
         "focus_right" => Some(Action::FocusNeighbor(Key::Right)),
         "focus_up" => Some(Action::FocusNeighbor(Key::Up)),
