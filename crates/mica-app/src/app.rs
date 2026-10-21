@@ -2107,9 +2107,11 @@ fn draw_frame() {
                 &t.palette,
             ));
         }
-        // #57 搜索:命中高亮(当前命中亮黄条,其余暗下划线)+ 底部搜索条。
-        // 高亮画在 pane 实例之后 = 画家序在上(append 进 strip,draw 时
-        // strip 在 all_instances 前——见下,倒序拼接后条与高亮都在字形上)
+        // #57 搜索:命中高亮 + 底部搜索条,收集进独立 overlay——
+        // draw 缓冲序 = 画家序(blend:None 后画胜),overlay 必须在
+        // 终端实例**之后**拼接才不被内容盖住(首版教训:直接推 strip
+        // 被 append(all_instances) 压底,条完全不可见)
+        let mut search_overlay: Vec<mica_render::frame::CellInstance> = Vec::new();
         if SEARCH_OPEN.with(std::cell::Cell::get) {
             let offset = t.term.display_offset() as i32;
             let rows = t.rows as i32;
@@ -2157,7 +2159,7 @@ fn draw_frame() {
                     let y = pr.y + view as f32 * t.metrics.line_height;
                     if mi == cur {
                         // 当前命中:整行高 2px 亮黄顶条(不遮字,视觉锚)
-                        strip.push(mk_quad(
+                        search_overlay.push(mk_quad(
                             x,
                             y,
                             *len as f32 * t.metrics.cell_width,
@@ -2166,7 +2168,7 @@ fn draw_frame() {
                         ));
                     } else {
                         // 其余命中:底部 2px 暗条
-                        strip.push(mk_quad(
+                        search_overlay.push(mk_quad(
                             x,
                             y + t.metrics.line_height - 2.0,
                             *len as f32 * t.metrics.cell_width,
@@ -2183,7 +2185,7 @@ fn draw_frame() {
                     (t.palette.bg.g as u16 * 2 + 255) as u8 / 3,
                     (t.palette.bg.b as u16 * 2 + 255) as u8 / 3,
                 ];
-                strip.push(mk_quad(
+                search_overlay.push(mk_quad(
                     pr.x,
                     bar_y,
                     bar_w,
@@ -2210,7 +2212,7 @@ fn draw_frame() {
                         mica_render::font::GlyphStyle::PLAIN,
                     );
                     if g.size_px[0] > 0.0 {
-                        strip.push(mica_render::frame::CellInstance {
+                        search_overlay.push(mica_render::frame::CellInstance {
                             pos_uv: [tx + g.offset_px[0], ty + g.offset_px[1], g.uv[0], g.uv[1]],
                             size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
                             fg: [
@@ -2234,6 +2236,8 @@ fn draw_frame() {
         let revision = t.router.atlas_revision();
         let atlas = t.router.atlas();
         strip.append(&mut all_instances);
+        // #57 搜索 overlay 最后拼 = 最上层(盖在终端内容之上)
+        strip.extend(search_overlay);
         // GPU 窗口级(T7):set_atlas 切到活跃标签的图集再 draw。
         // 门控用窗口级所有权(pane_id, revision)——1.0.10 修切标签乱码:
         // 旧逻辑按标签记 revision,切回旧标签时其自身未变便跳过重传,
