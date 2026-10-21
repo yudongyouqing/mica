@@ -2148,36 +2148,36 @@ fn draw_frame() {
                 // 条形标记两版被否("不明显")——正解是命中格背景反色 +
                 // 字变暗,与选区同观感。做法:命中矩形内的终端实例直接
                 // 改色(背景 quad → 高亮色;字形 quad 墨色 → 近黑保证可读)
+                // 可见命中矩形;仅**当前**命中做整块反色,其余画底部
+                // 亮黄下划线(整块混色版被否"丑"——黄混深底 = 泥橄榄色)
                 let mut hit_rects: Vec<(f32, f32, f32, f32, bool)> = Vec::new();
                 for (mi, (line, col, len)) in matches.iter().enumerate() {
                     let view = line + offset;
                     if !(0..rows).contains(&view) {
                         continue;
                     }
-                    hit_rects.push((
+                    let (x, y, w) = (
                         pr.x + *col as f32 * t.metrics.cell_width,
                         pr.y + view as f32 * t.metrics.line_height,
                         *len as f32 * t.metrics.cell_width,
-                        t.metrics.line_height,
-                        mi == cur,
-                    ));
+                    );
+                    if mi == cur {
+                        hit_rects.push((x, y, w, t.metrics.line_height, true));
+                    } else {
+                        // 非当前:2px 底部下划线(overlay 层,不碰文字)
+                        search_overlay.push(mk_quad(
+                            x,
+                            y + t.metrics.line_height - 2.0,
+                            w,
+                            2.0,
+                            yellow,
+                        ));
+                    }
                 }
                 let hl_cur = [
                     yellow[0] as f32 / 255.0,
                     yellow[1] as f32 / 255.0,
                     yellow[2] as f32 / 255.0,
-                    0.0,
-                ];
-                // 其余命中:黄混 bg(50%)
-                let soft_c = [
-                    ((yellow[0] as u16 + t.palette.bg.r as u16) / 2) as u8,
-                    ((yellow[1] as u16 + t.palette.bg.g as u16) / 2) as u8,
-                    ((yellow[2] as u16 + t.palette.bg.b as u16) / 2) as u8,
-                ];
-                let hl_soft = [
-                    soft_c[0] as f32 / 255.0,
-                    soft_c[1] as f32 / 255.0,
-                    soft_c[2] as f32 / 255.0,
                     0.0,
                 ];
                 let ink_dark = [0.05, 0.05, 0.05, 0.0];
@@ -2188,19 +2188,16 @@ fn draw_frame() {
                         inst.size_uv[0],
                         inst.size_uv[1],
                     );
-                    for &(hx, hy, hw, hh, is_cur) in hit_rects.iter() {
+                    for &(hx, hy, hw, hh, _is_cur) in hit_rects.iter() {
                         if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
                             if inst.size_uv[2] > 0.0 {
                                 // 字形 quad:墨色改近黑(黄底可读)
-                                inst.fg = if is_cur { ink_dark } else { inst.fg };
-                                if is_cur {
-                                    inst.bg = hl_cur;
-                                }
+                                inst.fg = ink_dark;
+                                inst.bg = hl_cur;
                             } else {
                                 // 背景 quad:整块换高亮色
-                                let c = if is_cur { hl_cur } else { hl_soft };
-                                inst.fg = c;
-                                inst.bg = c;
+                                inst.fg = hl_cur;
+                                inst.bg = hl_cur;
                             }
                             break;
                         }
