@@ -2164,14 +2164,14 @@ fn draw_frame() {
                     if mi == cur {
                         hit_rects.push((x, y, w, t.metrics.line_height, true));
                     } else {
-                        // 非当前:2px 底部下划线(overlay 层,不碰文字)
-                        search_overlay.push(mk_quad(
-                            x,
-                            y + t.metrics.line_height - 2.0,
-                            w,
-                            2.0,
-                            yellow,
-                        ));
+                        // 非当前:矩形描边框(用户点名"正方形"——四边
+                        // 2px 亮黄空心框,overlay 层不碰文字)
+                        let lh = t.metrics.line_height;
+                        let b = 2.0; // 边宽
+                        search_overlay.push(mk_quad(x, y, w, b, yellow)); // 顶
+                        search_overlay.push(mk_quad(x, y + lh - b, w, b, yellow)); // 底
+                        search_overlay.push(mk_quad(x, y, b, lh, yellow)); // 左
+                        search_overlay.push(mk_quad(x + w - b, y, b, lh, yellow)); // 右
                     }
                 }
                 let hl_cur = [
