@@ -2075,7 +2075,7 @@ fn draw_frame() {
                 t.palette.colors[8].g,
                 t.palette.colors[8].b,
             ];
-            let mut mk_quad =
+            let mk_quad =
                 |x: f32, y: f32, w: f32, h: f32, c: [u8; 3]| mica_render::frame::CellInstance {
                     pos_uv: [x, y, 0.0, 0.0],
                     size_uv: [w, h, 0.0, 0.0],
