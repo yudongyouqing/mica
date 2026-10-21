@@ -294,6 +294,9 @@ thread_local! {
     /// 打字藏鼠标(Ghostty mouse-hide-while-typing 默认 true):键入隐藏
     /// 指针、移动恢复;ShowCursor 计数严格配对(藏一次显一次)
     static MOUSE_HIDE_ON_TYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// 选中即复制(#58 同批:copy-on-select 配置键,false 时松开鼠标
+    /// 不写剪贴板——修剪贴板历史双份)
+    static COPY_ON_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
     static MOUSE_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// keymap 消费了字母/数字键(ctrl+shift+t 等):TranslateMessage 生成
@@ -510,6 +513,7 @@ pub fn run() {
         KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
         TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
         MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
+        COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
@@ -750,6 +754,8 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
                 CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
                 MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
+                COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+                COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
                 let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
                 let title = HSTRING::from("Mica");
                 // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
@@ -1193,6 +1199,7 @@ unsafe fn reload_config(hwnd: HWND) {
     KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
     TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
     MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
+    COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
@@ -2961,8 +2968,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = forward_mouse(px, py, 0, false, false);
                 return LRESULT(0);
             }
-            // copy-on-select(Ghostty 默认 true):选区完成即入剪贴板;
-            // 空选区(单击清除)不覆盖
+            // copy-on-select(copy-on-select 配置键,默认 true):选区完成
+            // 即入剪贴板;空选区(单击清除)不覆盖;false 时只走显式 Ctrl+C
             TABS.with(|tabs| {
                 let mut guard = tabs.borrow_mut();
                 if let Some(t) = guard
