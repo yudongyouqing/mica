@@ -330,6 +330,13 @@ thread_local! {
     /// 邻位滑移量(按原始标签下标;槽位变化时记跳变差,timer 5 指数
     /// 衰减到 0)——挤压是滑过去不是瞬移(2026-10-12 三版)
     static TAB_DX: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// #57 回看搜索:开态 + 查询串 + 命中表(行 buffer 坐标/列/宽)+ 游标。
+    /// 窗口级状态,重绘与 WM_CHAR/WM_KEYDOWN 路由共享
+    static SEARCH_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SEARCH_QUERY: RefCell<String> = const { RefCell::new(String::new()) };
+    static SEARCH_MATCHES: RefCell<Vec<(i32, usize, usize)>> =
+        const { RefCell::new(Vec::new()) };
+    static SEARCH_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -2050,6 +2057,130 @@ fn draw_frame() {
                 &t.palette,
             ));
         }
+        // #57 搜索:命中高亮(当前命中亮黄条,其余暗下划线)+ 底部搜索条。
+        // 高亮画在 pane 实例之后 = 画家序在上(append 进 strip,draw 时
+        // strip 在 all_instances 前——见下,倒序拼接后条与高亮都在字形上)
+        if SEARCH_OPEN.with(std::cell::Cell::get) {
+            let offset = t.term.display_offset() as i32;
+            let rows = t.rows as i32;
+            let cur = SEARCH_IDX.with(std::cell::Cell::get);
+            let matches = SEARCH_MATCHES.with(|m| m.borrow().clone());
+            let yellow = [
+                t.palette.colors[3].r,
+                t.palette.colors[3].g,
+                t.palette.colors[3].b,
+            ];
+            let dimc = [
+                t.palette.colors[8].r,
+                t.palette.colors[8].g,
+                t.palette.colors[8].b,
+            ];
+            let mut mk_quad =
+                |x: f32, y: f32, w: f32, h: f32, c: [u8; 3]| mica_render::frame::CellInstance {
+                    pos_uv: [x, y, 0.0, 0.0],
+                    size_uv: [w, h, 0.0, 0.0],
+                    fg: [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        0.0,
+                    ],
+                    bg: [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        0.0,
+                    ],
+                };
+            let pane_rect = rects
+                .iter()
+                .find(|(id, _)| *id == focused_pane_id)
+                .map(|(_, r)| *r);
+            if let Some(pr) = pane_rect {
+                for (mi, (line, col, len)) in matches.iter().enumerate() {
+                    // buffer 行 → 视口行(行 0 = 视口顶);不可见跳过
+                    let view = line + offset;
+                    if !(0..rows).contains(&view) {
+                        continue;
+                    }
+                    let x = pr.x + *col as f32 * t.metrics.cell_width;
+                    let y = pr.y + view as f32 * t.metrics.line_height;
+                    if mi == cur {
+                        // 当前命中:整行高 2px 亮黄顶条(不遮字,视觉锚)
+                        strip.push(mk_quad(
+                            x,
+                            y,
+                            *len as f32 * t.metrics.cell_width,
+                            2.0,
+                            yellow,
+                        ));
+                    } else {
+                        // 其余命中:底部 2px 暗条
+                        strip.push(mk_quad(
+                            x,
+                            y + t.metrics.line_height - 2.0,
+                            *len as f32 * t.metrics.cell_width,
+                            2.0,
+                            dimc,
+                        ));
+                    }
+                }
+                // 搜索条(pane 底部内侧,一行高):bg 提亮 + "/query  N/M  Enter↓"
+                let bar_y = pr.y + pr.h - t.metrics.line_height - 4.0;
+                let bar_w = (t.metrics.cell_width * 48.0).min(pr.w);
+                let bar_bg = [
+                    (t.palette.bg.r as u16 * 2 + 255) as u8 / 3,
+                    (t.palette.bg.g as u16 * 2 + 255) as u8 / 3,
+                    (t.palette.bg.b as u16 * 2 + 255) as u8 / 3,
+                ];
+                strip.push(mk_quad(
+                    pr.x,
+                    bar_y,
+                    bar_w,
+                    t.metrics.line_height + 4.0,
+                    bar_bg,
+                ));
+                let q = SEARCH_QUERY.with(|q| q.borrow().clone());
+                let mut label = format!("/{}", q);
+                if q.is_empty() {
+                    label = "/(输入以搜索)".into();
+                } else {
+                    label.push_str(&format!(
+                        "  {}/{}",
+                        if matches.is_empty() { 0 } else { cur + 1 },
+                        matches.len()
+                    ));
+                }
+                let mut tx = pr.x + 2.0;
+                let ty = bar_y + 2.0;
+                for ch in label.chars().take(46) {
+                    let g = <DwriteRouter as mica_render::font::router::GlyphRouter>::route(
+                        &mut t.router,
+                        ch,
+                        mica_render::font::GlyphStyle::PLAIN,
+                    );
+                    if g.size_px[0] > 0.0 {
+                        strip.push(mica_render::frame::CellInstance {
+                            pos_uv: [tx + g.offset_px[0], ty + g.offset_px[1], g.uv[0], g.uv[1]],
+                            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                            fg: [
+                                t.palette.fg.r as f32 / 255.0,
+                                t.palette.fg.g as f32 / 255.0,
+                                t.palette.fg.b as f32 / 255.0,
+                                0.0,
+                            ],
+                            bg: [
+                                bar_bg[0] as f32 / 255.0,
+                                bar_bg[1] as f32 / 255.0,
+                                bar_bg[2] as f32 / 255.0,
+                                0.0,
+                            ],
+                        });
+                    }
+                    tx += t.metrics.cell_width;
+                }
+            }
+        }
         let revision = t.router.atlas_revision();
         let atlas = t.router.atlas();
         strip.append(&mut all_instances);
@@ -2105,6 +2236,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CHAR => {
             hide_cursor_if_typing();
+            // #57 搜索态字符全吞(查询/跳转/关闭),不进 pty
+            if search_char((wparam.0 as u32).try_into().unwrap_or(' ')) {
+                return LRESULT(0);
+            }
             // keymap 已消费该键(如 Ctrl+Shift+T):TranslateMessage 的控制
             // 字节伴生投递吞掉;任何 WM_CHAR 到来都清位(正常打字即复位)
             if KEYMAP_ATE_CHAR.with(std::cell::Cell::take) && (wparam.0 as u32) < 0x20 {
@@ -2177,6 +2312,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             hide_cursor_if_typing();
+            // #57 搜索态 Up/Down 步进命中,其余键放行(keymap 不会命中,
+            // ctrl+shift+f 的 toggle 仍可关——search_char 不碰它)
+            if search_key(wparam.0 as u32) {
+                return LRESULT(0);
+            }
             // 剪贴板组合(T5;T6 Keymap 落地后迁入 Action 表):
             // Ctrl+C 有选区 → 复制并清选区,无选区 → 放行给 WM_CHAR 的
             // (ETX 中断,WT 同款语义);Ctrl+V / Shift+Insert → 粘贴
@@ -3621,6 +3761,7 @@ fn tab_follow_active() {
 fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut need_draw = false;
     let mut restart = false; // 延迟执行(块内自借 TABS 会 panic——冒烟实证)
+    let mut search_toggle = false; // #57:段外 toggle(不借 TABS)
     let mut new_tab = false;
     let mut new_window = false;
     let mut close_idx: Option<usize> = None;
@@ -3656,6 +3797,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                     need_draw = true;
                 }
                 Action::RestartPane => restart = true, // 延迟:with 块内再借 TABS 会双借 panic
+                Action::SearchScrollback => search_toggle = !search_toggle,
                 Action::NewWindow => new_window = true,
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
                     if t.term.jump_prompt(matches!(action, Action::JumpNextPrompt)) {
@@ -3706,6 +3848,13 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     // 标签操作段外执行:TABS 借用已还,switch/close/start 可自由再借
     if restart {
         restart_active_pane();
+    }
+    if search_toggle {
+        if SEARCH_OPEN.with(std::cell::Cell::take) {
+            search_close();
+        } else {
+            search_open();
+        }
     }
     if new_window {
         spawn_window(None);
@@ -3827,6 +3976,130 @@ fn arm_hover(hwnd: HWND) {
 }
 
 /// 客户区坐标处的 OSC 8 URI(Ctrl+Click 与 hover 气泡共用;None = 无链接)。
+/// #57 打开搜索:清查询/命中,首帧空条
+fn search_open() {
+    SEARCH_OPEN.with(|o| o.set(true));
+    SEARCH_QUERY.with(|q| q.borrow_mut().clear());
+    SEARCH_MATCHES.with(|m| m.borrow_mut().clear());
+    SEARCH_IDX.with(|i| i.set(0));
+    draw_frame();
+}
+
+/// #57 关闭搜索
+fn search_close() {
+    SEARCH_OPEN.with(|o| o.set(false));
+    SEARCH_MATCHES.with(|m| m.borrow_mut().clear());
+    draw_frame();
+}
+
+/// #57 重扫:查询变更后全 buffer(历史+视口)大小写不敏感匹配。
+/// 命中表 = (buffer 行, 列, 宽);buffer 行坐标与 jump_prompt 同构
+/// (Line 负 = 历史)。扫完跳首个命中
+fn search_rescan() {
+    let query = SEARCH_QUERY.with(|q| q.borrow().clone());
+    let mut matches: Vec<(i32, usize, usize)> = Vec::new();
+    if !query.is_empty() {
+        let needle = query.to_lowercase();
+        TABS.with(|tabs| {
+            let guard = tabs.borrow();
+            if let Some(t) = guard
+                .get(ACTIVE.get())
+                .and_then(|tab| tab.active_pane_ref())
+            {
+                let (hist, rows, grid) = t.term.grid_dims();
+                for l in -(hist as i32)..rows as i32 {
+                    let (text, _) = mica_render::frame::row_string(grid, l);
+                    let hay = text.to_lowercase();
+                    let mut from = 0;
+                    while let Some(at) = hay[from..].find(&needle) {
+                        matches.push((l, from + at, needle.chars().count()));
+                        from += at + needle.len().max(1);
+                    }
+                }
+            }
+        });
+    }
+    SEARCH_MATCHES.with(|m| *m.borrow_mut() = matches);
+    SEARCH_IDX.with(|i| i.set(0));
+    search_jump(false);
+}
+
+/// #57 跳命中:forward = 下一(Enter)/上一(Shift+Enter);跳到即滚视口
+fn search_jump(forward: bool) {
+    let n = SEARCH_MATCHES.with(|m| m.borrow().len());
+    if n == 0 {
+        draw_frame(); // 空命中也要刷条(计数显示 0/0)
+        return;
+    }
+    let old = SEARCH_IDX.with(std::cell::Cell::get);
+    let new = if forward {
+        (old + 1) % n
+    } else {
+        (old + n.saturating_sub(1)) % n
+    };
+    SEARCH_IDX.with(|i| i.set(new));
+    let (line, _, _) = SEARCH_MATCHES.with(|m| m.borrow()[new]);
+    TABS.with(|tabs| {
+        if let Some(t) = tabs
+            .borrow_mut()
+            .get_mut(ACTIVE.get())
+            .and_then(|tab| tab.active_pane())
+        {
+            t.term.scroll_to_line(line);
+            // 视口几何变了:行缓存按行号语义失效,显式全量
+            t.force_full = true;
+        }
+    });
+    draw_frame();
+}
+
+/// #57 WM_CHAR 的搜索态拦截:消费则返回 true(调用方吞掉不进 pty)。
+/// 可打印入查询;CR 跳下一;退格删字;Esc 关闭
+fn search_char(ch: char) -> bool {
+    if !SEARCH_OPEN.with(std::cell::Cell::get) {
+        return false;
+    }
+    match ch {
+        '\r' => {
+            search_jump(current_mods().shift);
+        }
+        '\n' => {}
+        '\u{8}' => {
+            SEARCH_QUERY.with(|q| {
+                q.borrow_mut().pop();
+            });
+            search_rescan();
+        }
+        '\u{1b}' => {
+            search_close();
+        }
+        c if (c as u32) >= 0x20 => {
+            SEARCH_QUERY.with(|q| {
+                q.borrow_mut().push(c);
+            });
+            search_rescan();
+        }
+        _ => {}
+    }
+    true
+}
+
+/// #57 WM_KEYDOWN 的搜索态拦截:Up/Down = 命中步进;消费返回 true
+fn search_key(vk: u32) -> bool {
+    if !SEARCH_OPEN.with(std::cell::Cell::get) {
+        return false;
+    }
+    if vk == VK_UP.0 as u32 {
+        search_jump(false);
+        return true;
+    }
+    if vk == VK_DOWN.0 as u32 {
+        search_jump(true);
+        return true;
+    }
+    false
+}
+
 fn link_at(px: i32, py: i32) -> Option<String> {
     let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
         (px as f32) >= r.x
