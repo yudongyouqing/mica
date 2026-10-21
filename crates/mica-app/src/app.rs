@@ -2122,11 +2122,6 @@ fn draw_frame() {
                 t.palette.colors[3].g,
                 t.palette.colors[3].b,
             ];
-            let dimc = [
-                t.palette.colors[8].r,
-                t.palette.colors[8].g,
-                t.palette.colors[8].b,
-            ];
             let mk_quad =
                 |x: f32, y: f32, w: f32, h: f32, c: [u8; 3]| mica_render::frame::CellInstance {
                     pos_uv: [x, y, 0.0, 0.0],
@@ -2149,38 +2144,69 @@ fn draw_frame() {
                 .find(|(id, _)| *id == focused_pane_id)
                 .map(|(_, r)| *r);
             if let Some(pr) = pane_rect {
+                // ---- 命中高亮:浏览器式**选中反色**(三版定档)。
+                // 条形标记两版被否("不明显")——正解是命中格背景反色 +
+                // 字变暗,与选区同观感。做法:命中矩形内的终端实例直接
+                // 改色(背景 quad → 高亮色;字形 quad 墨色 → 近黑保证可读)
+                let mut hit_rects: Vec<(f32, f32, f32, f32, bool)> = Vec::new();
                 for (mi, (line, col, len)) in matches.iter().enumerate() {
-                    // buffer 行 → 视口行(行 0 = 视口顶);不可见跳过
                     let view = line + offset;
                     if !(0..rows).contains(&view) {
                         continue;
                     }
-                    let x = pr.x + *col as f32 * t.metrics.cell_width;
-                    let y = pr.y + view as f32 * t.metrics.line_height;
-                    let mw = *len as f32 * t.metrics.cell_width;
-                    if mi == cur {
-                        // 当前命中:顶+底 3px 亮黄双条(不遮字;双条比单条
-                        // 锚定感强,用户实报 2px 单条不可见)
-                        search_overlay.push(mk_quad(x, y, mw, 3.0, yellow));
-                        search_overlay.push(mk_quad(
-                            x,
-                            y + t.metrics.line_height - 3.0,
-                            mw,
-                            3.0,
-                            yellow,
-                        ));
-                    } else {
-                        // 其余命中:顶 2px 黄(混 bg 60% 提亮——旧暗条在深色
-                        // 主题上不可见,用户实报)
-                        let soft = [
-                            ((yellow[0] as u16 * 2 + dimc[0] as u16) / 3) as u8,
-                            ((yellow[1] as u16 * 2 + dimc[1] as u16) / 3) as u8,
-                            ((yellow[2] as u16 * 2 + dimc[2] as u16) / 3) as u8,
-                        ];
-                        search_overlay.push(mk_quad(x, y, mw, 2.0, soft));
+                    hit_rects.push((
+                        pr.x + *col as f32 * t.metrics.cell_width,
+                        pr.y + view as f32 * t.metrics.line_height,
+                        *len as f32 * t.metrics.cell_width,
+                        t.metrics.line_height,
+                        mi == cur,
+                    ));
+                }
+                let hl_cur = [
+                    yellow[0] as f32 / 255.0,
+                    yellow[1] as f32 / 255.0,
+                    yellow[2] as f32 / 255.0,
+                    0.0,
+                ];
+                // 其余命中:黄混 bg(50%)
+                let soft_c = [
+                    ((yellow[0] as u16 + t.palette.bg.r as u16) / 2) as u8,
+                    ((yellow[1] as u16 + t.palette.bg.g as u16) / 2) as u8,
+                    ((yellow[2] as u16 + t.palette.bg.b as u16) / 2) as u8,
+                ];
+                let hl_soft = [
+                    soft_c[0] as f32 / 255.0,
+                    soft_c[1] as f32 / 255.0,
+                    soft_c[2] as f32 / 255.0,
+                    0.0,
+                ];
+                let ink_dark = [0.05, 0.05, 0.05, 0.0];
+                for inst in all_instances.iter_mut() {
+                    let (ix, iy, iw, ih) = (
+                        inst.pos_uv[0],
+                        inst.pos_uv[1],
+                        inst.size_uv[0],
+                        inst.size_uv[1],
+                    );
+                    for &(hx, hy, hw, hh, is_cur) in hit_rects.iter() {
+                        if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
+                            if inst.size_uv[2] > 0.0 {
+                                // 字形 quad:墨色改近黑(黄底可读)
+                                inst.fg = if is_cur { ink_dark } else { inst.fg };
+                                if is_cur {
+                                    inst.bg = hl_cur;
+                                }
+                            } else {
+                                // 背景 quad:整块换高亮色
+                                let c = if is_cur { hl_cur } else { hl_soft };
+                                inst.fg = c;
+                                inst.bg = c;
+                            }
+                            break;
+                        }
                     }
                 }
-                // 搜索条(pane 底部内侧,一行高):bg 提亮 + "/query  N/M  Enter↓"
+                // ---- 搜索条(pane 底部内侧,一行高):bg 提亮 + query + N/M
                 let bar_y = pr.y + pr.h - t.metrics.line_height - 4.0;
                 let bar_w = (t.metrics.cell_width * 48.0).min(pr.w);
                 let bar_bg = [
@@ -4091,8 +4117,16 @@ fn search_rescan() {
 
 /// #57 定位到 SEARCH_IDX 当前命中(不推进游标):滚视口 + 重绘
 fn search_show() {
-    let line = SEARCH_MATCHES.with(|m| m.borrow().first().map(|(l, _, _)| *l));
-    if let Some(line) = line {
+    // 滚到 **SEARCH_IDX 当前**命中(首版误取 first()——Enter 步进后
+    // 视口钉死在第一个命中,用户实报"不往下走")
+    let target = SEARCH_MATCHES.with(|m| {
+        let guard = m.borrow();
+        SEARCH_IDX
+            .with(std::cell::Cell::get)
+            .checked_rem(guard.len())
+            .and_then(|i| guard.get(i).map(|(l, _, _)| *l))
+    });
+    if let Some(line) = target {
         TABS.with(|tabs| {
             if let Some(t) = tabs
                 .borrow_mut()
