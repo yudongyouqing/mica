@@ -111,6 +111,9 @@ pub struct Settings {
     pub quick_terminal_key: Option<String>,
     /// 打字藏鼠标(Ghostty mouse-hide-while-typing,默认 true)。
     pub mouse_hide_while_typing: bool,
+    /// #78 窗口透明度(0.05..=1.0,默认 1.0 不透明):整窗 LWA_ALPHA;
+    /// toggle_background_opacity 在 1.0 与此值间切换
+    pub background_opacity: f32,
     /// 右键行为(#80):`none`(默认,无操作)/ `paste`(粘贴剪贴板,
     /// 有选区先复制再粘贴——Linux 传统 + WT 可选,迁移用户肌肉记忆)
     pub mouse_right_click: MouseRightClick,
@@ -133,6 +136,7 @@ impl Default for Settings {
             font_size_pt: DEFAULT_FONT_SIZE_PT,
             title: None,
             mouse_hide_while_typing: true,
+            background_opacity: 1.0,
             mouse_right_click: MouseRightClick::None,
             copy_on_select: true,
             palette: Palette::DEFAULT,

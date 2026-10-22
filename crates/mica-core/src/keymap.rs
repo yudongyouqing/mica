@@ -122,6 +122,8 @@ pub enum Action {
     WriteScrollback,
     /// 滚动回看搜索(#57):开/关注入式搜索模式(窗口级,非 pane 级)
     SearchScrollback,
+    /// 透明度切换(#78):1.0 ↔ background-opacity(默认 0.85)两档
+    ToggleBackgroundOpacity,
     /// OSC 133 jump(D37):跳上一个 prompt 行。
     JumpPrevPrompt,
     /// OSC 133 jump(D37):跳下一个 prompt 行;越过最新 = 回底部跟随。
@@ -231,6 +233,12 @@ impl Keymap {
             m(true, true, false),
             TriggerKey::Letter('S'),
             Action::WriteScrollback,
+        );
+        // #78:透明度切换(默认 Ctrl+Shift+O)
+        push(
+            m(true, true, false),
+            TriggerKey::Letter('O'),
+            Action::ToggleBackgroundOpacity,
         );
         // #57:回看搜索(浏览器查找直觉同款键位)
         push(
@@ -374,6 +382,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "restart_pane" => Some(Action::RestartPane),
         "write_scrollback" => Some(Action::WriteScrollback),
         "search_scrollback" => Some(Action::SearchScrollback),
+        "toggle_background_opacity" => Some(Action::ToggleBackgroundOpacity),
         "focus_left" => Some(Action::FocusNeighbor(Key::Left)),
         "focus_right" => Some(Action::FocusNeighbor(Key::Right)),
         "focus_up" => Some(Action::FocusNeighbor(Key::Up)),

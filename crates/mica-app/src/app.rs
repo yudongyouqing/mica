@@ -257,6 +257,50 @@ fn cursor_workarea_origin() -> (i32, i32) {
     }
 }
 
+/// #78 整窗透明(WS_EX_LAYERED + LWA_ALPHA):true = 透明档(DIM),
+/// false = 不透明(摘 LAYERED,回到普通合成)。渲染管线零改动——
+/// DWM 在合成层打折;文字同步半透明是 v1 接受的差异(per-pixel
+/// composition swapchain 留后续增强)
+fn apply_window_alpha(hwnd: HWND, translucent: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongPtrW,
+        WS_EX_LAYERED,
+    };
+    // SAFETY: 样式位与分层属性读写;失败静默(老系统降级不透明)
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as usize;
+        if translucent {
+            let alpha = WINDOW_ALPHA_DIM.with(std::cell::Cell::get);
+            if style & WS_EX_LAYERED.0 as usize == 0 {
+                let _ = SetWindowLongPtrW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    (style | WS_EX_LAYERED.0 as usize) as isize,
+                );
+            }
+            let _ = SetLayeredWindowAttributes(
+                hwnd,
+                windows::Win32::Foundation::COLORREF(0),
+                alpha,
+                LWA_ALPHA,
+            );
+        } else if style & WS_EX_LAYERED.0 as usize != 0 {
+            let _ = SetWindowLongPtrW(
+                hwnd,
+                GWL_EXSTYLE,
+                (style & !(WS_EX_LAYERED.0 as usize)) as isize,
+            );
+            // 摘位前先恢复全不透明,避免窗口僵在半透明
+            let _ = SetLayeredWindowAttributes(
+                hwnd,
+                windows::Win32::Foundation::COLORREF(0),
+                255,
+                LWA_ALPHA,
+            );
+        }
+    }
+}
+
 /// WM_APP 用户消息区(0x8000 起):
 /// +1 = WM_APP_RENDER(T7,pty 转发线程唤醒渲染);+2 = WM_APP_CONFIG(T5,热重载)
 const WM_APP_RENDER: u32 = 0x8000 + 1;
@@ -313,6 +357,10 @@ thread_local! {
     /// #79 修饰键重映射表(encode 前应用;动作判定不受影响)
     static KEY_REMAP: RefCell<Vec<mica_core::keymap::KeyRemap>> =
         const { RefCell::new(Vec::new()) };
+    /// #78 透明度档位:true = 透明档(background_opacity),false = 不透明
+    static WINDOW_TRANSLUCENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #78 配置的透明档 alpha(255.0*background_opacity;1.0 = 未配置→0.85 默认)
+    static WINDOW_ALPHA_DIM: std::cell::Cell<u8> = const { std::cell::Cell::new(217) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
     static MOUSE_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// keymap 消费了字母/数字键(ctrl+shift+t 等):TranslateMessage 生成
@@ -539,6 +587,16 @@ pub fn run() {
         COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
         RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
         KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
+        let dim = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+            217 // 未配置:0.85 默认档
+        } else {
+            (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
+        };
+        WINDOW_ALPHA_DIM.with(|a| a.set(dim));
+        if (settings.background_opacity - 1.0).abs() >= f32::EPSILON {
+            // 配置即透明:标记进透明档(窗口建成后再 apply,见 ShowWindow 后)
+            WINDOW_TRANSLUCENT.with(|t| t.set(true));
+        }
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
@@ -783,6 +841,12 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 RIGHT_CLICK_PASTE
                     .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
                 KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
+                let dim = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+                    217
+                } else {
+                    (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
+                };
+                WINDOW_ALPHA_DIM.with(|a| a.set(dim));
                 let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
                 let title = HSTRING::from("Mica");
                 // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
@@ -1229,6 +1293,21 @@ unsafe fn reload_config(hwnd: HWND) {
     COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
     RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
     KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
+    let dim = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+        217
+    } else {
+        (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
+    };
+    WINDOW_ALPHA_DIM.with(|a| a.set(dim));
+    // 热重载改透明度:立即生效
+    if (settings.background_opacity - 1.0).abs() >= f32::EPSILON {
+        WINDOW_TRANSLUCENT.with(|t| t.set(true));
+        apply_window_alpha(hwnd, true);
+    } else if WINDOW_TRANSLUCENT.with(std::cell::Cell::get) {
+        // 改回 1.0:若处于透明档(配置进的,非 toggle),回不透明
+        WINDOW_TRANSLUCENT.with(|t| t.set(false));
+        apply_window_alpha(hwnd, false);
+    }
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
@@ -4047,6 +4126,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut restart = false; // 延迟执行(块内自借 TABS 会 panic——冒烟实证)
     let mut search_toggle = false; // #57:段外 toggle(不借 TABS)
     let mut write_scrollback = false; // #81:段外写文件+打开(不走 TABS 双借)
+    let mut toggle_opacity = false; // #78:段外切档(需要 hwnd)
     let mut new_tab = false;
     let mut new_window = false;
     let mut close_idx: Option<usize> = None;
@@ -4083,6 +4163,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 }
                 Action::RestartPane => restart = true, // 延迟:with 块内再借 TABS 会双借 panic
                 Action::SearchScrollback => search_toggle = !search_toggle,
+                Action::ToggleBackgroundOpacity => toggle_opacity = true,
                 Action::WriteScrollback => write_scrollback = true,
                 Action::NewWindow => new_window = true,
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
@@ -4134,6 +4215,11 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     // 标签操作段外执行:TABS 借用已还,switch/close/start 可自由再借
     if restart {
         restart_active_pane();
+    }
+    if toggle_opacity {
+        // #78 两档切换:replace 返回旧档,to_translucent = 翻转后的新档
+        let to_translucent = !WINDOW_TRANSLUCENT.with(|t| t.replace(false));
+        apply_window_alpha(hwnd, to_translucent);
     }
     if write_scrollback {
         // #81:回看导出——%TEMP%/mica-scrollback-{标题}-{时间戳}.log,
