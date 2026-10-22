@@ -4140,7 +4140,15 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
             guard
                 .get(ACTIVE.get())
                 .and_then(|tab| tab.active_pane_ref())
-                .map(|t| (t.term.scrollback_text(), tab_title_safe(tab)))
+                .map(|t| {
+                    (
+                        t.term.scrollback_text(),
+                        guard
+                            .get(ACTIVE.get())
+                            .map(tab_title_safe)
+                            .unwrap_or_default(),
+                    )
+                })
                 .unwrap_or_default()
         });
         if !text.is_empty() {
@@ -4168,7 +4176,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                             ShellExecuteW(
                                 None,
                                 windows::core::w!("open"),
-                                windows::core::HSTRING::from(p).as_wide().as_ptr(),
+                                windows::core::PCWSTR(windows::core::HSTRING::from(p).as_ptr()),
                                 None,
                                 None,
                                 SW_SHOWNORMAL,
