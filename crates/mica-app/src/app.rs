@@ -2272,37 +2272,46 @@ fn draw_frame() {
                 }
             }
         }
-        // #58 悬停路径下划线:2px 亮色,画在字形之上(overlay 尾部)
+        // #58 悬停路径高亮(二版,用户点名"浅色转深色更清晰"):选中反色
+        // 式——浅蓝底 + 深色字,与搜索当前命中(黄底黑字)同款形制。
+        // 做法与搜索 hit_rects 相同:矩形相交的实例直接改色
         if let Some((line, col, cells)) = HOVER_PATH.with(|h| *h.borrow()) {
             let offset = t.term.display_offset() as i32;
             let view = line + offset;
             if (0..t.rows as i32).contains(&view)
                 && let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
             {
-                let x = pr.x + col as f32 * t.metrics.cell_width;
-                let y = pr.y + (view as f32 + 1.0) * t.metrics.line_height - 2.0;
-                let w = cells as f32 * t.metrics.cell_width;
-                let c = [
-                    t.palette.colors[12].r,
-                    t.palette.colors[12].g,
-                    t.palette.colors[12].b,
+                let hx = pr.x + col as f32 * t.metrics.cell_width;
+                let hy = pr.y + view as f32 * t.metrics.line_height;
+                let hw = cells as f32 * t.metrics.cell_width;
+                let hh = t.metrics.line_height;
+                let bc = t.palette.colors[12];
+                let hl = [
+                    bc.r as f32 / 255.0,
+                    bc.g as f32 / 255.0,
+                    bc.b as f32 / 255.0,
+                    0.0,
                 ];
-                search_overlay.push(mica_render::frame::CellInstance {
-                    pos_uv: [x, y, 0.0, 0.0],
-                    size_uv: [w, 2.0, 0.0, 0.0],
-                    fg: [
-                        c[0] as f32 / 255.0,
-                        c[1] as f32 / 255.0,
-                        c[2] as f32 / 255.0,
-                        0.0,
-                    ],
-                    bg: [
-                        c[0] as f32 / 255.0,
-                        c[1] as f32 / 255.0,
-                        c[2] as f32 / 255.0,
-                        0.0,
-                    ],
-                });
+                let ink_dark = [0.05, 0.05, 0.05, 0.0];
+                for inst in all_instances.iter_mut() {
+                    let (ix, iy, iw, ih) = (
+                        inst.pos_uv[0],
+                        inst.pos_uv[1],
+                        inst.size_uv[0],
+                        inst.size_uv[1],
+                    );
+                    if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
+                        if inst.size_uv[2] > 0.0 {
+                            // 字形 quad:墨色改近黑(浅蓝底可读)
+                            inst.fg = ink_dark;
+                            inst.bg = hl;
+                        } else {
+                            // 背景 quad:整块换高亮色
+                            inst.fg = hl;
+                            inst.bg = hl;
+                        }
+                    }
+                }
             }
         }
         let revision = t.router.atlas_revision();
