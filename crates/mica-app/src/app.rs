@@ -782,6 +782,7 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
                 RIGHT_CLICK_PASTE
                     .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+<<<<<<< HEAD
                 KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
                 RIGHT_CLICK_PASTE
                     .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
@@ -793,6 +794,15 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 RIGHT_CLICK_PASTE
                     .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
                 KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
+=======
+                RIGHT_CLICK_PASTE
+                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+                RIGHT_CLICK_PASTE
+                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                RIGHT_CLICK_PASTE
+                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+>>>>>>> origin/dev
                 let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
                 let title = HSTRING::from("Mica");
                 // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
@@ -1238,7 +1248,10 @@ unsafe fn reload_config(hwnd: HWND) {
     MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
     COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
     RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+<<<<<<< HEAD
     KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
+=======
+>>>>>>> origin/dev
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
