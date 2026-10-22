@@ -4,6 +4,17 @@ on:
     branches: [main, dev]
   pull_request:
 
+# 计费止血(2026-10-22,Actions 免费额度 2000 计费分钟/月被烧穿):
+# Private 仓库 macOS job 按 10× 计、Windows 按 2× 计——每轮五件套约 21
+# 计费分钟,纯文档 PR 与冲突重推曾全额空烧。三连修:
+# 1) 并发取消:同分支新 run 自动取消旧 run(修冲突连推场景,最大节省)
+# 2) msi/perf 降频:仅 push 到 main/dev 与 tag 跑(PR 不跑,产物只在
+#    发版用;PR 侧的回归防线由 windows/macos 的全量测试承担)
+# 3) 纯文档路径跳过(PR 只改 docs/**/*.md 时五件套全免)
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # main 只接受 dev 的合并(分支与合并规范,CLAUDE.md):head 不是 dev 直接红,
   # required status check 锁住绕行路径
@@ -45,6 +56,8 @@ jobs:
 
   msi:
     # M3c(D23):cargo-wix 打包 MSI artifact;candle/light 预装在 windows runner。
+    # 计费降频:仅主干 push / tag 跑(发版才需要产物;PR 轮不烧这 2 分钟)
+    if: github.event_name == 'push' || startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     needs: windows
     steps:
@@ -65,6 +78,9 @@ jobs:
     # M5c/T3(D34):渲染吞吐防退化。spec 写 5% 预算,但 GitHub 共享
     # runner 机器方差实测 >5%——CI 阈值放宽到 25%(结果页与本地跑仍按
     # 5% 口径人工复核),数字进 summary 供纵向对比。
+    # 计费降频:仅主干 push / tag 跑(3 轮 bench ≈ 4-14 计费分钟,
+    # PR 轮由全量测试兜底正确性,性能门禁在合入主干前把关即可)
+    if: github.event_name == 'push' || startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     needs: []
     steps:
