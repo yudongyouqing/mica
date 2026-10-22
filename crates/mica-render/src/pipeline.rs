@@ -75,6 +75,10 @@ struct Globals {
     /// 图集纹理尺寸(纹素):UV 归一移到 shader,实例存纹素坐标——
     /// 页追加式高度增长不改变既有条目采样位置(2026-10-08)
     atlas_size: [f32; 2],
+    /// #77 背景图 (alpha, w, h, pad):alpha<0.5 = 无图(空 quad 直通);
+    /// 有图时空白 quad 的底混采样图(cover 平铺,alpha 即混合强度
+    /// = background-opacity 的图向部分)
+    bg: [f32; 4],
 }
 
 const INSTANCE_CAPACITY: usize = 4096;
@@ -109,6 +113,12 @@ pub struct Renderer {
     /// 持有当前图集纹理供 bind group 引用(替换时旧纹理随之释放)
     atlas_texture: Option<wgpu::Texture>,
     clear_color: wgpu::Color,
+    /// #77 背景图纹理(持有供 bind group;None = 无图)
+    bg_texture: Option<wgpu::Texture>,
+    bg_view: Option<wgpu::TextureView>,
+    bg_sampler: Option<wgpu::Sampler>,
+    /// #77 当前背景参数(写 globals 的缓存)
+    bg_param: [f32; 4],
 }
 
 impl Renderer {
@@ -126,6 +136,7 @@ impl Renderer {
             contents: cast_slice(&[Globals {
                 viewport: [1.0, 1.0],
                 atlas_size: [1.0, 1.0],
+                bg: [0.0, 1.0, 1.0, 0.0],
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -161,6 +172,22 @@ impl Renderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -238,6 +265,10 @@ impl Renderer {
             atlas_uploads: 0,
             atlas_texture: None,
             clear_color: bg_clear_color(&Palette::DEFAULT),
+            bg_texture: None,
+            bg_view: None,
+            bg_sampler: None,
+            bg_param: [0.0, 1.0, 1.0, 0.0],
         }
     }
 
@@ -304,16 +335,24 @@ impl Renderer {
             ..wgpu::SamplerDescriptor::default()
         });
         // 重建 bind_group(新 view/sampler);texture 存字段供 drop
+        if self.bg_sampler.is_none() {
+            self.bg_sampler = Some(self.device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("bg"),
+                ..wgpu::SamplerDescriptor::default()
+            }));
+        }
         self.bind_group = Some(self.rebuild_bind_group(&view, &sampler));
         self.atlas_texture = Some(texture);
     }
 
     /// 用当前 globals 槽 + 给定的图集 view/sampler 重建 bind group。
+    /// #77:binding 3/4 = 背景图;无图时占位(bind group 布局静态)
     fn rebuild_bind_group(
         &self,
         view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
+        let (bg_view, bg_sampler) = self.bg_resources();
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cells bg"),
             layout: &self.bgl,
@@ -330,8 +369,129 @@ impl Renderer {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&bg_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&bg_sampler),
+                },
             ],
         })
+    }
+
+    /// #77 背景 (view, sampler) 句柄:有图取真源,无图建 1x1 占位
+    fn bg_resources(&self) -> (wgpu::TextureView, wgpu::Sampler) {
+        if let (Some(v), Some(s)) = (self.bg_view.clone(), self.bg_sampler.clone()) {
+            return (v, s);
+        }
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bg placeholder"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self
+            .device
+            .create_sampler(&wgpu::SamplerDescriptor::default());
+        (view, sampler)
+    }
+
+    /// #77 设置背景图:解码(png/jpeg/bmp/webp)→ 上传 → 重绑。
+    /// opacity 0..1 为图的混合强度;None 关图。长边钳 4096(显存折中)
+    pub fn set_background_image(
+        &mut self,
+        path: Option<&std::path::Path>,
+        opacity: f32,
+    ) -> Result<(), String> {
+        let Some(p) = path else {
+            self.bg_texture = None;
+            self.bg_view = None;
+            self.bg_param = [0.0, 1.0, 1.0, 0.0];
+            self.rebind_after_bg();
+            return Ok(());
+        };
+        let img = image::open(p).map_err(|e| format!("背景图打开失败 {}: {e}", p.display()))?;
+        let (iw, ih) = (img.width(), img.height());
+        let scale = if iw.max(ih) > 4096 {
+            4096.0 / iw.max(ih) as f32
+        } else {
+            1.0
+        };
+        let rgba = if scale < 1.0 {
+            image::imageops::resize(
+                &img,
+                (iw as f32 * scale) as u32,
+                (ih as f32 * scale) as u32,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            img.to_rgba8()
+        };
+        let (w, h) = (rgba.width(), rgba.height());
+        let size = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bg image"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        // w*4 不满足 256 对齐时逐行零垫(padded 布局)
+        let stride = w * 4;
+        let aligned = stride.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let mut buf = Vec::with_capacity((aligned * h) as usize);
+        for y in 0..h {
+            buf.extend_from_slice(&rgba.as_raw()[(y * w * 4) as usize..((y + 1) * w * 4) as usize]);
+            buf.resize(buf.len() + (aligned - stride) as usize, 0);
+        }
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            &buf,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(aligned),
+                rows_per_image: Some(h),
+            },
+            size,
+        );
+        self.bg_texture = Some(texture.clone());
+        self.bg_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        self.bg_param = [opacity.clamp(0.0, 1.0), w as f32, h as f32, 0.0];
+        self.rebind_after_bg();
+        Ok(())
+    }
+
+    /// #77 bg 变更后重建 bind group(用已存图集 view 的克隆)
+    fn rebind_after_bg(&mut self) {
+        let Some(tex) = self.atlas_texture.clone() else {
+            return;
+        };
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("glyphs"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..wgpu::SamplerDescriptor::default()
+        });
+        self.bind_group = Some(self.rebuild_bind_group(&view, &sampler));
     }
 
     /// 全量重绘一帧(M0 策略,spec Global Constraints)。
@@ -371,6 +531,7 @@ impl Renderer {
             cast_slice(&[Globals {
                 viewport: [config.width as f32, config.height as f32],
                 atlas_size: [atlas_w, atlas_h],
+                bg: self.bg_param,
             }]),
         );
         // set_atlas 之前 draw 是接线错误(T7 起先 set_atlas 再 draw)

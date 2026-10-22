@@ -111,6 +111,9 @@ pub struct Settings {
     pub quick_terminal_key: Option<String>,
     /// 打字藏鼠标(Ghostty mouse-hide-while-typing,默认 true)。
     pub mouse_hide_while_typing: bool,
+    /// #77 背景图绝对路径(None = 无图;受 background-opacity 的图向
+    /// 部分影响,首版 cover 平铺)
+    pub background_image: Option<String>,
     /// #78 窗口透明度(0.05..=1.0,默认 1.0 不透明):整窗 LWA_ALPHA;
     /// toggle_background_opacity 在 1.0 与此值间切换
     pub background_opacity: f32,
@@ -136,6 +139,7 @@ impl Default for Settings {
             font_size_pt: DEFAULT_FONT_SIZE_PT,
             title: None,
             mouse_hide_while_typing: true,
+            background_image: None,
             background_opacity: 1.0,
             mouse_right_click: MouseRightClick::None,
             copy_on_select: true,

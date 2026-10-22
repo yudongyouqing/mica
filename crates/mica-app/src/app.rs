@@ -359,6 +359,8 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
     /// #78 透明度档位:true = 透明档(background_opacity),false = 不透明
     static WINDOW_TRANSLUCENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #77 背景图路径(热重载即时换图;Some(path))
+    static BG_IMG_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
     /// #78 配置的透明档 alpha(255.0*background_opacity;1.0 = 未配置→0.85 默认)
     static WINDOW_ALPHA_DIM: std::cell::Cell<u8> = const { std::cell::Cell::new(217) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
@@ -592,6 +594,7 @@ pub fn run() {
         } else {
             (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
         };
+        BG_IMG_PATH.with(|b| *b.borrow_mut() = settings.background_image.clone());
         WINDOW_ALPHA_DIM.with(|a| a.set(dim));
         if (settings.background_opacity - 1.0).abs() >= f32::EPSILON {
             // 配置即透明:标记进透明档(窗口建成后再 apply,见 ShowWindow 后)
@@ -1309,6 +1312,23 @@ unsafe fn reload_config(hwnd: HWND) {
         apply_window_alpha(hwnd, false);
     }
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+    BG_IMG_PATH.with(|b| *b.borrow_mut() = settings.background_image.clone());
+    GPU.with(|g| {
+        if let Some(gpu) = g.borrow_mut().as_mut() {
+            let path = settings
+                .background_image
+                .as_deref()
+                .map(std::path::Path::new);
+            let alpha = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+                0.9
+            } else {
+                settings.background_opacity
+            };
+            if let Err(e) = gpu.renderer.set_background_image(path, alpha) {
+                eprintln!("[bg] {e}");
+            }
+        }
+    });
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
     // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
