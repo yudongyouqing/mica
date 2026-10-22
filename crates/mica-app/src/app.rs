@@ -373,6 +373,10 @@ thread_local! {
     /// D28 hover 气泡:URL + 绘制锚(客户区坐标)。None = 不画
     static HOVER_URL: RefCell<Option<(String, f32, f32)>> =
         const { RefCell::new(None) };
+    /// #58 悬停路径 span(buffer 行,列,格宽):即时下划线的数据源;
+    /// None = 光标不在路径上(WM_MOUSEMOVE 每次刷新,替代 300ms 气泡)
+    static HOVER_PATH: RefCell<Option<(i32, usize, usize)>> =
+        const { RefCell::new(None) };
     /// strip 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的反馈
     /// (const 初始化用字面量——Default::default 不是 const fn)
     static HOVER_STRIP: std::cell::Cell<mica_render::frame::StripHover> = const {
@@ -2268,6 +2272,39 @@ fn draw_frame() {
                 }
             }
         }
+        // #58 悬停路径下划线:2px 亮色,画在字形之上(overlay 尾部)
+        if let Some((line, col, cells)) = HOVER_PATH.with(|h| *h.borrow()) {
+            let offset = t.term.display_offset() as i32;
+            let view = line + offset;
+            if (0..t.rows as i32).contains(&view)
+                && let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
+            {
+                let x = pr.x + col as f32 * t.metrics.cell_width;
+                let y = pr.y + (view as f32 + 1.0) * t.metrics.line_height - 2.0;
+                let w = cells as f32 * t.metrics.cell_width;
+                let c = [
+                    t.palette.colors[12].r,
+                    t.palette.colors[12].g,
+                    t.palette.colors[12].b,
+                ];
+                search_overlay.push(mica_render::frame::CellInstance {
+                    pos_uv: [x, y, 0.0, 0.0],
+                    size_uv: [w, 2.0, 0.0, 0.0],
+                    fg: [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        0.0,
+                    ],
+                    bg: [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        0.0,
+                    ],
+                });
+            }
+        }
         let revision = t.router.atlas_revision();
         let atlas = t.router.atlas();
         strip.append(&mut all_instances);
@@ -2810,7 +2847,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // 那个无关标签"亮一下"再灭(用户实测)。每 MOVE 刷新即除
                 let (hx, hy) = mouse_xy(lparam);
                 let hover = strip_hover_at(hx, hy);
-                let changed = HOVER_STRIP.with(|s| {
+                let strip_changed = HOVER_STRIP.with(|s| {
                     let old = s.get();
                     if old != hover {
                         s.set(hover);
@@ -2819,7 +2856,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         false
                     }
                 });
-                if changed {
+                // #58 路径悬停 span 实时算(单行扫描,轻):即时下划线;
+                // 路径上抑制气泡(旧 300ms 气泡循环 = 用户实报鼠标区闪烁)
+                let path_span = hover_path_span(hx, hy);
+                let path_changed = HOVER_PATH.with(|h| {
+                    let old = *h.borrow();
+                    if old != path_span {
+                        *h.borrow_mut() = path_span;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if strip_changed || path_changed {
                     draw_frame();
                 }
                 return LRESULT(0);
@@ -2858,7 +2907,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             HOVER_ARMED.with(|a| a.set(false));
             arm_hover(hwnd);
             let (px, py) = mouse_xy(lparam);
-            let url = link_at(px, py);
+            // #58:路径上用即时下划线(WM_MOUSEMOVE 算的 HOVER_PATH),
+            // 气泡退役——300ms 循环 + 锚点跟随是鼠标区闪烁的来源
+            let url = if HOVER_PATH.with(|h| h.borrow().is_some()) {
+                None
+            } else {
+                link_at(px, py)
+            };
             let changed = HOVER_URL.with(|h| {
                 let mut h = h.borrow_mut();
                 let same = match (&*h, &url) {
@@ -2891,12 +2946,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // TrackMouseEvent TME_LEAVE 投递(675,本地声明——windows-rs 未收录)
             HOVER_ARMED.with(|a| a.set(false));
             let had = HOVER_URL.with(|h| h.borrow_mut().take().is_some());
+            let path_had = HOVER_PATH.with(|h| h.borrow_mut().take().is_some());
             let strip_had = HOVER_STRIP.with(|s| {
                 let had = s.get() != mica_render::frame::StripHover::default();
                 s.set(mica_render::frame::StripHover::default());
                 had
             });
-            if had || strip_had {
+            if had || path_had || strip_had {
                 draw_frame();
             }
             LRESULT(0)
@@ -2984,6 +3040,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .and_then(|tab| tab.active_pane())
                     && let Some(text) = t.term.selection_text()
                     && !text.is_empty()
+                    && COPY_ON_SELECT.with(std::cell::Cell::get)
                 {
                     clipboard::set_text(&text);
                 }
@@ -4216,6 +4273,55 @@ fn search_key(vk: u32) -> bool {
     false
 }
 
+/// #58 光标处路径的渲染 span(buffer 行,列,格宽):与 link_at 同源
+/// 检测但带定位;None = 不在路径上。WM_MOUSEMOVE 每步调用
+fn hover_path_span(px: i32, py: i32) -> Option<(i32, usize, usize)> {
+    let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
+        (px as f32) >= r.x
+            && (px as f32) < r.x + r.w
+            && (py as f32) >= r.y
+            && (py as f32) < r.y + r.h
+    })?;
+    TABS.with(|tabs| {
+        let guard = tabs.borrow();
+        let t = guard.get(ACTIVE.get())?.active_pane_ref()?;
+        let line =
+            ((py as f32 - r.y) / t.metrics.line_height) as i32 + t.term.display_offset() as i32;
+        let col = ((px as f32 - r.x) / t.metrics.cell_width) as usize;
+        let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), line);
+        detect_path_token(&text, &cell_of, col)?;
+        let (_, c0, cells) = span_of_token(&text, &cell_of, col)?;
+        Some((line, c0, cells))
+    })
+}
+
+/// 命中 token 的 (col_start, cell 宽):重扫一遍行找覆盖 cursor_col 的
+/// token 边界(detect 判定已过,这里只取几何)
+fn span_of_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<(i32, usize, usize)> {
+    let bytes: Vec<char> = text.chars().collect();
+    let is_word = |c: char| {
+        c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word(bytes[i]) {
+            i += 1;
+        }
+        let covered: std::collections::HashSet<usize> = cell_of[start..i].iter().copied().collect();
+        if covered.contains(&cursor_col) {
+            let c0 = *cell_of.get(start).unwrap_or(&cursor_col);
+            let c1 = *cell_of.get(i.saturating_sub(1)).unwrap_or(&cursor_col);
+            return Some((c0 as i32, 0, c1.saturating_sub(c0) + 1));
+        }
+    }
+    None
+}
+
 fn link_at(px: i32, py: i32) -> Option<String> {
     let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
         (px as f32) >= r.x
@@ -4238,15 +4344,33 @@ fn link_at(px: i32, py: i32) -> Option<String> {
     })
 }
 
-/// 裸路径检测(#58):token 化 → 路径模式判定 → 定位剥离(:line[:col]),
-/// 命中要求:盘符绝对路径 / 点或斜杠起头的相对路径 / 含扩展名的
-/// 单斜杠路径(rustc 风格 src/main.rs:3:10)——纯单词不吃
+/// 裸路径检测(#58)入口:命中 token 后相对路径用 OSC 7 cwd 补全
 fn path_at_in_row(
     t: &Terminal,
     text: &str,
     cell_of: &[usize],
     cursor_col: usize,
 ) -> Option<String> {
+    let path = detect_path_token(text, cell_of, cursor_col)?;
+    Some(match path.chars().next() {
+        Some('/') | Some('\\') => path,
+        _ => {
+            let c = path.as_str();
+            if c.len() > 2 && c.as_bytes()[1] == b':' {
+                path // 盘符绝对路径
+            } else {
+                match t.term.cwd() {
+                    Some(cwd) => format!("{}\\{}", cwd.trim_end_matches('\\'), path),
+                    None => path,
+                }
+            }
+        }
+    })
+}
+
+/// #58 纯检测(不碰 Terminal,可 TDD):token 化 → 模式判定 →
+/// 定位剥离(:line[:col])→ 光标覆盖判定
+fn detect_path_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<String> {
     let bytes: Vec<char> = text.chars().collect();
     let is_word = |c: char| {
         c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
@@ -4267,21 +4391,7 @@ fn path_at_in_row(
             let covered: std::collections::HashSet<usize> =
                 cell_of[start..i].iter().copied().collect();
             if covered.contains(&cursor_col) {
-                // 相对路径 → OSC 7 的 cwd 补全
-                return Some(match path.chars().next() {
-                    Some('/') | Some('\\') => path,
-                    _ => {
-                        let c = path.as_str();
-                        if c.len() > 2 && c.as_bytes()[1] == b':' {
-                            path // 盘符绝对路径
-                        } else {
-                            match t.term.cwd() {
-                                Some(cwd) => format!("{}\\{}", cwd.trim_end_matches('\\'), path),
-                                None => path,
-                            }
-                        }
-                    }
-                });
+                return Some(path);
             }
         }
     }
@@ -4360,7 +4470,7 @@ fn current_mods() -> Mods {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_path_token, pretty_title};
+    use super::{detect_path_token, normalize_path_token, pretty_title};
 
     /// 标题呈现:exe 路径 basename 去扩展(Ghostty direct-command argv[0]
     /// 的 Windows 适配);普通 OSC 标题原样(nvim / user@host:cwd)
@@ -4373,6 +4483,28 @@ mod tests {
         assert_eq!(pretty_title(r"C:\Windows\system32\cmd.exe"), "cmd");
         assert_eq!(pretty_title("nvim"), "nvim");
         assert_eq!(pretty_title("user@host: ~/mica"), "user@host: ~/mica");
+    }
+
+    /// #58 端到端检测回归网(2026-10-22 用户实报不能跳转,检测层定责)
+    #[test]
+    fn detect_path_token_e2e() {
+        let text = r"PS C:\x> echo C:\proj\src\main.rs:3:10";
+        let cell_of: Vec<usize> = (0..text.chars().count()).collect();
+        assert_eq!(
+            detect_path_token(text, cell_of.as_slice(), 20).as_deref(),
+            Some(r"C:\proj\src\main.rs")
+        );
+        assert_eq!(
+            detect_path_token(text, cell_of.as_slice(), 0),
+            None,
+            "提示符区无路径"
+        );
+        let text2 = "error: found at src/lib.rs:42:7 here";
+        let cell_of2: Vec<usize> = (0..text2.chars().count()).collect();
+        assert!(
+            detect_path_token(text2, cell_of2.as_slice(), 20).is_some(),
+            "rustc 风格"
+        );
     }
 
     /// #58 路径 token 判定:吃真路径、不吃纯词/时间戳/URL 前缀
