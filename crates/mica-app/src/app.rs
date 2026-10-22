@@ -310,6 +310,9 @@ thread_local! {
     static COPY_ON_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// #80 右键行为(配置驱动;Paste = 粘贴剪贴板)
     static RIGHT_CLICK_PASTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #79 修饰键重映射表(encode 前应用;动作判定不受影响)
+    static KEY_REMAP: RefCell<Vec<mica_core::keymap::KeyRemap>> =
+        const { RefCell::new(Vec::new()) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
     static MOUSE_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// keymap 消费了字母/数字键(ctrl+shift+t 等):TranslateMessage 生成
@@ -535,6 +538,7 @@ pub fn run() {
         MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
         COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
         RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+        KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
@@ -778,13 +782,17 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
                 RIGHT_CLICK_PASTE
                     .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
                 RIGHT_CLICK_PASTE
                     .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
                 COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
                 RIGHT_CLICK_PASTE
                     .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
                 RIGHT_CLICK_PASTE
                     .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
                 let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
                 let title = HSTRING::from("Mica");
                 // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
@@ -1230,6 +1238,7 @@ unsafe fn reload_config(hwnd: HWND) {
     MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
     COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
     RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+    KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
@@ -2605,8 +2614,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             mica_core::protocol::kitty::EventKind::Press
                         };
                         if let Some(key) = vk_to_key(vk)
-                            && let Some(bytes) =
-                                mica_core::protocol::kitty::kitty_encode(key, mods, kind, flags)
+                            && let Some(bytes) = mica_core::protocol::kitty::kitty_encode(
+                                key,
+                                remap_mods(mods),
+                                kind,
+                                flags,
+                            )
                         {
                             let _ = t.session.write(&bytes);
                             return;
@@ -4650,6 +4663,8 @@ fn normalize_path_token(token: &str) -> Option<String> {
 }
 
 fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
+    // #79 key-remap:encode 前转换修饰(动作判定已在上游完成)
+    let mods = remap_mods(mods);
     let key = match VIRTUAL_KEY(vk as u16) {
         VK_UP => Key::Up,
         VK_DOWN => Key::Down,
@@ -4663,6 +4678,11 @@ fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(input::encode(key, mods, app_cursor))
+}
+
+/// #79 应用 key-remap 表(链式:逐条翻转修饰位)
+fn remap_mods(mods: Mods) -> Mods {
+    KEY_REMAP.with(|r| r.borrow().iter().fold(mods, |m, rm| rm.apply(m)))
 }
 
 fn current_mods() -> Mods {

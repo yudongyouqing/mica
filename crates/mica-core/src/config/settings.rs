@@ -8,7 +8,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 use crate::config::palette::{Palette, parse_hex};
 use crate::config::parse::{self, ParseError};
 use crate::config::theme;
-use crate::keymap::{self, Keymap};
+use crate::keymap::{self, KeyRemap, Keymap};
 
 /// 默认字体回退链(D9)。定义在此(core)——render 侧 re-export,
 /// 与格子度量一样保持单一来源。
@@ -102,6 +102,9 @@ pub struct Settings {
     pub theme_name: Option<String>,
     /// 键位表(D15):默认 WT 兼容,`keybind` 键覆盖。
     pub keymap: Keymap,
+    /// #79 修饰键重映射(`key-remap = ctrl=super`,可多条):encode 前
+    /// 转换发给 pty 的修饰;keymap 动作判定不受影响
+    pub key_remap: Vec<KeyRemap>,
     /// 光标闪烁(D20):默认不闪,`cursor-blink = true` 开 500ms 定时器。
     pub cursor_blink: bool,
     /// Quick Terminal 全局热键(M3b,默认 Win+`;禁用写 `none`)。
@@ -135,6 +138,7 @@ impl Default for Settings {
             palette: Palette::DEFAULT,
             theme_name: None,
             keymap: Keymap::wt_default(),
+            key_remap: Vec::new(),
             cursor_blink: false,
             quick_terminal_key: Some("win+oem_3".into()),
             strip: StripCfg::default(),
@@ -261,6 +265,12 @@ fn apply_pairs(
                 _ => err
                     .values
                     .push(format!("cursor-blink 应为 true/false,得 `{value}`")),
+            },
+            "key-remap" => match KeyRemap::parse_pair(&value) {
+                Some(r) => settings.key_remap.push(r),
+                None => err.values.push(format!(
+                    "key-remap 应为 <修饰>=<修饰>(如 ctrl=super),得 `{value}`"
+                )),
             },
             "keybind" => {
                 // 值形如 `ctrl+shift+t = new_tab`;`clear` 清默认表
