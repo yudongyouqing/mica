@@ -20,7 +20,7 @@ use std::time::Duration;
 use notify::{Event, RecursiveMode, Watcher};
 
 use mica_core::config::palette::Palette;
-use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
+use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, MouseRightClick, Settings};
 use mica_core::input::{self, Key, Mods};
 use mica_core::ipc::IpcMessage;
 use mica_core::keymap::{Action, Keymap, TriggerKey};
@@ -54,7 +54,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ERASEBKGND, WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMOUSEMOVE, WM_PAINT,
-    WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_RBUTTONDOWN, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
@@ -307,6 +308,11 @@ thread_local! {
     /// 选中即复制(#58 同批:copy-on-select 配置键,false 时松开鼠标
     /// 不写剪贴板——修剪贴板历史双份)
     static COPY_ON_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// #80 右键行为(配置驱动;Paste = 粘贴剪贴板)
+    static RIGHT_CLICK_PASTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #79 修饰键重映射表(encode 前应用;动作判定不受影响)
+    static KEY_REMAP: RefCell<Vec<mica_core::keymap::KeyRemap>> =
+        const { RefCell::new(Vec::new()) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
     static MOUSE_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// keymap 消费了字母/数字键(ctrl+shift+t 等):TranslateMessage 生成
@@ -531,6 +537,8 @@ pub fn run() {
         TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
         MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
         COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+        RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+        KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
@@ -772,7 +780,9 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
                 MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
                 COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
-                COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+                RIGHT_CLICK_PASTE
+                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
                 let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
                 let title = HSTRING::from("Mica");
                 // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
@@ -1217,6 +1227,8 @@ unsafe fn reload_config(hwnd: HWND) {
     TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
     MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
     COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+    RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+    KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
@@ -2592,8 +2604,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             mica_core::protocol::kitty::EventKind::Press
                         };
                         if let Some(key) = vk_to_key(vk)
-                            && let Some(bytes) =
-                                mica_core::protocol::kitty::kitty_encode(key, mods, kind, flags)
+                            && let Some(bytes) = mica_core::protocol::kitty::kitty_encode(
+                                key,
+                                remap_mods(mods),
+                                kind,
+                                flags,
+                            )
                         {
                             let _ = t.session.write(&bytes);
                             return;
@@ -3057,6 +3073,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             });
             if had {
                 draw_frame();
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            // #80 mouse-right-click = paste:右键粘贴(选区存在先复制);
+            // 应用捕获鼠标时上报优先(与左/中键同序);strip 区不劫持
+            let (px, py) = mouse_xy(lparam);
+            if !RIGHT_CLICK_PASTE.with(std::cell::Cell::get)
+                || strip_hit(px, py).is_some()
+                || forward_mouse(px, py, 2, true, false)
+            {
+                return LRESULT(0);
+            }
+            if let Some(text) = clipboard::get_text() {
+                TABS.with(|tabs| {
+                    if let Some(t) = tabs
+                        .borrow_mut()
+                        .get_mut(ACTIVE.get())
+                        .and_then(|tab| tab.active_pane())
+                    {
+                        // 选区存在:先复制(选完右键的完整语义)
+                        if let Some(sel) = t.term.selection_text()
+                            && !sel.is_empty()
+                        {
+                            clipboard::set_text(&sel);
+                        }
+                        let normalized = clipboard::normalize_paste(&text);
+                        let bytes = if t.term.bracketed_paste_active() {
+                            let mut wrapped = b"[200~".to_vec();
+                            wrapped.extend_from_slice(normalized.as_bytes());
+                            wrapped.extend_from_slice(b"[201~");
+                            wrapped
+                        } else {
+                            normalized.into_bytes()
+                        };
+                        let _ = t.session.write(&bytes);
+                    }
+                });
             }
             LRESULT(0)
         }
@@ -3979,12 +4033,20 @@ fn tab_follow_active() {
     }
 }
 
+/// 标签显示名(#81 导出文件名用):TITLE_LOCK 优先,回退标签自身标题
+fn tab_title_safe(tab: &TabState) -> String {
+    TITLE_LOCK
+        .with(|t| t.borrow().clone())
+        .unwrap_or_else(|| tab.title.clone())
+}
+
 /// 执行终端外语义动作。返回 true = 已消费(不再走 pty 编码)。
 /// 标签类动作待 T7 标签池落地(TODO 占位消费,防误发 pty 序列)。
 fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut need_draw = false;
     let mut restart = false; // 延迟执行(块内自借 TABS 会 panic——冒烟实证)
     let mut search_toggle = false; // #57:段外 toggle(不借 TABS)
+    let mut write_scrollback = false; // #81:段外写文件+打开(不走 TABS 双借)
     let mut new_tab = false;
     let mut new_window = false;
     let mut close_idx: Option<usize> = None;
@@ -4021,6 +4083,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 }
                 Action::RestartPane => restart = true, // 延迟:with 块内再借 TABS 会双借 panic
                 Action::SearchScrollback => search_toggle = !search_toggle,
+                Action::WriteScrollback => write_scrollback = true,
                 Action::NewWindow => new_window = true,
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
                     if t.term.jump_prompt(matches!(action, Action::JumpNextPrompt)) {
@@ -4071,6 +4134,62 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     // 标签操作段外执行:TABS 借用已还,switch/close/start 可自由再借
     if restart {
         restart_active_pane();
+    }
+    if write_scrollback {
+        // #81:回看导出——%TEMP%/mica-scrollback-{标题}-{时间戳}.log,
+        // UTF-8 写入 + 系统默认打开;失败只记日志
+        let (text, title) = TABS.with(|tabs| {
+            let guard = tabs.borrow();
+            guard
+                .get(ACTIVE.get())
+                .and_then(|tab| tab.active_pane_ref())
+                .map(|t| {
+                    (
+                        t.term.scrollback_text(),
+                        guard
+                            .get(ACTIVE.get())
+                            .map(tab_title_safe)
+                            .unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_default()
+        });
+        if !text.is_empty() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let safe: String = title
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || matches!(c, '-') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(24)
+                .collect();
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("mica-scrollback-{safe}-{ts}.log"));
+            match std::fs::write(&path, &text) {
+                Ok(()) => {
+                    let _ = path.to_str().map(|p| {
+                        unsafe {
+                            ShellExecuteW(
+                                None,
+                                windows::core::w!("open"),
+                                windows::core::PCWSTR(windows::core::HSTRING::from(p).as_ptr()),
+                                None,
+                                None,
+                                SW_SHOWNORMAL,
+                            )
+                        };
+                    });
+                }
+                Err(e) => eprintln!("[scrollback] 写出失败:{e}"),
+            }
+        }
     }
     if search_toggle {
         if SEARCH_OPEN.with(std::cell::Cell::take) {
@@ -4534,6 +4653,8 @@ fn normalize_path_token(token: &str) -> Option<String> {
 }
 
 fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
+    // #79 key-remap:encode 前转换修饰(动作判定已在上游完成)
+    let mods = remap_mods(mods);
     let key = match VIRTUAL_KEY(vk as u16) {
         VK_UP => Key::Up,
         VK_DOWN => Key::Down,
@@ -4547,6 +4668,11 @@ fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(input::encode(key, mods, app_cursor))
+}
+
+/// #79 应用 key-remap 表(链式:逐条翻转修饰位)
+fn remap_mods(mods: Mods) -> Mods {
+    KEY_REMAP.with(|r| r.borrow().iter().fold(mods, |m, rm| rm.apply(m)))
 }
 
 fn current_mods() -> Mods {
