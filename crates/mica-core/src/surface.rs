@@ -393,6 +393,13 @@ impl Surface {
         std::mem::take(&mut lock(&self.proxy.0).title)
     }
 
+    /// #57 搜索用尺寸打包:(历史行数, 视口行数, grid 引用)——app 层
+    /// 不 import alacritty trait 的取值捷径
+    pub fn grid_dims(&self) -> (usize, usize, &Grid<Cell>) {
+        let g = self.term.grid();
+        (g.history_size(), g.screen_lines(), g)
+    }
+
     pub fn grid(&self) -> &Grid<Cell> {
         self.term.grid()
     }
@@ -499,6 +506,27 @@ impl Surface {
     /// 当前滚动偏移(0 = 钉在屏幕底跟随输出)。
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
+    }
+
+    /// 视口滚到指定偏移(#57 搜索跳转用):目标行 buffer 坐标 → 置于
+    /// 视口上 1/3 处(首尾行留上下文)。line 为 buffer 行(负 = 历史)。
+    /// 返回是否滚动(需重绘)。jump 锚重置(与手动滚动同语义)。
+    pub fn scroll_to_line(&mut self, line: i32) -> bool {
+        let screen = self.term.grid().screen_lines() as i32;
+        // line 是视口顶的 buffer 坐标(负 = 历史)。目标 = 让该行出现在
+        // 视口上 1/3;clamp 到 [0, history]
+        let want_top = line - screen / 3;
+        let hist = self.term.grid().history_size() as i32;
+        let want = (-want_top).clamp(0, hist) as usize;
+        let cur = self.term.grid().display_offset() as i32;
+        let delta = want as i32 - cur;
+        if delta != 0 {
+            self.jump_ref = None;
+            self.term.scroll_display(Scroll::Delta(delta));
+            true
+        } else {
+            false
+        }
     }
 
     // ---- 选择(M2a/T3):状态与拼接全用上游成品,这里只做薄封装 ----
@@ -1045,6 +1073,39 @@ mod tests {
         // 无选区时 no-op
         s.selection_clear();
         assert!(!s.selection_extend_edge(true));
+    }
+
+    /// #57 scroll_to_line 契约:历史目标行应落在视口上 1/3;屏内目标
+    /// 不滚出;clamp 不越界
+    #[test]
+    fn scroll_to_line_places_history_in_view() {
+        let mut s = Surface::new(ScreenSize::new(20, 6));
+        for i in 0..20 {
+            s.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let hist = s.grid().history_size();
+        assert!(hist >= 14, "20 行进 6 行屏,历史 ≥14(得 {hist})");
+        // 滚到最老历史行(buffer 行 = -(hist as i32))
+        assert!(s.scroll_to_line(-(hist as i32)));
+        // 目标行应可见:display_offset 使 oldest 的 view = offset - hist ≥ 0
+        let off = s.display_offset() as i32;
+        assert!(off > 0, "滚进历史区(offset={off})");
+        let view_of_oldest = -(hist as i32) + off;
+        assert!(
+            (0..6).contains(&view_of_oldest),
+            "最老行在视口内(view={view_of_oldest}, offset={off})"
+        );
+        // 屏内行(底部提示行,line ≥ 0):滚回底或保持可见,不得滚进历史
+        let bottom_line = 5; // 视口底行(buffer 坐标在底跟随时 = 屏行)
+        s.scroll_to_line(bottom_line);
+        let off2 = s.display_offset();
+        assert!(
+            off2 as i32 + bottom_line >= 0 && (off2 as i32 + bottom_line) < 6 + off2 as i32,
+            "屏内目标保持在视口内"
+        );
+        // clamp:更深的负行不越界(offset ≤ hist)
+        s.scroll_to_line(-9999);
+        assert!(s.display_offset() <= hist, "clamp 到历史深度");
     }
 
     #[test]

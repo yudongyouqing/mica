@@ -62,7 +62,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-10-03-m5-1.0-design.md` — M5 1.0 设计(打磨/健壮/发布三切片,D32-D37;砍单 tear-off/defterm 二级/官网/连字引擎/签名;验收=winget 可装+崩溃有档+IME 跟随+1.0 tag)。
 - `docs/superpowers/plans/2026-10-03-m5c-release.md` — M5c 计划(发布五件;UiaRootObjectId=-25 判据三轮实证、perf 25% 门禁偏差注记)。
 - `docs/superpowers/plans/2026-10-03-m5b-robustness.md` — M5b 计划(健壮五件;wgpu lost 双钩子/DbgHelp/try_wait/Ime/winres-manifest API 全核实;冒烟抓到 restart 双借真 bug——T1 崩溃档案首秀定位)。
-- 里程碑:M0→M4(✅)→ M5 1.0(tag v1.0.0)→ **1.1 发布完成(2026-10-13,tag v1.1.0)**:标签栏双行重制(浅灰条/聚焦渐变/切换滑移/挤压式拖拽换序/溢出箭头)、多窗口(Ctrl+Shift+N)、tear-off 软版、QT 退出闭环、strip-* 全量可配(17 键)、最大化拖动还原、--multi 隔离调试旗标。→ 票箱:#36 winget(挂起)/#41 混合 DPI 初始缩水。
+- 里程碑:M0→M4(✅)→ M5 1.0(tag v1.0.0)→ 1.1(tag v1.1.0)→ **1.2 发布完成(2026-10-22,tag v1.2.0)**:send-text IPC(`mica send`,tmux send-keys 同义)、启动优化(非关键初始化移首帧后,实测 -424ms)、滚动回看搜索(Ctrl+Shift+F,五版定档反色高亮)、裸路径可点击(Ctrl+Click+常显下划线+悬停生长反色)、粘贴双份修复(硬编码分支控制字节泄漏)、copy-on-select 配置键、asciinema 回放基准、依赖更新(actions/serde/pollster)。→ 票箱:**空**(#36 winget 用户关账:项目完善前不做)。
 
 ## 当前边界(M3 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
@@ -77,7 +77,8 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - 标签溢出滚动:滚轮+左右箭头+活跃自动跟随齐备(1.1,#39)
 - 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段)
 - 标签 tear-off(1.1 软版,#35):拖出标签行即撕开独立窗,同 shell/cwd/标题重开——**进程不迁移**(COM/线程本地 !Send 架构),活进程迁移留后续增强
-- defterm 整体撤除(1.0.2):RRVA 一级注册实测是陷阱——装完即劫持默认终端且无 COM 实现接管,console 程序全弹 0xC0000142。真实现(ITerminalHandoff)完成前不再注册;winget 清单首提待做
+- 输入管线控制字节纪律(1.2):**任何消费了 Ctrl+字母 键的分支都必须置 KEYMAP_ATE_CHAR**(keymap 分支 2026-10 修过,硬编码粘贴/复制分支 1.2 补齐——漏置 = 伴生控制字节泄漏 pty,PSReadLine 当二次快捷键,粘贴双份实证);新增硬编码键分支时照此
+- defterm 整体撤除(1.0.2):RRVA 一级注册实测是陷阱——装完即劫持默认终端且无 COM 实现接管,console 程序全弹 0xC0000142。真实现(ITerminalHandoff)完成前不再注册
 - Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M5c 观察;QT 输入已对齐主窗契约(M5a 修双发)
 - IME(M5b 已实现跟随:组合/候选窗定光标格下缘)——**2026-10-04 用户手验通过**(中文输入正常、候选框跟随、不崩);旧 6/10 崩账定性为坏驱动栈时代伪影(1.0.8 后复测无恙)
 - OSC 4 全域正确(16-231 立方/232-255 灰阶,M5a 落);SGR 下划线族已渲染(M5a,此前从未画)

@@ -188,6 +188,16 @@ fn strip_anim_step() -> bool {
     } else if t0 >= 0.0 {
         CAPS_T0.with(|t| t.set(-1.0));
     }
+    // 悬停反色动画:120ms ease-out,从下划线长到整块
+    if HOVER_PATH.with(|h| h.borrow().is_some()) {
+        let a = HOVER_ANIM.with(std::cell::Cell::get);
+        if a < 1.0 {
+            HOVER_ANIM.with(|a| a.set((a.get() + 0.015 / 0.120).min(1.0)));
+            busy = true;
+        }
+    } else {
+        HOVER_ANIM.with(|a| a.set(1.0)); // 不在路径上:无动画态
+    }
     // 邻位滑移:指数衰减(15ms 一拍 ×0.72 ≈ 105ms 收敛),全落定即停
     TAB_DX.with(|d| {
         let mut d = d.borrow_mut();
@@ -294,6 +304,9 @@ thread_local! {
     /// 打字藏鼠标(Ghostty mouse-hide-while-typing 默认 true):键入隐藏
     /// 指针、移动恢复;ShowCursor 计数严格配对(藏一次显一次)
     static MOUSE_HIDE_ON_TYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// 选中即复制(#58 同批:copy-on-select 配置键,false 时松开鼠标
+    /// 不写剪贴板——修剪贴板历史双份)
+    static COPY_ON_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
     static MOUSE_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// keymap 消费了字母/数字键(ctrl+shift+t 等):TranslateMessage 生成
@@ -316,6 +329,14 @@ thread_local! {
     /// panic = 进程崩(2026-10-12 闪退实证)。标签数只在建/关标签时变,
     /// 建/关两处同步维护此 Cell
     static TAB_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// #59 启动计时锚(主线程;timer 7 补做非关键初始化时输出分段)
+    static START_T0: std::cell::Cell<Option<std::time::Instant>> = const {
+        std::cell::Cell::new(None)
+    };
+    /// #59 延迟初始化只做一次(副窗线程不触发:timer 只挂在主窗 hwnd)
+    static DEFER_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #59 延迟建立的配置 watcher handle(退出序从这取;主窗线程 TLS)
+    static RELOAD_TAKE: RefCell<Option<ReloadHandle>> = const { RefCell::new(None) };
     /// strip 外观配置快照(load_settings;热重载时整表替换)——几何/
     /// 颜色/字体/动画全从这里走(2026-10-12 全量可配)
     static STRIP_CFG: RefCell<mica_core::config::settings::StripCfg> =
@@ -330,6 +351,13 @@ thread_local! {
     /// 邻位滑移量(按原始标签下标;槽位变化时记跳变差,timer 5 指数
     /// 衰减到 0)——挤压是滑过去不是瞬移(2026-10-12 三版)
     static TAB_DX: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// #57 回看搜索:开态 + 查询串 + 命中表(行 buffer 坐标/列/宽)+ 游标。
+    /// 窗口级状态,重绘与 WM_CHAR/WM_KEYDOWN 路由共享
+    static SEARCH_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SEARCH_QUERY: RefCell<String> = const { RefCell::new(String::new()) };
+    static SEARCH_MATCHES: RefCell<Vec<(i32, usize, usize)>> =
+        const { RefCell::new(Vec::new()) };
+    static SEARCH_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// 非 BMP 字符(emoji、扩展区汉字)以 UTF-16 代理对各发一次 WM_CHAR,
     /// 高代理暂存于此,低代理到达时重组成码点
     static PENDING_SURROGATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -355,6 +383,13 @@ thread_local! {
     /// D28 hover 气泡:URL + 绘制锚(客户区坐标)。None = 不画
     static HOVER_URL: RefCell<Option<(String, f32, f32)>> =
         const { RefCell::new(None) };
+    /// #58 悬停路径 span(buffer 行,列,格宽):即时下划线的数据源;
+    /// None = 光标不在路径上(WM_MOUSEMOVE 每次刷新,替代 300ms 气泡)
+    static HOVER_PATH: RefCell<Option<(i32, usize, usize)>> =
+        const { RefCell::new(None) };
+    /// #58 悬停反色动画相位(0 = 2px 下划线,1 = 整块):进入/换路径时
+    /// 归零,timer 5 推进(120ms ease-out)——"从下划线滑成整块"
+    static HOVER_ANIM: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
     /// strip 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的反馈
     /// (const 初始化用字面量——Default::default 不是 const fn)
     static HOVER_STRIP: std::cell::Cell<mica_render::frame::StripHover> = const {
@@ -462,6 +497,8 @@ impl TabState {
 }
 
 pub fn run() {
+    // #59 启动计时锚(exec 起点近似;MICA_DEBUG_TIMING 门控输出分段)
+    let t0 = std::time::Instant::now();
     WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // ConPTY 宿主消毒(1.0.6):进程内剔除第三方 OpenConsole 目录,
     // 见 pty.rs 的 sanitize_conpty_host_path 文档——必须在一切 spawn
@@ -493,6 +530,7 @@ pub fn run() {
         KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
         TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
         MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
+        COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
@@ -648,32 +686,14 @@ pub fn run() {
         let gpu = init_window_gpu(hwnd);
         GPU.with(|g| *g.borrow_mut() = Some(gpu));
 
-        // T5:热重载 watcher 在窗口创建后启动(投递 WM_APP_CONFIG 需要 hwnd);
-        // config 文件缺失(全默认启动)则不监听——首次创建配置需重启生效
-        let reload = spawn_config_watcher(Arc::clone(&hwnd_slot));
         // M3a:单实例 IPC 服务(管道被占说明已有实例——main 侧已分流,这里
-        // 只可能首实例到达;失败降级单开不致命)
+        // 只可能首实例到达;失败降级单开不致命)。必须在首帧前:晚于此,
+        // 启动窗口期内的 `mica new-tab` 会自启第二个实例
         match ipc::serve(Arc::clone(&hwnd_slot)) {
             Ok(rx) => IPC_RX.with(|slot| *slot.borrow_mut() = Some(rx)),
             Err(false) => {} // 建管道失败:已在 ipc::serve 记日志
             Err(true) => unreachable!("main 已分流,GUI 路径不会撞已占管道"),
         }
-        // 孤儿 ConPTY 清理(M5c/T1):趁自身还没 spawn pty,零误杀窗口
-        let orphans = orphan::sweep_orphaned_conhost(true);
-        if orphans > 0 {
-            eprintln!("[orphan] 清杀 {orphans} 个父进程已死的 ConPTY 宿主");
-        }
-
-        // M3a:AUMID + jump list(profile 任务直达)
-        jumplist::set_appuser_model_id();
-        let profiles: Vec<(String, String)> = mica_core::profile::scan_all()
-            .into_iter()
-            .map(|p| (p.name, p.command))
-            .collect();
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        jumplist::install(&exe, &profiles);
         // T7:首个标签与 GPU 就位(forwarder 由 start_tab 内部起;
         // handle 不 join——退出序由杀 pty 断源自然收尾,detach 可接受)。
         // M3a:CLI/IPC 自启动路径经 MICA_START_PROFILE 指定首标签 profile
@@ -696,14 +716,23 @@ pub fn run() {
         // 暴露整个启动序:GPU/jumplist/profile 扫描/首帧都在其后——
         // 2026-10-06 用户实测"启动大块白屏")
         draw_frame();
+        if std::env::var_os("MICA_DEBUG_TIMING").is_some() {
+            eprintln!(
+                "[timing] run→首帧 {}ms(含窗口/GPU/首标签)",
+                t0.elapsed().as_millis()
+            );
+        }
         let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
             hwnd,
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
-        // M3b:Quick Terminal(热键 + 下拉窗;失败只记日志)
-        // QT 失败已内部记日志;Err = QT 禁用(主窗照常,增强件不炸主流程)
-        let _ = quickterm::init(hwnd);
-        message_loop(reload, hwnd_slot);
+
+        // #59 非关键初始化推迟:首帧已上屏,余下(COM/进程枚举/wsl.exe/
+        // 第二个 GPU surface/文件 watcher)经一拍定时器在主线程补做——
+        // TLS 安全(全主线程),用户感知 = 首帧即此前的全部等待
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 7, 100, None);
+        START_T0.with(|c| c.set(Some(t0)));
+        message_loop(None, hwnd_slot);
     }
 
     // 多窗口寿命(2026-10-12):主窗退出序已毕(其标签已拆、watcher 已停),
@@ -742,6 +771,8 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
                 CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
                 MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
+                COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+                COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
                 let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
                 let title = HSTRING::from("Mica");
                 // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
@@ -943,6 +974,52 @@ fn warn_box(text: &str) {
 /// 父目录并按路径过滤,原子替换/重建不失联)监听 config 文件,事件经 mpsc
 /// 交给去抖线程。None = 未监听(文件缺失或 watch 失败,热重载降级关闭)。
 /// 哨兵由 run() 统一建立后传入——与转发线程共用"窗口存活"这一个事实。
+/// #59 非关键初始化(首帧后一拍,主线程):孤儿清理 / jumplist COM /
+/// profile 扫描 / Quick Terminal / 配置 watcher。全在主线程执行——
+/// 这些件吃 TLS(GPU/SHARED_HWND),后台线程会撞双实例 TLS。
+/// DEFER_DONE 只在主窗线程置位(timer 挂主窗 hwnd),副窗天然不进
+unsafe fn deferred_init(hwnd: HWND) {
+    if DEFER_DONE.with(|c| c.replace(true)) {
+        return;
+    }
+    let t = std::time::Instant::now();
+    // 孤儿 ConPTY 清理(M5c/T1):此时首标签 pty 已起、活着,不误杀;
+    // "趁自身没 spawn 前零误杀窗口"的旧前提换成"父进程活着"同判据
+    let orphans = orphan::sweep_orphaned_conhost(true);
+    if orphans > 0 {
+        eprintln!("[orphan] 清杀 {orphans} 个父进程已死的 ConPTY 宿主");
+    }
+    // M3a:AUMID + jump list(profile 任务直达;COM 实例化是慢路径)
+    jumplist::set_appuser_model_id();
+    let profiles: Vec<(String, String)> = mica_core::profile::scan_all()
+        .into_iter()
+        .map(|p| (p.name, p.command))
+        .collect();
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    jumplist::install(&exe, &profiles);
+    // M3b:Quick Terminal(独立 GPU surface,重)
+    let _ = quickterm::init(hwnd);
+    // T5:配置 watcher(晚于首帧启动 = 首 100ms 内改配置不触发,可接受)
+    if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone())
+        && let Some(reload) = spawn_config_watcher(slot)
+    {
+        RELOAD_TAKE.with(|r| *r.borrow_mut() = Some(reload));
+    }
+    if std::env::var_os("MICA_DEBUG_TIMING").is_some() {
+        let total = START_T0
+            .with(std::cell::Cell::get)
+            .map(|t0| t0.elapsed().as_millis())
+            .unwrap_or_default();
+        eprintln!(
+            "[timing] 延迟段 {}ms(孤儿/COM/profile/QT/watcher),累计 {}ms",
+            t.elapsed().as_millis(),
+            total
+        );
+    }
+}
+
 fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle> {
     let path = config_path();
     if !path.exists() {
@@ -1139,6 +1216,7 @@ unsafe fn reload_config(hwnd: HWND) {
     KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
     TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
     MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
+    COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
@@ -1785,7 +1863,7 @@ pub(crate) fn spawn_qt_forwarder(
         .expect("spawn qt forwarder");
 }
 
-unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
+unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     let mut msg = MSG::default();
     loop {
         let ret = GetMessageW(&mut msg, None, 0, 0);
@@ -1814,7 +1892,10 @@ unsafe fn message_loop(reload: Option<ReloadHandle>, hwnd_slot: SharedHwnd) {
     eprintln!("[exit] step1: sentinel None");
     *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
     eprintln!("[exit] step2: watcher drop + join");
-    if let Some(reload) = reload {
+    // #59 watcher 改由延迟初始化建立,teardown 从 TLS 收(handle 由
+    // deferred_init 存入,与重建序互斥:退出时未建 = None = 无可拆)
+    let reload = RELOAD_TAKE.with(|r| r.take());
+    if let Some(reload) = reload.or(reload_param) {
         drop(reload.watcher);
         let _ = reload.thread.join();
     }
@@ -2050,9 +2131,246 @@ fn draw_frame() {
                 &t.palette,
             ));
         }
+        // #57 搜索:命中高亮 + 底部搜索条,收集进独立 overlay——
+        // draw 缓冲序 = 画家序(blend:None 后画胜),overlay 必须在
+        // 终端实例**之后**拼接才不被内容盖住(首版教训:直接推 strip
+        // 被 append(all_instances) 压底,条完全不可见)
+        let mut search_overlay: Vec<mica_render::frame::CellInstance> = Vec::new();
+        if SEARCH_OPEN.with(std::cell::Cell::get) {
+            let offset = t.term.display_offset() as i32;
+            let rows = t.rows as i32;
+            let cur = SEARCH_IDX.with(std::cell::Cell::get);
+            let matches = SEARCH_MATCHES.with(|m| m.borrow().clone());
+            let yellow = [
+                t.palette.colors[3].r,
+                t.palette.colors[3].g,
+                t.palette.colors[3].b,
+            ];
+            let mk_quad =
+                |x: f32, y: f32, w: f32, h: f32, c: [u8; 3]| mica_render::frame::CellInstance {
+                    pos_uv: [x, y, 0.0, 0.0],
+                    size_uv: [w, h, 0.0, 0.0],
+                    fg: [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        0.0,
+                    ],
+                    bg: [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        0.0,
+                    ],
+                };
+            let pane_rect = rects
+                .iter()
+                .find(|(id, _)| *id == focused_pane_id)
+                .map(|(_, r)| *r);
+            if let Some(pr) = pane_rect {
+                // ---- 命中高亮:浏览器式**选中反色**(三版定档)。
+                // 条形标记两版被否("不明显")——正解是命中格背景反色 +
+                // 字变暗,与选区同观感。做法:命中矩形内的终端实例直接
+                // 改色(背景 quad → 高亮色;字形 quad 墨色 → 近黑保证可读)
+                // 可见命中矩形;仅**当前**命中做整块反色,其余画底部
+                // 亮黄下划线(整块混色版被否"丑"——黄混深底 = 泥橄榄色)
+                let mut hit_rects: Vec<(f32, f32, f32, f32, bool)> = Vec::new();
+                for (mi, (line, col, len)) in matches.iter().enumerate() {
+                    let view = line + offset;
+                    if !(0..rows).contains(&view) {
+                        continue;
+                    }
+                    let (x, y, w) = (
+                        pr.x + *col as f32 * t.metrics.cell_width,
+                        pr.y + view as f32 * t.metrics.line_height,
+                        *len as f32 * t.metrics.cell_width,
+                    );
+                    if mi == cur {
+                        hit_rects.push((x, y, w, t.metrics.line_height, true));
+                    } else {
+                        // 非当前:矩形描边框(用户点名"正方形"——四边
+                        // 2px 亮黄空心框,overlay 层不碰文字)
+                        let lh = t.metrics.line_height;
+                        let b = 2.0; // 边宽
+                        search_overlay.push(mk_quad(x, y, w, b, yellow)); // 顶
+                        search_overlay.push(mk_quad(x, y + lh - b, w, b, yellow)); // 底
+                        search_overlay.push(mk_quad(x, y, b, lh, yellow)); // 左
+                        search_overlay.push(mk_quad(x + w - b, y, b, lh, yellow)); // 右
+                    }
+                }
+                let hl_cur = [
+                    yellow[0] as f32 / 255.0,
+                    yellow[1] as f32 / 255.0,
+                    yellow[2] as f32 / 255.0,
+                    0.0,
+                ];
+                let ink_dark = [0.05, 0.05, 0.05, 0.0];
+                for inst in all_instances.iter_mut() {
+                    let (ix, iy, iw, ih) = (
+                        inst.pos_uv[0],
+                        inst.pos_uv[1],
+                        inst.size_uv[0],
+                        inst.size_uv[1],
+                    );
+                    for &(hx, hy, hw, hh, _is_cur) in hit_rects.iter() {
+                        if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
+                            if inst.size_uv[2] > 0.0 {
+                                // 字形 quad:墨色改近黑(黄底可读)
+                                inst.fg = ink_dark;
+                                inst.bg = hl_cur;
+                            } else {
+                                // 背景 quad:整块换高亮色
+                                inst.fg = hl_cur;
+                                inst.bg = hl_cur;
+                            }
+                            break;
+                        }
+                    }
+                }
+                // ---- 搜索条(pane 底部内侧,一行高):bg 提亮 + query + N/M
+                let bar_y = pr.y + pr.h - t.metrics.line_height - 4.0;
+                let bar_w = (t.metrics.cell_width * 48.0).min(pr.w);
+                let bar_bg = [
+                    (t.palette.bg.r as u16 * 2 + 255) as u8 / 3,
+                    (t.palette.bg.g as u16 * 2 + 255) as u8 / 3,
+                    (t.palette.bg.b as u16 * 2 + 255) as u8 / 3,
+                ];
+                search_overlay.push(mk_quad(
+                    pr.x,
+                    bar_y,
+                    bar_w,
+                    t.metrics.line_height + 4.0,
+                    bar_bg,
+                ));
+                let q = SEARCH_QUERY.with(|q| q.borrow().clone());
+                let mut label = format!("/{}", q);
+                if q.is_empty() {
+                    label = "/(输入以搜索)".into();
+                } else {
+                    label.push_str(&format!(
+                        "  {}/{}",
+                        if matches.is_empty() { 0 } else { cur + 1 },
+                        matches.len()
+                    ));
+                }
+                let mut tx = pr.x + 2.0;
+                let ty = bar_y + 2.0;
+                for ch in label.chars().take(46) {
+                    let g = <DwriteRouter as mica_render::font::router::GlyphRouter>::route(
+                        &mut t.router,
+                        ch,
+                        mica_render::font::GlyphStyle::PLAIN,
+                    );
+                    if g.size_px[0] > 0.0 {
+                        search_overlay.push(mica_render::frame::CellInstance {
+                            pos_uv: [tx + g.offset_px[0], ty + g.offset_px[1], g.uv[0], g.uv[1]],
+                            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                            fg: [
+                                t.palette.fg.r as f32 / 255.0,
+                                t.palette.fg.g as f32 / 255.0,
+                                t.palette.fg.b as f32 / 255.0,
+                                0.0,
+                            ],
+                            bg: [
+                                bar_bg[0] as f32 / 255.0,
+                                bar_bg[1] as f32 / 255.0,
+                                bar_bg[2] as f32 / 255.0,
+                                0.0,
+                            ],
+                        });
+                    }
+                    // 步进按真字宽(CJK 双宽,恒 1 格会互相叠 = 乱码,
+                    // 用户实报;strip 的 adv 同款公式)
+                    tx += g.size_px[0].max(t.metrics.cell_width);
+                }
+            }
+        }
+        // #58 静态下划线:全部可见路径常显(用户裁定"有路径可点击的
+        // 都要下划线")——悬停块生长的起点与之重合,视觉无缝
+        {
+            let offset_s = t.term.display_offset() as i32;
+            let grid = t.term.grid();
+            let u_c = [
+                t.palette.colors[12].r,
+                t.palette.colors[12].g,
+                t.palette.colors[12].b,
+            ];
+            let u_cf = [
+                u_c[0] as f32 / 255.0,
+                u_c[1] as f32 / 255.0,
+                u_c[2] as f32 / 255.0,
+                0.0,
+            ];
+            if let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id) {
+                for view in 0..t.rows as i32 {
+                    let line = view - offset_s;
+                    let (text, cell_of) = mica_render::frame::row_string(grid, line);
+                    for (col, cells) in all_path_spans(&text, &cell_of) {
+                        let x = pr.x + col as f32 * t.metrics.cell_width;
+                        let y = pr.y + (view as f32 + 1.0) * t.metrics.line_height - 2.0;
+                        let w = cells as f32 * t.metrics.cell_width;
+                        search_overlay.push(mica_render::frame::CellInstance {
+                            pos_uv: [x, y, 0.0, 0.0],
+                            size_uv: [w, 2.0, 0.0, 0.0],
+                            fg: u_cf,
+                            bg: u_cf,
+                        });
+                    }
+                }
+            }
+        }
+        // #58 悬停路径高亮(二版,用户点名"浅色转深色更清晰"):选中反色
+        // 式——浅蓝底 + 深色字,与搜索当前命中(黄底黑字)同款形制。
+        // 做法与搜索 hit_rects 相同:矩形相交的实例直接改色
+        if let Some((line, col, cells)) = HOVER_PATH.with(|h| *h.borrow()) {
+            let offset = t.term.display_offset() as i32;
+            let view = line + offset;
+            if (0..t.rows as i32).contains(&view)
+                && let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
+            {
+                let hx = pr.x + col as f32 * t.metrics.cell_width;
+                let hy_full = pr.y + view as f32 * t.metrics.line_height;
+                let hw = cells as f32 * t.metrics.cell_width;
+                let lh = t.metrics.line_height;
+                // 动画:相位 0 → 2px 底线,相位 1 → 整行;ease-out cubic
+                let a = HOVER_ANIM.with(std::cell::Cell::get);
+                let ease = 1.0 - (1.0 - a).powi(3);
+                let hh = 2.0 + (lh - 2.0) * ease;
+                let hy = hy_full + lh - hh; // 自底向上长
+                let bc = t.palette.colors[12];
+                let hl = [
+                    bc.r as f32 / 255.0,
+                    bc.g as f32 / 255.0,
+                    bc.b as f32 / 255.0,
+                    0.0,
+                ];
+                let ink_dark = [0.05, 0.05, 0.05, 0.0];
+                for inst in all_instances.iter_mut() {
+                    let (ix, iy, iw, ih) = (
+                        inst.pos_uv[0],
+                        inst.pos_uv[1],
+                        inst.size_uv[0],
+                        inst.size_uv[1],
+                    );
+                    if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
+                        if inst.size_uv[2] > 0.0 {
+                            // 字形 quad:墨色改近黑(浅蓝底可读)
+                            inst.fg = ink_dark;
+                            inst.bg = hl;
+                        } else {
+                            // 背景 quad:整块换高亮色
+                            inst.fg = hl;
+                            inst.bg = hl;
+                        }
+                    }
+                }
+            }
+        }
         let revision = t.router.atlas_revision();
         let atlas = t.router.atlas();
         strip.append(&mut all_instances);
+        // #57 搜索 overlay 最后拼 = 最上层(盖在终端内容之上)
+        strip.extend(search_overlay);
         // GPU 窗口级(T7):set_atlas 切到活跃标签的图集再 draw。
         // 门控用窗口级所有权(pane_id, revision)——1.0.10 修切标签乱码:
         // 旧逻辑按标签记 revision,切回旧标签时其自身未变便跳过重传,
@@ -2105,6 +2423,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CHAR => {
             hide_cursor_if_typing();
+            // #57 搜索态字符全吞(查询/跳转/关闭),不进 pty
+            if search_char((wparam.0 as u32).try_into().unwrap_or(' ')) {
+                return LRESULT(0);
+            }
             // keymap 已消费该键(如 Ctrl+Shift+T):TranslateMessage 的控制
             // 字节伴生投递吞掉;任何 WM_CHAR 到来都清位(正常打字即复位)
             if KEYMAP_ATE_CHAR.with(std::cell::Cell::take) && (wparam.0 as u32) < 0x20 {
@@ -2177,6 +2499,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             hide_cursor_if_typing();
+            // #57 搜索态 Up/Down 步进命中,其余键放行(keymap 不会命中,
+            // ctrl+shift+f 的 toggle 仍可关——search_char 不碰它)
+            if search_key(wparam.0 as u32) {
+                return LRESULT(0);
+            }
             // 剪贴板组合(T5;T6 Keymap 落地后迁入 Action 表):
             // Ctrl+C 有选区 → 复制并清选区,无选区 → 放行给 WM_CHAR 的
             // (ETX 中断,WT 同款语义);Ctrl+V / Shift+Insert → 粘贴
@@ -2210,6 +2537,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 });
                 if copied {
+                    // 复制即消费:吞伴生 WM_CHAR(0x03 ETX)——否则复制完
+                    // 还给 shell 送中断(WT 语义:选中 Ctrl+C 只复制)
+                    KEYMAP_ATE_CHAR.with(|c| c.set(true));
                     draw_frame();
                     return LRESULT(0);
                 }
@@ -2217,6 +2547,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if (mods.ctrl && !mods.alt && !mods.shift && vk == 'V' as u32)
                 || (mods.shift && !mods.ctrl && vk == VK_INSERT.0 as u32)
             {
+                // 吞伴生 WM_CHAR(0x16):不置位则 SYN 泄给 pty,PSReadLine
+                // 把它当第二次 Ctrl+V 粘贴 → 文本双份(用户实报;与当年
+                // Ctrl+Shift+T 送 ^T 同类,keymap 分支修过硬编码漏了)
+                KEYMAP_ATE_CHAR.with(|c| c.set(true));
                 if let Some(text) = clipboard::get_text() {
                     let normalized = clipboard::normalize_paste(&text);
                     TABS.with(|tabs| {
@@ -2574,7 +2908,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // 那个无关标签"亮一下"再灭(用户实测)。每 MOVE 刷新即除
                 let (hx, hy) = mouse_xy(lparam);
                 let hover = strip_hover_at(hx, hy);
-                let changed = HOVER_STRIP.with(|s| {
+                let strip_changed = HOVER_STRIP.with(|s| {
                     let old = s.get();
                     if old != hover {
                         s.set(hover);
@@ -2583,7 +2917,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         false
                     }
                 });
-                if changed {
+                // #58 路径悬停 span 实时算(单行扫描,轻):即时下划线;
+                // 路径上抑制气泡(旧 300ms 气泡循环 = 用户实报鼠标区闪烁)
+                let path_span = hover_path_span(hx, hy);
+                let path_changed = HOVER_PATH.with(|h| {
+                    let old = *h.borrow();
+                    if old != path_span {
+                        *h.borrow_mut() = path_span;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if path_changed && path_span.is_some() {
+                    HOVER_ANIM.with(|a| a.set(0.0)); // 进入/换路径:下划线起步
+                    ensure_anim_timer();
+                }
+                if strip_changed || path_changed {
                     draw_frame();
                 }
                 return LRESULT(0);
@@ -2622,7 +2972,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             HOVER_ARMED.with(|a| a.set(false));
             arm_hover(hwnd);
             let (px, py) = mouse_xy(lparam);
-            let url = link_at(px, py);
+            // #58:路径上用即时下划线(WM_MOUSEMOVE 算的 HOVER_PATH),
+            // 气泡退役——300ms 循环 + 锚点跟随是鼠标区闪烁的来源
+            let url = if HOVER_PATH.with(|h| h.borrow().is_some()) {
+                None
+            } else {
+                link_at(px, py)
+            };
             let changed = HOVER_URL.with(|h| {
                 let mut h = h.borrow_mut();
                 let same = match (&*h, &url) {
@@ -2655,12 +3011,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // TrackMouseEvent TME_LEAVE 投递(675,本地声明——windows-rs 未收录)
             HOVER_ARMED.with(|a| a.set(false));
             let had = HOVER_URL.with(|h| h.borrow_mut().take().is_some());
+            let path_had = HOVER_PATH.with(|h| h.borrow_mut().take().is_some());
             let strip_had = HOVER_STRIP.with(|s| {
                 let had = s.get() != mica_render::frame::StripHover::default();
                 s.set(mica_render::frame::StripHover::default());
                 had
             });
-            if had || strip_had {
+            if had || path_had || strip_had {
                 draw_frame();
             }
             LRESULT(0)
@@ -2739,8 +3096,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = forward_mouse(px, py, 0, false, false);
                 return LRESULT(0);
             }
-            // copy-on-select(Ghostty 默认 true):选区完成即入剪贴板;
-            // 空选区(单击清除)不覆盖
+            // copy-on-select(copy-on-select 配置键,默认 true):选区完成
+            // 即入剪贴板;空选区(单击清除)不覆盖;false 时只走显式 Ctrl+C
             TABS.with(|tabs| {
                 let mut guard = tabs.borrow_mut();
                 if let Some(t) = guard
@@ -2748,6 +3105,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .and_then(|tab| tab.active_pane())
                     && let Some(text) = t.term.selection_text()
                     && !text.is_empty()
+                    && COPY_ON_SELECT.with(std::cell::Cell::get)
                 {
                     clipboard::set_text(&text);
                 }
@@ -3050,6 +3408,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             match wparam.0 {
+                7 => {
+                    // #59 非关键初始化补做(一拍定时器;主线程 = TLS 安全)
+                    windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 7).ok();
+                    unsafe { deferred_init(hwnd) };
+                }
                 5 => {
                     if strip_anim_step() {
                         ensure_anim_timer();
@@ -3621,6 +3984,7 @@ fn tab_follow_active() {
 fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut need_draw = false;
     let mut restart = false; // 延迟执行(块内自借 TABS 会 panic——冒烟实证)
+    let mut search_toggle = false; // #57:段外 toggle(不借 TABS)
     let mut new_tab = false;
     let mut new_window = false;
     let mut close_idx: Option<usize> = None;
@@ -3656,6 +4020,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                     need_draw = true;
                 }
                 Action::RestartPane => restart = true, // 延迟:with 块内再借 TABS 会双借 panic
+                Action::SearchScrollback => search_toggle = !search_toggle,
                 Action::NewWindow => new_window = true,
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
                     if t.term.jump_prompt(matches!(action, Action::JumpNextPrompt)) {
@@ -3706,6 +4071,13 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     // 标签操作段外执行:TABS 借用已还,switch/close/start 可自由再借
     if restart {
         restart_active_pane();
+    }
+    if search_toggle {
+        if SEARCH_OPEN.with(std::cell::Cell::take) {
+            search_close();
+        } else {
+            search_open();
+        }
     }
     if new_window {
         spawn_window(None);
@@ -3827,6 +4199,222 @@ fn arm_hover(hwnd: HWND) {
 }
 
 /// 客户区坐标处的 OSC 8 URI(Ctrl+Click 与 hover 气泡共用;None = 无链接)。
+/// #57 打开搜索:清查询/命中,首帧空条
+fn search_open() {
+    SEARCH_OPEN.with(|o| o.set(true));
+    SEARCH_QUERY.with(|q| q.borrow_mut().clear());
+    SEARCH_MATCHES.with(|m| m.borrow_mut().clear());
+    SEARCH_IDX.with(|i| i.set(0));
+    draw_frame();
+}
+
+/// #57 关闭搜索
+fn search_close() {
+    SEARCH_OPEN.with(|o| o.set(false));
+    SEARCH_MATCHES.with(|m| m.borrow_mut().clear());
+    draw_frame();
+}
+
+/// #57 重扫:查询变更后全 buffer(历史+视口)大小写不敏感匹配。
+/// 命中表 = (buffer 行, 列, 宽);buffer 行坐标与 jump_prompt 同构
+/// (Line 负 = 历史)。扫完跳首个命中
+fn search_rescan() {
+    let query = SEARCH_QUERY.with(|q| q.borrow().clone());
+    let mut matches: Vec<(i32, usize, usize)> = Vec::new();
+    if !query.is_empty() {
+        let needle = query.to_lowercase();
+        TABS.with(|tabs| {
+            let guard = tabs.borrow();
+            if let Some(t) = guard
+                .get(ACTIVE.get())
+                .and_then(|tab| tab.active_pane_ref())
+            {
+                let (hist, rows, grid) = t.term.grid_dims();
+                for l in -(hist as i32)..rows as i32 {
+                    let (text, _) = mica_render::frame::row_string(grid, l);
+                    let hay = text.to_lowercase();
+                    let mut from = 0;
+                    while let Some(at) = hay[from..].find(&needle) {
+                        matches.push((l, from + at, needle.chars().count()));
+                        from += at + needle.len().max(1);
+                    }
+                }
+            }
+        });
+    }
+    SEARCH_MATCHES.with(|m| *m.borrow_mut() = matches);
+    SEARCH_IDX.with(|i| i.set(0));
+    // 首搜定位第一个命中(旧版误调 search_jump(false) 倒跳 n-1)
+    search_show();
+}
+
+/// #57 定位到 SEARCH_IDX 当前命中(不推进游标):滚视口 + 重绘
+fn search_show() {
+    // 滚到 **SEARCH_IDX 当前**命中(首版误取 first()——Enter 步进后
+    // 视口钉死在第一个命中,用户实报"不往下走")
+    let target = SEARCH_MATCHES.with(|m| {
+        let guard = m.borrow();
+        SEARCH_IDX
+            .with(std::cell::Cell::get)
+            .checked_rem(guard.len())
+            .and_then(|i| guard.get(i).map(|(l, _, _)| *l))
+    });
+    if let Some(line) = target {
+        TABS.with(|tabs| {
+            if let Some(t) = tabs
+                .borrow_mut()
+                .get_mut(ACTIVE.get())
+                .and_then(|tab| tab.active_pane())
+            {
+                t.term.scroll_to_line(line);
+                t.force_full = true;
+            }
+        });
+    }
+    draw_frame();
+}
+
+/// #57 跳命中:forward = 下一(Enter)/上一(Shift+Enter);跳到即滚视口
+fn search_jump(forward: bool) {
+    let n = SEARCH_MATCHES.with(|m| m.borrow().len());
+    if n == 0 {
+        draw_frame(); // 空命中也要刷条(计数显示 0/0)
+        return;
+    }
+    let old = SEARCH_IDX.with(std::cell::Cell::get);
+    let new = if forward {
+        (old + 1) % n
+    } else {
+        (old + n.saturating_sub(1)) % n
+    };
+    SEARCH_IDX.with(|i| i.set(new));
+    search_show();
+}
+
+/// #57 WM_CHAR 的搜索态拦截:消费则返回 true(调用方吞掉不进 pty)。
+/// 可打印入查询;CR 跳下一;退格删字;Esc 关闭
+fn search_char(ch: char) -> bool {
+    if !SEARCH_OPEN.with(std::cell::Cell::get) {
+        return false;
+    }
+    match ch {
+        '\r' => {
+            search_jump(current_mods().shift);
+        }
+        '\n' => {}
+        '\u{8}' => {
+            SEARCH_QUERY.with(|q| {
+                q.borrow_mut().pop();
+            });
+            search_rescan();
+        }
+        '\u{1b}' => {
+            search_close();
+        }
+        c if (c as u32) >= 0x20 => {
+            SEARCH_QUERY.with(|q| {
+                q.borrow_mut().push(c);
+            });
+            search_rescan();
+        }
+        _ => {}
+    }
+    true
+}
+
+/// #57 WM_KEYDOWN 的搜索态拦截:Up/Down = 命中步进;消费返回 true
+fn search_key(vk: u32) -> bool {
+    if !SEARCH_OPEN.with(std::cell::Cell::get) {
+        return false;
+    }
+    if vk == VK_UP.0 as u32 {
+        search_jump(false);
+        return true;
+    }
+    if vk == VK_DOWN.0 as u32 {
+        search_jump(true);
+        return true;
+    }
+    false
+}
+
+/// #58 光标处路径的渲染 span(buffer 行,列,格宽):与 link_at 同源
+/// 检测但带定位;None = 不在路径上。WM_MOUSEMOVE 每步调用
+/// #58 行内全部路径 span(静态下划线):token 遍历同构,收集所有
+/// 通过模式判定的 token 的 (col, cells)——可点击路径常显下划线
+fn all_path_spans(text: &str, cell_of: &[usize]) -> Vec<(usize, usize)> {
+    let bytes: Vec<char> = text.chars().collect();
+    let is_word = |c: char| {
+        c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word(bytes[i]) {
+            i += 1;
+        }
+        let token: String = bytes[start..i].iter().collect();
+        if normalize_path_token(&token).is_some() {
+            let c0 = *cell_of.get(start).unwrap_or(&start);
+            let c1 = *cell_of.get(i.saturating_sub(1)).unwrap_or(&start);
+            out.push((c0, c1.saturating_sub(c0) + 1));
+        }
+    }
+    out
+}
+
+fn hover_path_span(px: i32, py: i32) -> Option<(i32, usize, usize)> {
+    let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
+        (px as f32) >= r.x
+            && (px as f32) < r.x + r.w
+            && (py as f32) >= r.y
+            && (py as f32) < r.y + r.h
+    })?;
+    TABS.with(|tabs| {
+        let guard = tabs.borrow();
+        let t = guard.get(ACTIVE.get())?.active_pane_ref()?;
+        let line =
+            ((py as f32 - r.y) / t.metrics.line_height) as i32 + t.term.display_offset() as i32;
+        let col = ((px as f32 - r.x) / t.metrics.cell_width) as usize;
+        let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), line);
+        detect_path_token(&text, &cell_of, col)?;
+        let (_, c0, cells) = span_of_token(&text, &cell_of, col)?;
+        Some((line, c0, cells))
+    })
+}
+
+/// 命中 token 的 (col_start, cell 宽):重扫一遍行找覆盖 cursor_col 的
+/// token 边界(detect 判定已过,这里只取几何)
+fn span_of_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<(i32, usize, usize)> {
+    let bytes: Vec<char> = text.chars().collect();
+    let is_word = |c: char| {
+        c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word(bytes[i]) {
+            i += 1;
+        }
+        let covered: std::collections::HashSet<usize> = cell_of[start..i].iter().copied().collect();
+        if covered.contains(&cursor_col) {
+            let c0 = *cell_of.get(start).unwrap_or(&cursor_col);
+            let c1 = *cell_of.get(i.saturating_sub(1)).unwrap_or(&cursor_col);
+            return Some((c0 as i32, 0, c1.saturating_sub(c0) + 1));
+        }
+    }
+    None
+}
+
 fn link_at(px: i32, py: i32) -> Option<String> {
     let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
         (px as f32) >= r.x
@@ -3840,10 +4428,109 @@ fn link_at(px: i32, py: i32) -> Option<String> {
         let line =
             ((py as f32 - r.y) / t.metrics.line_height) as i32 + t.term.display_offset() as i32;
         let col = ((px as f32 - r.x) / t.metrics.cell_width) as usize;
-        t.term.grid()[Line(line)][Column(col)]
-            .hyperlink()
-            .map(|l| l.uri().to_string())
+        if let Some(l) = t.term.grid()[Line(line)][Column(col)].hyperlink() {
+            return Some(l.uri().to_string());
+        }
+        // #58:OSC 8 未命中 → 行文本路径检测(编译器输出裸路径可点击)
+        let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), line);
+        path_at_in_row(t, &text, &cell_of, col)
     })
+}
+
+/// 裸路径检测(#58)入口:命中 token 后相对路径用 OSC 7 cwd 补全
+fn path_at_in_row(
+    t: &Terminal,
+    text: &str,
+    cell_of: &[usize],
+    cursor_col: usize,
+) -> Option<String> {
+    let path = detect_path_token(text, cell_of, cursor_col)?;
+    Some(match path.chars().next() {
+        Some('/') | Some('\\') => path,
+        _ => {
+            let c = path.as_str();
+            if c.len() > 2 && c.as_bytes()[1] == b':' {
+                path // 盘符绝对路径
+            } else {
+                match t.term.cwd() {
+                    Some(cwd) => format!("{}\\{}", cwd.trim_end_matches('\\'), path),
+                    None => path,
+                }
+            }
+        }
+    })
+}
+
+/// #58 纯检测(不碰 Terminal,可 TDD):token 化 → 模式判定 →
+/// 定位剥离(:line[:col])→ 光标覆盖判定
+fn detect_path_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<String> {
+    let bytes: Vec<char> = text.chars().collect();
+    let is_word = |c: char| {
+        c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word(bytes[i]) {
+            i += 1;
+        }
+        let token: String = bytes[start..i].iter().collect();
+        if let Some(path) = normalize_path_token(&token) {
+            // 光标落在 token 覆盖区(宽字符 token 的 cell 映射收缩)
+            let covered: std::collections::HashSet<usize> =
+                cell_of[start..i].iter().copied().collect();
+            if covered.contains(&cursor_col) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// token → 文件系统路径:剥离尾部 :line[:col],按模式判定是否路径。
+/// None = 不是路径(误报防线)
+fn normalize_path_token(token: &str) -> Option<String> {
+    // 剥离 :N[:N] 定位后缀(仅当剩余部分像路径)
+    let mut path = token;
+    let mut num = 0;
+    while let Some(idx) = path.rfind(':') {
+        let tail = &path[idx + 1..];
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            path = &path[..idx];
+            num += 1;
+        } else {
+            break;
+        }
+    }
+    if path.is_empty() {
+        return None;
+    }
+    let slashes = path.matches(['/']).count() + path.matches(['\\']).count();
+    let looks_abs = {
+        let b = path.as_bytes();
+        b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
+    };
+    let rel_start = path.starts_with("./")
+        || path.starts_with("../")
+        || path.starts_with(".\\")
+        || path.starts_with("..\\")
+        || path.starts_with('/')
+        || path.starts_with('\\');
+    let has_ext = path.rsplit(['/', '\\']).next().is_some_and(|f| {
+        let f = f.rsplit_once('.');
+        f.is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && ext.len() <= 8)
+    });
+    // 单斜杠无扩展名(a/b)太弱不吃;多斜杠(嵌套目录)放行
+    let is_path = looks_abs || rel_start || has_ext || slashes >= 2;
+    if !is_path || slashes == 0 && !looks_abs && !rel_start {
+        return None; // 无任何分隔符的裸词
+    }
+    let _ = num;
+    Some(path.replace('/', "\\"))
 }
 
 fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
@@ -3876,7 +4563,7 @@ fn current_mods() -> Mods {
 
 #[cfg(test)]
 mod tests {
-    use super::pretty_title;
+    use super::{detect_path_token, normalize_path_token, pretty_title};
 
     /// 标题呈现:exe 路径 basename 去扩展(Ghostty direct-command argv[0]
     /// 的 Windows 适配);普通 OSC 标题原样(nvim / user@host:cwd)
@@ -3889,5 +4576,61 @@ mod tests {
         assert_eq!(pretty_title(r"C:\Windows\system32\cmd.exe"), "cmd");
         assert_eq!(pretty_title("nvim"), "nvim");
         assert_eq!(pretty_title("user@host: ~/mica"), "user@host: ~/mica");
+    }
+
+    /// #58 端到端检测回归网(2026-10-22 用户实报不能跳转,检测层定责)
+    #[test]
+    fn detect_path_token_e2e() {
+        let text = r"PS C:\x> echo C:\proj\src\main.rs:3:10";
+        let cell_of: Vec<usize> = (0..text.chars().count()).collect();
+        assert_eq!(
+            detect_path_token(text, cell_of.as_slice(), 20).as_deref(),
+            Some(r"C:\proj\src\main.rs")
+        );
+        assert_eq!(
+            detect_path_token(text, cell_of.as_slice(), 0),
+            None,
+            "提示符区无路径"
+        );
+        let text2 = "error: found at src/lib.rs:42:7 here";
+        let cell_of2: Vec<usize> = (0..text2.chars().count()).collect();
+        assert!(
+            detect_path_token(text2, cell_of2.as_slice(), 20).is_some(),
+            "rustc 风格"
+        );
+    }
+
+    /// #58 路径 token 判定:吃真路径、不吃纯词/时间戳/URL 前缀
+    #[test]
+    fn path_token_detection() {
+        // 真路径(绝对/相对/rustc 风格带行列)
+        assert_eq!(
+            normalize_path_token(r"C:\proj\src\main.rs:3:10"),
+            Some(r"C:\proj\src\main.rs".into())
+        );
+        assert_eq!(
+            normalize_path_token("src/main.rs:42"),
+            Some(r"src\main.rs".into())
+        );
+        assert_eq!(
+            normalize_path_token("./relative/file.txt"),
+            Some(r".\relative\file.txt".into())
+        );
+        assert_eq!(normalize_path_token("../up/dir"), Some(r"..\up\dir".into()));
+        assert_eq!(
+            normalize_path_token("/unix/abs/path"),
+            Some(r"\unix\abs\path".into())
+        );
+        // 误报防线:纯词 / 版本号 / 时间戳 / 单段文件名
+        assert_eq!(normalize_path_token("hello"), None);
+        assert_eq!(normalize_path_token("v1.2.3"), None);
+        assert_eq!(normalize_path_token("12:34:56"), None);
+        assert_eq!(
+            normalize_path_token("main.rs"),
+            None,
+            "无目录的单文件名不吃(太宽)"
+        );
+        assert_eq!(normalize_path_token("a/b"), None, "单斜杠无扩展名不吃");
+        assert_eq!(normalize_path_token("::"), None);
     }
 }

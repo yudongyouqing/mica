@@ -101,6 +101,10 @@ pub struct Settings {
     pub quick_terminal_key: Option<String>,
     /// 打字藏鼠标(Ghostty mouse-hide-while-typing,默认 true)。
     pub mouse_hide_while_typing: bool,
+    /// 选中即复制(Ghostty `copy-on-select`,默认 true):松开鼠标选区
+    /// 即入剪贴板;false = 只在显式 Ctrl+C/Ctrl+Insert 时复制(用户
+    /// 实报剪贴板历史出现双份:选区自动复制 + Ctrl+C 各写一条)
+    pub copy_on_select: bool,
     /// 锁定标题(Ghostty `title` 同义):设定时窗口/标签标题恒为此值,
     /// 程序发的 OSC 0/2 标题被忽略;空串 = 解除锁定回落 shell 标题。
     /// 想视觉隐藏标题写单空格(Ghostty 文档同法)。
@@ -116,6 +120,7 @@ impl Default for Settings {
             font_size_pt: DEFAULT_FONT_SIZE_PT,
             title: None,
             mouse_hide_while_typing: true,
+            copy_on_select: true,
             palette: Palette::DEFAULT,
             theme_name: None,
             keymap: Keymap::wt_default(),

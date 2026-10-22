@@ -6,6 +6,7 @@ license.workspace = true
 description = "Terminal core: screen state machine, pty, input encoding (no GUI deps)"
 
 [dependencies]
+base64 = { workspace = true }
 alacritty_terminal = { workspace = true }
 include_dir = { workspace = true }
 portable-pty = { workspace = true }
