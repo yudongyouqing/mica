@@ -188,6 +188,16 @@ fn strip_anim_step() -> bool {
     } else if t0 >= 0.0 {
         CAPS_T0.with(|t| t.set(-1.0));
     }
+    // 悬停反色动画:120ms ease-out,从下划线长到整块
+    if HOVER_PATH.with(|h| h.borrow().is_some()) {
+        let a = HOVER_ANIM.with(std::cell::Cell::get);
+        if a < 1.0 {
+            HOVER_ANIM.with(|a| a.set((a.get() + 0.015 / 0.120).min(1.0)));
+            busy = true;
+        }
+    } else {
+        HOVER_ANIM.with(|a| a.set(1.0)); // 不在路径上:无动画态
+    }
     // 邻位滑移:指数衰减(15ms 一拍 ×0.72 ≈ 105ms 收敛),全落定即停
     TAB_DX.with(|d| {
         let mut d = d.borrow_mut();
@@ -377,6 +387,9 @@ thread_local! {
     /// None = 光标不在路径上(WM_MOUSEMOVE 每次刷新,替代 300ms 气泡)
     static HOVER_PATH: RefCell<Option<(i32, usize, usize)>> =
         const { RefCell::new(None) };
+    /// #58 悬停反色动画相位(0 = 2px 下划线,1 = 整块):进入/换路径时
+    /// 归零,timer 5 推进(120ms ease-out)——"从下划线滑成整块"
+    static HOVER_ANIM: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
     /// strip 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的反馈
     /// (const 初始化用字面量——Default::default 不是 const fn)
     static HOVER_STRIP: std::cell::Cell<mica_render::frame::StripHover> = const {
@@ -2282,9 +2295,14 @@ fn draw_frame() {
                 && let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
             {
                 let hx = pr.x + col as f32 * t.metrics.cell_width;
-                let hy = pr.y + view as f32 * t.metrics.line_height;
+                let hy_full = pr.y + view as f32 * t.metrics.line_height;
                 let hw = cells as f32 * t.metrics.cell_width;
-                let hh = t.metrics.line_height;
+                let lh = t.metrics.line_height;
+                // 动画:相位 0 → 2px 底线,相位 1 → 整行;ease-out cubic
+                let a = HOVER_ANIM.with(std::cell::Cell::get);
+                let ease = 1.0 - (1.0 - a).powi(3);
+                let hh = 2.0 + (lh - 2.0) * ease;
+                let hy = hy_full + lh - hh; // 自底向上长
                 let bc = t.palette.colors[12];
                 let hl = [
                     bc.r as f32 / 255.0,
@@ -2877,6 +2895,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         false
                     }
                 });
+                if path_changed && path_span.is_some() {
+                    HOVER_ANIM.with(|a| a.set(0.0)); // 进入/换路径:下划线起步
+                    ensure_anim_timer();
+                }
                 if strip_changed || path_changed {
                     draw_frame();
                 }
