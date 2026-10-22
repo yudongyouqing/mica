@@ -20,7 +20,7 @@ use std::time::Duration;
 use notify::{Event, RecursiveMode, Watcher};
 
 use mica_core::config::palette::Palette;
-use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
+use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, MouseRightClick, Settings};
 use mica_core::input::{self, Key, Mods};
 use mica_core::ipc::IpcMessage;
 use mica_core::keymap::{Action, Keymap, TriggerKey};
@@ -54,7 +54,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ERASEBKGND, WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMOUSEMOVE, WM_PAINT,
-    WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_RBUTTONDOWN, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
@@ -307,6 +308,8 @@ thread_local! {
     /// 选中即复制(#58 同批:copy-on-select 配置键,false 时松开鼠标
     /// 不写剪贴板——修剪贴板历史双份)
     static COPY_ON_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// #80 右键行为(配置驱动;Paste = 粘贴剪贴板)
+    static RIGHT_CLICK_PASTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
     static MOUSE_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// keymap 消费了字母/数字键(ctrl+shift+t 等):TranslateMessage 生成
@@ -531,6 +534,7 @@ pub fn run() {
         TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
         MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
         COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+        RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
@@ -772,7 +776,15 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
                 MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
                 COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+                RIGHT_CLICK_PASTE
+                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                RIGHT_CLICK_PASTE
+                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
                 COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+                RIGHT_CLICK_PASTE
+                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                RIGHT_CLICK_PASTE
+                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
                 let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
                 let title = HSTRING::from("Mica");
                 // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
@@ -1217,6 +1229,7 @@ unsafe fn reload_config(hwnd: HWND) {
     TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
     MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
     COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+    RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
@@ -3057,6 +3070,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             });
             if had {
                 draw_frame();
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            // #80 mouse-right-click = paste:右键粘贴(选区存在先复制);
+            // 应用捕获鼠标时上报优先(与左/中键同序);strip 区不劫持
+            let (px, py) = mouse_xy(lparam);
+            if !RIGHT_CLICK_PASTE.with(std::cell::Cell::get)
+                || strip_hit(px, py).is_some()
+                || forward_mouse(px, py, 2, true, false)
+            {
+                return LRESULT(0);
+            }
+            if let Some(text) = clipboard::get_text() {
+                TABS.with(|tabs| {
+                    if let Some(t) = tabs
+                        .borrow_mut()
+                        .get_mut(ACTIVE.get())
+                        .and_then(|tab| tab.active_pane())
+                    {
+                        // 选区存在:先复制(选完右键的完整语义)
+                        if let Some(sel) = t.term.selection_text()
+                            && !sel.is_empty()
+                        {
+                            clipboard::set_text(&sel);
+                        }
+                        let normalized = clipboard::normalize_paste(&text);
+                        let bytes = if t.term.bracketed_paste_active() {
+                            let mut wrapped = b"[200~".to_vec();
+                            wrapped.extend_from_slice(normalized.as_bytes());
+                            wrapped.extend_from_slice(b"[201~");
+                            wrapped
+                        } else {
+                            normalized.into_bytes()
+                        };
+                        let _ = t.session.write(&bytes);
+                    }
+                });
             }
             LRESULT(0)
         }
