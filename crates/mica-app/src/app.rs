@@ -4030,12 +4030,20 @@ fn tab_follow_active() {
     }
 }
 
+/// 标签显示名(#81 导出文件名用):TITLE_LOCK 优先,回退标签自身标题
+fn tab_title_safe(tab: &TabState) -> String {
+    TITLE_LOCK
+        .with(|t| t.borrow().clone())
+        .unwrap_or_else(|| tab.title.clone())
+}
+
 /// 执行终端外语义动作。返回 true = 已消费(不再走 pty 编码)。
 /// 标签类动作待 T7 标签池落地(TODO 占位消费,防误发 pty 序列)。
 fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut need_draw = false;
     let mut restart = false; // 延迟执行(块内自借 TABS 会 panic——冒烟实证)
     let mut search_toggle = false; // #57:段外 toggle(不借 TABS)
+    let mut write_scrollback = false; // #81:段外写文件+打开(不走 TABS 双借)
     let mut new_tab = false;
     let mut new_window = false;
     let mut close_idx: Option<usize> = None;
@@ -4072,6 +4080,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 }
                 Action::RestartPane => restart = true, // 延迟:with 块内再借 TABS 会双借 panic
                 Action::SearchScrollback => search_toggle = !search_toggle,
+                Action::WriteScrollback => write_scrollback = true,
                 Action::NewWindow => new_window = true,
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
                     if t.term.jump_prompt(matches!(action, Action::JumpNextPrompt)) {
@@ -4122,6 +4131,62 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     // 标签操作段外执行:TABS 借用已还,switch/close/start 可自由再借
     if restart {
         restart_active_pane();
+    }
+    if write_scrollback {
+        // #81:回看导出——%TEMP%/mica-scrollback-{标题}-{时间戳}.log,
+        // UTF-8 写入 + 系统默认打开;失败只记日志
+        let (text, title) = TABS.with(|tabs| {
+            let guard = tabs.borrow();
+            guard
+                .get(ACTIVE.get())
+                .and_then(|tab| tab.active_pane_ref())
+                .map(|t| {
+                    (
+                        t.term.scrollback_text(),
+                        guard
+                            .get(ACTIVE.get())
+                            .map(tab_title_safe)
+                            .unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_default()
+        });
+        if !text.is_empty() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let safe: String = title
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || matches!(c, '-') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(24)
+                .collect();
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("mica-scrollback-{safe}-{ts}.log"));
+            match std::fs::write(&path, &text) {
+                Ok(()) => {
+                    let _ = path.to_str().map(|p| {
+                        unsafe {
+                            ShellExecuteW(
+                                None,
+                                windows::core::w!("open"),
+                                windows::core::PCWSTR(windows::core::HSTRING::from(p).as_ptr()),
+                                None,
+                                None,
+                                SW_SHOWNORMAL,
+                            )
+                        };
+                    });
+                }
+                Err(e) => eprintln!("[scrollback] 写出失败:{e}"),
+            }
+        }
     }
     if search_toggle {
         if SEARCH_OPEN.with(std::cell::Cell::take) {
