@@ -86,6 +86,13 @@ impl Default for StripCfg {
 }
 
 /// 合成产物:app 据此建 DwriteRouter 与 Palette,渲染与应答同源。
+/// #80 右键行为
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseRightClick {
+    None,
+    Paste,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     /// 回退链按序;重复 `font-family` 追加(D9 链语义)
@@ -101,6 +108,9 @@ pub struct Settings {
     pub quick_terminal_key: Option<String>,
     /// 打字藏鼠标(Ghostty mouse-hide-while-typing,默认 true)。
     pub mouse_hide_while_typing: bool,
+    /// 右键行为(#80):`none`(默认,无操作)/ `paste`(粘贴剪贴板,
+    /// 有选区先复制再粘贴——Linux 传统 + WT 可选,迁移用户肌肉记忆)
+    pub mouse_right_click: MouseRightClick,
     /// 选中即复制(Ghostty `copy-on-select`,默认 true):松开鼠标选区
     /// 即入剪贴板;false = 只在显式 Ctrl+C/Ctrl+Insert 时复制(用户
     /// 实报剪贴板历史出现双份:选区自动复制 + Ctrl+C 各写一条)
@@ -120,6 +130,7 @@ impl Default for Settings {
             font_size_pt: DEFAULT_FONT_SIZE_PT,
             title: None,
             mouse_hide_while_typing: true,
+            mouse_right_click: MouseRightClick::None,
             copy_on_select: true,
             palette: Palette::DEFAULT,
             theme_name: None,
