@@ -2285,6 +2285,40 @@ fn draw_frame() {
                 }
             }
         }
+        // #58 静态下划线:全部可见路径常显(用户裁定"有路径可点击的
+        // 都要下划线")——悬停块生长的起点与之重合,视觉无缝
+        {
+            let offset_s = t.term.display_offset() as i32;
+            let grid = t.term.grid();
+            let u_c = [
+                t.palette.colors[12].r,
+                t.palette.colors[12].g,
+                t.palette.colors[12].b,
+            ];
+            let u_cf = [
+                u_c[0] as f32 / 255.0,
+                u_c[1] as f32 / 255.0,
+                u_c[2] as f32 / 255.0,
+                0.0,
+            ];
+            if let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id) {
+                for view in 0..t.rows as i32 {
+                    let line = view - offset_s;
+                    let (text, cell_of) = mica_render::frame::row_string(grid, line);
+                    for (col, cells) in all_path_spans(&text, &cell_of) {
+                        let x = pr.x + col as f32 * t.metrics.cell_width;
+                        let y = pr.y + (view as f32 + 1.0) * t.metrics.line_height - 2.0;
+                        let w = cells as f32 * t.metrics.cell_width;
+                        search_overlay.push(mica_render::frame::CellInstance {
+                            pos_uv: [x, y, 0.0, 0.0],
+                            size_uv: [w, 2.0, 0.0, 0.0],
+                            fg: u_cf,
+                            bg: u_cf,
+                        });
+                    }
+                }
+            }
+        }
         // #58 悬停路径高亮(二版,用户点名"浅色转深色更清晰"):选中反色
         // 式——浅蓝底 + 深色字,与搜索当前命中(黄底黑字)同款形制。
         // 做法与搜索 hit_rects 相同:矩形相交的实例直接改色
@@ -4306,6 +4340,34 @@ fn search_key(vk: u32) -> bool {
 
 /// #58 光标处路径的渲染 span(buffer 行,列,格宽):与 link_at 同源
 /// 检测但带定位;None = 不在路径上。WM_MOUSEMOVE 每步调用
+/// #58 行内全部路径 span(静态下划线):token 遍历同构,收集所有
+/// 通过模式判定的 token 的 (col, cells)——可点击路径常显下划线
+fn all_path_spans(text: &str, cell_of: &[usize]) -> Vec<(usize, usize)> {
+    let bytes: Vec<char> = text.chars().collect();
+    let is_word = |c: char| {
+        c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+    };
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_word(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_word(bytes[i]) {
+            i += 1;
+        }
+        let token: String = bytes[start..i].iter().collect();
+        if normalize_path_token(&token).is_some() {
+            let c0 = *cell_of.get(start).unwrap_or(&start);
+            let c1 = *cell_of.get(i.saturating_sub(1)).unwrap_or(&start);
+            out.push((c0, c1.saturating_sub(c0) + 1));
+        }
+    }
+    out
+}
+
 fn hover_path_span(px: i32, py: i32) -> Option<(i32, usize, usize)> {
     let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
         (px as f32) >= r.x
