@@ -62,12 +62,15 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-10-03-m5-1.0-design.md` — M5 1.0 设计(打磨/健壮/发布三切片,D32-D37;砍单 tear-off/defterm 二级/官网/连字引擎/签名;验收=winget 可装+崩溃有档+IME 跟随+1.0 tag)。
 - `docs/superpowers/plans/2026-10-03-m5c-release.md` — M5c 计划(发布五件;UiaRootObjectId=-25 判据三轮实证、perf 25% 门禁偏差注记)。
 - `docs/superpowers/plans/2026-10-03-m5b-robustness.md` — M5b 计划(健壮五件;wgpu lost 双钩子/DbgHelp/try_wait/Ime/winres-manifest API 全核实;冒烟抓到 restart 双借真 bug——T1 崩溃档案首秀定位)。
-- 里程碑:M0→M4(✅)→ M5 1.0(tag v1.0.0)→ 1.1(tag v1.1.0)→ **1.2 发布完成(2026-10-22,tag v1.2.0)**:send-text IPC(`mica send`,tmux send-keys 同义)、启动优化(非关键初始化移首帧后,实测 -424ms)、滚动回看搜索(Ctrl+Shift+F,五版定档反色高亮)、裸路径可点击(Ctrl+Click+常显下划线+悬停生长反色)、粘贴双份修复(硬编码分支控制字节泄漏)、copy-on-select 配置键、asciinema 回放基准、依赖更新(actions/serde/pollster)。→ 票箱:**空**(#36 winget 用户关账:项目完善前不做)。
+- 里程碑:M0→M4(✅)→ M5 1.0(tag v1.0.0)→ 1.1(tag v1.1.0)→ 1.2(tag v1.2.0,send-text/启动优化 -424ms/回看搜索/路径点击/粘贴双份修复)→ **1.3 发布完成(2026-10-23,tag v1.3.0)**:透明度(Ctrl+Shift+O 两档+`background-opacity`)、窗口背景图(`background-image`,空白格混合)、右键粘贴(`mouse-right-click=paste`)、回看导出(Ctrl+Shift+S)、key-remap 修饰键重映射、`window-position`、重开最近关闭标签(Ctrl+Shift+Z)、`minimum-contrast`、标签改名与着色(rename_tab+OSC 1337);仓库转 Public(Actions 免费不限量+CI 止血三连:并发取消/msi+perf 仅主干与 tag/纯文档免跑)。→ 票箱:**空**(#36 winget 用户关账:项目完善前不做)。
 
 ## 当前边界(M3 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
 - 连字:Cascadia 系需 TextLayout 级引擎(analyzer+liga/calt 不触发),管线已备,probe 阴性自动回退——换引擎留 M3
 - OSC 52:管线单测全过,真机经 ConPTY 疑被拦截——tmux 环境复验后定案(M3 或关账)
+- 透明度(1.3):整窗 LWA_ALPHA 通道,文字同步半透明——per-pixel 背景透明(需 swapchain alpha+composition 模式)留后续增强
+- 背景图(1.3):blend:None 管线下只在空白格混图、有字形格保实色底——文字区透图需开 blend,留后续
+- 标签改名(1.3):入口为键绑定(默认无键,`keybind = …:rename_tab`),右键菜单基建未建(立项原设想,量级中等)
 - DECSET 2026:sidecar 检测→帧持有管线单测全绿,但 ConPTY 不透传 2026(2026-10-03 真机探针实证 feed 零命中;同路径 OSC 8 可透传,唯 2026 被消费——ConPTY 自带同步缓冲)——直连 pty 场景生效,ConPTY 场景由其自身机制兜底
 - sidecar 快筛(M4b/D29 备胎,已启用):候选前缀深跑 + carry/open_seq 跨块续命;基准测试 `sidecar_throughput_budget`(#ignored,release 跑)预算 5%
 - 启动清理孤儿 ConPTY 宿主(M5c):强杀终端必留 OpenConsole 孤儿,管道断裂后 busy-loop——2026-10-03 冒烟事故实证 13 个孤儿各烧满 1 核;启动时按"父进程已死"清杀(真开着的 WT 父进程活着不受影响),与 minidump 崩溃恢复成对
@@ -82,7 +85,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M5c 观察;QT 输入已对齐主窗契约(M5a 修双发)
 - IME(M5b 已实现跟随:组合/候选窗定光标格下缘)——**2026-10-04 用户手验通过**(中文输入正常、候选框跟随、不崩);旧 6/10 崩账定性为坏驱动栈时代伪影(1.0.8 后复测无恙)
 - OSC 4 全域正确(16-231 立方/232-255 灰阶,M5a 落);SGR 下划线族已渲染(M5a,此前从未画)
-- DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始定尺寸链路已实证正确(#38 关账,**混合 DPI 跨屏初始落位仍缩水,#41**);`mica --multi` 起隔离实例是 DPI/首窗类排查的标准工具
+- DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始定尺寸链路已实证正确(#38/#41 均关账——"跨屏缩水"是 DPI-unaware 进程的虚拟化测量假象;光标屏锚定落地,#52);`mica --multi` 起隔离实例是 DPI/首窗类排查的标准工具
 
 ## 提交规范
 
