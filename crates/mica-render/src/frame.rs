@@ -49,10 +49,12 @@ pub fn enforce_contrast(fg: [u8; 3], bg: [u8; 3], min: f32) -> [u8; 3] {
     if min <= 0.0 {
         return fg;
     }
+    // min 是 0..1 归一化(Ghostty 同义);WCAG 对比域 1..21 → 映射后比
+    let target = min * 21.0;
     let lb = rel_lum(bg);
     let lf = rel_lum(fg);
     let cur = (lf.max(lb) + 0.05) / (lf.min(lb) + 0.05);
-    if cur >= min {
+    if cur >= target {
         return fg;
     }
     let dark_bg = lb < 0.5;
@@ -60,7 +62,7 @@ pub fn enforce_contrast(fg: [u8; 3], bg: [u8; 3], min: f32) -> [u8; 3] {
     for _ in 0..24 {
         let l = rel_lum(out);
         let ratio = (l.max(lb) + 0.05) / (l.min(lb) + 0.05);
-        if ratio >= min {
+        if ratio >= target {
             break;
         }
         for ch in out.iter_mut() {
@@ -1420,7 +1422,7 @@ mod tests {
         let lum = rel_lum(dark_fg);
         let ratio =
             (lum.max(rel_lum([10, 10, 10])) + 0.05) / (lum.min(rel_lum([10, 10, 10])) + 0.05);
-        assert!(ratio >= 0.59, "深底深字推白后 ratio={ratio}");
+        assert!(ratio >= 12.0, "深底深字推白后 ratio={ratio}");
         // 白底白字(245 vs 250 真低对比):推黑
         let light_fg = enforce_contrast([245, 245, 245], [250, 250, 250], 0.6);
         assert!(rel_lum(light_fg) < 0.5, "白底白字推黑");
