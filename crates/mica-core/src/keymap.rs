@@ -126,6 +126,8 @@ pub enum Action {
     ToggleBackgroundOpacity,
     /// 重开最近关闭的标签(#88,LIFO):恢复 shell/目录/标题
     ReopenTab,
+    /// 重命名当前标签(#87):进入行内改名模式
+    RenameTab,
     /// OSC 133 jump(D37):跳上一个 prompt 行。
     JumpPrevPrompt,
     /// OSC 133 jump(D37):跳下一个 prompt 行;越过最新 = 回底部跟随。
@@ -392,6 +394,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "search_scrollback" => Some(Action::SearchScrollback),
         "toggle_background_opacity" => Some(Action::ToggleBackgroundOpacity),
         "reopen_tab" => Some(Action::ReopenTab),
+        "rename_tab" => Some(Action::RenameTab),
         "focus_left" => Some(Action::FocusNeighbor(Key::Left)),
         "focus_right" => Some(Action::FocusNeighbor(Key::Right)),
         "focus_up" => Some(Action::FocusNeighbor(Key::Up)),
