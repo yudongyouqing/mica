@@ -621,6 +621,19 @@ impl Surface {
         self.term.selection_to_string()
     }
 
+    /// #81 回看全文(历史 + 视口)导出:行拼接带换行,供 write_scrollback
+    /// 写文件用。上游 Term::bounds_to_string 覆盖全 buffer 坐标域即可
+    pub fn scrollback_text(&self) -> String {
+        let hist = self.term.grid().history_size() as i32;
+        let cols = self.term.grid().columns();
+        let top = Point::new(Line(-hist), Column(0));
+        let bottom = Point::new(
+            Line(self.term.grid().screen_lines() as i32 - 1),
+            Column(cols.saturating_sub(1)),
+        );
+        self.term.bounds_to_string(top, bottom)
+    }
+
     pub fn size(&self) -> ScreenSize {
         self.size
     }

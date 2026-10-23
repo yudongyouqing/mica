@@ -20,7 +20,7 @@ use std::time::Duration;
 use notify::{Event, RecursiveMode, Watcher};
 
 use mica_core::config::palette::Palette;
-use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, Settings};
+use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, MouseRightClick, Settings};
 use mica_core::input::{self, Key, Mods};
 use mica_core::ipc::IpcMessage;
 use mica_core::keymap::{Action, Keymap, TriggerKey};
@@ -54,7 +54,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ERASEBKGND, WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMOUSEMOVE, WM_PAINT,
-    WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_RBUTTONDOWN, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
@@ -256,6 +257,50 @@ fn cursor_workarea_origin() -> (i32, i32) {
     }
 }
 
+/// #78 整窗透明(WS_EX_LAYERED + LWA_ALPHA):true = 透明档(DIM),
+/// false = 不透明(摘 LAYERED,回到普通合成)。渲染管线零改动——
+/// DWM 在合成层打折;文字同步半透明是 v1 接受的差异(per-pixel
+/// composition swapchain 留后续增强)
+fn apply_window_alpha(hwnd: HWND, translucent: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongPtrW,
+        WS_EX_LAYERED,
+    };
+    // SAFETY: 样式位与分层属性读写;失败静默(老系统降级不透明)
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as usize;
+        if translucent {
+            let alpha = WINDOW_ALPHA_DIM.with(std::cell::Cell::get);
+            if style & WS_EX_LAYERED.0 as usize == 0 {
+                let _ = SetWindowLongPtrW(
+                    hwnd,
+                    GWL_EXSTYLE,
+                    (style | WS_EX_LAYERED.0 as usize) as isize,
+                );
+            }
+            let _ = SetLayeredWindowAttributes(
+                hwnd,
+                windows::Win32::Foundation::COLORREF(0),
+                alpha,
+                LWA_ALPHA,
+            );
+        } else if style & WS_EX_LAYERED.0 as usize != 0 {
+            let _ = SetWindowLongPtrW(
+                hwnd,
+                GWL_EXSTYLE,
+                (style & !(WS_EX_LAYERED.0 as usize)) as isize,
+            );
+            // 摘位前先恢复全不透明,避免窗口僵在半透明
+            let _ = SetLayeredWindowAttributes(
+                hwnd,
+                windows::Win32::Foundation::COLORREF(0),
+                255,
+                LWA_ALPHA,
+            );
+        }
+    }
+}
+
 /// WM_APP 用户消息区(0x8000 起):
 /// +1 = WM_APP_RENDER(T7,pty 转发线程唤醒渲染);+2 = WM_APP_CONFIG(T5,热重载)
 const WM_APP_RENDER: u32 = 0x8000 + 1;
@@ -307,6 +352,25 @@ thread_local! {
     /// 选中即复制(#58 同批:copy-on-select 配置键,false 时松开鼠标
     /// 不写剪贴板——修剪贴板历史双份)
     static COPY_ON_SELECT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// #80 右键行为(配置驱动;Paste = 粘贴剪贴板)
+    static RIGHT_CLICK_PASTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #79 修饰键重映射表(encode 前应用;动作判定不受影响)
+    static KEY_REMAP: RefCell<Vec<mica_core::keymap::KeyRemap>> =
+        const { RefCell::new(Vec::new()) };
+    /// #78 透明度档位:true = 透明档(background_opacity),false = 不透明
+    static WINDOW_TRANSLUCENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// #77 背景图路径(热重载即时换图;Some(path))
+    static BG_IMG_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// #88 关闭标签历史(LIFO,容量 8):重开恢复 shell/cwd/标题
+    static CLOSED_TABS: RefCell<Vec<ClosedTab>> = const { RefCell::new(Vec::new()) };
+    /// #87 标签自定义色(idx→RGB,空白=无色);OSC 1337 与右键通道写
+    static TAB_COLORS: RefCell<Vec<[u8; 3]>> = const { RefCell::new(Vec::new()) };
+    /// #87 重命名模式(键入进查询替换标签标题,Enter 确认/Esc 取消)
+    static RENAME_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RENAME_QUERY: RefCell<String> = const { RefCell::new(String::new()) };
+    static RENAME_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// #78 配置的透明档 alpha(255.0*background_opacity;1.0 = 未配置→0.85 默认)
+    static WINDOW_ALPHA_DIM: std::cell::Cell<u8> = const { std::cell::Cell::new(217) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
     static MOUSE_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// keymap 消费了字母/数字键(ctrl+shift+t 等):TranslateMessage 生成
@@ -461,10 +525,21 @@ struct Terminal {
     force_full: bool,
 }
 
+/// #88 关闭标签的恢复元数据(首个 pane;多 pane 标签重开为单 pane——
+/// 布局树不保真,浏览器同款取舍)
+struct ClosedTab {
+    shell: String,
+    cwd: Option<String>,
+    title: String,
+    color: Option<[u8; 3]>,
+}
+
 /// 标签池条目:pane 池 + 布局树 + 池簿记(T7 分屏)。
 struct TabState {
     /// OSC 0 标题(strip 显示;shell 未设时用占位)
     title: String,
+    /// #87 自定义色(标签顶部 2px 色条;None = 无)
+    color: Option<[u8; 3]>,
     /// 后台标签有未渲染数据(D18:feed 照跑,渲染跳过)
     dirty: bool,
     panes: Vec<PaneState>,
@@ -531,17 +606,33 @@ pub fn run() {
         TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
         MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
         COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+        RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+        KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
+        let dim = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+            217 // 未配置:0.85 默认档
+        } else {
+            (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
+        };
+        BG_IMG_PATH.with(|b| *b.borrow_mut() = settings.background_image.clone());
+        WINDOW_ALPHA_DIM.with(|a| a.set(dim));
+        if (settings.background_opacity - 1.0).abs() >= f32::EPSILON {
+            // 配置即透明:标记进透明档(窗口建成后再 apply,见 ShowWindow 后)
+            WINDOW_TRANSLUCENT.with(|t| t.set(true));
+        }
         // 光标闪烁(D20):默认不闪;cursor-blink = true 时窗口创建后开定时器
         CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
         // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
         // 乘 DPI_SCALE——三者顺序曾为 router→窗口→播种,单 150% 屏(无
         // WM_DPICHANGED)字体永远 ×1.0 而 strip ×1.5,比例崩坏
         // (2026-10-06 用户实测);精确网格尺寸在播种后 SetWindowPos 定。
-        // 落位锚定光标所在屏(#41):CW_USEDEFAULT 在混合 DPI 双屏可能
-        // 落在边界另一侧,窗口长大后 majority 跨屏被重派 → WM_DPICHANGED
-        // 按建议矩形缩水(1462→975,逻辑尺寸保持物理变小)。锚定光标屏
-        // 后创建→播种→定尺寸全程同屏,不再触发重派
-        let (wx, wy) = cursor_workarea_origin();
+        // 落位优先级(#89):window-position 配置 > 光标屏锚定(#41)。
+        // 锚定原因:CW_USEDEFAULT 在混合 DPI 双屏可能落在边界另一侧,
+        // 窗口长大后 majority 跨屏被重派 → WM_DPICHANGED 按建议矩形
+        // 缩水(1462→975 实证);锚定光标屏后创建→播种→定尺寸全程同屏。
+        // 配置位直接信任用户坐标(多屏自由摆)
+        let (wx, wy) = settings
+            .window_position
+            .unwrap_or_else(cursor_workarea_origin);
         let class_name = HSTRING::from("mica_app_class"); // Param<PCWSTR> 的已证实实现
         let title = HSTRING::from("Mica");
         let hwnd = CreateWindowExW(
@@ -772,7 +863,15 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
                 MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
                 COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
-                COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+                RIGHT_CLICK_PASTE
+                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+                KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
+                let dim = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+                    217
+                } else {
+                    (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
+                };
+                WINDOW_ALPHA_DIM.with(|a| a.set(dim));
                 let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
                 let title = HSTRING::from("Mica");
                 // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
@@ -1217,7 +1316,41 @@ unsafe fn reload_config(hwnd: HWND) {
     TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
     MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
     COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+    RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+    KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
+    let dim = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+        217
+    } else {
+        (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
+    };
+    WINDOW_ALPHA_DIM.with(|a| a.set(dim));
+    // 热重载改透明度:立即生效
+    if (settings.background_opacity - 1.0).abs() >= f32::EPSILON {
+        WINDOW_TRANSLUCENT.with(|t| t.set(true));
+        apply_window_alpha(hwnd, true);
+    } else if WINDOW_TRANSLUCENT.with(std::cell::Cell::get) {
+        // 改回 1.0:若处于透明档(配置进的,非 toggle),回不透明
+        WINDOW_TRANSLUCENT.with(|t| t.set(false));
+        apply_window_alpha(hwnd, false);
+    }
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+    BG_IMG_PATH.with(|b| *b.borrow_mut() = settings.background_image.clone());
+    GPU.with(|g| {
+        if let Some(gpu) = g.borrow_mut().as_mut() {
+            let path = settings
+                .background_image
+                .as_deref()
+                .map(std::path::Path::new);
+            let alpha = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+                0.9
+            } else {
+                settings.background_opacity
+            };
+            if let Err(e) = gpu.renderer.set_background_image(path, alpha) {
+                eprintln!("[bg] {e}");
+            }
+        }
+    });
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
     // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
@@ -1795,6 +1928,7 @@ unsafe fn start_tab_with_shell(
     let pane_id = pane.id;
     let tab = TabState {
         title,
+        color: None,
         dirty: false,
         panes: vec![pane],
         layout: mica_core::layout::Layout::leaf(pane_id),
@@ -2242,10 +2376,21 @@ fn draw_frame() {
                     t.metrics.line_height + 4.0,
                     bar_bg,
                 ));
-                let q = SEARCH_QUERY.with(|q| q.borrow().clone());
-                let mut label = format!("/{}", q);
-                if q.is_empty() {
+                let rename = RENAME_OPEN.with(std::cell::Cell::get);
+                let q = if rename {
+                    RENAME_QUERY.with(|q| q.borrow().clone())
+                } else {
+                    SEARCH_QUERY.with(|q| q.borrow().clone())
+                };
+                let mut label = if rename {
+                    format!("rename: {}", q)
+                } else {
+                    format!("/{}", q)
+                };
+                if !rename && q.is_empty() {
                     label = "/(输入以搜索)".into();
+                } else if rename && q.is_empty() {
+                    label = "rename: (输入新标题)".into()
                 } else {
                     label.push_str(&format!(
                         "  {}/{}",
@@ -2316,6 +2461,32 @@ fn draw_frame() {
                             bg: u_cf,
                         });
                     }
+                }
+            }
+        }
+        // #87 标签色条(标签顶 2px):自定义色标签一眼区分
+        {
+            let colors = TAB_COLORS.with(|c| c.borrow().clone());
+            let sm2 = strip_metrics();
+            let w_tab = mica_render::frame::equal_tab_w(titles.len(), area_w, &sm2);
+            let shift_r = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm2.tab_min_w;
+            for (i, c) in colors.iter().enumerate() {
+                let x0 =
+                    mica_render::frame::tabs_x0(&sm2) + i as f32 * (w_tab + sm2.tab_gap) - shift_r;
+                let x1 = x0 + w_tab;
+                if x1 > 0.0 && x0 < area_w {
+                    let cf = [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        0.0,
+                    ];
+                    search_overlay.push(mica_render::frame::CellInstance {
+                        pos_uv: [x0.max(0.0), sm2.title_h + 2.0 * sm2.k, 0.0, 0.0],
+                        size_uv: [(x1 - x0).min(area_w - x0.max(0.0)), 2.0, 0.0, 0.0],
+                        fg: cf,
+                        bg: cf,
+                    });
                 }
             }
         }
@@ -2425,6 +2596,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             hide_cursor_if_typing();
             // #57 搜索态字符全吞(查询/跳转/关闭),不进 pty
             if search_char((wparam.0 as u32).try_into().unwrap_or(' ')) {
+                return LRESULT(0);
+            }
+            // #87 重命名态字符全吞(查询进新名,不进 pty)
+            if rename_char((wparam.0 as u32).try_into().unwrap_or(' ')) {
                 return LRESULT(0);
             }
             // keymap 已消费该键(如 Ctrl+Shift+T):TranslateMessage 的控制
@@ -2592,8 +2767,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             mica_core::protocol::kitty::EventKind::Press
                         };
                         if let Some(key) = vk_to_key(vk)
-                            && let Some(bytes) =
-                                mica_core::protocol::kitty::kitty_encode(key, mods, kind, flags)
+                            && let Some(bytes) = mica_core::protocol::kitty::kitty_encode(
+                                key,
+                                remap_mods(mods),
+                                kind,
+                                flags,
+                            )
                         {
                             let _ = t.session.write(&bytes);
                             return;
@@ -3057,6 +3236,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             });
             if had {
                 draw_frame();
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            // #80 mouse-right-click = paste:右键粘贴(选区存在先复制);
+            // 应用捕获鼠标时上报优先(与左/中键同序);strip 区不劫持
+            let (px, py) = mouse_xy(lparam);
+            if !RIGHT_CLICK_PASTE.with(std::cell::Cell::get)
+                || strip_hit(px, py).is_some()
+                || forward_mouse(px, py, 2, true, false)
+            {
+                return LRESULT(0);
+            }
+            if let Some(text) = clipboard::get_text() {
+                TABS.with(|tabs| {
+                    if let Some(t) = tabs
+                        .borrow_mut()
+                        .get_mut(ACTIVE.get())
+                        .and_then(|tab| tab.active_pane())
+                    {
+                        // 选区存在:先复制(选完右键的完整语义)
+                        if let Some(sel) = t.term.selection_text()
+                            && !sel.is_empty()
+                        {
+                            clipboard::set_text(&sel);
+                        }
+                        let normalized = clipboard::normalize_paste(&text);
+                        let bytes = if t.term.bracketed_paste_active() {
+                            let mut wrapped = b"[200~".to_vec();
+                            wrapped.extend_from_slice(normalized.as_bytes());
+                            wrapped.extend_from_slice(b"[201~");
+                            wrapped
+                        } else {
+                            normalized.into_bytes()
+                        };
+                        let _ = t.session.write(&bytes);
+                    }
+                });
             }
             LRESULT(0)
         }
@@ -3749,6 +3966,29 @@ fn close_tab(idx: usize) {
         // 实报"关窗未响应"的主挂点)。forget 换即时关窗;pty 子进程成孤儿
         // 由启动期孤儿清杀闭环(M5c/T1)兜底。
         let mut removed = guard.remove(idx);
+        // #88 历史入栈(容量 8 淘最旧;guard 活着但 removed 已独占所有权)
+        {
+            let first = removed.panes.first().map(|p| {
+                (
+                    p.terminal.shell.clone(),
+                    p.terminal.term.cwd().map(str::to_string),
+                )
+            });
+            if let Some((shell, cwd)) = first {
+                CLOSED_TABS.with(|h| {
+                    let mut hist = h.borrow_mut();
+                    if hist.len() >= 8 {
+                        hist.remove(0);
+                    }
+                    hist.push(ClosedTab {
+                        shell,
+                        cwd,
+                        title: removed.title.clone(),
+                        color: removed.color,
+                    });
+                });
+            }
+        }
         for pane in removed.panes.iter_mut() {
             pane.terminal.session.kill_child(); // 泄漏前杀子(防 defterm 弹窗,见 pty.rs)
         }
@@ -3979,12 +4219,23 @@ fn tab_follow_active() {
     }
 }
 
+/// 标签显示名(#81 导出文件名用):TITLE_LOCK 优先,回退标签自身标题
+fn tab_title_safe(tab: &TabState) -> String {
+    TITLE_LOCK
+        .with(|t| t.borrow().clone())
+        .unwrap_or_else(|| tab.title.clone())
+}
+
 /// 执行终端外语义动作。返回 true = 已消费(不再走 pty 编码)。
 /// 标签类动作待 T7 标签池落地(TODO 占位消费,防误发 pty 序列)。
 fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut need_draw = false;
     let mut restart = false; // 延迟执行(块内自借 TABS 会 panic——冒烟实证)
     let mut search_toggle = false; // #57:段外 toggle(不借 TABS)
+    let mut write_scrollback = false; // #81:段外写文件+打开(不走 TABS 双借)
+    let mut toggle_opacity = false; // #78:段外切档(需要 hwnd)
+    let mut reopen_tab = false; // #88:段外重开(需要 hwnd)
+    let mut rename_tab = false; // #87:段外开改名模式
     let mut new_tab = false;
     let mut new_window = false;
     let mut close_idx: Option<usize> = None;
@@ -4021,6 +4272,10 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 }
                 Action::RestartPane => restart = true, // 延迟:with 块内再借 TABS 会双借 panic
                 Action::SearchScrollback => search_toggle = !search_toggle,
+                Action::ToggleBackgroundOpacity => toggle_opacity = true,
+                Action::ReopenTab => reopen_tab = true,
+                Action::RenameTab => rename_tab = true,
+                Action::WriteScrollback => write_scrollback = true,
                 Action::NewWindow => new_window = true,
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
                     if t.term.jump_prompt(matches!(action, Action::JumpNextPrompt)) {
@@ -4071,6 +4326,104 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     // 标签操作段外执行:TABS 借用已还,switch/close/start 可自由再借
     if restart {
         restart_active_pane();
+    }
+    if reopen_tab {
+        // #88 LIFO 重开:shell/cwd/标题恢复(标题先 pop 再由 OSC 0 接管
+        // 或保持;此处设为关闭时的标题,体验即"那个标签回来了")
+        let snapshot = CLOSED_TABS.with(|h| h.borrow_mut().pop());
+        let Some(ct) = snapshot else {
+            return true;
+        };
+        // SAFETY: 段外(TABS 借用已还),create/forwarder 与既有路径同款
+        unsafe {
+            let (pane, reader) =
+                match create_pane_with_size(hwnd, &ct.shell, None, ct.cwd.as_deref()) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn_box(&e);
+                        return true;
+                    }
+                };
+            let pane_id = pane.id;
+            let tab = TabState {
+                title: ct.title,
+                color: ct.color,
+                dirty: false,
+                panes: vec![pane],
+                layout: mica_core::layout::Layout::leaf(pane_id),
+                focused: 0,
+            };
+            let pty_buf = Arc::clone(&tab.panes[0].terminal.pty_buf);
+            TABS.with(|tabs| tabs.borrow_mut().push(tab));
+            ACTIVE.with(|a| a.set(TABS.with(|tabs| tabs.borrow().len() - 1)));
+            TAB_COUNT.with(|c| c.set(TABS.with(|tabs| tabs.borrow().len())));
+            tab_follow_active();
+            if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
+                spawn_render_forwarder(reader, pty_buf, slot, pane_id);
+            }
+            draw_frame();
+        }
+    }
+    if toggle_opacity {
+        // #78 两档切换:replace 返回旧档,to_translucent = 翻转后的新档
+        let to_translucent = !WINDOW_TRANSLUCENT.with(|t| t.replace(false));
+        apply_window_alpha(hwnd, to_translucent);
+    }
+    if write_scrollback {
+        // #81:回看导出——%TEMP%/mica-scrollback-{标题}-{时间戳}.log,
+        // UTF-8 写入 + 系统默认打开;失败只记日志
+        let (text, title) = TABS.with(|tabs| {
+            let guard = tabs.borrow();
+            guard
+                .get(ACTIVE.get())
+                .and_then(|tab| tab.active_pane_ref())
+                .map(|t| {
+                    (
+                        t.term.scrollback_text(),
+                        guard
+                            .get(ACTIVE.get())
+                            .map(tab_title_safe)
+                            .unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_default()
+        });
+        if !text.is_empty() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let safe: String = title
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || matches!(c, '-') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(24)
+                .collect();
+            let dir = std::env::temp_dir();
+            let path = dir.join(format!("mica-scrollback-{safe}-{ts}.log"));
+            match std::fs::write(&path, &text) {
+                Ok(()) => {
+                    let _ = path.to_str().map(|p| {
+                        unsafe {
+                            ShellExecuteW(
+                                None,
+                                windows::core::w!("open"),
+                                windows::core::PCWSTR(windows::core::HSTRING::from(p).as_ptr()),
+                                None,
+                                None,
+                                SW_SHOWNORMAL,
+                            )
+                        };
+                    });
+                }
+                Err(e) => eprintln!("[scrollback] 写出失败:{e}"),
+            }
+        }
     }
     if search_toggle {
         if SEARCH_OPEN.with(std::cell::Cell::take) {
@@ -4322,6 +4675,46 @@ fn search_char(ch: char) -> bool {
     true
 }
 
+/// #87 重命名态 WM_CHAR 拦截:同搜索条(Enter 确认/Esc 关/退格/可打印)
+fn rename_char(ch: char) -> bool {
+    if !RENAME_OPEN.with(std::cell::Cell::get) {
+        return false;
+    }
+    match ch {
+        '\r' => {
+            let name = RENAME_QUERY.with(|q| q.borrow().clone());
+            let idx = RENAME_IDX.with(std::cell::Cell::get);
+            TABS.with(|tabs| {
+                if let Some(tab) = tabs.borrow_mut().get_mut(idx)
+                    && !name.trim().is_empty()
+                {
+                    tab.title = name;
+                }
+            });
+            RENAME_OPEN.with(|o| o.set(false));
+            draw_frame();
+        }
+        '\x1b' => {
+            RENAME_OPEN.with(|o| o.set(false));
+            draw_frame();
+        }
+        '\u{8}' => {
+            RENAME_QUERY.with(|q| {
+                q.borrow_mut().pop();
+            });
+            draw_frame();
+        }
+        c if (c as u32) >= 0x20 => {
+            RENAME_QUERY.with(|q| {
+                q.borrow_mut().push(c);
+            });
+            draw_frame();
+        }
+        _ => {}
+    }
+    true
+}
+
 /// #57 WM_KEYDOWN 的搜索态拦截:Up/Down = 命中步进;消费返回 true
 fn search_key(vk: u32) -> bool {
     if !SEARCH_OPEN.with(std::cell::Cell::get) {
@@ -4534,6 +4927,8 @@ fn normalize_path_token(token: &str) -> Option<String> {
 }
 
 fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
+    // #79 key-remap:encode 前转换修饰(动作判定已在上游完成)
+    let mods = remap_mods(mods);
     let key = match VIRTUAL_KEY(vk as u16) {
         VK_UP => Key::Up,
         VK_DOWN => Key::Down,
@@ -4547,6 +4942,11 @@ fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(input::encode(key, mods, app_cursor))
+}
+
+/// #79 应用 key-remap 表(链式:逐条翻转修饰位)
+fn remap_mods(mods: Mods) -> Mods {
+    KEY_REMAP.with(|r| r.borrow().iter().fold(mods, |m, rm| rm.apply(m)))
 }
 
 fn current_mods() -> Mods {

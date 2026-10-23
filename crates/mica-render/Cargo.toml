@@ -6,6 +6,7 @@ license.workspace = true
 description = "Grid-to-GPU renderer: atlas, color resolve, wgpu pipeline"
 
 [dependencies]
+image = { workspace = true }
 mica-core = { path = "../mica-core" }
 alacritty_terminal = { workspace = true }
 wgpu = { workspace = true }

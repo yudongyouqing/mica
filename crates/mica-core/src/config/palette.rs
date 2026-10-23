@@ -6,13 +6,16 @@
 
 use alacritty_terminal::vte::ansi::Rgb;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Palette {
     /// 索引 0-15,与 xterm 色序对齐(black/red/…/bright white)。
     pub colors: [Rgb; 16],
     pub fg: Rgb,
     pub bg: Rgb,
     pub cursor: Rgb,
+    /// #90 最小对比度阈值(0=关;非配置键——Settings 合成时由
+    /// minimum-contrast 写入,渲染着色层消费)
+    pub minimum_contrast: f32,
     /// 选区配色(spec §5):主题库 630 个文件全带 selection-* 键,
     /// M1 忽略、M2a 接上。
     pub selection_fg: Rgb,
@@ -129,6 +132,7 @@ impl Palette {
             g: 0xff,
             b: 0xff,
         },
+        minimum_contrast: 0.0,
         selection_fg: Rgb {
             r: 0x28,
             g: 0x2c,

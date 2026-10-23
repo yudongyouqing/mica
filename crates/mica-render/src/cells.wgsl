@@ -16,10 +16,16 @@ struct Globals {
     /// 图集纹理尺寸(纹素)——UV 归一在 shader 做:实例存纹素坐标,
     /// 高度追加(页式增长)不改变既有条目的采样位置(2026-10-08)
     atlas_size: vec2f,
+    /// #77 背景图:alpha 1 = 启用,alpha 0 = 禁用;xy = 图像像素尺寸
+    /// (cover 平铺采样归一在 shader 做)
+    bg_alpha_size: vec4f,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var glyphs: texture_2d<f32>;
 @group(0) @binding(2) var glyph_sampler: sampler;
+// #77 背景图(binding 3/4 + 语义开关 bg_enabled;无图时 zero view 占位)
+@group(0) @binding(3) var bg_image: texture_2d<f32>;
+@group(0) @binding(4) var bg_sampler: sampler;
 
 struct VsOut {
     @builtin(position) pos: vec4f,
@@ -75,6 +81,14 @@ fn rounded_coverage(local: vec2f, size_px: vec2f, r_top: f32, r_bot: f32) -> f32
 // 实例对彩色字形 fg 填白即得原色——一条公式覆盖两种格式。
 @fragment
 fn fs(inp: VsOut) -> @location(0) vec4f {
+    // #77 背景图采样:空白 quad(bg==fg 同色)的底换图采样(cover
+    // 平铺——短边贴满,长边裁切;采样坐标 = 像素坐标)。有字形/圆角的
+    // quad 不混合图(其 bg 已是实色,与图叠加会双重压字)——图只在
+    // 空白格"透出"
+    if (globals.bg_alpha_size.x > 0.5 && inp.ink_mask < 0.5 && inp.geo.z == 0.0 && inp.geo.w == 0.0) {
+        let bgc = textureSample(bg_image, bg_sampler, bg_uv(inp.pos.xy));
+        return vec4f(mix(inp.bg, bgc.rgb, globals.bg_alpha_size.x), 1.0);
+    }
     if (inp.geo.z > 0.0 || inp.geo.w > 0.0) {
         // fg.w < 0 哨兵 = 未知底衬(悬浮层):圆角外硬 discard——premix AA
         // 无从谈起,小半径硬边可接受;半径取 bg.w(上下同值)
@@ -90,4 +104,16 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
     let tex = textureSample(glyphs, glyph_sampler, inp.uv);
     let ink = tex.a * inp.ink_mask;
     return vec4f(mix(inp.bg, tex.rgb * inp.fg, ink), 1.0);
+}
+
+// #77 cover 平铺:屏幕像素坐标 → 图 UV。短边贴满视口,长边按比例
+// 裁切居中;图小于视口时自然重复地址(采样器 repeat)
+fn bg_uv(px: vec2f) -> vec2f {
+    let vp = globals.viewport;
+    let img = globals.bg_alpha_size.yz;
+    let scale = max(vp.x / img.x, vp.y / img.y); // cover:取大覆盖
+    let scaled = img * scale;
+    let over = (scaled - vp) / 2.0; // 居中裁切量
+    let img_px = px + over; // 视口坐标 → 图内像素坐标
+    return img_px / scaled;
 }

@@ -3,6 +3,73 @@
 
 use crate::input::{Key, Mods};
 
+/// #79 应用层修饰键重映射(RemapKey → Mods 修饰位):encode 前转换,
+/// keymap 动作判定不受影响(动作看原始修饰)。
+/// `key-remap = ctrl=super` 语义:物理 Ctrl 按下时,发给 pty 的编码
+/// 带 Super 位而非 Ctrl 位
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyRemap {
+    /// 源修饰(按下的)
+    pub from: RemapMod,
+    /// 目标修饰(编码进 pty 的)
+    pub to: RemapMod,
+}
+
+/// 可重映射的修饰位(Win 键在 Windows 消息里不是独立 VK 修饰,以
+/// mods.win 标志承载;M3b 同款)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemapMod {
+    Shift,
+    Alt,
+    Ctrl,
+    Win,
+}
+
+impl RemapMod {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "shift" => Some(Self::Shift),
+            "alt" | "option" => Some(Self::Alt),
+            "ctrl" | "control" => Some(Self::Ctrl),
+            "win" | "super" | "cmd" | "meta" => Some(Self::Win),
+            _ => None,
+        }
+    }
+}
+
+impl KeyRemap {
+    /// 应用重映射:输入 Mods → 输出编码用 Mods(重映射源/目标翻转)
+    pub fn apply(&self, mods: Mods) -> Mods {
+        let get = |m: Mods, r: RemapMod| match r {
+            RemapMod::Shift => m.shift,
+            RemapMod::Alt => m.alt,
+            RemapMod::Ctrl => m.ctrl,
+            RemapMod::Win => m.win,
+        };
+        let set = |m: &mut Mods, r: RemapMod, v: bool| match r {
+            RemapMod::Shift => m.shift = v,
+            RemapMod::Alt => m.alt = v,
+            RemapMod::Ctrl => m.ctrl = v,
+            RemapMod::Win => m.win = v,
+        };
+        let from_down = get(mods, self.from);
+        let to_down = get(mods, self.to);
+        let mut out = mods;
+        set(&mut out, self.from, to_down);
+        set(&mut out, self.to, from_down);
+        out
+    }
+
+    /// 解析单条 `a=b`(from=to)
+    pub fn parse_pair(s: &str) -> Option<Self> {
+        let (from, to) = s.split_once('=')?;
+        Some(Self {
+            from: RemapMod::parse(from)?,
+            to: RemapMod::parse(to)?,
+        })
+    }
+}
+
 /// 触发键:导航/编辑键用现成 Key,字母/数字是 KEYDOWN 的 VK 空间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TriggerKey {
@@ -51,8 +118,16 @@ pub enum Action {
     FocusNeighbor(Key),
     /// 重开 pane(M5b/T3):同 shell 新会话,退出态清零。
     RestartPane,
+    /// 回看导出(#81):全 buffer 写 %TEMP% 文件并系统默认打开
+    WriteScrollback,
     /// 滚动回看搜索(#57):开/关注入式搜索模式(窗口级,非 pane 级)
     SearchScrollback,
+    /// 透明度切换(#78):1.0 ↔ background-opacity(默认 0.85)两档
+    ToggleBackgroundOpacity,
+    /// 重开最近关闭的标签(#88,LIFO):恢复 shell/目录/标题
+    ReopenTab,
+    /// 重命名当前标签(#87):进入行内改名模式
+    RenameTab,
     /// OSC 133 jump(D37):跳上一个 prompt 行。
     JumpPrevPrompt,
     /// OSC 133 jump(D37):跳下一个 prompt 行;越过最新 = 回底部跟随。
@@ -156,6 +231,24 @@ impl Keymap {
             m(true, true, false),
             TriggerKey::Letter('R'),
             Action::RestartPane,
+        );
+        // #81:回看导出(与搜索同族:搜到→导出深挖)
+        push(
+            m(true, true, false),
+            TriggerKey::Letter('S'),
+            Action::WriteScrollback,
+        );
+        // #88:重开最近关闭的标签(浏览器 Ctrl+Shift+Z 肌肉记忆)
+        push(
+            m(true, true, false),
+            TriggerKey::Letter('Z'),
+            Action::ReopenTab,
+        );
+        // #78:透明度切换(默认 Ctrl+Shift+O)
+        push(
+            m(true, true, false),
+            TriggerKey::Letter('O'),
+            Action::ToggleBackgroundOpacity,
         );
         // #57:回看搜索(浏览器查找直觉同款键位)
         push(
@@ -297,7 +390,11 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "split_down" => Some(Action::SplitDown),
         "close_pane" => Some(Action::ClosePane),
         "restart_pane" => Some(Action::RestartPane),
+        "write_scrollback" => Some(Action::WriteScrollback),
         "search_scrollback" => Some(Action::SearchScrollback),
+        "toggle_background_opacity" => Some(Action::ToggleBackgroundOpacity),
+        "reopen_tab" => Some(Action::ReopenTab),
+        "rename_tab" => Some(Action::RenameTab),
         "focus_left" => Some(Action::FocusNeighbor(Key::Left)),
         "focus_right" => Some(Action::FocusNeighbor(Key::Right)),
         "focus_up" => Some(Action::FocusNeighbor(Key::Up)),
@@ -314,6 +411,37 @@ pub fn parse_action(s: &str) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #79 重映射语义:交换语义(源↔目标),无源修饰时目标清位
+    #[test]
+    fn key_remap_swaps_mods() {
+        let ctrl_super = KeyRemap::parse_pair("ctrl=super").unwrap();
+        let base = Mods {
+            shift: false,
+            alt: false,
+            ctrl: true,
+            win: false,
+        };
+        let out = ctrl_super.apply(base);
+        assert!(!out.ctrl && out.win, "ctrl→win(物理 ctrl 编码为 super)");
+        let back = ctrl_super.apply(Mods {
+            shift: false,
+            alt: false,
+            ctrl: false,
+            win: true,
+        });
+        assert!(back.ctrl && !back.win, "物理 win → 编码 ctrl");
+        let none = ctrl_super.apply(Mods {
+            shift: false,
+            alt: false,
+            ctrl: false,
+            win: false,
+        });
+        assert!(!none.ctrl && !none.win, "都没按:不变");
+        assert!(KeyRemap::parse_pair("alt=meta").is_some(), "别名");
+        assert!(KeyRemap::parse_pair("bad=x").is_none());
+        assert!(KeyRemap::parse_pair("noeq").is_none());
+    }
 
     #[test]
     fn wt_default_covers_core_combos() {
