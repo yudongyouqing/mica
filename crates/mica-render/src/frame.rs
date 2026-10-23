@@ -30,6 +30,52 @@ pub struct CellInstance {
     pub bg: [f32; 4],
 }
 
+/// #90 WCAG 相对亮度(sRGB 简化线性化)
+fn rel_lum(rgb: [u8; 3]) -> f32 {
+    let c = |v: u8| {
+        let s = f32::from(v) / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * c(rgb[0]) + 0.7152 * c(rgb[1]) + 0.0722 * c(rgb[2])
+}
+
+/// #90 最小对比度强制:对比低于 min 时把 fg 推向白或黑(朝更远的极端
+/// 逐通道夹逼,24 步收敛;纯函数可 TDD)
+pub fn enforce_contrast(fg: [u8; 3], bg: [u8; 3], min: f32) -> [u8; 3] {
+    if min <= 0.0 {
+        return fg;
+    }
+    // min 是 0..1 归一化(Ghostty 同义);WCAG 对比域 1..21 → 映射后比
+    let target = min * 21.0;
+    let lb = rel_lum(bg);
+    let lf = rel_lum(fg);
+    let cur = (lf.max(lb) + 0.05) / (lf.min(lb) + 0.05);
+    if cur >= target {
+        return fg;
+    }
+    let dark_bg = lb < 0.5;
+    let mut out = fg;
+    for _ in 0..24 {
+        let l = rel_lum(out);
+        let ratio = (l.max(lb) + 0.05) / (l.min(lb) + 0.05);
+        if ratio >= target {
+            break;
+        }
+        for ch in out.iter_mut() {
+            *ch = if dark_bg {
+                ch.saturating_add(11)
+            } else {
+                ch.saturating_sub(11)
+            };
+        }
+    }
+    out
+}
+
 /// `[u8;3]` 终端色 → shader 的 `[f32;4]`(沿用 M0 的 u8/255 换算,alpha 恒 0)。
 fn to_color(rgb: [u8; 3]) -> [f32; 4] {
     [
@@ -1073,6 +1119,10 @@ fn cell_colors(
     } else if cell.flags.contains(Flags::INVERSE) {
         std::mem::swap(&mut fg, &mut bg);
     }
+    // #90 最小对比度:最终 (fg,bg) 过闸(0 = 直通,单分支零开销)
+    if palette.minimum_contrast > 0.0 {
+        fg = enforce_contrast(fg, bg, palette.minimum_contrast);
+    }
     (fg, bg)
 }
 
@@ -1362,6 +1412,30 @@ mod tests {
             ascent: 13.0,
             descent: 3.0,
         }
+    }
+
+    /// #90 对比度强制:低对比被推达标、已达标直通、0 关闭、方向正确
+    #[test]
+    fn contrast_enforcement() {
+        // 深底深字(黑底 #111):推白
+        let dark_fg = enforce_contrast([17, 17, 17], [10, 10, 10], 0.6);
+        let lum = rel_lum(dark_fg);
+        let ratio =
+            (lum.max(rel_lum([10, 10, 10])) + 0.05) / (lum.min(rel_lum([10, 10, 10])) + 0.05);
+        assert!(ratio >= 12.0, "深底深字推白后 ratio={ratio}");
+        // 白底白字(245 vs 250 真低对比):推黑
+        let light_fg = enforce_contrast([245, 245, 245], [250, 250, 250], 0.6);
+        assert!(rel_lum(light_fg) < 0.5, "白底白字推黑");
+        // 已达标:直通
+        assert_eq!(
+            enforce_contrast([255, 255, 255], [0, 0, 0], 0.6),
+            [255, 255, 255]
+        );
+        // 0 关闭
+        assert_eq!(
+            enforce_contrast([17, 17, 17], [10, 10, 10], 0.0),
+            [17, 17, 17]
+        );
     }
 
     #[test]

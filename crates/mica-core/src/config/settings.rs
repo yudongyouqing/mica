@@ -111,6 +111,9 @@ pub struct Settings {
     pub quick_terminal_key: Option<String>,
     /// 打字藏鼠标(Ghostty mouse-hide-while-typing,默认 true)。
     pub mouse_hide_while_typing: bool,
+    /// #90 最小对比度(0..1,默认 0 不启用):fg/bg 相对亮度对比低于
+    /// 阈值时提亮/加深前景至达标(Ghostty 同名语义)
+    pub minimum_contrast: f32,
     /// #89 启动窗口位置 "x,y"(客户区像素,屏幕坐标系);None = 光标屏
     /// 锚定(默认)。负坐标合法(副屏在左侧)
     pub window_position: Option<(i32, i32)>,
@@ -142,6 +145,7 @@ impl Default for Settings {
             font_size_pt: DEFAULT_FONT_SIZE_PT,
             title: None,
             mouse_hide_while_typing: true,
+            minimum_contrast: 0.0,
             window_position: None,
             background_image: None,
             background_opacity: 1.0,
@@ -213,6 +217,8 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
     if !explicit[2] {
         settings.palette.cursor = settings.palette.fg;
     }
+    // #90 minimum-contrast 是渲染参数非调色板项:合成尾写入
+    settings.palette.minimum_contrast = settings.minimum_contrast;
 
     if err.is_empty() {
         Ok(settings)
