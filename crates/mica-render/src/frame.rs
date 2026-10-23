@@ -1421,8 +1421,8 @@ mod tests {
         let ratio =
             (lum.max(rel_lum([10, 10, 10])) + 0.05) / (lum.min(rel_lum([10, 10, 10])) + 0.05);
         assert!(ratio >= 0.59, "深底深字推白后 ratio={ratio}");
-        // 白底白字:推黑
-        let light_fg = enforce_contrast([240, 240, 240], [250, 250, 250], 0.6);
+        // 白底白字(245 vs 250 真低对比):推黑
+        let light_fg = enforce_contrast([245, 245, 245], [250, 250, 250], 0.6);
         assert!(rel_lum(light_fg) < 0.5, "白底白字推黑");
         // 已达标:直通
         assert_eq!(
