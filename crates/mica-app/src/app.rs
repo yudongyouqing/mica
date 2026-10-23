@@ -4685,10 +4685,10 @@ fn rename_char(ch: char) -> bool {
             let name = RENAME_QUERY.with(|q| q.borrow().clone());
             let idx = RENAME_IDX.with(std::cell::Cell::get);
             TABS.with(|tabs| {
-                if let Some(tab) = tabs.borrow_mut().get_mut(idx) {
-                    if !name.trim().is_empty() {
-                        tab.title = name;
-                    }
+                if let Some(tab) = tabs.borrow_mut().get_mut(idx)
+                    && !name.trim().is_empty()
+                {
+                    tab.title = name;
                 }
             });
             RENAME_OPEN.with(|o| o.set(false));
