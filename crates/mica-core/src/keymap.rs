@@ -124,6 +124,8 @@ pub enum Action {
     SearchScrollback,
     /// 透明度切换(#78):1.0 ↔ background-opacity(默认 0.85)两档
     ToggleBackgroundOpacity,
+    /// 重开最近关闭的标签(#88,LIFO):恢复 shell/目录/标题
+    ReopenTab,
     /// OSC 133 jump(D37):跳上一个 prompt 行。
     JumpPrevPrompt,
     /// OSC 133 jump(D37):跳下一个 prompt 行;越过最新 = 回底部跟随。
@@ -233,6 +235,12 @@ impl Keymap {
             m(true, true, false),
             TriggerKey::Letter('S'),
             Action::WriteScrollback,
+        );
+        // #88:重开最近关闭的标签(浏览器 Ctrl+Shift+Z 肌肉记忆)
+        push(
+            m(true, true, false),
+            TriggerKey::Letter('Z'),
+            Action::ReopenTab,
         );
         // #78:透明度切换(默认 Ctrl+Shift+O)
         push(
@@ -383,6 +391,7 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "write_scrollback" => Some(Action::WriteScrollback),
         "search_scrollback" => Some(Action::SearchScrollback),
         "toggle_background_opacity" => Some(Action::ToggleBackgroundOpacity),
+        "reopen_tab" => Some(Action::ReopenTab),
         "focus_left" => Some(Action::FocusNeighbor(Key::Left)),
         "focus_right" => Some(Action::FocusNeighbor(Key::Right)),
         "focus_up" => Some(Action::FocusNeighbor(Key::Up)),

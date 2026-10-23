@@ -361,6 +361,8 @@ thread_local! {
     static WINDOW_TRANSLUCENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// #77 背景图路径(热重载即时换图;Some(path))
     static BG_IMG_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// #88 关闭标签历史(LIFO,容量 8):重开恢复 shell/cwd/标题
+    static CLOSED_TABS: RefCell<Vec<ClosedTab>> = const { RefCell::new(Vec::new()) };
     /// #78 配置的透明档 alpha(255.0*background_opacity;1.0 = 未配置→0.85 默认)
     static WINDOW_ALPHA_DIM: std::cell::Cell<u8> = const { std::cell::Cell::new(217) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
@@ -515,6 +517,14 @@ struct Terminal {
     /// 强制全量重建。Term::resize 自身会标 full,但那属于上游实现细节,
     /// 几何失配必须显式钉死在本层
     force_full: bool,
+}
+
+/// #88 关闭标签的恢复元数据(首个 pane;多 pane 标签重开为单 pane——
+/// 布局树不保真,浏览器同款取舍)
+struct ClosedTab {
+    shell: String,
+    cwd: Option<String>,
+    title: String,
 }
 
 /// 标签池条目:pane 池 + 布局树 + 池簿记(T7 分屏)。
@@ -3905,6 +3915,28 @@ fn close_tab(idx: usize) {
         // 实报"关窗未响应"的主挂点)。forget 换即时关窗;pty 子进程成孤儿
         // 由启动期孤儿清杀闭环(M5c/T1)兜底。
         let mut removed = guard.remove(idx);
+        // #88 历史入栈(容量 8 淘最旧;guard 活着但 removed 已独占所有权)
+        {
+            let first = removed.panes.first().map(|p| {
+                (
+                    p.terminal.shell.clone(),
+                    p.terminal.term.cwd().map(str::to_string),
+                )
+            });
+            if let Some((shell, cwd)) = first {
+                CLOSED_TABS.with(|h| {
+                    let mut hist = h.borrow_mut();
+                    if hist.len() >= 8 {
+                        hist.remove(0);
+                    }
+                    hist.push(ClosedTab {
+                        shell,
+                        cwd,
+                        title: removed.title.clone(),
+                    });
+                });
+            }
+        }
         for pane in removed.panes.iter_mut() {
             pane.terminal.session.kill_child(); // 泄漏前杀子(防 defterm 弹窗,见 pty.rs)
         }
@@ -4150,6 +4182,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut search_toggle = false; // #57:段外 toggle(不借 TABS)
     let mut write_scrollback = false; // #81:段外写文件+打开(不走 TABS 双借)
     let mut toggle_opacity = false; // #78:段外切档(需要 hwnd)
+    let mut reopen_tab = false; // #88:段外重开(需要 hwnd)
     let mut new_tab = false;
     let mut new_window = false;
     let mut close_idx: Option<usize> = None;
@@ -4187,6 +4220,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 Action::RestartPane => restart = true, // 延迟:with 块内再借 TABS 会双借 panic
                 Action::SearchScrollback => search_toggle = !search_toggle,
                 Action::ToggleBackgroundOpacity => toggle_opacity = true,
+                Action::ReopenTab => reopen_tab = true,
                 Action::WriteScrollback => write_scrollback = true,
                 Action::NewWindow => new_window = true,
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
@@ -4238,6 +4272,42 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     // 标签操作段外执行:TABS 借用已还,switch/close/start 可自由再借
     if restart {
         restart_active_pane();
+    }
+    if reopen_tab {
+        // #88 LIFO 重开:shell/cwd/标题恢复(标题先 pop 再由 OSC 0 接管
+        // 或保持;此处设为关闭时的标题,体验即"那个标签回来了")
+        let snapshot = CLOSED_TABS.with(|h| h.borrow_mut().pop());
+        let Some(ct) = snapshot else {
+            return true;
+        };
+        // SAFETY: 段外(TABS 借用已还),create/forwarder 与既有路径同款
+        unsafe {
+            let (pane, reader) =
+                match create_pane_with_size(hwnd, &ct.shell, None, ct.cwd.as_deref()) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn_box(&e);
+                        return true;
+                    }
+                };
+            let pane_id = pane.id;
+            let tab = TabState {
+                title: ct.title,
+                dirty: false,
+                panes: vec![pane],
+                layout: mica_core::layout::Layout::leaf(pane_id),
+                focused: 0,
+            };
+            let pty_buf = Arc::clone(&tab.panes[0].terminal.pty_buf);
+            TABS.with(|tabs| tabs.borrow_mut().push(tab));
+            ACTIVE.with(|a| a.set(TABS.with(|tabs| tabs.borrow().len() - 1)));
+            TAB_COUNT.with(|c| c.set(TABS.with(|tabs| tabs.borrow().len())));
+            tab_follow_active();
+            if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
+                spawn_render_forwarder(reader, pty_buf, slot, pane_id);
+            }
+            draw_frame();
+        }
     }
     if toggle_opacity {
         // #78 两档切换:replace 返回旧档,to_translucent = 翻转后的新档
