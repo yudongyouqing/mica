@@ -363,6 +363,12 @@ thread_local! {
     static BG_IMG_PATH: RefCell<Option<String>> = const { RefCell::new(None) };
     /// #88 关闭标签历史(LIFO,容量 8):重开恢复 shell/cwd/标题
     static CLOSED_TABS: RefCell<Vec<ClosedTab>> = const { RefCell::new(Vec::new()) };
+    /// #87 标签自定义色(idx→RGB,空白=无色);OSC 1337 与右键通道写
+    static TAB_COLORS: RefCell<Vec<[u8; 3]>> = const { RefCell::new(Vec::new()) };
+    /// #87 重命名模式(键入进查询替换标签标题,Enter 确认/Esc 取消)
+    static RENAME_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RENAME_QUERY: RefCell<String> = const { RefCell::new(String::new()) };
+    static RENAME_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// #78 配置的透明档 alpha(255.0*background_opacity;1.0 = 未配置→0.85 默认)
     static WINDOW_ALPHA_DIM: std::cell::Cell<u8> = const { std::cell::Cell::new(217) };
     /// 鼠标捕获进行中(应用启用 DECSET 1000 族,按下到抬起间全部上报)
@@ -525,12 +531,15 @@ struct ClosedTab {
     shell: String,
     cwd: Option<String>,
     title: String,
+    color: Option<[u8; 3]>,
 }
 
 /// 标签池条目:pane 池 + 布局树 + 池簿记(T7 分屏)。
 struct TabState {
     /// OSC 0 标题(strip 显示;shell 未设时用占位)
     title: String,
+    /// #87 自定义色(标签顶部 2px 色条;None = 无)
+    color: Option<[u8; 3]>,
     /// 后台标签有未渲染数据(D18:feed 照跑,渲染跳过)
     dirty: bool,
     panes: Vec<PaneState>,
@@ -1919,6 +1928,7 @@ unsafe fn start_tab_with_shell(
     let pane_id = pane.id;
     let tab = TabState {
         title,
+        color: None,
         dirty: false,
         panes: vec![pane],
         layout: mica_core::layout::Layout::leaf(pane_id),
@@ -2366,10 +2376,21 @@ fn draw_frame() {
                     t.metrics.line_height + 4.0,
                     bar_bg,
                 ));
-                let q = SEARCH_QUERY.with(|q| q.borrow().clone());
-                let mut label = format!("/{}", q);
-                if q.is_empty() {
+                let rename = RENAME_OPEN.with(std::cell::Cell::get);
+                let q = if rename {
+                    RENAME_QUERY.with(|q| q.borrow().clone())
+                } else {
+                    SEARCH_QUERY.with(|q| q.borrow().clone())
+                };
+                let mut label = if rename {
+                    format!("rename: {}", q)
+                } else {
+                    format!("/{}", q)
+                };
+                if !rename && q.is_empty() {
                     label = "/(输入以搜索)".into();
+                } else if rename && q.is_empty() {
+                    label = "rename: (输入新标题)".into()
                 } else {
                     label.push_str(&format!(
                         "  {}/{}",
@@ -2440,6 +2461,32 @@ fn draw_frame() {
                             bg: u_cf,
                         });
                     }
+                }
+            }
+        }
+        // #87 标签色条(标签顶 2px):自定义色标签一眼区分
+        {
+            let colors = TAB_COLORS.with(|c| c.borrow().clone());
+            let sm2 = strip_metrics();
+            let w_tab = mica_render::frame::equal_tab_w(titles.len(), area_w, &sm2);
+            let shift_r = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm2.tab_min_w;
+            for (i, c) in colors.iter().enumerate() {
+                let x0 =
+                    mica_render::frame::tabs_x0(&sm2) + i as f32 * (w_tab + sm2.tab_gap) - shift_r;
+                let x1 = x0 + w_tab;
+                if x1 > 0.0 && x0 < area_w {
+                    let cf = [
+                        c[0] as f32 / 255.0,
+                        c[1] as f32 / 255.0,
+                        c[2] as f32 / 255.0,
+                        0.0,
+                    ];
+                    search_overlay.push(mica_render::frame::CellInstance {
+                        pos_uv: [x0.max(0.0), sm2.title_h + 2.0 * sm2.k, 0.0, 0.0],
+                        size_uv: [(x1 - x0).min(area_w - x0.max(0.0)), 2.0, 0.0, 0.0],
+                        fg: cf,
+                        bg: cf,
+                    });
                 }
             }
         }
@@ -2549,6 +2596,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             hide_cursor_if_typing();
             // #57 搜索态字符全吞(查询/跳转/关闭),不进 pty
             if search_char((wparam.0 as u32).try_into().unwrap_or(' ')) {
+                return LRESULT(0);
+            }
+            // #87 重命名态字符全吞(查询进新名,不进 pty)
+            if rename_char((wparam.0 as u32).try_into().unwrap_or(' ')) {
                 return LRESULT(0);
             }
             // keymap 已消费该键(如 Ctrl+Shift+T):TranslateMessage 的控制
@@ -3933,6 +3984,7 @@ fn close_tab(idx: usize) {
                         shell,
                         cwd,
                         title: removed.title.clone(),
+                        color: removed.color,
                     });
                 });
             }
@@ -4183,6 +4235,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut write_scrollback = false; // #81:段外写文件+打开(不走 TABS 双借)
     let mut toggle_opacity = false; // #78:段外切档(需要 hwnd)
     let mut reopen_tab = false; // #88:段外重开(需要 hwnd)
+    let mut rename_tab = false; // #87:段外开改名模式
     let mut new_tab = false;
     let mut new_window = false;
     let mut close_idx: Option<usize> = None;
@@ -4221,6 +4274,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 Action::SearchScrollback => search_toggle = !search_toggle,
                 Action::ToggleBackgroundOpacity => toggle_opacity = true,
                 Action::ReopenTab => reopen_tab = true,
+                Action::RenameTab => rename_tab = true,
                 Action::WriteScrollback => write_scrollback = true,
                 Action::NewWindow => new_window = true,
                 Action::JumpPrevPrompt | Action::JumpNextPrompt => {
@@ -4293,6 +4347,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
             let pane_id = pane.id;
             let tab = TabState {
                 title: ct.title,
+                color: ct.color,
                 dirty: false,
                 panes: vec![pane],
                 layout: mica_core::layout::Layout::leaf(pane_id),
@@ -4614,6 +4669,46 @@ fn search_char(ch: char) -> bool {
                 q.borrow_mut().push(c);
             });
             search_rescan();
+        }
+        _ => {}
+    }
+    true
+}
+
+/// #87 重命名态 WM_CHAR 拦截:同搜索条(Enter 确认/Esc 关/退格/可打印)
+fn rename_char(ch: char) -> bool {
+    if !RENAME_OPEN.with(std::cell::Cell::get) {
+        return false;
+    }
+    match ch {
+        '\r' => {
+            let name = RENAME_QUERY.with(|q| q.borrow().clone());
+            let idx = RENAME_IDX.with(std::cell::Cell::get);
+            TABS.with(|tabs| {
+                if let Some(tab) = tabs.borrow_mut().get_mut(idx) {
+                    if !name.trim().is_empty() {
+                        tab.title = name;
+                    }
+                }
+            });
+            RENAME_OPEN.with(|o| o.set(false));
+            draw_frame();
+        }
+        '\x1b' => {
+            RENAME_OPEN.with(|o| o.set(false));
+            draw_frame();
+        }
+        '\u{8}' => {
+            RENAME_QUERY.with(|q| {
+                q.borrow_mut().pop();
+            });
+            draw_frame();
+        }
+        c if (c as u32) >= 0x20 => {
+            RENAME_QUERY.with(|q| {
+                q.borrow_mut().push(c);
+            });
+            draw_frame();
         }
         _ => {}
     }
