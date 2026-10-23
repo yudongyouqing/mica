@@ -111,6 +111,9 @@ pub struct Settings {
     pub quick_terminal_key: Option<String>,
     /// 打字藏鼠标(Ghostty mouse-hide-while-typing,默认 true)。
     pub mouse_hide_while_typing: bool,
+    /// #89 启动窗口位置 "x,y"(客户区像素,屏幕坐标系);None = 光标屏
+    /// 锚定(默认)。负坐标合法(副屏在左侧)
+    pub window_position: Option<(i32, i32)>,
     /// #77 背景图绝对路径(None = 无图;受 background-opacity 的图向
     /// 部分影响,首版 cover 平铺)
     pub background_image: Option<String>,
@@ -139,6 +142,7 @@ impl Default for Settings {
             font_size_pt: DEFAULT_FONT_SIZE_PT,
             title: None,
             mouse_hide_while_typing: true,
+            window_position: None,
             background_image: None,
             background_opacity: 1.0,
             mouse_right_click: MouseRightClick::None,
