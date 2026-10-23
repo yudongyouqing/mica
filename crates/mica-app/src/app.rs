@@ -606,11 +606,14 @@ pub fn run() {
         // 乘 DPI_SCALE——三者顺序曾为 router→窗口→播种,单 150% 屏(无
         // WM_DPICHANGED)字体永远 ×1.0 而 strip ×1.5,比例崩坏
         // (2026-10-06 用户实测);精确网格尺寸在播种后 SetWindowPos 定。
-        // 落位锚定光标所在屏(#41):CW_USEDEFAULT 在混合 DPI 双屏可能
-        // 落在边界另一侧,窗口长大后 majority 跨屏被重派 → WM_DPICHANGED
-        // 按建议矩形缩水(1462→975,逻辑尺寸保持物理变小)。锚定光标屏
-        // 后创建→播种→定尺寸全程同屏,不再触发重派
-        let (wx, wy) = cursor_workarea_origin();
+        // 落位优先级(#89):window-position 配置 > 光标屏锚定(#41)。
+        // 锚定原因:CW_USEDEFAULT 在混合 DPI 双屏可能落在边界另一侧,
+        // 窗口长大后 majority 跨屏被重派 → WM_DPICHANGED 按建议矩形
+        // 缩水(1462→975 实证);锚定光标屏后创建→播种→定尺寸全程同屏。
+        // 配置位直接信任用户坐标(多屏自由摆)
+        let (wx, wy) = settings
+            .window_position
+            .unwrap_or_else(cursor_workarea_origin);
         let class_name = HSTRING::from("mica_app_class"); // Param<PCWSTR> 的已证实实现
         let title = HSTRING::from("Mica");
         let hwnd = CreateWindowExW(
