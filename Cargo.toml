@@ -10,7 +10,7 @@ authors = ["yudongyouqing"]
 
 [workspace.dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "webp"] }
-base64 = "0.22"
+base64 = "0.23"
 alacritty_terminal = "0.26"
 portable-pty = "0.9"
 wgpu = "30"
