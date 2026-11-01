@@ -182,7 +182,10 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     if let Some(pid) = session.child_pid() {
         crate::app::orphan::track_session(pid); // 入注册表(T02,同主窗)
     }
-    let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let pty_buf: Arc<Mutex<crate::app::PtyBuf>> = Arc::new(Mutex::new(crate::app::PtyBuf {
+        epoch: 0,
+        data: Vec::new(),
+    }));
     term.set_clipboard_provider(Arc::new(|| {
         crate::app::clipboard::get_text().unwrap_or_default()
     }));
@@ -191,6 +194,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         term,
         session,
         pty_buf: Arc::clone(&pty_buf),
+        session_gen: 0,
         router,
         metrics,
         palette,
@@ -216,7 +220,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 
     // 转发线程(与主窗同款;WPARAM 用 QT 专属 id 0xFF00——不与 pane id 冲突)
     if let Some(slot) = crate::app::shared_hwnd_for_quickterm() {
-        crate::app::spawn_qt_forwarder(reader, pty_buf, slot);
+        crate::app::spawn_qt_forwarder(reader, pty_buf, slot, 0);
     }
     // #37:会话退出轮询(1s;命中即停表)——QT 无 strip,主窗的
     // poll_exits 轮不到它
@@ -239,7 +243,8 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
                 crate::app::orphan::track_session(new_pid);
             }
             let old = std::mem::replace(&mut t.session, session);
-            std::mem::forget(old); // 脏退出哲学:不 drop(坏驱动栈会卡)
+            // 旧会话交后台回收(T03):ClosePseudoConsole 阻塞面不上 UI 线程
+            crate::app::lifecycle::reap_session(old);
             t.exited = None;
             let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
             term.set_cell_metrics(
@@ -250,9 +255,16 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
             t.term = term;
             t.row_insts.clear();
             t.force_full = true;
-            t.pty_buf.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            // 会话换代:旧转发线程尾字节按代丢弃(T03,同主窗)
+            let new_gen = {
+                let mut b = t.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
+                b.epoch += 1;
+                b.data.clear();
+                b.epoch
+            };
+            t.session_gen = new_gen;
             if let Some(slot) = crate::app::shared_hwnd_for_quickterm() {
-                crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), slot);
+                crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), slot, new_gen);
             }
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 6, 1000, None);
         }
@@ -260,18 +272,28 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     }
 }
 
-/// 退出序取走 QT 状态(调用方 mem::forget——故意泄漏换可靠退出,见
-/// message_loop 退出序注释;teardown drop 在坏驱动栈上会陷内核卡死)。
+/// 退出序取走 QT 状态(T03 收窄绕行面):终端 CPU 态正常回收、session
+/// 交 reaper;**只 forget renderer/wgpu_surface(GPU 对象)**——坏驱动
+/// 栈上 wgpu teardown 陷内核(1.0.2 实证),这是与主窗同款的最后绕行。
 pub fn forget_state() {
-    // 取到的 QtState:先杀 pty 子进程(与 TABS 退出序同款——否则 QT 的
-    // powershell 泄漏成孤儿,下次启动被清杀时 defterm 弹窗/142,
-    // "第二次启动报错"的 QT 分支),再 forget
     if let Some(mut st) = QT.with(|q| q.borrow_mut().take()) {
-        st.terminal.session.kill_child();
+        st.terminal.session.kill_child(); // 先杀子,防 defterm 弹窗(1.0.4 同款)
         if let Some(pid) = st.terminal.session.child_pid() {
             crate::app::orphan::untrack_session(pid); // 干净终结,出注册表(T02)
         }
-        std::mem::forget(st);
+        // 拆分:GPU 泄漏,终端态回收
+        let QtState {
+            terminal,
+            renderer,
+            wgpu_surface,
+            config,
+            pending_surrogate: _,
+            atlas_revision: _,
+        } = st;
+        std::mem::forget(renderer);
+        std::mem::forget(wgpu_surface);
+        std::mem::forget(config);
+        crate::app::lifecycle::close_terminal(terminal);
     }
 }
 
@@ -380,7 +402,7 @@ unsafe extern "system" fn qt_wndproc(
                 let mut guard = q.borrow_mut();
                 let Some(st) = guard.as_mut() else { return };
                 let bytes =
-                    std::mem::take(&mut *st.terminal.pty_buf.lock().expect("qt buf poisoned"));
+                    std::mem::take(&mut st.terminal.pty_buf.lock().expect("qt buf poisoned").data);
                 if bytes.is_empty() {
                     return;
                 }

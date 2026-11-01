@@ -326,6 +326,7 @@ mod clipboard;
 pub(crate) mod crash;
 pub(crate) mod ipc;
 mod jumplist;
+pub(crate) mod lifecycle;
 pub mod orphan; // pub:tests 直入(真进程集成回归,T02)
 pub(crate) mod quickterm;
 pub mod uia;
@@ -491,13 +492,22 @@ struct WindowGpu {
     atlas_owner: Option<(u64, u64)>,
 }
 
+/// pty 输出落点(T03 加代):gen 标识会话代——重启 shell 换代后,旧转发
+/// 线程的残余尾字节按代丢弃,不污染新 shell 的输入流。
+pub(crate) struct PtyBuf {
+    pub epoch: u64,
+    pub data: Vec<u8>,
+}
+
 /// 单个标签的终端态:GPU 以外的一切(M1 时代的 Terminal 字段原样)。
-struct Terminal {
+pub(crate) struct Terminal {
     term: Surface,
     session: PtySession,
     /// pty 输出落点:转发线程(独占 PtyReader 通道)往里追加,WM_APP_RENDER
     /// 在主线程取空。放 Terminal 里让 handler 借一次取齐,关闭标签时一起拆
-    pty_buf: Arc<Mutex<Vec<u8>>>,
+    pty_buf: Arc<Mutex<PtyBuf>>,
+    /// 当前会话代(与 pty_buf.gen 同源;重启递增,转发线程据此弃旧)
+    session_gen: u64,
     router: DwriteRouter,
     metrics: FontMetrics,
     /// 配置合成出的调色板:渲染实例着色与 OSC 4/10/11/12 应答同源(T2 Settings)
@@ -1171,9 +1181,10 @@ fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle> {
 /// pty 再 join,见 message_loop。
 fn spawn_render_forwarder(
     reader: PtyReader,
-    buffer: Arc<Mutex<Vec<u8>>>,
+    buffer: Arc<Mutex<PtyBuf>>,
     hwnd_slot: SharedHwnd,
     tab_id: u64,
+    epoch: u64,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("pty-forwarder".into())
@@ -1182,9 +1193,12 @@ fn spawn_render_forwarder(
                 match reader.recv_block() {
                     Some(chunk) => {
                         {
-                            // 锁只罩 extend,绝不跨 PostMessageW 持锁
+                            // 锁只罩 extend,绝不跨 PostMessageW 持锁;
+                            // 代不匹配 = 旧会话尾字节,丢弃(T03)
                             let mut pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                            pending.extend_from_slice(&chunk);
+                            if pending.epoch == epoch {
+                                pending.data.extend_from_slice(&chunk);
+                            }
                         }
                         let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(raw) = hwnd {
@@ -1507,7 +1521,8 @@ fn restart_active_pane() -> bool {
             orphan::track_session(new_pid);
         }
         let old = std::mem::replace(&mut t.session, session);
-        std::mem::forget(old); // 不 drop——统一脏退出哲学,不留任何 drop 路径
+        // 旧会话交后台回收:唯一阻塞面 ClosePseudoConsole 不上 UI 线程(T03)
+        lifecycle::reap_session(old);
         t.exited = None;
         // 干净起步:新 Surface 重置网格(度量/调色板/剪贴板 provider 同建)
         let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
@@ -1520,11 +1535,18 @@ fn restart_active_pane() -> bool {
         t.term = term;
         t.row_insts.clear();
         t.force_full = true;
-        t.pty_buf.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // 会话换代:旧转发线程的尾字节按代丢弃,新转发线程从干净缓冲起步
+        let new_gen = {
+            let mut b = t.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
+            b.epoch += 1;
+            b.data.clear();
+            b.epoch
+        };
+        t.session_gen = new_gen;
         // 重挂转发线程(同 pane id:WM_APP_RENDER 寻址不变)
         let pty_buf = Arc::clone(&t.pty_buf);
         if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
-            spawn_render_forwarder(reader, pty_buf, slot, pid);
+            spawn_render_forwarder(reader, pty_buf, slot, pid, new_gen);
         }
     });
     true
@@ -1742,12 +1764,10 @@ fn close_pane_action() {
             return;
         }
         if let Some(pos) = tab.panes.iter().position(|p| p.id == pid) {
-            let mut removed = tab.panes.remove(pos);
-            removed.terminal.session.kill_child(); // 泄漏前杀子(同 close_tab)
-            if let Some(pid) = removed.terminal.session.child_pid() {
-                orphan::untrack_session(pid); // 会话干净终结,出注册表
-            }
-            std::mem::forget(removed);
+            let removed = tab.panes.remove(pos);
+            // T03:杀子+出注册表在 close_terminal 内;session 交后台回收,
+            // Surface/行缓存/路由等 CPU 状态当场释放——不再 forget 整份
+            lifecycle::close_terminal(removed.terminal);
         }
         tab.focused = tab.focused.min(tab.panes.len() - 1);
         for p in tab.panes.iter_mut() {
@@ -1784,13 +1804,14 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
         };
         let pane_id = pane.id;
         let pty_buf = Arc::clone(&pane.terminal.pty_buf);
+        let fwd_epoch = pane.terminal.session_gen;
         tab.layout.split(target, dir, pane_id);
         tab.panes.push(pane);
         tab.focused = tab.panes.len() - 1; // 新 pane 焦点(WT 语义)
         for p in tab.panes.iter_mut() {
             p.terminal.force_full = true;
         }
-        spawn_render_forwarder(reader, pty_buf, slot, pane_id);
+        spawn_render_forwarder(reader, pty_buf, slot, pane_id, fwd_epoch);
     });
 }
 
@@ -1855,12 +1876,16 @@ unsafe fn create_pane_with_size(
     if let Some(pid) = session.child_pid() {
         orphan::track_session(pid); // 入注册表:强杀后下次启动按此清孤儿(T02)
     }
-    let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let pty_buf: Arc<Mutex<PtyBuf>> = Arc::new(Mutex::new(PtyBuf {
+        epoch: 0,
+        data: Vec::new(),
+    }));
 
     let terminal = Terminal {
         term,
         session,
         pty_buf: Arc::clone(&pty_buf),
+        session_gen: 0,
         router,
         metrics,
         palette,
@@ -1952,6 +1977,7 @@ unsafe fn start_tab_with_shell(
     };
     let id = tab.panes[0].id; // WPARAM 按 pane 寻址(T7)
     let pty_buf = Arc::clone(&tab.panes[0].terminal.pty_buf);
+    let fwd_epoch = tab.panes[0].terminal.session_gen;
     TABS.with(|tabs| {
         let mut guard = tabs.borrow_mut();
         guard.push(tab);
@@ -1962,7 +1988,7 @@ unsafe fn start_tab_with_shell(
     ensure_anim_timer();
     tab_follow_active(); // T8:新标签滚入可视区(溢出时)
     if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
-        spawn_render_forwarder(reader, pty_buf, slot, id);
+        spawn_render_forwarder(reader, pty_buf, slot, id, fwd_epoch);
     }
 }
 
@@ -1984,8 +2010,9 @@ pub(crate) fn shared_hwnd_for_quickterm() -> Option<SharedHwnd> {
 /// QT 窗口(独立消息域;WPARAM=0xFF00 哨兵)。
 pub(crate) fn spawn_qt_forwarder(
     reader: mica_core::pty::PtyReader,
-    buffer: Arc<Mutex<Vec<u8>>>,
+    buffer: Arc<Mutex<PtyBuf>>,
     hwnd_slot: SharedHwnd,
+    epoch: u64,
 ) {
     std::thread::Builder::new()
         .name("qt-forwarder".into())
@@ -1994,8 +2021,11 @@ pub(crate) fn spawn_qt_forwarder(
                 match reader.recv_block() {
                     Some(chunk) => {
                         {
+                            // 代不匹配 = 旧会话尾字节,丢弃(T03,同主窗)
                             let mut pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                            pending.extend_from_slice(&chunk);
+                            if pending.epoch == epoch {
+                                pending.data.extend_from_slice(&chunk);
+                            }
                         }
                         let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(raw) = hwnd {
@@ -2049,25 +2079,25 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
         drop(reload.watcher);
         let _ = reload.thread.join();
     }
-    // 退出序终招(1.0.2):GPU/QT/Terminal 资源 mem::forget,不 drop——
-    // 实证:虚拟显卡驱动栈不稳的机器上,wgpu teardown 陷内核不可中断
-    // 调用,进程杀不死(僵尸占管道连锁害死后续实例,用户实报"关窗未
-    // 响应")。故意泄漏换可靠退出(Alacritty/WezTerm 同款哲学):进程
-    // 一死 OS 全额回收,泄漏上限 = 进程生命期。
-    eprintln!("[exit] step5: kill children, then leak GPU/QT/terminals");
-    TABS.with(|tabs| {
-        for tab in tabs.borrow_mut().iter_mut() {
-            for pane in tab.panes.iter_mut() {
-                pane.terminal.session.kill_child(); // 泄漏前杀子——否则 powershell
-                // 孤儿被下次启动的清杀打掉宿主,defterm 重派终端(WT 弹窗/142)
-            }
+    // 退出序(T03 收窄绕行面):历史上 GPU/QT/Terminal 全部 forget;如今
+    // 终端 CPU 状态与 PTY 会话走正常回收(close_terminal:杀子+出注册表
+    // +reaper),泄漏只剩**wgpu 对象**——实证虚拟显卡驱动栈不稳的机器上
+    // wgpu teardown 陷内核不可中断调用,进程杀不死(1.0.2 用户实报"关窗
+    // 未响应")。GPU 泄漏换可靠退出(Alacritty/WezTerm 同款哲学),进程
+    // 一死 OS 全额回收。reaper 不 join:进程退出不等排空,等价 forget
+    // 但有界(通道容量 16)。
+    eprintln!("[exit] step5: reclaim terminals, leak only GPU");
+    let tabs = TABS.with(|tabs| std::mem::take(&mut *tabs.borrow_mut()));
+    for tab in tabs {
+        for pane in tab.panes {
+            lifecycle::close_terminal(pane.terminal);
         }
-    });
-    std::mem::forget(TABS.with(|tabs| std::mem::take(&mut *tabs.borrow_mut())));
+    }
     std::mem::forget(GPU.with(|g| g.borrow_mut().take()));
     crate::app::quickterm::forget_state();
     orphan::clear_sessions_for_exit(); // 干净退出:本进程注册表条目全清(T02)
-    eprintln!("[exit] step6: done");
+    let (ok, fallback, inflight) = lifecycle::reaper_stats();
+    eprintln!("[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight})");
 }
 
 fn draw_frame() {
@@ -3559,7 +3589,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return;
                 };
                 let bytes =
-                    std::mem::take(&mut *t.pty_buf.lock().unwrap_or_else(|e| e.into_inner()));
+                    std::mem::take(&mut t.pty_buf.lock().unwrap_or_else(|e| e.into_inner()).data);
                 if bytes.is_empty() {
                     return; // 积压的重复唤醒:缓冲已被上一条取空,免重绘
                 }
@@ -3978,11 +4008,11 @@ fn close_tab(idx: usize) {
         if idx >= guard.len() {
             return;
         }
-        // 脏退出(1.0.2):Terminal drop 会 join pty 读线程——OpenConsole
-        // 半死(坏驱动栈常见)时 ReadFile 卡内核,join 挂死 wndproc(用户
-        // 实报"关窗未响应"的主挂点)。forget 换即时关窗;pty 子进程成孤儿
-        // 由启动期孤儿清杀闭环(M5c/T1)兜底。
-        let mut removed = guard.remove(idx);
+        // T03 资源回收:不再 forget 整份标签。杀子/出注册表/会话后台
+        // 回收/CPU 状态当场释放都收在 close_terminal(其内注释有最小
+        // 阻塞对象分析);旧"join 挂死"的根因是 drop 阻塞面在 UI 线程,
+        // 现在阻塞面唯一(ClosePseudoConsole)由 reaper 线程承担。
+        let removed = guard.remove(idx);
         // #88 历史入栈(容量 8 淘最旧;guard 活着但 removed 已独占所有权)
         {
             let first = removed.panes.first().map(|p| {
@@ -4006,13 +4036,9 @@ fn close_tab(idx: usize) {
                 });
             }
         }
-        for pane in removed.panes.iter_mut() {
-            pane.terminal.session.kill_child(); // 泄漏前杀子(防 defterm 弹窗,见 pty.rs)
-            if let Some(pid) = pane.terminal.session.child_pid() {
-                orphan::untrack_session(pid); // 会话干净终结,出注册表(T02)
-            }
+        for pane in removed.panes {
+            lifecycle::close_terminal(pane.terminal);
         }
-        std::mem::forget(removed);
         let len = guard.len();
         TAB_COUNT.with(|c| c.set(len));
         if len == 0 {
@@ -4374,12 +4400,13 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 focused: 0,
             };
             let pty_buf = Arc::clone(&tab.panes[0].terminal.pty_buf);
+            let fwd_epoch = tab.panes[0].terminal.session_gen;
             TABS.with(|tabs| tabs.borrow_mut().push(tab));
             ACTIVE.with(|a| a.set(TABS.with(|tabs| tabs.borrow().len() - 1)));
             TAB_COUNT.with(|c| c.set(TABS.with(|tabs| tabs.borrow().len())));
             tab_follow_active();
             if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
-                spawn_render_forwarder(reader, pty_buf, slot, pane_id);
+                spawn_render_forwarder(reader, pty_buf, slot, pane_id, fwd_epoch);
             }
             draw_frame();
         }
