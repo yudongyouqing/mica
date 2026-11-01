@@ -150,6 +150,11 @@ impl PtySession {
         self.writer.write_all(data)
     }
 
+    /// 子进程 PID(孤儿会话注册表按 PID+创建时间证明归属,2026-11 T02)。
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     pub fn resize(&self, columns: u16, rows: u16) -> anyhow::Result<()> {
         self.master.resize(PtySize {
             rows,

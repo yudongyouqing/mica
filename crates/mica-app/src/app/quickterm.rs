@@ -179,6 +179,9 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     )
     .inspect_err(|e| eprintln!("quickterm: pty 失败 {e:?},QT 禁用"))
     .map_err(|_| ())?;
+    if let Some(pid) = session.child_pid() {
+        crate::app::orphan::track_session(pid); // 入注册表(T02,同主窗)
+    }
     let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     term.set_clipboard_provider(Arc::new(|| {
         crate::app::clipboard::get_text().unwrap_or_default()
@@ -229,6 +232,12 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     match mica_core::pty::PtySession::spawn(mica_core::pty::command_from_str(&t.shell), cols, rows)
     {
         Ok((session, reader)) => {
+            if let Some(old_pid) = t.session.child_pid() {
+                crate::app::orphan::untrack_session(old_pid); // 旧会话终结,出注册表
+            }
+            if let Some(new_pid) = session.child_pid() {
+                crate::app::orphan::track_session(new_pid);
+            }
             let old = std::mem::replace(&mut t.session, session);
             std::mem::forget(old); // 脏退出哲学:不 drop(坏驱动栈会卡)
             t.exited = None;
@@ -259,6 +268,9 @@ pub fn forget_state() {
     // "第二次启动报错"的 QT 分支),再 forget
     if let Some(mut st) = QT.with(|q| q.borrow_mut().take()) {
         st.terminal.session.kill_child();
+        if let Some(pid) = st.terminal.session.child_pid() {
+            crate::app::orphan::untrack_session(pid); // 干净终结,出注册表(T02)
+        }
         std::mem::forget(st);
     }
 }

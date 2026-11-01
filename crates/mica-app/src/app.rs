@@ -326,7 +326,7 @@ mod clipboard;
 pub(crate) mod crash;
 pub(crate) mod ipc;
 mod jumplist;
-pub(crate) mod orphan;
+pub mod orphan; // pub:tests 直入(真进程集成回归,T02)
 pub(crate) mod quickterm;
 pub mod uia;
 
@@ -1082,11 +1082,15 @@ unsafe fn deferred_init(hwnd: HWND) {
         return;
     }
     let t = std::time::Instant::now();
-    // 孤儿 ConPTY 清理(M5c/T1):此时首标签 pty 已起、活着,不误杀;
-    // "趁自身没 spawn 前零误杀窗口"的旧前提换成"父进程活着"同判据
-    let orphans = orphan::sweep_orphaned_conhost(true);
+    // 孤儿会话清理(T02,2026-11-01 重造):只清注册表里能证明归属本项目
+    // 旧实例的会话(child 活着 + 创建时间一致 + owner 已死),不再按全机
+    // 进程名+父 PID 泛杀。首标签 pty 属存活的本进程,天然跳过
+    let orphans = orphan::sweep_owned(
+        &orphan::Registry::new(orphan::Registry::default_path()),
+        true,
+    );
     if orphans > 0 {
-        eprintln!("[orphan] 清杀 {orphans} 个父进程已死的 ConPTY 宿主");
+        eprintln!("[orphan] 清杀 {orphans} 个上个实例遗留的孤儿会话");
     }
     // M3a:AUMID + jump list(profile 任务直达;COM 实例化是慢路径)
     jumplist::set_appuser_model_id();
@@ -1496,6 +1500,12 @@ fn restart_active_pane() -> bool {
             return;
         };
         t.session.kill_child(); // 先杀旧子(非阻塞);restart 语义=旧会话终结
+        if let Some(old_pid) = t.session.child_pid() {
+            orphan::untrack_session(old_pid); // 旧会话干净终结,出注册表
+        }
+        if let Some(new_pid) = session.child_pid() {
+            orphan::track_session(new_pid);
+        }
         let old = std::mem::replace(&mut t.session, session);
         std::mem::forget(old); // 不 drop——统一脏退出哲学,不留任何 drop 路径
         t.exited = None;
@@ -1734,6 +1744,9 @@ fn close_pane_action() {
         if let Some(pos) = tab.panes.iter().position(|p| p.id == pid) {
             let mut removed = tab.panes.remove(pos);
             removed.terminal.session.kill_child(); // 泄漏前杀子(同 close_tab)
+            if let Some(pid) = removed.terminal.session.child_pid() {
+                orphan::untrack_session(pid); // 会话干净终结,出注册表
+            }
             std::mem::forget(removed);
         }
         tab.focused = tab.focused.min(tab.panes.len() - 1);
@@ -1839,6 +1852,9 @@ unsafe fn create_pane_with_size(
     }
     let (session, reader) = PtySession::spawn(cmd, cols, rows)
         .map_err(|e| format!("无法启动 shell({shell_command}):{e}"))?;
+    if let Some(pid) = session.child_pid() {
+        orphan::track_session(pid); // 入注册表:强杀后下次启动按此清孤儿(T02)
+    }
     let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
 
     let terminal = Terminal {
@@ -2050,6 +2066,7 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
     std::mem::forget(TABS.with(|tabs| std::mem::take(&mut *tabs.borrow_mut())));
     std::mem::forget(GPU.with(|g| g.borrow_mut().take()));
     crate::app::quickterm::forget_state();
+    orphan::clear_sessions_for_exit(); // 干净退出:本进程注册表条目全清(T02)
     eprintln!("[exit] step6: done");
 }
 
@@ -3991,6 +4008,9 @@ fn close_tab(idx: usize) {
         }
         for pane in removed.panes.iter_mut() {
             pane.terminal.session.kill_child(); // 泄漏前杀子(防 defterm 弹窗,见 pty.rs)
+            if let Some(pid) = pane.terminal.session.child_pid() {
+                orphan::untrack_session(pid); // 会话干净终结,出注册表(T02)
+            }
         }
         std::mem::forget(removed);
         let len = guard.len();
