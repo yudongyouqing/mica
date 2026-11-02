@@ -50,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
     DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG,
     MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowTextW,
-    TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CHAR, WM_DESTROY, WM_DPICHANGED,
+    TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
     WM_ERASEBKGND, WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMOUSEMOVE, WM_PAINT,
@@ -330,6 +330,7 @@ pub(crate) mod lifecycle;
 pub mod orphan; // pub:tests 直入(真进程集成回归,T02)
 pub(crate) mod quickterm;
 pub mod uia;
+pub mod window_registry; // pub:tests 直入(真窗口生命周期回归,T04)
 
 thread_local! {
     static GPU: RefCell<Option<WindowGpu>> = const { RefCell::new(None) };
@@ -584,7 +585,8 @@ impl TabState {
 pub fn run() {
     // #59 启动计时锚(exec 起点近似;MICA_DEBUG_TIMING 门控输出分段)
     let t0 = std::time::Instant::now();
-    WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // T04:计数在 CreateWindowExW 成功后才递增(见下方 slot 建立处)——
+    // 创建失败不登记,销毁(真实 WM_DESTROY)才递减,两侧严格配对
     // ConPTY 宿主消毒(1.0.6):进程内剔除第三方 OpenConsole 目录,
     // 见 pty.rs 的 sanitize_conpty_host_path 文档——必须在一切 spawn
     // 之前(profile 扫描/QT/主窗 pty 全部受益)
@@ -780,6 +782,8 @@ pub fn run() {
         // T5/T7:后台线程共用的窗口哨兵,窗口创建后建立(两个线程都要投递)
         let hwnd_slot: SharedHwnd = Arc::new(Mutex::new(Some(hwnd.0 as isize)));
         SHARED_HWND.with(|s| *s.borrow_mut() = Some(Arc::clone(&hwnd_slot)));
+        window_registry::register(&hwnd_slot); // T04:进程级窗口表
+        WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         TAB_SEED
             .with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
         STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
@@ -863,156 +867,148 @@ fn spawn_window_tear(shell: String, cwd: Option<String>, title: String) {
 fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
     std::thread::Builder::new()
         .name("mica-window".into())
-        .spawn(move || {
-            WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            unsafe {
-                // 配置种子:副窗线程的 TLS 全新,按当前配置文件重播
-                let settings = load_settings();
-                KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
-                TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
-                CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
-                MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
-                COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
-                RIGHT_CLICK_PASTE
-                    .with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
-                KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
-                let dim = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
-                    217
+        .spawn(move || unsafe {
+            // 配置种子:副窗线程的 TLS 全新,按当前配置文件重播
+            let settings = load_settings();
+            KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
+            TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
+            CURSOR_BLINK.with(|b| b.set(settings.cursor_blink));
+            MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
+            COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
+            RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
+            KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
+            let dim = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+                217
+            } else {
+                (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
+            };
+            WINDOW_ALPHA_DIM.with(|a| a.set(dim));
+            let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
+            let title = HSTRING::from("Mica");
+            // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
+            // 落位同样锚定光标屏(#41,混合 DPI 重派缩水)
+            let (wx, wy) = cursor_workarea_origin();
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("mica_app_class"),
+                &title,
+                WS_OVERLAPPEDWINDOW,
+                wx,
+                wy,
+                900,
+                560,
+                None,
+                None,
+                Some(hinstance),
+                None,
+            )
+            .expect("CreateWindowExW (second window)");
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+            );
+            let dark: i32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+            let no_border: u32 = 0xFFFF_FFFE;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                windows::Win32::Graphics::Dwm::DWMWA_BORDER_COLOR,
+                &no_border as *const u32 as *const std::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            );
+            let corner: i32 = windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE.0;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
+                &corner as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+            // DPI 播种 + 网格落位(与主窗同式)
+            {
+                let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
+                if dpi != 96 {
+                    DPI_SCALE.with(|d| d.set(dpi as f32 / 96.0));
+                }
+            }
+            {
+                let families: Vec<&str> = if settings.font_families.is_empty() {
+                    DEFAULT_FAMILIES.to_vec()
                 } else {
-                    (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
+                    settings.font_families.iter().map(String::as_str).collect()
                 };
-                WINDOW_ALPHA_DIM.with(|a| a.set(dim));
-                let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
-                let title = HSTRING::from("Mica");
-                // 窗口序与 run() 同构(哑尺寸起步,播完 DPI 精确落位);
-                // 落位同样锚定光标屏(#41,混合 DPI 重派缩水)
-                let (wx, wy) = cursor_workarea_origin();
-                let hwnd = CreateWindowExW(
-                    WINDOW_EX_STYLE::default(),
-                    w!("mica_app_class"),
-                    &title,
-                    WS_OVERLAPPEDWINDOW,
-                    wx,
-                    wy,
-                    900,
-                    560,
-                    None,
-                    None,
-                    Some(hinstance),
-                    None,
-                )
-                .expect("CreateWindowExW (second window)");
+                let router = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families)
+                    .expect("no fonts resolved");
+                let metrics = router.metrics();
+                let mut rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: (f32::from(COLS) * metrics.cell_width).round() as i32,
+                    bottom: (f32::from(ROWS) * metrics.line_height).round() as i32,
+                };
+                AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false).expect("AdjustWindowRect");
                 let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                     hwnd,
                     None,
                     0,
                     0,
-                    0,
-                    0,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_FRAMECHANGED
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
                 );
-                let dark: i32 = 1;
-                let _ = DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_USE_IMMERSIVE_DARK_MODE,
-                    &dark as *const i32 as *const std::ffi::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-                let no_border: u32 = 0xFFFF_FFFE;
-                let _ = DwmSetWindowAttribute(
-                    hwnd,
-                    windows::Win32::Graphics::Dwm::DWMWA_BORDER_COLOR,
-                    &no_border as *const u32 as *const std::ffi::c_void,
-                    std::mem::size_of::<u32>() as u32,
-                );
-                let corner: i32 = windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE.0;
-                let _ = DwmSetWindowAttribute(
-                    hwnd,
-                    windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
-                    &corner as *const i32 as *const std::ffi::c_void,
-                    std::mem::size_of::<i32>() as u32,
-                );
-                // DPI 播种 + 网格落位(与主窗同式)
-                {
-                    let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd);
-                    if dpi != 96 {
-                        DPI_SCALE.with(|d| d.set(dpi as f32 / 96.0));
-                    }
-                }
-                {
-                    let families: Vec<&str> = if settings.font_families.is_empty() {
-                        DEFAULT_FAMILIES.to_vec()
-                    } else {
-                        settings.font_families.iter().map(String::as_str).collect()
-                    };
-                    let router = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families)
-                        .expect("no fonts resolved");
-                    let metrics = router.metrics();
-                    let mut rect = RECT {
-                        left: 0,
-                        top: 0,
-                        right: (f32::from(COLS) * metrics.cell_width).round() as i32,
-                        bottom: (f32::from(ROWS) * metrics.line_height).round() as i32,
-                    };
-                    AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)
-                        .expect("AdjustWindowRect");
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-                        hwnd,
-                        None,
-                        0,
-                        0,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
-                        windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                            | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
-                    );
-                }
-                if CURSOR_BLINK.with(std::cell::Cell::get) {
-                    let _ =
-                        windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 500, None);
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
-                        Some(hwnd),
-                        3,
-                        1000,
-                        None,
-                    );
-                }
-                let hwnd_slot: SharedHwnd = Arc::new(Mutex::new(Some(hwnd.0 as isize)));
-                SHARED_HWND.with(|s| *s.borrow_mut() = Some(Arc::clone(&hwnd_slot)));
-                TAB_SEED.with(|s| {
-                    *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt)
-                });
-                STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
-                CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
-                let gpu = init_window_gpu(hwnd);
-                GPU.with(|g| *g.borrow_mut() = Some(gpu));
-                let start_profile = std::env::var("MICA_START_PROFILE").ok();
-                if start_profile.is_some() {
-                    std::env::remove_var("MICA_START_PROFILE");
-                }
-                // 首标签:tear-off 种子优先(#35),否则 profile/默认
-                match seed {
-                    Some((shell, cwd, title)) => {
-                        start_tab_with_shell(hwnd, &shell, None, cwd.as_deref(), title)
-                    }
-                    None => start_tab_with_profile(hwnd, start_profile.as_deref(), None),
-                }
-                GPU.with(|g| {
-                    if let Some(gpu) = g.borrow_mut().as_mut() {
-                        gpu.renderer.set_clear_color(&settings.palette);
-                    }
-                });
-                draw_frame();
-                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-                    hwnd,
-                    windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
-                );
-                message_loop(None, hwnd_slot);
             }
+            if CURSOR_BLINK.with(std::cell::Cell::get) {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 500, None);
+                let _ =
+                    windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 3, 1000, None);
+            }
+            let hwnd_slot: SharedHwnd = Arc::new(Mutex::new(Some(hwnd.0 as isize)));
+            SHARED_HWND.with(|s| *s.borrow_mut() = Some(Arc::clone(&hwnd_slot)));
+            window_registry::register(&hwnd_slot); // T04:进程级窗口表
+            WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            TAB_SEED.with(|s| {
+                *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt)
+            });
+            STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
+            CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
+            let gpu = init_window_gpu(hwnd);
+            GPU.with(|g| *g.borrow_mut() = Some(gpu));
+            let start_profile = std::env::var("MICA_START_PROFILE").ok();
+            if start_profile.is_some() {
+                std::env::remove_var("MICA_START_PROFILE");
+            }
+            // 首标签:tear-off 种子优先(#35),否则 profile/默认
+            match seed {
+                Some((shell, cwd, title)) => {
+                    start_tab_with_shell(hwnd, &shell, None, cwd.as_deref(), title)
+                }
+                None => start_tab_with_profile(hwnd, start_profile.as_deref(), None),
+            }
+            GPU.with(|g| {
+                if let Some(gpu) = g.borrow_mut().as_mut() {
+                    gpu.renderer.set_clear_color(&settings.palette);
+                }
+            });
+            draw_frame();
+            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                hwnd,
+                windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+            );
+            message_loop(None, hwnd_slot);
         })
         .expect("spawn window thread");
 }
@@ -1242,12 +1238,10 @@ fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<notify::Result<Event>>, hwnd_
         if !path.exists() {
             continue;
         }
-        let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hwnd) = hwnd {
-            // 失败(队列满/窗口已死)忽略即可;Post 到死句柄无害
-            let hwnd = HWND(hwnd as *mut std::ffi::c_void);
-            let _ = unsafe { PostMessageW(Some(hwnd), WM_APP_CONFIG, WPARAM(0), LPARAM(0)) };
-        }
+        // T04:向首个存活窗口投递(主窗先关时副窗接管);无存活窗口
+        // (进程退出中)静默丢弃本轮
+        let _ = window_registry::post_to_alive(WM_APP_CONFIG, WPARAM(0), LPARAM(0));
+        let _ = &hwnd_slot;
     }
 }
 
@@ -3852,7 +3846,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     );
                 }
                 HTCLOSE => {
-                    let _ = PostMessageW(Some(hwnd), WM_DESTROY, WPARAM(0), LPARAM(0));
+                    // T04:统一关闭入口——投 WM_CLOSE(wndproc 里走真
+                    // DestroyWindow)。旧实现投伪 WM_DESTROY:计数与退出
+                    // 序照跑但 HWND 不销毁,副窗场景留僵尸窗口
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                 }
                 _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
             }
@@ -3942,7 +3939,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             reload_config(hwnd);
             LRESULT(0)
         }
+        WM_CLOSE => {
+            // T04 统一关闭入口:一切关闭(Alt+F4 走 DefWindowProc 同途、
+            // caption ×、最后标签)都到达这里,真实销毁 HWND;WM_DESTROY
+            // 才减计数/发退出——禁止再伪造 WM_DESTROY
+            // SAFETY: 本线程拥有该窗口,销毁合法
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            // 真实销毁(WM_CLOSE → DestroyWindow)必经;注销窗口表在
+            // 计数递减前,此后 IPC/配置通知不再寻址本窗
+            let slot = SHARED_HWND
+                .with(|s| s.borrow().clone())
+                .unwrap_or_else(|| Arc::new(Mutex::new(Some(hwnd.0 as isize))));
+            window_registry::unregister(&slot);
             WINDOW_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             PostQuitMessage(0);
             LRESULT(0)
@@ -4071,7 +4082,27 @@ fn close_tab(idx: usize) {
         }
     });
     if quit {
-        unsafe { PostQuitMessage(0) };
+        // T04:末标签 = 关窗口——投 WM_CLOSE 走统一销毁(真 DestroyWindow
+        // → WM_DESTROY → 计数递减)。旧实现只 PostQuitMessage:HWND 不
+        // 销毁、计数不归零,run() 尾部 park 永久挂死进程
+        let hwnd = SHARED_HWND
+            .with(|s| s.borrow().clone())
+            .and_then(|slot| *slot.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(raw) = hwnd {
+            // SAFETY: 目标是本线程窗口;投递失败(窗口已死)则本窗
+            // 已在销毁序中,无需再动
+            let _ = unsafe {
+                PostMessageW(
+                    Some(HWND(raw as *mut std::ffi::c_void)),
+                    WM_CLOSE,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+        } else {
+            // 哨兵已空(退出序进行中):直接退出消息循环兜底
+            unsafe { PostQuitMessage(0) };
+        }
         return;
     }
     if let Some(na) = new_active {

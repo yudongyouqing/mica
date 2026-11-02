@@ -48,3 +48,9 @@ windows-core = { workspace = true }
 pollster = { workspace = true }
 raw-window-handle = { workspace = true }
 notify = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -22,9 +22,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW,
-    PostQuitMessage, RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP,
-    WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER,
-    WNDCLASSEXW, WS_POPUP, WS_VISIBLE,
+    RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR,
+    WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
+    WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
@@ -507,8 +507,9 @@ unsafe extern "system" fn qt_wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            // T04:QT 与主窗同线程——QT 销毁绝不能 PostQuitMessage(会把
+            // 主窗消息循环一并掐死,主窗沦为未销毁的假退出)。QT 随进程退出
             let _ = unregister_hotkey();
-            PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

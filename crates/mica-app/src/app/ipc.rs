@@ -77,20 +77,19 @@ fn accept_loop(pipe: HANDLE, tx: mpsc::Sender<IpcMessage>, hwnd_slot: SharedHwnd
         }
         let msg = read_one_message(pipe);
         if let Some(msg) = msg {
-            // 唤醒主线程:哨兵拿 HWND 投递 WM_APP_IPC(profile 字符串经 Box
-            // 转移所有权,主线程必须收——见 wndproc 的 WM_APP_IPC)
-            let hwnd = *hwnd_slot.lock().expect("hwnd slot poisoned");
-            if let Some(raw) = hwnd {
-                let hwnd = windows::Win32::Foundation::HWND(raw as *mut std::ffi::c_void);
-                let _ = unsafe {
-                    windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                        Some(hwnd),
-                        crate::app::WM_APP_IPC,
-                        windows::Win32::Foundation::WPARAM(0),
-                        windows::Win32::Foundation::LPARAM(0),
-                    )
-                };
+            // 唤醒窗口线程:T04 起向进程级窗口表的**首个存活窗口**投递
+            // (主窗先关时副窗接管接收;旧实现只认 serve() 时捕获的主窗
+            // slot,主窗关闭后通知全部落空)。投递失败(无存活窗口,
+            // 进程退出中)只记日志
+            let posted = super::window_registry::post_to_alive(
+                crate::app::WM_APP_IPC,
+                windows::Win32::Foundation::WPARAM(0),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+            if !posted {
+                eprintln!("ipc: 无存活窗口接收通知(进程退出中?)");
             }
+            let _ = &hwnd_slot; // 保留参数;寻址已统一走窗口表
             if tx.send(msg).is_err() {
                 // 主线程已收摊(退出序):停止服务
                 // SAFETY: 句柄收尾
