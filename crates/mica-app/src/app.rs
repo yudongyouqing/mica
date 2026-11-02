@@ -22,7 +22,7 @@ use notify::{Event, RecursiveMode, Watcher};
 use mica_core::config::palette::Palette;
 use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, MouseRightClick, Settings};
 use mica_core::input::{self, Key, Mods};
-use mica_core::ipc::IpcMessage;
+use mica_core::ipc::{IpcError, IpcRequest, IpcResponse};
 use mica_core::keymap::{Action, Keymap, TriggerKey};
 use mica_core::pty::{PtyReader, PtySession};
 use mica_core::surface::{
@@ -430,7 +430,10 @@ thread_local! {
     /// 窗口级键位表(Settings 合成;热重载时整表替换)
     static KEYMAP: RefCell<Keymap> = RefCell::new(Keymap::wt_default());
     /// IPC 服务端消息队列(主线程 WM_APP_IPC 时 try_recv)
-    static IPC_RX: RefCell<Option<std::sync::mpsc::Receiver<IpcMessage>>> = const { RefCell::new(None) };
+    /// IPC 服务端消息队列(主线程 WM_APP_IPC 时 try_recv);请求带单槽
+    /// 回复通道,处理完必须应答(服务端 3s 等不到就回 timeout)
+    static IPC_RX: RefCell<Option<std::sync::mpsc::Receiver<ipc::IncomingRequest>>> =
+        const { RefCell::new(None) };
     /// 2026 同步持帧(D29):h 起置 true,l 或 150ms 超时放帧。
     /// 持帧只跳 draw(数据照 drain+feed,不丢)
     static SYNC_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -794,7 +797,7 @@ pub fn run() {
         // M3a:单实例 IPC 服务(管道被占说明已有实例——main 侧已分流,这里
         // 只可能首实例到达;失败降级单开不致命)。必须在首帧前:晚于此,
         // 启动窗口期内的 `mica new-tab` 会自启第二个实例
-        match ipc::serve(Arc::clone(&hwnd_slot)) {
+        match ipc::serve() {
             Ok(rx) => IPC_RX.with(|slot| *slot.borrow_mut() = Some(rx)),
             Err(false) => {} // 建管道失败:已在 ipc::serve 记日志
             Err(true) => unreachable!("main 已分流,GUI 路径不会撞已占管道"),
@@ -3946,62 +3949,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_APP_IPC => {
-            // IPC 客户端请求(M3a):主线程排空消息队列——new-tab 起 profile
-            // 标签,activate 仅前置窗口
-            while let Some(msg) =
+            // IPC 客户端请求(M3a → T06):主线程排空消息队列,逐条应用并
+            // **应答**(请求带单槽回复通道,服务端在管道上等这个响应)
+            while let Some(incoming) =
                 IPC_RX.with(|slot| slot.borrow_mut().as_mut().and_then(|rx| rx.try_recv().ok()))
             {
-                if msg.op == "new-tab" {
-                    let profile = msg.profile.as_deref();
-                    start_tab_with_profile(hwnd, profile, msg.font_size);
-                }
-                if msg.op == "new-window" {
-                    spawn_window(None);
-                }
-                // #44 send-text(tmux send-keys 同义):向目标 pane 的 pty
-                // 输入流写字节;pane 开了 bracketed paste 自动包边界
-                // (多行 prompt 进 Claude Code 不炸)
-                if msg.op == "send-text" {
-                    let bytes = msg.text.unwrap_or_default().into_bytes();
-                    let target = |t: &mut Terminal| {
-                        let payload = if t.term.bracketed_paste_active() {
-                            let mut w = b"\x1b[200~".to_vec();
-                            w.extend_from_slice(&bytes);
-                            w.extend_from_slice(b"\x1b[201~");
-                            w
-                        } else {
-                            bytes.clone()
-                        };
-                        let _ = t.session.write(&payload);
-                    };
-                    match msg.tab {
-                        Some(-1) => quickterm::send_text(&bytes),
-                        Some(n) if n >= 0 => {
-                            TABS.with(|tabs| {
-                                if let Some(t) = tabs
-                                    .borrow_mut()
-                                    .get_mut(n as usize)
-                                    .and_then(|tab| tab.active_pane())
-                                {
-                                    target(t);
-                                }
-                            });
-                        }
-                        _ => {
-                            TABS.with(|tabs| {
-                                if let Some(t) = tabs
-                                    .borrow_mut()
-                                    .get_mut(ACTIVE.get())
-                                    .and_then(|tab| tab.active_pane())
-                                {
-                                    target(t);
-                                }
-                            });
-                        }
-                    }
-                }
+                let resp = unsafe { apply_ipc_request(hwnd, &incoming.req) };
+                incoming.reply(resp);
             }
-            // activate 语义(两条消息共用):前置既有窗口
+            // activate 语义:前置既有窗口
             let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd) };
             draw_frame();
             LRESULT(0)
@@ -4036,6 +3992,78 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// T06:应用一条 IPC 请求并生成应答。参数校验在这里(服务端只挡未知
+/// op);send-text 成功仅承诺字节写入 PTY——不承诺 shell 执行完毕。
+unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
+    match req.op.as_str() {
+        "activate" => IpcResponse::applied(req.id),
+        "new-window" => {
+            spawn_window(None);
+            IpcResponse::applied(req.id)
+        }
+        "new-tab" => {
+            if let Some(fs) = req.font_size
+                && (!fs.is_finite() || !(6.0..=72.0).contains(&fs))
+            {
+                return IpcResponse::error(req.id, IpcError::BadFontSize);
+            }
+            if let Some(profile) = req.profile.as_deref() {
+                let known = mica_core::profile::scan_all()
+                    .iter()
+                    .any(|p| p.name.eq_ignore_ascii_case(profile));
+                if !known {
+                    return IpcResponse::error(req.id, IpcError::BadProfile);
+                }
+            }
+            // spawn 失败路径在 start_tab_with_profile 内记日志;应答
+            // applied 表示"已受理并尝试开标签"
+            start_tab_with_profile(hwnd, req.profile.as_deref(), req.font_size);
+            IpcResponse::applied(req.id)
+        }
+        "send-text" => {
+            let bytes = req.text.clone().unwrap_or_default().into_bytes();
+            let write_to = |t: &mut Terminal| -> bool {
+                let payload = if t.term.bracketed_paste_active() {
+                    let mut w = b"\x1b[200~".to_vec();
+                    w.extend_from_slice(&bytes);
+                    w.extend_from_slice(b"\x1b[201~");
+                    w
+                } else {
+                    bytes.clone()
+                };
+                t.session.write(&payload).is_ok()
+            };
+            let written = match req.tab {
+                Some(-1) => {
+                    quickterm::send_text(&bytes);
+                    true
+                }
+                Some(n) if n >= 0 => TABS.with(|tabs| {
+                    tabs.borrow_mut()
+                        .get_mut(n as usize)
+                        .and_then(|tab| tab.active_pane())
+                        .map(write_to)
+                        .unwrap_or(false)
+                }),
+                _ => TABS.with(|tabs| {
+                    tabs.borrow_mut()
+                        .get_mut(ACTIVE.get())
+                        .and_then(|tab| tab.active_pane())
+                        .map(write_to)
+                        .unwrap_or(false)
+                }),
+            };
+            if written {
+                IpcResponse::applied(req.id)
+            } else {
+                IpcResponse::error(req.id, IpcError::BadTarget)
+            }
+        }
+        // 服务端已挡未知 op;防御性兜底
+        _ => IpcResponse::error(req.id, IpcError::UnknownOp),
     }
 }
 
