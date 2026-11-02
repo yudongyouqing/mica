@@ -430,10 +430,7 @@ thread_local! {
     /// 窗口级键位表(Settings 合成;热重载时整表替换)
     static KEYMAP: RefCell<Keymap> = RefCell::new(Keymap::wt_default());
     /// IPC 服务端消息队列(主线程 WM_APP_IPC 时 try_recv)
-    /// IPC 服务端消息队列(主线程 WM_APP_IPC 时 try_recv);请求带单槽
-    /// 回复通道,处理完必须应答(服务端 3s 等不到就回 timeout)
-    static IPC_RX: RefCell<Option<std::sync::mpsc::Receiver<ipc::IncomingRequest>>> =
-        const { RefCell::new(None) };
+
     /// 2026 同步持帧(D29):h 起置 true,l 或 150ms 超时放帧。
     /// 持帧只跳 draw(数据照 drain+feed,不丢)
     static SYNC_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -478,6 +475,12 @@ thread_local! {
 /// device lost 标志(M5b/T2):静态而非 TLS——wgpu 的 lost callback 可能
 /// 从内部线程触发,主线程在 draw_frame 入口轮询消费。
 static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// IPC 服务端消息队列(T06):**进程级**而非 TLS——窗口表会把
+/// WM_APP_IPC 投给任意存活窗口(主窗先关时副窗接管),任意窗口线程
+/// 都必须能排空;请求带单槽回复通道,处理完必须应答。
+static IPC_RX: std::sync::Mutex<Option<std::sync::mpsc::Receiver<ipc::IncomingRequest>>> =
+    std::sync::Mutex::new(None);
+
 /// 存活窗口计数(2026-10-12 多窗口):创建 +1 / WM_DESTROY -1;
 /// 主窗退出序后按此数等剩余窗口,归零才进程退出
 static WINDOW_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -798,7 +801,7 @@ pub fn run() {
         // 只可能首实例到达;失败降级单开不致命)。必须在首帧前:晚于此,
         // 启动窗口期内的 `mica new-tab` 会自启第二个实例
         match ipc::serve() {
-            Ok(rx) => IPC_RX.with(|slot| *slot.borrow_mut() = Some(rx)),
+            Ok(rx) => *IPC_RX.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx),
             Err(false) => {} // 建管道失败:已在 ipc::serve 记日志
             Err(true) => unreachable!("main 已分流,GUI 路径不会撞已占管道"),
         }
@@ -3951,9 +3954,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_IPC => {
             // IPC 客户端请求(M3a → T06):主线程排空消息队列,逐条应用并
             // **应答**(请求带单槽回复通道,服务端在管道上等这个响应)
-            while let Some(incoming) =
-                IPC_RX.with(|slot| slot.borrow_mut().as_mut().and_then(|rx| rx.try_recv().ok()))
-            {
+            loop {
+                let incoming = {
+                    let mut slot = IPC_RX.lock().unwrap_or_else(|e| e.into_inner());
+                    slot.as_mut().and_then(|rx| rx.try_recv().ok())
+                };
+                let Some(incoming) = incoming else { break };
                 let resp = unsafe { apply_ipc_request(hwnd, &incoming.req) };
                 incoming.reply(resp);
             }
