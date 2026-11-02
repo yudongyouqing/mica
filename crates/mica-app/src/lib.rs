@@ -132,8 +132,12 @@ pub fn handle_cli() -> i32 {
                         1
                     }
                 },
-                Err(IpcError::Transport) => {
+                Err(IpcError::NoInstance) => {
                     eprintln!("mica send: 无运行中的 mica 实例(IPC 不通)");
+                    1
+                }
+                Err(IpcError::Disconnected) => {
+                    eprintln!("mica send: 连接在请求送达后断开——文本可能已注入,请勿盲目重试");
                     1
                 }
                 Err(e) => {
@@ -179,9 +183,10 @@ fn dispatch_ipc(req: mica_core::ipc::IpcRequest, fallback_shell: String) -> i32 
             }
             0
         }
-        // 连不上(管道不存在):自启动 GUI。仅 Transport 触发自启——
-        // Timeout 说明实例活着但没应答,自启会造成双实例
-        Err(mica_core::ipc::IpcError::Transport) => {
+        // 管道不存在(无实例):**唯一**可安全自启的形态。Busy/
+        // AccessDenied/Timeout/Disconnected 都说明实例活着或结果未知——
+        // 自启会造双实例或重复操作(复核 2)
+        Err(mica_core::ipc::IpcError::NoInstance) => {
             let _ = &fallback_shell;
             if let Some(p) = &req.profile {
                 // SAFETY: 多线程前调用(单线程 CLI)
@@ -189,6 +194,15 @@ fn dispatch_ipc(req: mica_core::ipc::IpcRequest, fallback_shell: String) -> i32 
             }
             app::run();
             0
+        }
+        // 结果未知类:请求可能已被执行,明确警示勿盲目重试
+        Err(mica_core::ipc::IpcError::Disconnected) => {
+            eprintln!("mica: 连接在请求送达后断开——请求可能已执行,请勿盲目重试");
+            1
+        }
+        Err(mica_core::ipc::IpcError::Timeout) => {
+            eprintln!("mica: 实例未在期限内应答——请求可能已执行,请勿盲目重试");
+            1
         }
         Err(e) => {
             eprintln!("mica: IPC 失败({})", e.code());

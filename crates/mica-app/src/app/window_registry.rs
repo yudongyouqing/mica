@@ -70,6 +70,32 @@ pub fn post_to_alive(msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
     false
 }
 
+/// 向**全部**存活窗口广播消息(配置热重载:T04/T06 复核 4——只发首个
+/// 存活窗口时其余窗口不会同步)。返回投递数。
+pub fn post_to_all_alive(msg: u32, wparam: WPARAM, lparam: LPARAM) -> usize {
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut sent = 0;
+    for slot in reg.iter() {
+        let hwnd = *slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(raw) = hwnd {
+            // SAFETY: hwnd 来自登记窗口;Post 失败无害
+            if unsafe {
+                PostMessageW(
+                    Some(HWND(raw as *mut std::ffi::c_void)),
+                    msg,
+                    wparam,
+                    lparam,
+                )
+            }
+            .is_ok()
+            {
+                sent += 1;
+            }
+        }
+    }
+    sent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

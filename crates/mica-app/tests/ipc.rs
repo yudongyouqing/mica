@@ -20,6 +20,18 @@ fn guard() -> &'static Mutex<()> {
     GUARD.get_or_init(|| Mutex::new(()))
 }
 
+/// 本用例的隔离身份:管道名由 USERNAME 派生——每个用例独占一条管道,
+/// 绝不触碰真实用户实例的 \.\pipe\mica-<用户名>(复核 6)。
+static TEST_USER: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn test_user() -> String {
+    TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 struct ChildGuard(std::process::Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -34,18 +46,25 @@ impl Drop for ChildGuard {
 }
 
 fn launch_isolated() -> ChildGuard {
-    let iso = std::env::temp_dir().join(format!(
-        "mica-ipc-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let iso = std::env::temp_dir().join(format!("mica-ipc-{unique}"));
     std::fs::create_dir_all(&iso).unwrap();
+    // 唯一管道身份:USERNAME 派生管道名;LOCALAPPDATA 隔离状态目录
+    // (pty 注册表不再写用户真实文件)
+    let user = format!("micatest{unique}");
+    *TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = user.clone();
     ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_mica"))
             .arg("--multi")
             .env("APPDATA", &iso)
+            .env("LOCALAPPDATA", &iso)
+            .env("USERNAME", &user)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -54,7 +73,14 @@ fn launch_isolated() -> ChildGuard {
 }
 
 fn pipe_name() -> String {
-    let user = std::env::var("USERNAME").unwrap_or_default();
+    let user = {
+        let t = test_user();
+        if t.is_empty() {
+            std::env::var("USERNAME").unwrap_or_default()
+        } else {
+            t
+        }
+    };
     let safe: String = user
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -76,6 +102,7 @@ fn wait_ready(timeout: Duration) -> bool {
     while Instant::now() < deadline {
         let ok = Command::new(env!("CARGO_BIN_EXE_mica"))
             .args(["send", "--literal", "x"])
+            .env("USERNAME", test_user())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -158,6 +185,56 @@ fn read_response(h: HANDLE, timeout: Duration) -> Option<IpcResponse> {
         }
         buf.extend_from_slice(&chunk[..read as usize]);
     }
+}
+
+/// EnumWindows 的收集上下文(回调与调用方共用)。
+struct EnumCtx {
+    pid: u32,
+    out: Vec<windows::Win32::Foundation::HWND>,
+}
+
+/// 枚举属于指定 PID 的可见 mica 主窗(验证派发兑现)。
+fn windows_of(pid: u32) -> Vec<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    let mut ctx = EnumCtx {
+        pid,
+        out: Vec::new(),
+    };
+    let ctx_ptr = &mut ctx as *mut EnumCtx;
+    // SAFETY: 回调只写调用方栈上的 ctx;EnumWindows 同步完成
+    unsafe {
+        let _ = EnumWindows(
+            Some(enumerate_proc as unsafe extern "system" fn(HWND, LPARAM) -> windows::core::BOOL),
+            LPARAM(ctx_ptr as isize),
+        );
+    }
+    ctx.out
+}
+
+unsafe extern "system" fn enumerate_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::core::BOOL {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+    // SAFETY(Rust 2024):lparam 指向调用方栈上的 EnumCtx;按契约调用
+    unsafe {
+        let ctx = &mut *(lparam.0 as *mut EnumCtx);
+        let mut wpid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut wpid));
+        if wpid == ctx.pid && IsWindowVisible(hwnd).as_bool() {
+            let mut name = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut name);
+            let class = String::from_utf16_lossy(&name[..n.max(0) as usize]);
+            if class == "mica_app_class" {
+                ctx.out.push(hwnd);
+            }
+        }
+    }
+    windows::core::BOOL(1)
 }
 
 /// 正常 activate 请求 → applied,响应回带请求 id。
@@ -330,6 +407,7 @@ fn cli_reports_errors_nonzero() {
     assert!(wait_ready(Duration::from_secs(20)));
     let bad = Command::new(env!("CARGO_BIN_EXE_mica"))
         .args(["send", "--tab=99", "--literal", "x"])
+        .env("USERNAME", test_user())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -337,9 +415,96 @@ fn cli_reports_errors_nonzero() {
     assert_eq!(bad.code(), Some(1), "错目标必须非零退出");
     let good = Command::new(env!("CARGO_BIN_EXE_mica"))
         .args(["send", "--literal", "x"])
+        .env("USERNAME", test_user())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .unwrap();
     assert_eq!(good.code(), Some(0));
+}
+
+/// 复核 1:发请求后**保持连接但不读**的客户端不能卡死服务——写响应
+/// 走有界收尾(宽限 ≤2s),后续正常客户端照常受理。
+#[test]
+fn non_reading_client_does_not_block_server() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let _app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)));
+    // 恶意客户端 A:发完请求就挂着,永不读响应
+    let ha = connect(Duration::from_secs(5)).expect("A 连接");
+    assert!(write_bytes(
+        ha,
+        &encode_frame(&IpcRequest::new(601, "activate"))
+    ));
+    // 不读;给服务端一点时间进入收尾宽限
+    std::thread::sleep(Duration::from_millis(300));
+    // 正常客户端 B:在宽限 + 服务能力范围内必须被受理(服务被 A 占用
+    // 最多 = A 的收尾宽限 2s + B 自身服务时间)
+    let start = Instant::now();
+    let hb = connect(Duration::from_secs(15)).expect("B 应能连上(A 的宽限有限)");
+    assert!(write_bytes(
+        hb,
+        &encode_frame(&IpcRequest::new(602, "activate"))
+    ));
+    let resp = read_response(hb, Duration::from_secs(10)).expect("B 必须得到应答");
+    // SAFETY: 测试侧句柄
+    unsafe { windows::Win32::Foundation::CloseHandle(hb).ok() };
+    assert_eq!(resp.id, 602);
+    assert_eq!(resp.status, IpcStatus::Applied);
+    assert!(
+        start.elapsed() < Duration::from_secs(12),
+        "A(不读)最多占用其收尾宽限,B 不应被长期挡住"
+    );
+    // A 的连接在服务端 Disconnect 后读端断裂;清理
+    // SAFETY: 测试侧句柄
+    unsafe { windows::Win32::Foundation::CloseHandle(ha).ok() };
+}
+
+/// 复核 3:new-window 是异步派发——必须回 Queued 而非 Applied。
+#[test]
+fn new_window_responds_queued_not_applied() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let _app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)));
+    let h = connect(Duration::from_secs(5)).expect("连接");
+    assert!(write_bytes(
+        h,
+        &encode_frame(&IpcRequest::new(701, "new-window"))
+    ));
+    let resp = read_response(h, Duration::from_secs(5)).expect("应答");
+    // SAFETY: 测试侧句柄
+    unsafe { windows::Win32::Foundation::CloseHandle(h).ok() };
+    assert_eq!(resp.id, 701);
+    assert_eq!(resp.status, IpcStatus::Queued, "异步派发只承诺入队");
+    // 等副窗真的出现(派发兑现),再关掉它收尾:关最后窗口进程退出
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut two = false;
+    while Instant::now() < deadline {
+        let ws = windows_of(_app.0.id());
+        if ws.len() >= 2 {
+            two = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(two, "Queued 之后副窗应实际创建");
+}
+
+/// 复核 6:连接的管道必须属于**自己启动的实例**——GetNamedPipeServerProcessId
+/// 与子进程 PID 一致(防止探测/操作到用户已有实例)。
+#[test]
+fn server_pid_is_the_launched_instance() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)));
+    let h = connect(Duration::from_secs(5)).expect("连接");
+    let mut server_pid = 0u32;
+    // SAFETY: 句柄为本测试连接
+    let ok =
+        unsafe { windows::Win32::System::Pipes::GetNamedPipeServerProcessId(h, &mut server_pid) }
+            .is_ok();
+    // SAFETY: 测试侧句柄
+    unsafe { windows::Win32::Foundation::CloseHandle(h).ok() };
+    assert!(ok, "GetNamedPipeServerProcessId 失败");
+    assert_eq!(server_pid, app.0.id(), "管道服务端必须是本测试启动的实例");
 }

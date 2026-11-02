@@ -307,10 +307,19 @@ pub fn forget_state() {
 
 /// 切换:可见→隐藏;隐藏→显示+置顶激活。
 /// #44 send-text 的 QT 入口:向 QT pane 注入输入(bracketed paste 自动包)
-pub fn send_text(bytes: &[u8]) {
+/// QT 是否已建(供 IPC 区分 bad_target 与 pty_write)。
+pub fn exists() -> bool {
+    QT.with(|q| q.borrow().is_some())
+}
+
+/// 向 QT pane 注入输入。返回真实结果(复核 3):false = QT 不存在
+/// 或 pty 写失败——IPC 不再假报成功。
+pub fn send_text(bytes: &[u8]) -> bool {
     QT.with(|q| {
         let mut guard = q.borrow_mut();
-        let Some(st) = guard.as_mut() else { return };
+        let Some(st) = guard.as_mut() else {
+            return false; // QT 不存在(未建/禁用)
+        };
         let t = &mut st.terminal;
         let payload = if t.term.bracketed_paste_active() {
             let mut w = b"\x1b[200~".to_vec();
@@ -320,10 +329,9 @@ pub fn send_text(bytes: &[u8]) {
         } else {
             bytes.to_vec()
         };
-        let _ = t.session.write(&payload);
-    });
+        t.session.write(&payload).is_ok()
+    })
 }
-
 pub unsafe fn toggle() {
     let raw = QT_HWND.with(|c| c.get());
     if raw == 0 {

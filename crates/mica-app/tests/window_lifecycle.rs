@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindowRect, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    PostMessageW, SendMessageW, WM_CLOSE, WM_NCLBUTTONDOWN,
+    EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+    IsWindowVisible, PostMessageW, SendMessageW, WM_CLOSE, WM_NCLBUTTONDOWN,
 };
 use windows::core::BOOL;
 
@@ -35,24 +35,149 @@ impl Drop for ChildGuard {
     }
 }
 
+/// 本用例的隔离身份(唯一管道名 + 状态目录,复核 6)。
+static TEST_USER: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn test_user() -> String {
+    TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 fn launch_isolated() -> ChildGuard {
-    // 配置隔离:空 APPDATA = 全默认(不受用户配置影响)
-    let iso = std::env::temp_dir().join(format!(
-        "mica-winlife-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    // 配置隔离:空 APPDATA = 全默认;USERNAME 派生唯一管道;
+    // LOCALAPPDATA 隔离状态目录(pty 注册表)
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let iso = std::env::temp_dir().join(format!("mica-winlife-{unique}"));
     std::fs::create_dir_all(&iso).unwrap();
+    let user = format!("micawin{unique}");
+    *TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = user.clone();
     let child = Command::new(env!("CARGO_BIN_EXE_mica"))
         .arg("--multi")
         .env("APPDATA", &iso)
+        .env("LOCALAPPDATA", &iso)
+        .env("USERNAME", &user)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("launch mica");
     ChildGuard(child)
+}
+
+/// 预置(空但存在的)config 文件启动:热重载 watcher 只在文件存在时
+/// 建立(spawn_config_watcher 的契约)。
+fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let iso = std::env::temp_dir().join(format!("mica-winlife-cfg-{unique}"));
+    let dir = iso.join("mica");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config");
+    std::fs::write(&cfg, b"").unwrap(); // 空文件 = 全默认且 watcher 启用
+    let user = format!("micawincfg{unique}");
+    *TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = user.clone();
+    let child = Command::new(env!("CARGO_BIN_EXE_mica"))
+        .arg("--multi")
+        .env("APPDATA", &iso)
+        .env("LOCALAPPDATA", &iso)
+        .env("USERNAME", &user)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("launch mica");
+    (ChildGuard(child), cfg)
+}
+
+/// 读窗口标题(热重载 title 即时应用的观测面)。
+fn window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
+    let mut buf = [0u16; 128];
+    // SAFETY: 缓冲与长度对应
+    let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// 复核 4:主窗先关后改配置——watcher 是进程级服务,热重载必须继续
+/// 工作(标题从默认变为配置值 = reload 真实执行的外部证据)。
+#[test]
+fn config_reload_survives_main_close() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, cfg) = launch_with_config();
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    let other = ws.iter().find(|h| **h != first[0]).copied().unwrap();
+    // 关主窗(watcher 的建立者)
+    // SAFETY: 本测试的子进程窗口
+    unsafe {
+        let _ = PostMessageW(Some(first[0]), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { IsWindow(Some(first[0])) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!unsafe { IsWindow(Some(first[0])) }.as_bool(), "主窗销毁");
+    assert!(app.0.try_wait().unwrap().is_none(), "副窗在,进程存活");
+
+    // 改配置 → 去抖 300ms → 广播 → 副窗 reload → title 即时应用
+    std::fs::write(&cfg, b"title = ReloadAfterMainClose").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while window_title(other) != "ReloadAfterMainClose" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        window_title(other),
+        "ReloadAfterMainClose",
+        "主窗关闭后热重载必须仍然工作"
+    );
+
+    // 收尾
+    // SAFETY: 本测试的子进程窗口
+    unsafe {
+        let _ = PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    assert!(wait_exit(&mut app.0, Duration::from_secs(5)));
+}
+
+/// 复核 4:多窗同时更新——广播到全部存活窗口,无漂移。
+#[test]
+fn both_windows_reload_from_broadcast() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, cfg) = launch_with_config();
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let _first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+
+    std::fs::write(&cfg, b"title = BothReloaded").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while ws.iter().any(|h| window_title(*h) != "BothReloaded") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    for h in &ws {
+        assert_eq!(window_title(*h), "BothReloaded", "广播必须覆盖全部窗口");
+    }
+
+    // SAFETY: 本测试的子进程窗口
+    unsafe {
+        for h in &ws {
+            let _ = PostMessageW(Some(*h), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    assert!(wait_exit(&mut app.0, Duration::from_secs(5)));
 }
 
 /// CLI 过 IPC 驱动实例(activate/new-tab/new-window)。
@@ -61,6 +186,7 @@ fn launch_isolated() -> ChildGuard {
 fn cli(args: &[&str]) -> bool {
     Command::new(env!("CARGO_BIN_EXE_mica"))
         .args(args)
+        .env("USERNAME", test_user())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

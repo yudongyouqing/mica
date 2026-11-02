@@ -481,6 +481,11 @@ static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 static IPC_RX: std::sync::Mutex<Option<std::sync::mpsc::Receiver<ipc::IncomingRequest>>> =
     std::sync::Mutex::new(None);
 
+/// 配置 watcher 的进程级持有(复核 4):watcher 只在主窗 deferred_init
+/// 建立,但**不随主窗销毁**——主窗先关、副窗仍在时热重载必须继续工作。
+/// 进程退出时随进程回收(watcher Drop 停后端,线程随进程结束)。
+static CONFIG_WATCHER: Mutex<Option<ReloadHandle>> = Mutex::new(None);
+
 /// 存活窗口计数(2026-10-12 多窗口):创建 +1 / WM_DESTROY -1;
 /// 主窗退出序后按此数等剩余窗口,归零才进程退出
 static WINDOW_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -998,11 +1003,14 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 std::env::remove_var("MICA_START_PROFILE");
             }
             // 首标签:tear-off 种子优先(#35),否则 profile/默认
+            // (窗口启动路径:建败已有 warn_box,布尔结果此处不消费)
             match seed {
                 Some((shell, cwd, title)) => {
-                    start_tab_with_shell(hwnd, &shell, None, cwd.as_deref(), title)
+                    let _ = start_tab_with_shell(hwnd, &shell, None, cwd.as_deref(), title);
                 }
-                None => start_tab_with_profile(hwnd, start_profile.as_deref(), None),
+                None => {
+                    let _ = start_tab_with_profile(hwnd, start_profile.as_deref(), None);
+                }
             }
             GPU.with(|g| {
                 if let Some(gpu) = g.borrow_mut().as_mut() {
@@ -1120,7 +1128,9 @@ unsafe fn deferred_init(hwnd: HWND) {
     if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone())
         && let Some(reload) = spawn_config_watcher(slot)
     {
-        RELOAD_TAKE.with(|r| *r.borrow_mut() = Some(reload));
+        // 进程级持有(复核 4):主窗销毁不带走 watcher;重复初始化由
+        // DEFER_DONE 守卫(本函数只跑一次)
+        *CONFIG_WATCHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(reload);
     }
     if std::env::var_os("MICA_DEBUG_TIMING").is_some() {
         let total = START_T0
@@ -1244,9 +1254,9 @@ fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<notify::Result<Event>>, hwnd_
         if !path.exists() {
             continue;
         }
-        // T04:向首个存活窗口投递(主窗先关时副窗接管);无存活窗口
-        // (进程退出中)静默丢弃本轮
-        let _ = window_registry::post_to_alive(WM_APP_CONFIG, WPARAM(0), LPARAM(0));
+        // 复核 4:广播到**全部**存活窗口(单投会让多窗配置漂移);
+        // 无存活窗口(进程退出中)静默丢弃本轮
+        let _ = window_registry::post_to_all_alive(WM_APP_CONFIG, WPARAM(0), LPARAM(0));
         let _ = &hwnd_slot;
     }
 }
@@ -1371,6 +1381,11 @@ unsafe fn reload_config(hwnd: HWND) {
     });
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
+    // title 锁定值即时应用(此前要等下一次 shell 标题事件才生效)——
+    // 这也是"热重载确实执行"的外部观测面(测试读窗口文本)
+    if let Some(t) = TITLE_LOCK.with(|t| t.borrow().clone()) {
+        let _ = SetWindowTextW(hwnd, &HSTRING::from(t));
+    }
     // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
     if reloaded {
         draw_frame();
@@ -1931,7 +1946,11 @@ unsafe fn start_tab(hwnd: HWND) {
 /// 带 profile 的建标签(M3a):IPC new-tab / CLI 注入。名字在 scan_all
 /// 里查(大小写不敏感);查不到回落默认并记日志。font_size(T9)覆盖
 /// 启动字号(pt),None 跟随全局 seed——每标签字号的 IPC 通路。
-unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>, font_size: Option<f32>) {
+unsafe fn start_tab_with_profile(
+    hwnd: HWND,
+    profile: Option<&str>,
+    font_size: Option<f32>,
+) -> bool {
     let profiles = mica_core::profile::scan_all();
     let picked = profile.and_then(|name| {
         let p = profiles
@@ -1959,7 +1978,7 @@ unsafe fn start_tab_with_profile(hwnd: HWND, profile: Option<&str>, font_size: O
             .and_then(|tab| tab.active_pane_ref())
             .and_then(|t| t.term.cwd().map(str::to_string))
     });
-    start_tab_with_shell(hwnd, &shell, font_size, inherit.as_deref(), title);
+    start_tab_with_shell(hwnd, &shell, font_size, inherit.as_deref(), title)
 }
 
 /// 带 shell/cwd/标题的建标签(#35 tear-off 与 profile 路径的公共底):
@@ -1970,14 +1989,14 @@ unsafe fn start_tab_with_shell(
     font_size: Option<f32>,
     cwd: Option<&str>,
     title: String,
-) {
+) -> bool {
     let old_active = ACTIVE.get(); // 胶囊滑动动画的起点(旧活跃位)
     let (pane, reader) = match create_pane_with_size(hwnd, shell, font_size, cwd) {
         Ok(pair) => pair,
         Err(e) => {
             // P1(1.0.9):新标签 spawn 失败——提示而非闪退(保活既有标签)
             warn_box(&e);
-            return;
+            return false;
         }
     };
     let pane_id = pane.id;
@@ -2004,6 +2023,7 @@ unsafe fn start_tab_with_shell(
     if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
         spawn_render_forwarder(reader, pty_buf, slot, id, fwd_epoch);
     }
+    true
 }
 
 /// 主循环:GetMessageW 阻塞等消息,零轮询(T7)。返回 0 = 取到 WM_QUIT,
@@ -2085,13 +2105,14 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
     // 不醒,先杀后 join 才不悬挂(偏差已记 task 报告)。
     eprintln!("[exit] step1: sentinel None");
     *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    eprintln!("[exit] step2: watcher drop + join");
-    // #59 watcher 改由延迟初始化建立,teardown 从 TLS 收(handle 由
-    // deferred_init 存入,与重建序互斥:退出时未建 = None = 无可拆)
-    let reload = RELOAD_TAKE.with(|r| r.take());
-    if let Some(reload) = reload.or(reload_param) {
-        drop(reload.watcher);
-        let _ = reload.thread.join();
+    eprintln!("[exit] step2: watcher 留存(进程级,副窗仍在时热重载继续)");
+    // 复核 4:watcher 是进程级服务(CONFIG_WATCHER),主窗退出不拆——
+    // 进程最后一个窗口关闭时进程退出,watcher 随进程回收。
+    // reload_param(旧 TLS 交接)同样不拆,留它自然终结。
+    if let Some(reload) = reload_param {
+        // 旧路径句柄:防 Drop 提前停后端,显式遗忘(watcher 存活到进程尾)
+        std::mem::forget(reload.watcher);
+        let _ = reload.thread;
     }
     // 退出序(T03 收窄绕行面):历史上 GPU/QT/Terminal 全部 forget;如今
     // 终端 CPU 状态与 PTY 会话走正常回收(close_terminal:杀子+出注册表
@@ -4006,9 +4027,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
     match req.op.as_str() {
         "activate" => IpcResponse::applied(req.id),
+        // new-window 是异步派发(窗口线程创建),此刻无法确知创建结果——
+        // 如实回 Queued(复核 3:仅派发线程不得回 Applied)
         "new-window" => {
             spawn_window(None);
-            IpcResponse::applied(req.id)
+            IpcResponse::queued(req.id)
         }
         "new-tab" => {
             if let Some(fs) = req.font_size
@@ -4024,10 +4047,15 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
                     return IpcResponse::error(req.id, IpcError::BadProfile);
                 }
             }
-            // spawn 失败路径在 start_tab_with_profile 内记日志;应答
-            // applied 表示"已受理并尝试开标签"
-            start_tab_with_profile(hwnd, req.profile.as_deref(), req.font_size);
-            IpcResponse::applied(req.id)
+            // 真实结果(复核 3):创建失败(DEGRADED/spawn 失败)回错误,
+            // 不再假报 Applied
+            match start_tab_with_profile(hwnd, req.profile.as_deref(), req.font_size) {
+                true => IpcResponse::applied(req.id),
+                false if !lifecycle::spawn_capacity_ok() => {
+                    IpcResponse::error(req.id, IpcError::Degraded)
+                }
+                false => IpcResponse::error(req.id, IpcError::SpawnFailed),
+            }
         }
         "send-text" => {
             let bytes = req.text.clone().unwrap_or_default().into_bytes();
@@ -4042,30 +4070,38 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
                 };
                 t.session.write(&payload).is_ok()
             };
-            let written = match req.tab {
+            // 写入语义分层:目标不存在 = bad_target;存在但写失败 =
+            // pty_write(QT 不存在不再是假成功,复核 3)
+            match req.tab {
                 Some(-1) => {
-                    quickterm::send_text(&bytes);
-                    true
+                    if quickterm::send_text(&bytes) {
+                        IpcResponse::applied(req.id)
+                    } else if quickterm::exists() {
+                        IpcResponse::error(req.id, IpcError::PtyWrite)
+                    } else {
+                        IpcResponse::error(req.id, IpcError::BadTarget)
+                    }
                 }
-                Some(n) if n >= 0 => TABS.with(|tabs| {
+                Some(n) if n >= 0 => match TABS.with(|tabs| {
                     tabs.borrow_mut()
                         .get_mut(n as usize)
                         .and_then(|tab| tab.active_pane())
                         .map(write_to)
-                        .unwrap_or(false)
-                }),
-                _ => TABS.with(|tabs| {
+                }) {
+                    Some(true) => IpcResponse::applied(req.id),
+                    Some(false) => IpcResponse::error(req.id, IpcError::PtyWrite),
+                    None => IpcResponse::error(req.id, IpcError::BadTarget),
+                },
+                _ => match TABS.with(|tabs| {
                     tabs.borrow_mut()
                         .get_mut(ACTIVE.get())
                         .and_then(|tab| tab.active_pane())
                         .map(write_to)
-                        .unwrap_or(false)
-                }),
-            };
-            if written {
-                IpcResponse::applied(req.id)
-            } else {
-                IpcResponse::error(req.id, IpcError::BadTarget)
+                }) {
+                    Some(true) => IpcResponse::applied(req.id),
+                    Some(false) => IpcResponse::error(req.id, IpcError::PtyWrite),
+                    None => IpcResponse::error(req.id, IpcError::BadTarget),
+                },
             }
         }
         // 服务端已挡未知 op;防御性兜底

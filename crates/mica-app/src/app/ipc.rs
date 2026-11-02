@@ -26,7 +26,6 @@ use mica_core::ipc::{
     FrameDecode, IpcError, IpcRequest, IpcResponse, MAX_FRAME_BYTES, decode_frame, encode_frame,
 };
 use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED, HANDLE};
-use windows::Win32::Storage::FileSystem::FlushFileBuffers;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
@@ -146,22 +145,24 @@ fn accept_loop(pipe: HANDLE, tx: mpsc::Sender<IncomingRequest>) {
     }
 }
 
-/// 服务单个连接:读帧(带期限)→ 校验 → 入队+唤醒 → 等应答 → 写响应。
+/// 服务单个连接:读帧(带期限)→ 校验 → 入队+唤醒 → 等应答 → 写响应
+/// (有界收尾)。写响应集中到唯一出口,任何路径都不跳过收尾宽限。
 fn serve_one_connection(pipe: HANDLE, tx: &mpsc::Sender<IncomingRequest>) {
+    let resp = process_request(pipe, tx);
+    write_response_and_finish(pipe, &resp);
+}
+
+fn process_request(pipe: HANDLE, tx: &mpsc::Sender<IncomingRequest>) -> IpcResponse {
     // ---- 读一帧(增量 + 期限)----
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     let req = match read_request(pipe, &mut buf) {
         Ok(r) => r,
-        Err(e) => {
-            write_response(pipe, &IpcResponse::error(0, e));
-            return;
-        }
+        Err(e) => return IpcResponse::error(0, e),
     };
 
     // ---- 校验(未知 op 不入队,立即拒绝)----
     if !IpcRequest::is_known_op(&req.op) {
-        write_response(pipe, &IpcResponse::error(req.id, IpcError::UnknownOp));
-        return;
+        return IpcResponse::error(req.id, IpcError::UnknownOp);
     }
 
     // ---- 入队 → 唤醒(顺序即修复:先 send 后 Post)----
@@ -173,8 +174,7 @@ fn serve_one_connection(pipe: HANDLE, tx: &mpsc::Sender<IncomingRequest>) {
         })
         .is_err()
     {
-        write_response(pipe, &IpcResponse::error(req.id, IpcError::NoWindow));
-        return;
+        return IpcResponse::error(req.id, IpcError::NoWindow);
     }
     let posted = window_registry::post_to_alive(
         crate::app::WM_APP_IPC,
@@ -184,16 +184,15 @@ fn serve_one_connection(pipe: HANDLE, tx: &mpsc::Sender<IncomingRequest>) {
     if !posted {
         // 无存活窗口:已入队的请求稍后被 UI 排空时丢弃(reply 通道已断)
         eprintln!("ipc: 无存活窗口接收请求");
-        write_response(pipe, &IpcResponse::error(req.id, IpcError::NoWindow));
-        return;
+        return IpcResponse::error(req.id, IpcError::NoWindow);
     }
 
-    // ---- 等应答(UI 处理后 reply;超时只承诺"未确认",不谎报成功)----
-    let resp = match reply_rx.recv_timeout(REPLY_DEADLINE) {
+    // ---- 等应答(UI 处理后 reply;超时只承诺"未确认",不谎报成功;
+    // 请求可能已被执行——客户端文案明确"结果未知")----
+    match reply_rx.recv_timeout(REPLY_DEADLINE) {
         Ok(r) => r,
         Err(_) => IpcResponse::error(req.id, IpcError::Timeout),
-    };
-    write_response(pipe, &resp);
+    }
 }
 
 /// 增量读请求帧到完整/坏帧;期限到 → Transport(慢客户端不占死服务)。
@@ -232,14 +231,31 @@ fn read_request(pipe: HANDLE, buf: &mut Vec<u8>) -> Result<IpcRequest, IpcError>
     }
 }
 
-/// 写响应帧并冲刷(客户端立刻能读,不等断开)。
-fn write_response(pipe: HANDLE, resp: &IpcResponse) {
+/// 响应写出入站缓冲的宽限:响应帧 <200B ≪ 4KB 管道出站缓冲,WriteFile
+/// 即时返回;宽限期内正常客户端(发出请求后就会读)一定能读到。
+const WRITE_GRACE: Duration = Duration::from_secs(2);
+
+/// 写响应帧并**有界收尾**(复核 1):FlushFileBuffers 会阻塞到客户端
+/// 读完——不读的客户端能把唯一服务线程永久卡死。改为:写入出站缓冲
+/// (即时)→ 宽限期内轮询客户端是否断开(Peek 报错 = 对端已关)→
+/// 返回后由 accept_loop Disconnect。选择不读的客户端在 Disconnect 时
+/// 丢失响应,是它自己的选择;正常客户端的可靠交付由宽限覆盖
+/// (non_reading_client_does_not_block_server 与既有 9 项应答测试共同
+/// 锁定这两面)。
+fn write_response_and_finish(pipe: HANDLE, resp: &IpcResponse) {
     let frame = encode_frame(resp);
     let mut written = 0u32;
-    // SAFETY: 缓冲与计数严格对应
+    // SAFETY: 帧远小于出站缓冲,不会阻塞
     let _ = unsafe { WriteFile(pipe, Some(&frame), Some(&mut written), None) };
-    // SAFETY: 冲刷让客户端读端立即见到
-    let _ = unsafe { FlushFileBuffers(pipe) };
+    let deadline = Instant::now() + WRITE_GRACE;
+    while Instant::now() < deadline {
+        let mut avail = 0u32;
+        // SAFETY: Peek 只探测对端存活性
+        if unsafe { PeekNamedPipe(pipe, None, 0, None, Some(&mut avail), None) }.is_err() {
+            break; // 客户端已断开:可立即收尾
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// RAII 管道句柄(客户端):任何早退路径都不泄漏。
@@ -251,40 +267,63 @@ impl Drop for ClientPipe {
     }
 }
 
-/// 客户端:发请求收响应。超时毫秒(连接与应答共用预算)。
-/// Ok = 服务端应答且 id 对应;Err = 传输失败/超时/坏帧。
+/// 客户端:发请求收响应。timeout_ms 是**全流程预算**(连接+写入+读应答
+/// 共用,复核 2:旧实现的 deadline 在连接与同步写入之后才开始,写入可
+/// 能无限等)。错误分类见 IpcError——NoInstance(可自启)/Busy/
+/// AccessDenied/Disconnected(结果未知)/Timeout(结果未知)/…。
 pub fn send_request(req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, IpcError> {
     let name: HSTRING = pipe_name().into();
-    // SAFETY: WaitNamedPipeW 探测就绪(超时 → Transport,调用方决定自启)
-    if !unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), timeout_ms) }.as_bool() {
-        return Err(IpcError::Transport);
-    }
-    // SAFETY: 独占打开;RAII 保证早退不泄漏
-    let pipe = unsafe {
-        CreateFileW(
-            PCWSTR(name.as_ptr()),
-            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
-            FILE_SHARE_NONE,
-            None,
-            OPEN_EXISTING,
-            Default::default(),
-            None,
-        )
-    }
-    .map_err(|_| IpcError::Transport)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+
+    // ---- 连接(区分:管道不存在 / 占用 / 拒绝)----
+    let pipe = loop {
+        if Instant::now() >= deadline {
+            return Err(IpcError::Busy); // 管道在但一直拿不到 = 实例忙
+        }
+        let remain_ms = (deadline - Instant::now()).as_millis().clamp(1, 500) as u32;
+        // SAFETY: WaitNamedPipeW 探测实例可用性
+        if !unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), remain_ms) }.as_bool() {
+            let err = unsafe { windows::Win32::Foundation::GetLastError() };
+            if err == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND {
+                return Err(IpcError::NoInstance); // 无实例:唯一可自启形态
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        // SAFETY: 独占打开;RAII 保证早退不泄漏
+        match unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+        } {
+            Ok(h) => break h,
+            // ERROR_PIPE_BUSY(231):重试直到预算尽
+            Err(e) if e.code() == windows::core::HRESULT(0x8007_00E7u32 as i32) => continue,
+            // ERROR_ACCESS_DENIED(5):提升边界/ACL 不匹配
+            Err(e) if e.code() == windows::core::HRESULT(0x8007_0005u32 as i32) => {
+                return Err(IpcError::AccessDenied);
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
     let _guard = ClientPipe(pipe);
 
+    // ---- 写入(未送达 = 未执行,可安全重试)----
     let frame = encode_frame(req);
     let mut written = 0u32;
-    // SAFETY: 整帧写出
-    unsafe { WriteFile(pipe, Some(&frame), Some(&mut written), None) }
-        .map_err(|_| IpcError::Transport)?;
-    if written as usize != frame.len() {
-        return Err(IpcError::Transport); // 部分写按失败
+    // SAFETY: 整帧写出;帧 < 出站缓冲,不阻塞
+    let w_ok = unsafe { WriteFile(pipe, Some(&frame), Some(&mut written), None) }.is_ok();
+    if !w_ok || written as usize != frame.len() {
+        return Err(IpcError::Transport); // 未送达:可安全重试
     }
 
-    // 读响应到完整帧(期限 = 预算)
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    // ---- 读响应(请求可能已执行;断开/超时都是"结果未知")----
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     let mut chunk = [0u8; 4096];
     loop {
@@ -292,19 +331,19 @@ pub fn send_request(req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, Ip
             FrameDecode::NeedMore => {}
             FrameDecode::Complete(resp, _) => {
                 if resp.id != req.id {
-                    return Err(IpcError::Transport); // 应答与请求不对应
+                    return Err(IpcError::Disconnected); // 应答错乱:按结果未知
                 }
                 return Ok(resp);
             }
             FrameDecode::Invalid(_) => return Err(IpcError::BadJson),
         }
         if Instant::now() >= deadline {
-            return Err(IpcError::Timeout);
+            return Err(IpcError::Timeout); // 请求可能已执行:文案警示
         }
         let mut avail = 0u32;
         // SAFETY: Peek 判可读量
         if unsafe { PeekNamedPipe(pipe, None, 0, None, Some(&mut avail), None) }.is_err() {
-            return Err(IpcError::Transport);
+            return Err(IpcError::Disconnected); // 已送达后断开:结果未知
         }
         if avail == 0 {
             std::thread::sleep(Duration::from_millis(10));
@@ -318,13 +357,12 @@ pub fn send_request(req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, Ip
             // 对端写完就断是合法收尾:拿已收字节判一次完整性再定论
             return match decode_frame::<IpcResponse>(&buf) {
                 FrameDecode::Complete(resp, _) if resp.id == req.id => Ok(resp),
-                _ => Err(IpcError::Transport),
+                _ => Err(IpcError::Disconnected),
             };
         }
         buf.extend_from_slice(&chunk[..read as usize]);
     }
 }
-
 /// 本用户专用 DACL:取进程令牌的用户 SID,仅授予该 SID 管道读写;
 /// 其他任何主体(含隐式继承)不授。返回的 SECURITY_ATTRIBUTES 引用的
 /// ACL 内存**有意随进程保留**:管道是进程级单例,只建一次,保留量 =

@@ -93,9 +93,23 @@ pub enum IpcError {
     BadFontSize,
     /// 无存活窗口可执行(进程退出中)
     NoWindow,
-    /// UI 已入队但未在期限内应答(不承诺执行结果)
+    /// UI 已入队但未在期限内应答——请求**可能已执行**,勿盲目重试
     Timeout,
-    /// 传输层失败(连接/读/写)
+    /// 管道不存在(无运行实例)——唯一可安全自启的形态
+    NoInstance,
+    /// 管道存在但占用超预算(实例活着,勿自启)
+    Busy,
+    /// 打开管道被拒(权限/提升边界不匹配)
+    AccessDenied,
+    /// 请求已发出后连接断开——**结果未知**,勿盲目重试
+    Disconnected,
+    /// 会话回收通道故障态(DEGRADED),暂不能建新会话
+    Degraded,
+    /// shell/pty 创建失败
+    SpawnFailed,
+    /// pty 写入失败
+    PtyWrite,
+    /// 其余传输层失败
     Transport,
 }
 
@@ -110,6 +124,13 @@ impl IpcError {
             IpcError::BadFontSize => "bad_font_size",
             IpcError::NoWindow => "no_window",
             IpcError::Timeout => "timeout",
+            IpcError::NoInstance => "no_instance",
+            IpcError::Busy => "busy",
+            IpcError::AccessDenied => "access_denied",
+            IpcError::Disconnected => "disconnected",
+            IpcError::Degraded => "degraded",
+            IpcError::SpawnFailed => "spawn_failed",
+            IpcError::PtyWrite => "pty_write",
             IpcError::Transport => "transport",
         }
     }

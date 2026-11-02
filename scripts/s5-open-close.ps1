@@ -31,7 +31,7 @@ try {
     $deadline = (Get-Date).AddSeconds(20)
     do {
         Start-Sleep -Milliseconds 500
-        $pipeUp = Test-Path "\\.\pipe\mica"
+        $pipeUp = Test-Path ("\\.\pipe\mica-" + $env:USERNAME)
     } while (-not $pipeUp -and (Get-Date) -lt $deadline)
     if (-not $pipeUp) { throw "IPC 管道未就绪" }
     Start-Sleep -Seconds 5
