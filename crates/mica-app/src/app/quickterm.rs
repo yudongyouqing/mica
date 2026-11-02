@@ -21,7 +21,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_NOREPEAT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_OEM_3,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW, PostMessageW,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW,
     RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR,
     WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
     WS_POPUP, WS_VISIBLE,
@@ -188,7 +188,33 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     if let Some(pid) = session.child_pid() {
         crate::app::orphan::track_session_since(&probe, pid); // 入注册表(T02,同主窗)
     }
-    let pty_buf: Arc<Mutex<crate::app::PtyBuf>> = Arc::new(Mutex::new(crate::app::PtyBuf::new(0)));
+    // T08:QT 输出积压/写队列(WPARAM 0xFF00 寻址 QT 窗口)
+    let pty_buf = crate::app::pty_bridge::PtyBacklog::new(
+        0xFF00,
+        crate::app::pty_bridge::PANE_BUDGET_BYTES,
+        Arc::new(crate::app::pty_bridge::WindowWake {
+            slot: crate::app::shared_hwnd_for_quickterm()
+                .unwrap_or_else(|| Arc::new(Mutex::new(None))),
+            msg: WM_APP,
+        }),
+    );
+    let writeq = crate::app::pty_bridge::WriteQueue::new();
+    let session = Arc::new(Mutex::new(session));
+    {
+        let wq = Arc::clone(&writeq);
+        let sess = Arc::clone(&session);
+        std::thread::Builder::new()
+            .name("qt-pty-writer".into())
+            .spawn(move || {
+                if let Err(e) = crate::app::pty_bridge::writer_loop(
+                    wq,
+                    Arc::new(crate::app::pty_bridge::SessionSink(sess)),
+                ) {
+                    eprintln!("[qt-pty-writer] 写失败:{e}");
+                }
+            })
+            .expect("spawn qt writer");
+    }
     term.set_clipboard_provider(Arc::new(|| {
         crate::app::clipboard::get_text().unwrap_or_default()
     }));
@@ -197,6 +223,8 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         term,
         session,
         pty_buf: Arc::clone(&pty_buf),
+        writeq: Arc::clone(&writeq),
+        pending_paste: Vec::new(),
         session_gen: 0,
         router,
         metrics,
@@ -222,9 +250,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     });
 
     // 转发线程(与主窗同款;WPARAM 用 QT 专属 id 0xFF00——不与 pane id 冲突)
-    if let Some(slot) = crate::app::shared_hwnd_for_quickterm() {
-        crate::app::spawn_qt_forwarder(reader, pty_buf, slot, 0);
-    }
+    crate::app::spawn_qt_forwarder(reader, pty_buf, 0xFF00, 0);
     // #37:会话退出轮询(1s;命中即停表)——QT 无 strip,主窗的
     // poll_exits 轮不到它
     let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd_qt), 6, 1000, None);
@@ -244,16 +270,42 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     match mica_core::pty::PtySession::spawn(mica_core::pty::command_from_str(&t.shell), cols, rows)
     {
         Ok((session, reader)) => {
-            let old_pid = t.session.child_pid();
+            let old_pid = t
+                .session
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .child_pid();
             if let Some(pid) = old_pid {
                 crate::app::orphan::mark_session_closing(pid); // Closing:回收确认才移除
             }
             if let Some(new_pid) = session.child_pid() {
                 crate::app::orphan::track_session_since(&probe, new_pid);
             }
-            let old = std::mem::replace(&mut t.session, session);
+            // T08 换代先行(旧代 push/enqueue 立即失效),旧 writer 自然退场
+            let new_gen = t.pty_buf.bump_generation();
+            let wq_gen = t.writeq.bump_generation();
+            debug_assert_eq!(new_gen, wq_gen, "输出/写队列同源换代");
+            let old = std::mem::replace(
+                &mut *t.session.lock().unwrap_or_else(|e| e.into_inner()),
+                session,
+            );
             // 旧会话交后台回收(T03):ClosePseudoConsole 阻塞面不上 UI 线程
             crate::app::lifecycle::reap_session_with_pid(old_pid, old);
+            {
+                let wq = Arc::clone(&t.writeq);
+                let sess = Arc::clone(&t.session);
+                std::thread::Builder::new()
+                    .name("qt-pty-writer".into())
+                    .spawn(move || {
+                        if let Err(e) = crate::app::pty_bridge::writer_loop(
+                            wq,
+                            Arc::new(crate::app::pty_bridge::SessionSink(sess)),
+                        ) {
+                            eprintln!("[qt-pty-writer] 写失败:{e}");
+                        }
+                    })
+                    .expect("spawn qt writer");
+            }
             t.exited = None;
             let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
             term.set_cell_metrics(
@@ -264,16 +316,8 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
             t.term = term;
             t.row_insts.clear();
             t.force_full = true;
-            // 会话换代:旧转发线程尾字节按代丢弃(T03,同主窗)
-            let new_gen = t
-                .pty_buf
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .bump_epoch();
             t.session_gen = new_gen;
-            if let Some(slot) = crate::app::shared_hwnd_for_quickterm() {
-                crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), slot, new_gen);
-            }
+            crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), 0xFF00, new_gen);
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 6, 1000, None);
         }
         Err(e) => eprintln!("[qt] 重开失败:{e}"),
@@ -325,7 +369,7 @@ pub fn send_text(bytes: &[u8]) -> bool {
         } else {
             bytes.to_vec()
         };
-        t.session.write(&payload).is_ok()
+        t.writeq.enqueue(t.session_gen, &payload).is_ok()
     })
 }
 pub unsafe fn toggle() {
@@ -348,7 +392,11 @@ pub unsafe fn toggle() {
             let mut guard = q.borrow_mut();
             let Some(st) = guard.as_mut() else { return };
             if st.terminal.exited.is_some() {
-                st.terminal.session.kill_child();
+                st.terminal
+                    .session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .kill_child();
                 qt_respawn(&mut st.terminal, hwnd);
             }
         });
@@ -393,11 +441,22 @@ unsafe extern "system" fn qt_wndproc(
                 QT.with(|q| {
                     let mut guard = q.borrow_mut();
                     let Some(st) = guard.as_mut() else { return };
-                    let t = &mut st.terminal;
-                    if t.exited.is_none()
-                        && let Ok(Some(s)) = t.session.try_wait()
-                    {
-                        t.exited = Some(s.exit_code());
+                    let exited_now = {
+                        let t = &mut st.terminal;
+                        if t.exited.is_none()
+                            && let Ok(Some(s)) = t
+                                .session
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .try_wait()
+                        {
+                            t.exited = Some(s.exit_code());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if exited_now {
                         hit = true;
                         qt_draw(st);
                     }
@@ -413,28 +472,20 @@ unsafe extern "system" fn qt_wndproc(
             QT.with(|q| {
                 let mut guard = q.borrow_mut();
                 let Some(st) = guard.as_mut() else { return };
-                // T08 批预算(同主窗):单批 ≤256 KiB,余量补投续批
+                // T08 批预算(同主窗):drain_batch 内含补通知(含续批)
                 let Some(bytes) = st
                     .terminal
                     .pty_buf
-                    .lock()
-                    .expect("qt buf poisoned")
-                    .drain_budget()
+                    .drain_batch(crate::app::pty_bridge::UI_BATCH_BYTES)
                 else {
                     return;
                 };
                 st.terminal.term.feed(&bytes);
-                if st
-                    .terminal
-                    .pty_buf
-                    .lock()
-                    .expect("qt buf poisoned")
-                    .has_more()
-                {
-                    let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0xFF00), LPARAM(0));
-                }
                 for reply in st.terminal.term.take_pty_writes() {
-                    let _ = st.terminal.session.write(reply.as_bytes());
+                    let _ = st
+                        .terminal
+                        .writeq
+                        .enqueue(st.terminal.session_gen, reply.as_bytes());
                 }
                 if let Some(t) = st.terminal.term.take_title() {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
@@ -478,7 +529,7 @@ unsafe extern "system" fn qt_wndproc(
                 } else {
                     ch.to_string().into_bytes()
                 };
-                let _ = st.terminal.session.write(&bytes);
+                let _ = st.terminal.writeq.enqueue(st.terminal.session_gen, &bytes);
             });
             LRESULT(0)
         }
@@ -505,12 +556,12 @@ unsafe extern "system" fn qt_wndproc(
                     && let Some(bytes) =
                         mica_core::protocol::kitty::kitty_encode(key, mods, kind, flags)
                 {
-                    let _ = st.terminal.session.write(&bytes);
+                    let _ = st.terminal.writeq.enqueue(st.terminal.session_gen, &bytes);
                     return;
                 }
                 if let Some(bytes) = super::vkey_bytes(vk, mods, st.terminal.term.app_cursor_mode())
                 {
-                    let _ = st.terminal.session.write(&bytes);
+                    let _ = st.terminal.writeq.enqueue(st.terminal.session_gen, &bytes);
                 }
             });
             LRESULT(0)

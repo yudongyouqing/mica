@@ -37,11 +37,32 @@ impl PtyReader {
     pub fn recv_block(&self) -> Option<Vec<u8>> {
         self.rx.recv().ok()
     }
+
+    /// 带超时的三态接收(T08 转发线程用):Timeout 用于空闲期做唤醒
+    /// 重试,与断开(退场)严格区分——recv_timeout 把两者折叠成 None,
+    /// 无法支撑"Post 失败后在空闲期自愈"。
+    pub fn recv_event(&self, timeout: std::time::Duration) -> RecvEvent {
+        match self.rx.recv_timeout(timeout) {
+            Ok(chunk) => RecvEvent::Data(chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => RecvEvent::Timeout,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => RecvEvent::Closed,
+        }
+    }
+}
+
+/// `recv_event` 的三态:数据 / 超时(继续等) / 断开(通道关闭)。
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecvEvent {
+    Data(Vec<u8>),
+    Timeout,
+    Closed,
 }
 
 /// A running child on a pseudo-terminal.
 pub struct PtySession {
-    writer: Box<dyn Write + Send>,
+    /// 写端内部互斥(T08):`write` 取 `&self`——UI 与 writer 线程并发
+    /// 写同一会话而无需外部锁(write_all 在互斥下天然保序)。
+    writer: std::sync::Mutex<Box<dyn Write + Send>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -140,7 +161,7 @@ impl PtySession {
 
         Ok((
             Self {
-                writer,
+                writer: std::sync::Mutex::new(writer),
                 master: pair.master,
                 child,
             },
@@ -148,9 +169,13 @@ impl PtySession {
         ))
     }
 
-    /// Bytes typed by the user.
-    pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.writer.write_all(data)
+    /// Bytes typed by the user. `&self`(T08):写端内部互斥,writer 线程
+    /// 与 UI 可并发调用,write_all 逐次持锁保序。
+    pub fn write(&self, data: &[u8]) -> io::Result<()> {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write_all(data)
     }
 
     /// 子进程 PID(孤儿会话注册表按 PID+创建时间证明归属,2026-11 T02)。

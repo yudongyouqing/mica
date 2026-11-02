@@ -505,16 +505,20 @@ struct WindowGpu {
     atlas_owner: Option<(u64, u64)>,
 }
 
-pub(crate) use pty_bridge::PtyBuf;
+pub(crate) use pty_bridge::{PtyBacklog, WriteQueue};
 
 /// 单个标签的终端态:GPU 以外的一切(M1 时代的 Terminal 字段原样)。
 pub(crate) struct Terminal {
     term: Surface,
-    session: PtySession,
-    /// pty 输出落点:转发线程(独占 PtyReader 通道)往里追加,WM_APP_RENDER
-    /// 在主线程取空。放 Terminal 里让 handler 借一次取齐,关闭标签时一起拆
-    pty_buf: Arc<Mutex<PtyBuf>>,
-    /// 当前会话代(与 pty_buf.gen 同源;重启递增,转发线程据此弃旧)
+    /// 会话(共享:writer 线程写、UI resize/轮询/关闭——Arc<Mutex>)
+    session: Arc<Mutex<PtySession>>,
+    /// 有界输出积压(T08:零丢弃背压 + 唤醒合并)
+    pty_buf: Arc<pty_bridge::PtyBacklog>,
+    /// 单 writer 保序写队列(T08:输入/粘贴/注入/协议回复)
+    writeq: Arc<pty_bridge::WriteQueue>,
+    /// 粘贴欠账(写队列满时的余量,消息循环分批续灌——UI 永不阻塞)
+    pending_paste: Vec<u8>,
+    /// 当前会话代(与 pty_buf 同源;重启递增,转发线程/写队列据此弃旧)
     session_gen: u64,
     router: DwriteRouter,
     metrics: FontMetrics,
@@ -1189,40 +1193,24 @@ fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle> {
 /// pty 再 join,见 message_loop。
 fn spawn_render_forwarder(
     reader: PtyReader,
-    buffer: Arc<Mutex<PtyBuf>>,
-    hwnd_slot: SharedHwnd,
-    tab_id: u64,
+    backlog: Arc<PtyBacklog>,
+    _pane_id: u64,
     epoch: u64,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("pty-forwarder".into())
         .spawn(move || {
+            use mica_core::pty::RecvEvent;
+            // T08:push 满则阻塞(背压链),close/换代 Err 退场;空闲
+            // 超时做唤醒重试(Post 失败自愈,含"最后一块失败再无输出")
             loop {
-                match reader.recv_block() {
-                    Some(chunk) => {
-                        {
-                            // 锁只罩 extend,绝不跨 PostMessageW 持锁;
-                            // 代不匹配 = 旧会话尾字节,丢弃(T03)
-                            let pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                            if pending.epoch() == epoch {
-                                pending.push(&chunk);
-                            }
-                        }
-                        let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(raw) = hwnd {
-                            // 失败(队列满/窗口已死)忽略即可;Post 到死句柄无害
-                            let hwnd = HWND(raw as *mut std::ffi::c_void);
-                            let _ = unsafe {
-                                PostMessageW(
-                                    Some(hwnd),
-                                    WM_APP_RENDER,
-                                    WPARAM(tab_id as usize),
-                                    LPARAM(0),
-                                )
-                            };
-                        }
-                    }
-                    None => return, // pty 读线程挂断:通道断开,转发使命结束
+                match reader.recv_event(Duration::from_millis(200)) {
+                    RecvEvent::Data(chunk) => match backlog.push(epoch, &chunk) {
+                        Ok(()) => {}
+                        Err(_) => return, // 关闭或换代:本线程退场
+                    },
+                    RecvEvent::Timeout => backlog.retry_wake(),
+                    RecvEvent::Closed => return, // pty 读线程挂断
                 }
             }
         })
@@ -1321,7 +1309,11 @@ unsafe fn reload_config(hwnd: HWND) {
                     metrics.cell_width.round() as u16,
                     metrics.line_height.round() as u16,
                 );
-                let _ = t.session.resize(cols, rows);
+                let _ = t
+                    .session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .resize(cols, rows);
                 // 几何/字形全换:行缓存结构性失配,显式全量(Task 8)
                 t.force_full = true;
                 t.term.set_palette(&settings.palette);
@@ -1484,7 +1476,11 @@ fn poll_exits() -> bool {
             for pane in tab.panes.iter_mut() {
                 let t = &mut pane.terminal;
                 if t.exited.is_none()
-                    && let Ok(Some(st)) = t.session.try_wait()
+                    && let Ok(Some(st)) = t
+                        .session
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .try_wait()
                 {
                     t.exited = Some(st.exit_code());
                     changed = true;
@@ -1531,15 +1527,44 @@ fn restart_active_pane() -> bool {
             eprintln!("[restart] spawn 失败: {shell}");
             return;
         };
-        t.session.kill_child(); // 先杀旧子(非阻塞);restart 语义=旧会话终结
-        let old_pid = t.session.child_pid();
+        t.session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .kill_child(); // 先杀旧子(非阻塞);restart 语义=旧会话终结
+        let old_pid = t
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .child_pid();
         if let Some(pid) = old_pid {
             orphan::mark_session_closing(pid); // Closing 态:回收确认才移除
         }
         if let Some(new_pid) = session.child_pid() {
             orphan::track_session_since(&probe, new_pid);
         }
-        let old = std::mem::replace(&mut t.session, session);
+        // T08 换代先行:旧代写入/输出立即失效(push/enqueue 按代退场),
+        // 旧 writer 在 pop 见代不符后自然退场,新 writer 随后挂上
+        let new_gen = t.pty_buf.bump_generation();
+        let wq_gen = t.writeq.bump_generation();
+        debug_assert_eq!(new_gen, wq_gen, "输出/写队列同源换代");
+        let old = std::mem::replace(
+            &mut *t.session.lock().unwrap_or_else(|e| e.into_inner()),
+            session,
+        );
+        {
+            let wq = Arc::clone(&t.writeq);
+            let sess = Arc::clone(&t.session);
+            std::thread::Builder::new()
+                .name("pty-writer".into())
+                .spawn(move || {
+                    if let Err(e) =
+                        pty_bridge::writer_loop(wq, Arc::new(pty_bridge::SessionSink(sess)))
+                    {
+                        eprintln!("[pty-writer] 写失败(管道断?):{e}");
+                    }
+                })
+                .expect("spawn pty writer");
+        }
         // 旧会话交后台回收:唯一阻塞面 ClosePseudoConsole 不上 UI 线程(T03)
         lifecycle::reap_session_with_pid(old_pid, old);
         t.exited = None;
@@ -1554,17 +1579,12 @@ fn restart_active_pane() -> bool {
         t.term = term;
         t.row_insts.clear();
         t.force_full = true;
-        // 会话换代:旧转发线程的尾字节按代丢弃,新转发线程从干净缓冲起步
-        let new_gen = t
-            .pty_buf
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .bump_epoch();
         t.session_gen = new_gen;
         // 重挂转发线程(同 pane id:WM_APP_RENDER 寻址不变)
         let pty_buf = Arc::clone(&t.pty_buf);
         if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
-            spawn_render_forwarder(reader, pty_buf, slot, pid, new_gen);
+            let _ = &slot;
+            spawn_render_forwarder(reader, pty_buf, pid, new_gen);
         }
     });
     true
@@ -1829,7 +1849,8 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
         for p in tab.panes.iter_mut() {
             p.terminal.force_full = true;
         }
-        spawn_render_forwarder(reader, pty_buf, slot, pane_id, fwd_epoch);
+        let _ = &slot;
+        spawn_render_forwarder(reader, pty_buf, pane_id, fwd_epoch);
     });
 }
 
@@ -1900,12 +1921,40 @@ unsafe fn create_pane_with_size(
     if let Some(pid) = session.child_pid() {
         orphan::track_session_since(&probe, pid); // 入注册表:宿主身份随登记(T02)
     }
-    let pty_buf: Arc<Mutex<PtyBuf>> = Arc::new(Mutex::new(PtyBuf::new(0)));
+    // T08:pane_id 先行(输出积压的唤醒 WPARAM 按 pane 寻址)
+    let pane_id = NEXT_TAB_ID.with(|n| n.replace(n.get() + 1));
+    let session = Arc::new(Mutex::new(session));
+    let slot = SHARED_HWND.with(|s| s.borrow().clone());
+    let pty_buf = PtyBacklog::new(
+        pane_id,
+        pty_bridge::PANE_BUDGET_BYTES,
+        Arc::new(pty_bridge::WindowWake {
+            slot: slot.clone().unwrap_or_else(|| Arc::new(Mutex::new(None))),
+            msg: WM_APP_RENDER,
+        }),
+    );
+    let writeq = WriteQueue::new();
+    // 单 writer 线程:独占写 pty(shell 不读输入也不卡 UI)
+    {
+        let wq = Arc::clone(&writeq);
+        let sess = Arc::clone(&session);
+        std::thread::Builder::new()
+            .name("pty-writer".into())
+            .spawn(move || {
+                if let Err(e) = pty_bridge::writer_loop(wq, Arc::new(pty_bridge::SessionSink(sess)))
+                {
+                    eprintln!("[pty-writer] 写失败(管道断?):{e}");
+                }
+            })
+            .expect("spawn pty writer");
+    }
 
     let terminal = Terminal {
         term,
         session,
         pty_buf: Arc::clone(&pty_buf),
+        writeq: Arc::clone(&writeq),
+        pending_paste: Vec::new(),
         session_gen: 0,
         router,
         metrics,
@@ -1919,7 +1968,6 @@ unsafe fn create_pane_with_size(
         strip_router: None, // 惰性建(首次画 strip)与终端路由共享图集
         last_atlas_ver: 0,
     };
-    let pane_id = NEXT_TAB_ID.with(|n| n.replace(n.get() + 1));
     Ok((
         PaneState {
             id: pane_id,
@@ -2013,7 +2061,8 @@ unsafe fn start_tab_with_shell(
     ensure_anim_timer();
     tab_follow_active(); // T8:新标签滚入可视区(溢出时)
     if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
-        spawn_render_forwarder(reader, pty_buf, slot, id, fwd_epoch);
+        let _ = &slot;
+        spawn_render_forwarder(reader, pty_buf, id, fwd_epoch);
     }
     true
 }
@@ -2036,33 +2085,23 @@ pub(crate) fn shared_hwnd_for_quickterm() -> Option<SharedHwnd> {
 /// QT 窗口(独立消息域;WPARAM=0xFF00 哨兵)。
 pub(crate) fn spawn_qt_forwarder(
     reader: mica_core::pty::PtyReader,
-    buffer: Arc<Mutex<PtyBuf>>,
-    hwnd_slot: SharedHwnd,
+    backlog: Arc<PtyBacklog>,
+    _pane_id: u64,
     epoch: u64,
 ) {
     std::thread::Builder::new()
         .name("qt-forwarder".into())
         .spawn(move || {
+            use mica_core::pty::RecvEvent;
             loop {
-                match reader.recv_block() {
-                    Some(chunk) => {
-                        {
-                            // 代不匹配 = 旧会话尾字节,丢弃(T03,同主窗)
-                            let pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                            if pending.epoch() == epoch {
-                                pending.push(&chunk);
-                            }
-                        }
-                        let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(raw) = hwnd {
-                            let hwnd = HWND(raw as *mut std::ffi::c_void);
-                            // SAFETY: Post 到死句柄无害
-                            let _ = unsafe {
-                                PostMessageW(Some(hwnd), WM_APP_MSG, WPARAM(0xFF00), LPARAM(0))
-                            };
+                match reader.recv_event(Duration::from_millis(200)) {
+                    RecvEvent::Data(chunk) => {
+                        if backlog.push(epoch, &chunk).is_err() {
+                            return;
                         }
                     }
-                    None => return,
+                    RecvEvent::Timeout => backlog.retry_wake(),
+                    RecvEvent::Closed => return,
                 }
             }
         })
@@ -2124,9 +2163,9 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
     crate::app::quickterm::forget_state();
     orphan::clear_sessions_for_exit(); // 干净退出:本进程注册表条目全清(T02)
     let (ok, fallback, inflight, degraded) = lifecycle::reaper_stats();
-    let (backlog, dropped) = pty_bridge::backlog_stats();
     eprintln!(
-        "[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight}/故障态 {degraded};pty 积压 {backlog}B/累计截尾 {dropped}B)"
+        "[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight}/故障态 {degraded};pty 预留 {}B)",
+        pty_bridge::reserved_bytes()
     );
 }
 
@@ -2225,7 +2264,11 @@ fn draw_frame() {
                 t.rows = want_rows;
                 t.term
                     .resize(ScreenSize::new(want_cols as usize, want_rows as usize));
-                let _ = t.session.resize(want_cols, want_rows);
+                let _ = t
+                    .session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .resize(want_cols, want_rows);
                 t.force_full = true;
             }
             // 图集 grow 重排检查:布局变了,行实例缓存的 UV 全作废
@@ -2821,7 +2864,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     .get_mut(ACTIVE.get())
                     .and_then(|tab| tab.active_pane())
                 {
-                    let _ = t.session.write(&bytes);
+                    let _ = t.writeq.enqueue(t.session_gen, &bytes);
                 }
             });
             LRESULT(0)
@@ -2899,7 +2942,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             } else {
                                 normalized.into_bytes()
                             };
-                            let _ = t.session.write(&bytes);
+                            let _ = t.writeq.enqueue(t.session_gen, &bytes);
                         }
                     });
                 }
@@ -2928,12 +2971,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 flags,
                             )
                         {
-                            let _ = t.session.write(&bytes);
+                            let _ = t.writeq.enqueue(t.session_gen, &bytes);
                             return;
                         }
                     }
                     if let Some(bytes) = vkey_bytes(vk, mods, t.term.app_cursor_mode()) {
-                        let _ = t.session.write(&bytes);
+                        let _ = t.writeq.enqueue(t.session_gen, &bytes);
                     }
                 }
             });
@@ -2958,7 +3001,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             flags,
                         )
                     {
-                        let _ = t.session.write(&bytes);
+                        let _ = t.writeq.enqueue(t.session_gen, &bytes);
                     }
                 }
             });
@@ -2977,7 +3020,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             .get_mut(ACTIVE.get())
                             .and_then(|tab| tab.active_pane())
                         {
-                            let _ = t.session.write(&bytes);
+                            let _ = t.writeq.enqueue(t.session_gen, &bytes);
                         }
                     });
                     LRESULT(0)
@@ -3007,7 +3050,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         // Alt 修饰由消息本身保证:前置 ESC 完成 meta 编码
                         let mut prefixed = vec![0x1b];
                         prefixed.append(&mut bytes);
-                        let _ = t.session.write(&prefixed);
+                        let _ = t.writeq.enqueue(t.session_gen, &prefixed);
                     }
                 });
                 LRESULT(0)
@@ -3425,7 +3468,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         } else {
                             normalized.into_bytes()
                         };
-                        let _ = t.session.write(&bytes);
+                        // T08:粘贴走欠账路径(队列满不卡 UI)
+                        match t.writeq.enqueue_or_defer(t.session_gen, &bytes) {
+                            Ok(left) => t.pending_paste.extend_from_slice(&left),
+                            Err(_) => {}
+                        }
                     }
                 });
             }
@@ -3649,7 +3696,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             t.metrics.cell_width.round() as u16,
                             t.metrics.line_height.round() as u16,
                         );
-                        let _ = t.session.resize(cols, rows);
+                        let _ = t
+                            .session
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .resize(cols, rows);
                         // 行缓存与视口几何脱节:显式全量(Task 8)
                         t.force_full = true;
                         resized = true;
@@ -3697,35 +3748,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 };
                 // T08 批预算:单批 ≤256 KiB,余量补投自唤醒续批(让出
                 // 消息循环,DSR 应答/输入不被长批饿死)
-                let Some(bytes) = t
-                    .pty_buf
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .drain_budget()
-                else {
+                // T08 批预算:单批 ≤256 KiB;drain_batch 内部完成
+                // "清标记→复查→补通知"的防丢唤醒契约(含续批自唤醒)
+                let Some(bytes) = t.pty_buf.drain_batch(pty_bridge::UI_BATCH_BYTES) else {
                     return; // 积压的重复唤醒:缓冲已被上一条取空,免重绘
                 };
                 t.term.feed(&bytes);
-                if t.pty_buf
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .has_more()
-                {
-                    // SAFETY: 自唤醒本 pane 的续批消息(同转发线程的 Post)
-                    let _ = PostMessageW(
-                        Some(hwnd),
-                        WM_APP_RENDER,
-                        WPARAM(pane_id as usize),
-                        LPARAM(0),
-                    );
-                }
+                flush_pending_paste(t);
+
                 // 钉在历史区时仍有输出:保守全量(滚动期间通常无输出,量小)
                 if t.term.display_offset() > 0 {
                     t.force_full = true;
                 }
                 // 终端对查询的应答(DSR/OSC)必须写回 pty,否则 shell 会卡在等待
                 for reply in t.term.take_pty_writes() {
-                    let _ = t.session.write(reply.as_bytes());
+                    let _ = t.writeq.enqueue(t.session_gen, reply.as_bytes());
                 }
                 // OSC 52 写向(tmux 复制到本机):转交系统剪贴板
                 // (多条取最后一条——同一轮多次 set 是覆盖语义)
@@ -4079,7 +4116,7 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
                 } else {
                     bytes.clone()
                 };
-                t.session.write(&payload).is_ok()
+                t.writeq.enqueue(t.session_gen, &payload).is_ok()
             };
             // 写入语义分层:目标不存在 = bad_target;存在但写失败 =
             // pty_write(QT 不存在不再是假成功,复核 3)
@@ -4117,6 +4154,18 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
         }
         // 服务端已挡未知 op;防御性兜底
         _ => IpcResponse::error(req.id, IpcError::UnknownOp),
+    }
+}
+
+/// T08:粘贴欠账续灌——写队列有余量即灌入,余下继续欠。任何 UI 心跳
+/// (WM_APP_RENDER/WM_TIMER)调用,大粘贴期间 UI 始终可响应。
+fn flush_pending_paste(t: &mut Terminal) {
+    if t.pending_paste.is_empty() {
+        return;
+    }
+    match t.writeq.enqueue_or_defer(t.session_gen, &t.pending_paste) {
+        Ok(left) => t.pending_paste = left,
+        Err(_) => t.pending_paste.clear(), // 会话关闭:欠账作废
     }
 }
 
@@ -4362,7 +4411,7 @@ fn forward_mouse(px: i32, py: i32, button: u8, pressed: bool, motion: bool) -> b
             row,
             current_mods(),
         );
-        let _ = t.session.write(&bytes);
+        let _ = t.writeq.enqueue(t.session_gen, &bytes);
         true
     })
 }
@@ -4513,7 +4562,14 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 Action::Paste => {
                     if let Some(text) = clipboard::get_text() {
                         let normalized = clipboard::normalize_paste(&text);
-                        let _ = t.session.write(normalized.as_bytes());
+                        // T08:粘贴走欠账路径(队列满不卡 UI)
+                        match t
+                            .writeq
+                            .enqueue_or_defer(t.session_gen, normalized.as_bytes())
+                        {
+                            Ok(left) => t.pending_paste.extend_from_slice(&left),
+                            Err(_) => {}
+                        }
                     }
                 }
                 Action::ScrollLine(n) => {
@@ -4611,7 +4667,8 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
             TAB_COUNT.with(|c| c.set(TABS.with(|tabs| tabs.borrow().len())));
             tab_follow_active();
             if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone()) {
-                spawn_render_forwarder(reader, pty_buf, slot, pane_id, fwd_epoch);
+                let _ = &slot;
+                spawn_render_forwarder(reader, pty_buf, pane_id, fwd_epoch);
             }
             draw_frame();
         }
