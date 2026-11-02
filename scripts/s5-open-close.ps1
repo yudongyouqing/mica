@@ -9,6 +9,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# IPC 身份守卫:管道名全局固定(\\.\pipe\mica)。若已有别的 mica 实例,
+# 我们的 new-tab/send 会打到**那个**实例而采样目标实例——数据张冠李戴。
+# 要求:启动前系统里没有任何 mica.exe(运行中被第三方实例抢占属残余风险)。
+$existing = Get-Process mica -ErrorAction SilentlyContinue
+if ($existing) {
+    throw "已有 mica 实例在运行(pid: $($existing.Id -join ','));固定管道会让它接收采样指令。请关闭后重试。"
+}
+
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $isoAppData = Join-Path $OutDir "iso-appdata"
 New-Item -ItemType Directory -Force -Path $isoAppData | Out-Null
