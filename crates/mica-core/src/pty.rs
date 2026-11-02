@@ -117,7 +117,10 @@ impl PtySession {
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        // T08 有界读通道:满则读线程阻塞在 send → ConPTY 管道写端顶住
+        // → shell 暂停产出(源头背压,正常字节零丢弃)。64 块 × 8KB =
+        // 512KB 通道缓冲,叠加 app 侧 PtyBuf 预算。
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
         std::thread::Builder::new()
             .name("pty-reader".into())
             .spawn(move || {

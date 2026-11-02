@@ -328,6 +328,7 @@ pub(crate) mod ipc;
 mod jumplist;
 pub(crate) mod lifecycle;
 pub mod orphan; // pub:tests 直入(真进程集成回归,T02)
+pub(crate) mod pty_bridge;
 pub(crate) mod quickterm;
 pub mod uia;
 pub mod window_registry; // pub:tests 直入(真窗口生命周期回归,T04)
@@ -504,12 +505,7 @@ struct WindowGpu {
     atlas_owner: Option<(u64, u64)>,
 }
 
-/// pty 输出落点(T03 加代):gen 标识会话代——重启 shell 换代后,旧转发
-/// 线程的残余尾字节按代丢弃,不污染新 shell 的输入流。
-pub(crate) struct PtyBuf {
-    pub epoch: u64,
-    pub data: Vec<u8>,
-}
+pub(crate) use pty_bridge::PtyBuf;
 
 /// 单个标签的终端态:GPU 以外的一切(M1 时代的 Terminal 字段原样)。
 pub(crate) struct Terminal {
@@ -1207,9 +1203,9 @@ fn spawn_render_forwarder(
                         {
                             // 锁只罩 extend,绝不跨 PostMessageW 持锁;
                             // 代不匹配 = 旧会话尾字节,丢弃(T03)
-                            let mut pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                            if pending.epoch == epoch {
-                                pending.data.extend_from_slice(&chunk);
+                            let pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
+                            if pending.epoch() == epoch {
+                                pending.push(&chunk);
                             }
                         }
                         let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -1559,12 +1555,11 @@ fn restart_active_pane() -> bool {
         t.row_insts.clear();
         t.force_full = true;
         // 会话换代:旧转发线程的尾字节按代丢弃,新转发线程从干净缓冲起步
-        let new_gen = {
-            let mut b = t.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
-            b.epoch += 1;
-            b.data.clear();
-            b.epoch
-        };
+        let new_gen = t
+            .pty_buf
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bump_epoch();
         t.session_gen = new_gen;
         // 重挂转发线程(同 pane id:WM_APP_RENDER 寻址不变)
         let pty_buf = Arc::clone(&t.pty_buf);
@@ -1905,10 +1900,7 @@ unsafe fn create_pane_with_size(
     if let Some(pid) = session.child_pid() {
         orphan::track_session_since(&probe, pid); // 入注册表:宿主身份随登记(T02)
     }
-    let pty_buf: Arc<Mutex<PtyBuf>> = Arc::new(Mutex::new(PtyBuf {
-        epoch: 0,
-        data: Vec::new(),
-    }));
+    let pty_buf: Arc<Mutex<PtyBuf>> = Arc::new(Mutex::new(PtyBuf::new(0)));
 
     let terminal = Terminal {
         term,
@@ -2056,9 +2048,9 @@ pub(crate) fn spawn_qt_forwarder(
                     Some(chunk) => {
                         {
                             // 代不匹配 = 旧会话尾字节,丢弃(T03,同主窗)
-                            let mut pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                            if pending.epoch == epoch {
-                                pending.data.extend_from_slice(&chunk);
+                            let pending = buffer.lock().unwrap_or_else(|e| e.into_inner());
+                            if pending.epoch() == epoch {
+                                pending.push(&chunk);
                             }
                         }
                         let hwnd = *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -2132,8 +2124,9 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
     crate::app::quickterm::forget_state();
     orphan::clear_sessions_for_exit(); // 干净退出:本进程注册表条目全清(T02)
     let (ok, fallback, inflight, degraded) = lifecycle::reaper_stats();
+    let (backlog, dropped) = pty_bridge::backlog_stats();
     eprintln!(
-        "[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight}/故障态 {degraded})"
+        "[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight}/故障态 {degraded};pty 积压 {backlog}B/累计截尾 {dropped}B)"
     );
 }
 
@@ -3702,12 +3695,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 else {
                     return;
                 };
-                let bytes =
-                    std::mem::take(&mut t.pty_buf.lock().unwrap_or_else(|e| e.into_inner()).data);
-                if bytes.is_empty() {
+                // T08 批预算:单批 ≤256 KiB,余量补投自唤醒续批(让出
+                // 消息循环,DSR 应答/输入不被长批饿死)
+                let Some(bytes) = t
+                    .pty_buf
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .drain_budget()
+                else {
                     return; // 积压的重复唤醒:缓冲已被上一条取空,免重绘
-                }
+                };
                 t.term.feed(&bytes);
+                if t.pty_buf
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .has_more()
+                {
+                    // SAFETY: 自唤醒本 pane 的续批消息(同转发线程的 Post)
+                    let _ = PostMessageW(
+                        Some(hwnd),
+                        WM_APP_RENDER,
+                        WPARAM(pane_id as usize),
+                        LPARAM(0),
+                    );
+                }
                 // 钉在历史区时仍有输出:保守全量(滚动期间通常无输出,量小)
                 if t.term.display_offset() > 0 {
                     t.force_full = true;

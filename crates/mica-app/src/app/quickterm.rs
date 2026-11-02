@@ -21,7 +21,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_NOREPEAT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_OEM_3,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW, PostMessageW,
     RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR,
     WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
     WS_POPUP, WS_VISIBLE,
@@ -188,10 +188,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     if let Some(pid) = session.child_pid() {
         crate::app::orphan::track_session_since(&probe, pid); // 入注册表(T02,同主窗)
     }
-    let pty_buf: Arc<Mutex<crate::app::PtyBuf>> = Arc::new(Mutex::new(crate::app::PtyBuf {
-        epoch: 0,
-        data: Vec::new(),
-    }));
+    let pty_buf: Arc<Mutex<crate::app::PtyBuf>> = Arc::new(Mutex::new(crate::app::PtyBuf::new(0)));
     term.set_clipboard_provider(Arc::new(|| {
         crate::app::clipboard::get_text().unwrap_or_default()
     }));
@@ -268,12 +265,11 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
             t.row_insts.clear();
             t.force_full = true;
             // 会话换代:旧转发线程尾字节按代丢弃(T03,同主窗)
-            let new_gen = {
-                let mut b = t.pty_buf.lock().unwrap_or_else(|e| e.into_inner());
-                b.epoch += 1;
-                b.data.clear();
-                b.epoch
-            };
+            let new_gen = t
+                .pty_buf
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .bump_epoch();
             t.session_gen = new_gen;
             if let Some(slot) = crate::app::shared_hwnd_for_quickterm() {
                 crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), slot, new_gen);
@@ -417,12 +413,26 @@ unsafe extern "system" fn qt_wndproc(
             QT.with(|q| {
                 let mut guard = q.borrow_mut();
                 let Some(st) = guard.as_mut() else { return };
-                let bytes =
-                    std::mem::take(&mut st.terminal.pty_buf.lock().expect("qt buf poisoned").data);
-                if bytes.is_empty() {
+                // T08 批预算(同主窗):单批 ≤256 KiB,余量补投续批
+                let Some(bytes) = st
+                    .terminal
+                    .pty_buf
+                    .lock()
+                    .expect("qt buf poisoned")
+                    .drain_budget()
+                else {
                     return;
-                }
+                };
                 st.terminal.term.feed(&bytes);
+                if st
+                    .terminal
+                    .pty_buf
+                    .lock()
+                    .expect("qt buf poisoned")
+                    .has_more()
+                {
+                    let _ = PostMessageW(Some(hwnd), WM_APP, WPARAM(0xFF00), LPARAM(0));
+                }
                 for reply in st.terminal.term.take_pty_writes() {
                     let _ = st.terminal.session.write(reply.as_bytes());
                 }
