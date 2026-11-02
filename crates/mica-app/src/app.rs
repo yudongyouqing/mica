@@ -1507,6 +1507,13 @@ fn restart_active_pane() -> bool {
             return;
         };
         let t = &mut pane.terminal;
+        // 故障态门(回收通道满/断):拒绝创建新会话,泄漏上界不随重启增长
+        if !lifecycle::spawn_capacity_ok() {
+            eprintln!("[restart] 会话回收通道故障态,本轮拒绝重启");
+            return;
+        }
+        // spawn 前快照:差分登记新会话宿主的确切身份(复核加固)
+        let probe = orphan::before_spawn();
         let Ok((session, reader)) =
             PtySession::spawn(mica_core::pty::command_from_str(&shell), cols, rows)
         else {
@@ -1514,15 +1521,16 @@ fn restart_active_pane() -> bool {
             return;
         };
         t.session.kill_child(); // 先杀旧子(非阻塞);restart 语义=旧会话终结
-        if let Some(old_pid) = t.session.child_pid() {
-            orphan::untrack_session(old_pid); // 旧会话干净终结,出注册表
+        let old_pid = t.session.child_pid();
+        if let Some(pid) = old_pid {
+            orphan::mark_session_closing(pid); // Closing 态:回收确认才移除
         }
         if let Some(new_pid) = session.child_pid() {
-            orphan::track_session(new_pid);
+            orphan::track_session_since(&probe, new_pid);
         }
         let old = std::mem::replace(&mut t.session, session);
         // 旧会话交后台回收:唯一阻塞面 ClosePseudoConsole 不上 UI 线程(T03)
-        lifecycle::reap_session(old);
+        lifecycle::reap_session_with_pid(old_pid, old);
         t.exited = None;
         // 干净起步:新 Surface 重置网格(度量/调色板/剪贴板 provider 同建)
         let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
@@ -1871,10 +1879,16 @@ unsafe fn create_pane_with_size(
     if let Some(dir) = cwd {
         cmd.cwd(std::path::PathBuf::from(dir));
     }
+    // 故障态门:回收通道满/断时拒绝新会话(有界泄漏,见 lifecycle.rs)
+    if !lifecycle::spawn_capacity_ok() {
+        return Err("会话回收通道故障(通道满/断),暂不能开新标签——关闭部分标签后自动恢复".into());
+    }
+    // spawn 前快照:差分登记宿主确切身份(复核加固)
+    let probe = orphan::before_spawn();
     let (session, reader) = PtySession::spawn(cmd, cols, rows)
         .map_err(|e| format!("无法启动 shell({shell_command}):{e}"))?;
     if let Some(pid) = session.child_pid() {
-        orphan::track_session(pid); // 入注册表:强杀后下次启动按此清孤儿(T02)
+        orphan::track_session_since(&probe, pid); // 入注册表:宿主身份随登记(T02)
     }
     let pty_buf: Arc<Mutex<PtyBuf>> = Arc::new(Mutex::new(PtyBuf {
         epoch: 0,
@@ -2096,8 +2110,10 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
     std::mem::forget(GPU.with(|g| g.borrow_mut().take()));
     crate::app::quickterm::forget_state();
     orphan::clear_sessions_for_exit(); // 干净退出:本进程注册表条目全清(T02)
-    let (ok, fallback, inflight) = lifecycle::reaper_stats();
-    eprintln!("[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight})");
+    let (ok, fallback, inflight, degraded) = lifecycle::reaper_stats();
+    eprintln!(
+        "[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight}/故障态 {degraded})"
+    );
 }
 
 fn draw_frame() {

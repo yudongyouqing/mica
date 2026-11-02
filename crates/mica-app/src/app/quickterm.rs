@@ -172,6 +172,12 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     );
     term.set_palette(&palette);
     // QT shell 恒 PowerShell(下拉终端语义;profile 化 M4)
+    if !crate::app::lifecycle::spawn_capacity_ok() {
+        // 故障态门:拒绝新会话(有界泄漏);QT 是增强件,禁用即可
+        eprintln!("quickterm: 会话回收通道故障态,QT 本轮禁用");
+        return Err(());
+    }
+    let probe = crate::app::orphan::before_spawn();
     let (session, reader) = mica_core::pty::PtySession::spawn(
         mica_core::pty::command_from_str("powershell.exe -NoLogo"),
         cols,
@@ -180,7 +186,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     .inspect_err(|e| eprintln!("quickterm: pty 失败 {e:?},QT 禁用"))
     .map_err(|_| ())?;
     if let Some(pid) = session.child_pid() {
-        crate::app::orphan::track_session(pid); // 入注册表(T02,同主窗)
+        crate::app::orphan::track_session_since(&probe, pid); // 入注册表(T02,同主窗)
     }
     let pty_buf: Arc<Mutex<crate::app::PtyBuf>> = Arc::new(Mutex::new(crate::app::PtyBuf {
         epoch: 0,
@@ -233,18 +239,24 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 /// 挂新转发线程 + 重启退出轮询。调用前须已 kill 旧子
 unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     let (cols, rows) = (t.cols, t.rows);
+    if !crate::app::lifecycle::spawn_capacity_ok() {
+        eprintln!("[qt] 会话回收通道故障态,本轮不重开");
+        return;
+    }
+    let probe = crate::app::orphan::before_spawn();
     match mica_core::pty::PtySession::spawn(mica_core::pty::command_from_str(&t.shell), cols, rows)
     {
         Ok((session, reader)) => {
-            if let Some(old_pid) = t.session.child_pid() {
-                crate::app::orphan::untrack_session(old_pid); // 旧会话终结,出注册表
+            let old_pid = t.session.child_pid();
+            if let Some(pid) = old_pid {
+                crate::app::orphan::mark_session_closing(pid); // Closing:回收确认才移除
             }
             if let Some(new_pid) = session.child_pid() {
-                crate::app::orphan::track_session(new_pid);
+                crate::app::orphan::track_session_since(&probe, new_pid);
             }
             let old = std::mem::replace(&mut t.session, session);
             // 旧会话交后台回收(T03):ClosePseudoConsole 阻塞面不上 UI 线程
-            crate::app::lifecycle::reap_session(old);
+            crate::app::lifecycle::reap_session_with_pid(old_pid, old);
             t.exited = None;
             let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
             term.set_cell_metrics(
@@ -272,16 +284,12 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     }
 }
 
-/// 退出序取走 QT 状态(T03 收窄绕行面):终端 CPU 态正常回收、session
-/// 交 reaper;**只 forget renderer/wgpu_surface(GPU 对象)**——坏驱动
-/// 栈上 wgpu teardown 陷内核(1.0.2 实证),这是与主窗同款的最后绕行。
+/// 退出序取走 QT 状态(T03 收窄绕行面):终端态走 close_terminal 统一
+/// 回收(杀子/标 Closing/交 reaper);**只 forget renderer/wgpu_surface
+/// (GPU 对象)**——坏驱动栈上 wgpu teardown 陷内核(1.0.2 实证),这是
+/// 与主窗同款的最后绕行。
 pub fn forget_state() {
-    if let Some(mut st) = QT.with(|q| q.borrow_mut().take()) {
-        st.terminal.session.kill_child(); // 先杀子,防 defterm 弹窗(1.0.4 同款)
-        if let Some(pid) = st.terminal.session.child_pid() {
-            crate::app::orphan::untrack_session(pid); // 干净终结,出注册表(T02)
-        }
-        // 拆分:GPU 泄漏,终端态回收
+    if let Some(st) = QT.with(|q| q.borrow_mut().take()) {
         let QtState {
             terminal,
             renderer,
