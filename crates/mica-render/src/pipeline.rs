@@ -119,6 +119,19 @@ pub struct Renderer {
     bg_sampler: Option<wgpu::Sampler>,
     /// #77 当前背景参数(写 globals 的缓存)
     bg_param: [f32; 4],
+    /// 帧目标(T05 分批绘制):begin_frame 建立,end_frame 呈现并取空。
+    /// 分批期间持视图与呈现句柄;每批独立 encoder+submit(顶点缓冲逐批
+    /// 覆写,同批内引用一致——合并 submit 会让先批画到后批内容)。
+    frame: Option<FrameTarget>,
+    /// 帧视口尺寸(scissor 钳制用)
+    frame_extent: (u32, u32),
+}
+
+/// 一帧的渲染目标:swapchain 纹理视图 + 呈现句柄(离屏测试为 None)。
+struct FrameTarget {
+    view: wgpu::TextureView,
+    present: Option<wgpu::SurfaceTexture>,
+    cleared: bool,
 }
 
 impl Renderer {
@@ -269,6 +282,8 @@ impl Renderer {
             bg_view: None,
             bg_sampler: None,
             bg_param: [0.0, 1.0, 1.0, 0.0],
+            frame: None,
+            frame_extent: (0, 0),
         }
     }
 
@@ -494,7 +509,8 @@ impl Renderer {
         self.bind_group = Some(self.rebuild_bind_group(&view, &sampler));
     }
 
-    /// 全量重绘一帧(M0 策略,spec Global Constraints)。
+    /// 全量重绘一帧(M0 策略,spec Global Constraints)。单批便捷封装:
+    /// begin_frame → draw_batch → end_frame;QT 与单 pane 路径用它。
     pub fn draw(
         &mut self,
         surface: &wgpu::Surface<'_>,
@@ -504,17 +520,74 @@ impl Renderer {
         if instances.is_empty() {
             return;
         }
+        if !self.begin_frame(surface, config) {
+            return;
+        }
+        self.draw_batch(instances, None);
+        self.end_frame();
+    }
+
+    /// 开始一帧(T05 分批绘制):取 swapchain 纹理,建立帧目标。
+    /// 返回 false = 本帧跳过(表面过期会顺带重新 configure,下帧恢复)。
+    /// begin/end 之间可用 draw_batch 画多批,每批各自绑定图集;
+    /// **禁止嵌套**(上一帧未 end_frame 时 debug_assert)。
+    pub fn begin_frame(
+        &mut self,
+        surface: &wgpu::Surface<'_>,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> bool {
+        debug_assert!(self.frame.is_none(), "上一帧未 end_frame(禁止嵌套帧)");
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
             // 表面过期/丢失:重新 configure,下一帧恢复
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 surface.configure(&self.device, config);
-                return;
+                return false;
             }
-            _ => return, // Timeout/Occluded/Validation:跳过本帧
+            _ => return false, // Timeout/Occluded/Validation:跳过本帧
         };
-        self.upload_instances(instances);
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.frame_extent = (config.width, config.height);
+        self.frame = Some(FrameTarget {
+            view,
+            present: Some(frame),
+            cleared: false,
+        });
+        true
+    }
+
+    /// 离屏帧入口(测试/无窗口渲染):直接给目标视图与视口,不呈现。
+    pub fn begin_frame_offscreen(&mut self, view: &wgpu::TextureView, extent: (u32, u32)) {
+        debug_assert!(self.frame.is_none(), "上一帧未 end_frame(禁止嵌套帧)");
+        self.frame_extent = extent;
+        self.frame = Some(FrameTarget {
+            view: view.clone(),
+            present: None,
+            cleared: false,
+        });
+    }
+
+    /// 画一批实例(T05):使用**当前绑定**的图集(set_atlas 已在批间切换),
+    /// scissor 钳制到帧视口(None = 全视口)。首批 clear,后续 load——
+    /// 分屏各 pane 依次入帧,最后一次 present。
+    pub fn draw_batch(
+        &mut self,
+        instances: &[CellInstance],
+        scissor: Option<(u32, u32, u32, u32)>,
+    ) {
+        if self.frame.is_none() {
+            return; // 未 begin_frame:静默丢批(与旧 draw 空帧同哲学)
+        }
+        // set_atlas 之前画是接线错误(T7 起先 set_atlas 再画)
+        let bind_group = self
+            .bind_group
+            .clone()
+            .expect("set_atlas() must be called before draw_batch()");
+        // globals 随批更新:atlas_size 是像素 UV 的归一化分母,分屏各
+        // pane 图集尺寸可以不同,不能用帧首一次写入
         let atlas_w = self
             .atlas_texture
             .as_ref()
@@ -525,38 +598,39 @@ impl Renderer {
             .as_ref()
             .map(|t| t.height() as f32)
             .unwrap_or(1.0);
+        let (vp_w, vp_h) = self.frame_extent;
         self.queue.write_buffer(
             &self.globals_buf,
             0,
             cast_slice(&[Globals {
-                viewport: [config.width as f32, config.height as f32],
+                viewport: [vp_w as f32, vp_h as f32],
                 atlas_size: [atlas_w, atlas_h],
                 bg: self.bg_param,
             }]),
         );
-        // set_atlas 之前 draw 是接线错误(T7 起先 set_atlas 再 draw)
-        let bind_group = self
-            .bind_group
-            .as_ref()
-            .expect("set_atlas() must be called before draw()");
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.upload_instances(instances);
+        let cleared = self.frame.as_ref().map(|f| f.cleared).unwrap_or(false);
+        let load = if cleared {
+            wgpu::LoadOp::Load
+        } else {
+            // 全量重绘,但客户区非 8/16 整数倍时右/下边缘不足一格的像素
+            // 露清屏色 —— 背景色使其融入
+            wgpu::LoadOp::Clear(self.clear_color)
+        };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frame"),
+                label: Some("frame batch"),
             });
         {
+            let view = self.frame.as_ref().map(|f| &f.view).unwrap();
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("cells"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     resolve_target: None,
-                    // 全量重绘,但客户区非 8/16 整数倍时右/下边缘
-                    // 不足一格的像素露清屏色 —— 用背景色使其融入
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -567,13 +641,61 @@ impl Renderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_bind_group(0, &bind_group, &[]);
             pass.set_vertex_buffer(0, self.instance_buf.slice(..));
+            if let Some((sx, sy, sw, sh)) = scissor {
+                // 钳制到视口(wgpu 校验要求 scissor 完整落在附件内)
+                let x = sx.min(vp_w.saturating_sub(1));
+                let y = sy.min(vp_h.saturating_sub(1));
+                let w = sw.min(vp_w - x);
+                let h = sh.min(vp_h - y);
+                if w > 0 && h > 0 {
+                    pass.set_scissor_rect(x, y, w, h);
+                }
+            }
             pass.draw(0..6, 0..instances.len() as u32);
         }
         self.queue.submit([encoder.finish()]);
-        // wgpu 30:present 移到了 Queue 上
-        self.queue.present(frame);
+        if let Some(f) = self.frame.as_mut() {
+            f.cleared = true;
+        }
+    }
+
+    /// 结束一帧:全空帧也要保证清屏(否则呈现陈旧内容),随后呈现。
+    pub fn end_frame(&mut self) {
+        let Some(mut target) = self.frame.take() else {
+            return;
+        };
+        if !target.cleared {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("frame clear"),
+                });
+            {
+                let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("clear only"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target.view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(self.clear_color),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            self.queue.submit([encoder.finish()]);
+        }
+        if let Some(frame) = target.present.take() {
+            // wgpu 30:present 移到了 Queue 上
+            self.queue.present(frame);
+        }
     }
 
     fn upload_instances(&mut self, instances: &[CellInstance]) {
@@ -602,7 +724,8 @@ fn is_srgb(format: wgpu::TextureFormat) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{GpuContext, Renderer, bg_clear_color, is_srgb};
-    use crate::font::atlas::{GlyphAtlas, GlyphBitmap};
+    use crate::font::atlas::{GlyphAtlas, GlyphBitmap, GlyphFormat};
+    use crate::frame::CellInstance;
     use mica_core::config::palette::Palette;
     use wgpu::TextureFormat;
 
@@ -628,6 +751,143 @@ mod tests {
         assert_eq!(c.r, f64::from(0xab) / 255.0);
         assert_eq!(c.g, f64::from(0xcd) / 255.0);
         assert_eq!(c.b, f64::from(0xef) / 255.0);
+    }
+
+    /// T05 分屏图集归属的像素级回归:左右两批各绑自己的图集(相同 UV
+    /// 槽、不同颜色),离屏渲染后回读——左半必须红(A 图集)、右半必须
+    /// 蓝(B 图集)。修前形态(全部实例只绑焦点 pane 图集一次绘制)在
+    /// 本测试的等价路径是"两批都绑 A":右半会呈红色,断言失败。
+    #[test]
+    fn split_batches_bind_own_atlas_pixels() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            return; // 无适配器:跳过,不当作失败(与既有设备测试同哲学)
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("mica-render-split-test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("test device");
+        let ctx = GpuContext {
+            adapter,
+            device: device.clone(),
+            queue: queue.clone(),
+        };
+        let mut renderer = Renderer::new(&ctx, TextureFormat::Bgra8Unorm);
+
+        // 两个全新图集,首个插入位相同 → 相同 UV 槽;A 红 B 蓝
+        let mk_atlas = |rgb: [u8; 3]| {
+            let mut a = GlyphAtlas::new(256, 256);
+            let px: Vec<u8> = (0..8 * 12)
+                .flat_map(|_| [rgb[0], rgb[1], rgb[2], 255])
+                .collect();
+            let bmp = GlyphBitmap {
+                width: 8,
+                height: 12,
+                pixels: px,
+                format: GlyphFormat::Coverage,
+            };
+            let rect = a.insert(&bmp);
+            (a, rect)
+        };
+        let (atlas_a, rect_a) = mk_atlas([255, 0, 0]);
+        let (atlas_b, rect_b) = mk_atlas([0, 0, 255]);
+        assert_eq!(
+            (rect_a.u, rect_a.v),
+            (rect_b.u, rect_b.v),
+            "两图集同槽(等价 UV)"
+        );
+
+        // 字形 quad:x 处 8×12 像素,采样整个字形槽;墨色白(rgb 直通)。
+        // 注意 alpha 槽是圆角半径语义(0=方角),非 0 会进圆角路径跳过
+        // 图集采样——真实字形实例同此约定(见 cells.wgsl 头注)
+        let quad = |x: f32, rect: crate::font::atlas::Rect| CellInstance {
+            pos_uv: [x, 26.0, rect.u as f32, rect.v as f32],
+            size_uv: [8.0, 12.0, rect.w as f32, rect.h as f32],
+            fg: [1.0, 1.0, 1.0, 0.0],
+            bg: [0.0, 0.0, 0.0, 0.0],
+        };
+
+        // 离屏目标 256×64
+        let size = wgpu::Extent3d {
+            width: 256,
+            height: 64,
+            depth_or_array_layers: 1,
+        };
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 批 1:绑 A,scissor 左半;批 2:绑 B,scissor 右半
+        renderer.set_atlas(&atlas_a);
+        renderer.begin_frame_offscreen(&view, (256, 64));
+        renderer.draw_batch(&[quad(12.0, rect_a)], Some((0, 0, 128, 64)));
+        renderer.set_atlas(&atlas_b);
+        renderer.draw_batch(&[quad(140.0, rect_b)], Some((128, 0, 128, 64)));
+        renderer.end_frame();
+
+        // 回读(Bgra8:字节序 B,G,R,A)
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (256 * 64 * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy"),
+        });
+        enc.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256 * 4),
+                    rows_per_image: Some(64),
+                },
+            },
+            size,
+        );
+        queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).unwrap();
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("poll");
+        rx.recv().unwrap().expect("map");
+        let data = slice.get_mapped_range().expect("map range").to_vec();
+        buf.unmap();
+
+        let px = |x: usize, y: usize| (data[(y * 256 + x) * 4], data[(y * 256 + x) * 4 + 2]); // (B, R)
+        // 左半字形中心:红(B≈0, R≈255)
+        let (lb, lr) = px(16, 32);
+        assert!(
+            lb < 32 && lr > 223,
+            "左半必须是 A 图集的红色,得 B={lb} R={lr}"
+        );
+        // 右半字形中心:蓝(B≈255, R≈0)——修前错绑焦点图集时这里是红
+        let (rb, rr) = px(144, 32);
+        assert!(
+            rb > 223 && rr < 32,
+            "右半必须是 B 图集的蓝色,得 B={rb} R={rr}"
+        );
     }
 
     /// 无 GPU 也可跑的纯逻辑测试之外的设备冒烟:cells.wgsl 的 naga 校验、

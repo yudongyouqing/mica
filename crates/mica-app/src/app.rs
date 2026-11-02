@@ -2110,6 +2110,13 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
     );
 }
 
+/// T05 一次绘制批:pane id + scissor 矩形(px)+ 实例(该 pane 的图集批)
+struct PaneBatch {
+    pane_id: u64,
+    scissor: (u32, u32, u32, u32),
+    insts: Vec<mica_render::frame::CellInstance>,
+}
+
 fn draw_frame() {
     // device lost 重建(M5b/T2):下一帧发现丢失即整套重造(实例、适配
     // 器、surface、renderer),全部 tab 图集修订重置强制重传 + force_full。
@@ -2118,6 +2125,10 @@ fn draw_frame() {
     }
     // 条高先取(动态:单标签隐藏第二行;取值含 TABS 借用,须在 guard 外)
     let sh = strip_h();
+    // T05 批次容器:TABS 闭包填充,GPU 阶段消费(闭包早退 = 空批,
+    // GPU 阶段退化为纯清屏帧)
+    let mut pane_batches: Vec<PaneBatch> = Vec::new();
+    let mut strip_batch: (u64, Vec<mica_render::frame::CellInstance>) = (0, Vec::new());
     TABS.with(|tabs| {
         let mut guard = tabs.borrow_mut();
         // titles 先行收集(不可变借用),再取活跃标签可变借用
@@ -2170,7 +2181,10 @@ fn draw_frame() {
         let rects: Vec<(u64, Rect)> = active.layout.rects(area);
         let focused_pane_id = active.active_pane_id().unwrap_or(0);
 
-        let mut all_instances: Vec<mica_render::frame::CellInstance> = Vec::new();
+        // T05 分批绘制:每 pane 一批(自己的图集 + scissor 到 pane 矩形),
+        // strip/搜索 overlay 是焦点图集的独立批(pane 区外,无 scissor)。
+        // 修前:所有 pane 实例合并后只绑焦点图集单次绘制——非焦点 pane
+        // 的字形采样别人的纹理,字符集/插入顺序不同即错字
         // 焦点边框的色与 strip 用同一个 pane 的 router/色板
         for pane in active.panes.iter_mut() {
             let t = &mut pane.terminal;
@@ -2226,11 +2240,27 @@ fn draw_frame() {
                 &damage,
                 &mut t.row_insts,
             );
+            let mut insts: Vec<mica_render::frame::CellInstance> = Vec::new();
             for mut inst in repack(&t.row_insts) {
                 inst.pos_uv[0] += rect.x;
                 inst.pos_uv[1] += rect.y;
-                all_instances.push(inst);
+                insts.push(inst);
             }
+            // scissor = pane 矩形(像素,钳到视口):宽字/光标越界不再
+            // 污染邻 pane;draw_batch 内还会对帧视口再钳一次
+            let sx = rect.x.max(0.0).round() as u32;
+            let sy = rect.y.max(0.0).round() as u32;
+            let sw = ((rect.x + rect.w).round() as u32)
+                .min(area_w as u32)
+                .saturating_sub(sx);
+            let sh_r = ((rect.y + rect.h).round() as u32)
+                .min(area_h as u32)
+                .saturating_sub(sy);
+            pane_batches.push(PaneBatch {
+                pane_id: pane.id,
+                scissor: (sx, sy, sw, sh_r),
+                insts,
+            });
         }
         // 焦点 pane 边框退役(2026-10-07 用户裁定:不要任何描边)。
 
@@ -2396,25 +2426,29 @@ fn draw_frame() {
                     0.0,
                 ];
                 let ink_dark = [0.05, 0.05, 0.05, 0.0];
-                for inst in all_instances.iter_mut() {
-                    let (ix, iy, iw, ih) = (
-                        inst.pos_uv[0],
-                        inst.pos_uv[1],
-                        inst.size_uv[0],
-                        inst.size_uv[1],
-                    );
-                    for &(hx, hy, hw, hh, _is_cur) in hit_rects.iter() {
-                        if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
-                            if inst.size_uv[2] > 0.0 {
-                                // 字形 quad:墨色改近黑(黄底可读)
-                                inst.fg = ink_dark;
-                                inst.bg = hl_cur;
-                            } else {
-                                // 背景 quad:整块换高亮色
-                                inst.fg = hl_cur;
-                                inst.bg = hl_cur;
+                // T05:高亮后期处理遍历各 pane 批次实例(原 all_instances)
+                for batch in pane_batches.iter_mut() {
+                    let batch_insts = &mut batch.insts;
+                    for inst in batch_insts.iter_mut() {
+                        let (ix, iy, iw, ih) = (
+                            inst.pos_uv[0],
+                            inst.pos_uv[1],
+                            inst.size_uv[0],
+                            inst.size_uv[1],
+                        );
+                        for &(hx, hy, hw, hh, _is_cur) in hit_rects.iter() {
+                            if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
+                                if inst.size_uv[2] > 0.0 {
+                                    // 字形 quad:墨色改近黑(黄底可读)
+                                    inst.fg = ink_dark;
+                                    inst.bg = hl_cur;
+                                } else {
+                                    // 背景 quad:整块换高亮色
+                                    inst.fg = hl_cur;
+                                    inst.bg = hl_cur;
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
@@ -2573,51 +2607,94 @@ fn draw_frame() {
                     0.0,
                 ];
                 let ink_dark = [0.05, 0.05, 0.05, 0.0];
-                for inst in all_instances.iter_mut() {
-                    let (ix, iy, iw, ih) = (
-                        inst.pos_uv[0],
-                        inst.pos_uv[1],
-                        inst.size_uv[0],
-                        inst.size_uv[1],
-                    );
-                    if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
-                        if inst.size_uv[2] > 0.0 {
-                            // 字形 quad:墨色改近黑(浅蓝底可读)
-                            inst.fg = ink_dark;
-                            inst.bg = hl;
-                        } else {
-                            // 背景 quad:整块换高亮色
-                            inst.fg = hl;
-                            inst.bg = hl;
+                // T05:高亮后期处理遍历各 pane 批次实例(原 all_instances)
+                for batch in pane_batches.iter_mut() {
+                    let batch_insts = &mut batch.insts;
+                    for inst in batch_insts.iter_mut() {
+                        let (ix, iy, iw, ih) = (
+                            inst.pos_uv[0],
+                            inst.pos_uv[1],
+                            inst.size_uv[0],
+                            inst.size_uv[1],
+                        );
+                        if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
+                            if inst.size_uv[2] > 0.0 {
+                                // 字形 quad:墨色改近黑(浅蓝底可读)
+                                inst.fg = ink_dark;
+                                inst.bg = hl;
+                            } else {
+                                // 背景 quad:整块换高亮色
+                                inst.fg = hl;
+                                inst.bg = hl;
+                            }
                         }
                     }
                 }
             }
         }
-        let revision = t.router.atlas_revision();
-        let atlas = t.router.atlas();
-        strip.append(&mut all_instances);
         // #57 搜索 overlay 最后拼 = 最上层(盖在终端内容之上)
         strip.extend(search_overlay);
-        // GPU 窗口级(T7):set_atlas 切到活跃标签的图集再 draw。
-        // 门控用窗口级所有权(pane_id, revision)——1.0.10 修切标签乱码:
-        // 旧逻辑按标签记 revision,切回旧标签时其自身未变便跳过重传,
-        // GPU 纹理还装着别人的字形(用户稳定复现:多会话点第一个全乱码)
-        // 二段修复:a883e6e 的身份门曾 Renderer 内部另有一道"revision
-        // 数值相等"早退,字符集相似的两标签计数撞车即漏传(手验推翻
-        // 探针验证)——内门已拆,set_atlas 无条件上传,身份判断只在此处
-        // pane id 在借 active_pane 之前取,避开可变借用交叉
-        GPU.with(|g| {
-            let mut gpu_guard = g.borrow_mut();
-            let Some(gpu) = gpu_guard.as_mut() else {
-                return;
-            };
-            if gpu.atlas_owner != Some((focused_pane_id, revision)) {
-                gpu.renderer.set_atlas(&atlas);
-                gpu.atlas_owner = Some((focused_pane_id, revision));
+        // strip/overlay 与焦点 pane 同源图集(strip_router 共享终端图集,
+        // 见 Terminal::strip_router 注释),作为独立批(pane 区外无 scissor)
+        strip_batch = (focused_pane_id, strip);
+    });
+    // ---- T05 分批绘制:一次取帧、一次 clear、每批各绑各的图集、
+    // 一次 present。图集在批间经 TABS 短借获取(Ref 与 set_atlas 同闭包,
+    // 期间无 mut 借用)。门控仍是窗口级所有权 (pane_id, revision)——
+    // 1.0.10 修切标签乱码的身份门语义不变,只是从"每帧一次"变"每批一次"
+    GPU.with(|g| {
+        let mut gpu_guard = g.borrow_mut();
+        let Some(gpu) = gpu_guard.as_mut() else {
+            return;
+        };
+        if !gpu.renderer.begin_frame(&gpu.wgpu_surface, &gpu.config) {
+            return;
+        }
+        for batch in &pane_batches {
+            let (pane_id, scissor, insts) = (&batch.pane_id, &batch.scissor, &batch.insts);
+            if insts.is_empty() {
+                continue;
             }
-            gpu.renderer.draw(&gpu.wgpu_surface, &gpu.config, &strip);
-        });
+            TABS.with(|tabs| {
+                let guard = tabs.borrow();
+                let Some(p) = guard
+                    .iter()
+                    .find(|tab| tab.panes.iter().any(|p| p.id == *pane_id))
+                    .and_then(|tab| tab.panes.iter().find(|p| p.id == *pane_id))
+                else {
+                    return; // 批构建后 pane 已关:整批丢弃
+                };
+                let revision = p.terminal.router.atlas_revision();
+                if gpu.atlas_owner != Some((*pane_id, revision)) {
+                    let atlas = p.terminal.router.atlas();
+                    gpu.renderer.set_atlas(&atlas);
+                    gpu.atlas_owner = Some((*pane_id, revision));
+                }
+                gpu.renderer.draw_batch(insts, Some(*scissor));
+            });
+        }
+        // strip + 搜索 overlay:焦点图集,无 scissor(strip 在 pane 区外)
+        let (strip_pane, strip_insts) = &strip_batch;
+        if !strip_insts.is_empty() {
+            TABS.with(|tabs| {
+                let guard = tabs.borrow();
+                let Some(p) = guard
+                    .iter()
+                    .find(|tab| tab.panes.iter().any(|p| p.id == *strip_pane))
+                    .and_then(|tab| tab.panes.iter().find(|p| p.id == *strip_pane))
+                else {
+                    return;
+                };
+                let revision = p.terminal.router.atlas_revision();
+                if gpu.atlas_owner != Some((*strip_pane, revision)) {
+                    let atlas = p.terminal.router.atlas();
+                    gpu.renderer.set_atlas(&atlas);
+                    gpu.atlas_owner = Some((*strip_pane, revision));
+                }
+                gpu.renderer.draw_batch(strip_insts, None);
+            });
+        }
+        gpu.renderer.end_frame();
     });
 }
 
