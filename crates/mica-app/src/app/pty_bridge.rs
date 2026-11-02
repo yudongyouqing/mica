@@ -38,7 +38,7 @@ pub const PROCESS_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 /// UI 单次调度批上限(字节):超此让出消息循环续批。
 pub const UI_BATCH_BYTES: usize = 256 * 1024;
 /// 单 pane 写队列预算(字节):粘贴/注入的待写字节上限。
-pub const WRITE_QUEUE_BYTES: usize = 1 * 1024 * 1024;
+pub const WRITE_QUEUE_BYTES: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // 全局预算(严格:持锁判限,绝不 load-then-add)
@@ -467,6 +467,7 @@ impl WriteQueue {
     }
 
     /// 积压字节(诊断/测试)。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn queued_bytes(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).bytes
     }

@@ -159,7 +159,7 @@ pub fn reaper_stats() -> (usize, usize, usize, bool) {
 /// 3. 拆分回收:session 交 reaper(唯一阻塞面 ClosePseudoConsole 在后台),
 ///    Surface/行缓存/路由(COM)/调色板等 CPU 状态当场 Drop——config
 ///    热重载每轮都这么换 router,无内核阻塞面,有先例。
-pub fn close_terminal(mut t: super::Terminal) {
+pub fn close_terminal(t: super::Terminal) {
     // 关闭序(T08):先关写队列(writer 线程退场,阻塞中的 enqueue 脱身)
     // → 关输出积压(转发线程的 push 脱身;存量预算归还)→ 杀子 →
     // 会话交 reaper。UI 侧零阻塞:全部唤醒路径就位。

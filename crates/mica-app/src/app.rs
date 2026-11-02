@@ -306,9 +306,6 @@ fn apply_window_alpha(hwnd: HWND, translucent: bool) {
 const WM_APP_RENDER: u32 = 0x8000 + 1;
 const WM_APP_CONFIG: u32 = 0x8000 + 2;
 const WM_APP_IPC: u32 = 0x8000 + 3;
-/// WM_APP 基值(quickterm 转发线程投递用裸 WM_APP)
-const WM_APP_MSG: u32 = 0x8000;
-
 /// watch/转发线程共持的窗口句柄哨兵,唯一语义是"窗口是否存活":退出序第一
 /// 步统一落 None,两个后台线程自此不再向窗口投递消息;Post 到死句柄本就无害,
 /// 纪律照守。存裸 isize 而非 HWND——windows-rs 的句柄包着 *mut c_void,不是
@@ -3469,9 +3466,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             normalized.into_bytes()
                         };
                         // T08:粘贴走欠账路径(队列满不卡 UI)
-                        match t.writeq.enqueue_or_defer(t.session_gen, &bytes) {
-                            Ok(left) => t.pending_paste.extend_from_slice(&left),
-                            Err(_) => {}
+                        if let Ok(left) = t.writeq.enqueue_or_defer(t.session_gen, &bytes) {
+                            t.pending_paste.extend_from_slice(&left);
                         }
                     }
                 });
@@ -4563,12 +4559,11 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                     if let Some(text) = clipboard::get_text() {
                         let normalized = clipboard::normalize_paste(&text);
                         // T08:粘贴走欠账路径(队列满不卡 UI)
-                        match t
+                        if let Ok(left) = t
                             .writeq
                             .enqueue_or_defer(t.session_gen, normalized.as_bytes())
                         {
-                            Ok(left) => t.pending_paste.extend_from_slice(&left),
-                            Err(_) => {}
+                            t.pending_paste.extend_from_slice(&left);
                         }
                     }
                 }
