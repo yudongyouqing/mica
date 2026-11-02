@@ -23,17 +23,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-use std::time::{Duration, Instant};
 
 use mica_core::pty::PtySession;
 
 /// 回收通道容量:同时在途的待关闭会话上限。
 const REAPER_CAPACITY: usize = 16;
-/// 入队限时等待:通道满时的最长相让时间(等待 reaper 消化)。
-const ENQUEUE_WAIT: Duration = Duration::from_secs(2);
-/// 测试注入口:缩短等待,验证满通道降级路径。
-#[cfg(test)]
-const ENQUEUE_WAIT_TEST: Duration = Duration::from_millis(300);
 
 static REAPED_OK: AtomicUsize = AtomicUsize::new(0);
 static REAPED_FALLBACK_FORGET: AtomicUsize = AtomicUsize::new(0);
@@ -80,41 +74,24 @@ pub enum EnqueueOutcome {
 }
 
 /// 核心入队:限时等待 + 降级。断开(接收端没了)立即降级;满载限时
-/// 重试,超时降级。独立成函数是为了满通道/断通道路径可用自有通道
+/// 满/断立即降级。独立成函数是为了满通道/断通道路径可用自有通道
 /// 确定性测试。
 fn enqueue_with(
     tx: &SyncSender<ReapTask>,
     child_pid: Option<u32>,
     session: PtySession,
-    wait: Duration,
 ) -> EnqueueOutcome {
-    let deadline = Instant::now() + wait;
-    let mut sess = session;
-    loop {
-        // 计数顺序契约:先记在途,失败回滚(见模块 doc;消费者 sub 必然
-        // 落在本 add 之后)
-        REAPER_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
-        match tx.try_send(ReapTask {
-            child_pid,
-            session: sess,
-        }) {
-            Ok(()) => return EnqueueOutcome::Reaped,
-            Err(TrySendError::Disconnected(s)) => {
-                REAPER_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
-                let ReapTask { session, .. } = s;
-                fallback_forget(session);
-                return EnqueueOutcome::FellBack;
-            }
-            Err(TrySendError::Full(s)) => {
-                REAPER_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
-                let ReapTask { session: back, .. } = s;
-                sess = back;
-                if Instant::now() >= deadline {
-                    fallback_forget(sess);
-                    return EnqueueOutcome::FellBack;
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
+    // 计数顺序契约:先记在途,失败回滚(见模块 doc;消费者 sub 必然
+    // 落在本 add 之后)。单次尝试零等待:调用方全在 UI 线程,满/断
+    // 立即降级(有界性由 DEGRADED 故障态保证)
+    REAPER_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    match tx.try_send(ReapTask { child_pid, session }) {
+        Ok(()) => EnqueueOutcome::Reaped,
+        Err(TrySendError::Disconnected(s)) | Err(TrySendError::Full(s)) => {
+            REAPER_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+            let ReapTask { session, .. } = s;
+            fallback_forget(session);
+            EnqueueOutcome::FellBack
         }
     }
 }
@@ -134,7 +111,7 @@ fn fallback_forget(session: PtySession) {
 /// 防 defterm 弹窗接管——1.0.4 实证);child pid 由调用方提供
 /// (close_terminal 已取过,reap 侧不必重复查询)。
 pub fn reap_session_with_pid(child_pid: Option<u32>, session: PtySession) {
-    let outcome = enqueue_with(reaper_tx(), child_pid, session, ENQUEUE_WAIT);
+    let outcome = enqueue_with(reaper_tx(), child_pid, session);
     note_outcome(outcome);
 }
 
@@ -209,6 +186,7 @@ pub fn close_terminal(mut t: super::Terminal) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     fn short_session() -> (PtySession, Option<u32>) {
         let (mut s, r) = PtySession::spawn(
@@ -236,23 +214,11 @@ mod tests {
         assert!(reaper_stats().0 >= 1);
     }
 
-    /// 满通道(无消费者):限时等待后降级 forget,不阻塞不 panic。
+    /// 满通道(消费者卡死不 recv):**立即**降级 forget,零阻塞——
+    /// 入队调用方全在 UI 线程,任何 sleep 都会按会话数累积卡顿
+    /// (2026-11-02 复核要求:满队列时窗口仍能处理消息)。
     #[test]
-    fn full_channel_falls_back_after_deadline() {
-        let (tx, _rx) = sync_channel::<ReapTask>(0); // 零容量:必满
-        drop(_rx); // 且断开——本用例验证"断开即降级"的快路径
-        let (session, _) = short_session();
-        let start = Instant::now();
-        let out = enqueue_with(&tx, None, session, ENQUEUE_WAIT_TEST);
-        assert_eq!(out, EnqueueOutcome::FellBack);
-        assert!(start.elapsed() < Duration::from_secs(2), "断开不得长等");
-        assert!(reaper_stats().1 >= 1, "降级必须计数");
-    }
-
-    /// 永久阻塞形态:通道满但接收端活着(消费者卡死不 recv)。容量 1,
-    /// 塞满后第二个必须走满等待→降级,不无限阻塞。
-    #[test]
-    fn stuck_consumer_falls_back_not_blocks() {
+    fn full_channel_falls_back_immediately_without_blocking() {
         let (tx, rx) = sync_channel::<ReapTask>(1);
         let (filler, _) = short_session();
         tx.try_send(ReapTask {
@@ -260,12 +226,17 @@ mod tests {
             session: filler,
         })
         .expect("占位入队");
-        // rx 存活但永不 recv(卡死形态)
+        // rx 存活但永不 recv(卡死形态):第二个必须立即降级
         let (session, _) = short_session();
         let start = Instant::now();
-        let out = enqueue_with(&tx, None, session, ENQUEUE_WAIT_TEST);
+        let out = enqueue_with(&tx, None, session);
         assert_eq!(out, EnqueueOutcome::FellBack);
-        assert!(start.elapsed() >= ENQUEUE_WAIT_TEST, "满通道须等满限时");
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "入队零等待(UI 线程安全),耗时 {:?}",
+            start.elapsed()
+        );
+        assert!(reaper_stats().1 >= 1, "降级必须计数");
         drop(rx); // 释放占位会话(reaper 不碰这条测试通道)
         drop(tx);
     }
@@ -276,8 +247,10 @@ mod tests {
         let (tx, rx) = sync_channel::<ReapTask>(4);
         drop(rx);
         let (session, _) = short_session();
-        let out = enqueue_with(&tx, None, session, Duration::from_secs(5));
-        assert_eq!(out, EnqueueOutcome::FellBack, "断开不等满 5s");
+        let start = Instant::now();
+        let out = enqueue_with(&tx, None, session);
+        assert_eq!(out, EnqueueOutcome::FellBack, "断开不得长等");
+        assert!(start.elapsed() < Duration::from_millis(200));
         assert!(reaper_stats().1 >= 1);
     }
 
@@ -309,7 +282,7 @@ mod tests {
         });
         for _ in 0..50 {
             let (session, _) = short_session();
-            enqueue_with(&tx, None, session, Duration::from_secs(1));
+            enqueue_with(&tx, None, session);
         }
         drop(tx);
         consumer.join().unwrap();
