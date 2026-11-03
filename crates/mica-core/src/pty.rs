@@ -58,11 +58,27 @@ pub enum RecvEvent {
     Closed,
 }
 
+/// 写端句柄(T08 二次返工):**只持写端 Arc 互斥,不持会话**——
+/// writer 线程阻塞写时只卡这把锁,kill/resize/轮询走会话自身的字段,
+/// 永不被阻塞写拖住(复核 3 的锁分离)。
+pub struct PtyWriterHandle {
+    writer: std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+}
+
+impl PtyWriterHandle {
+    pub fn write(&self, data: &[u8]) -> std::io::Result<()> {
+        self.writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write_all(data)
+    }
+}
+
 /// A running child on a pseudo-terminal.
 pub struct PtySession {
-    /// 写端内部互斥(T08):`write` 取 `&self`——UI 与 writer 线程并发
-    /// 写同一会话而无需外部锁(write_all 在互斥下天然保序)。
-    writer: std::sync::Mutex<Box<dyn Write + Send>>,
+    /// 写端独立 Arc 互斥:句柄可在会话外分发(writer 线程),会话的
+    /// write 同源;控制面(kill/resize/wait)不碰这把锁。
+    writer: std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -161,7 +177,7 @@ impl PtySession {
 
         Ok((
             Self {
-                writer: std::sync::Mutex::new(writer),
+                writer: std::sync::Arc::new(std::sync::Mutex::new(writer)),
                 master: pair.master,
                 child,
             },
@@ -169,13 +185,25 @@ impl PtySession {
         ))
     }
 
-    /// Bytes typed by the user. `&self`(T08):写端内部互斥,writer 线程
-    /// 与 UI 可并发调用,write_all 逐次持锁保序。
+    /// Bytes typed by the user. `&self`(T08):写端内部互斥。
     pub fn write(&self, data: &[u8]) -> io::Result<()> {
         self.writer
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .write_all(data)
+    }
+
+    /// 取独立写端句柄(T08):writer 线程持它写,锁与控制面分离。
+    pub fn writer_handle(&self) -> PtyWriterHandle {
+        PtyWriterHandle {
+            writer: std::sync::Arc::clone(&self.writer),
+        }
+    }
+
+    /// 测试面:锁住写端(验证 kill/resize 不被阻塞写拖住)。
+    #[doc(hidden)]
+    pub fn block_writer_for_test(&self) -> std::sync::MutexGuard<'_, Box<dyn Write + Send>> {
+        self.writer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 子进程 PID(孤儿会话注册表按 PID+创建时间证明归属,2026-11 T02)。

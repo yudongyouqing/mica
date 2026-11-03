@@ -40,7 +40,7 @@ static DEGRADED: AtomicBool = AtomicBool::new(false);
 /// 或 writer 任一侧——ClosePseudoConsole 只阻塞持有者,不碰 UI)。
 struct ReapTask {
     child_pid: Option<u32>,
-    session: std::sync::Arc<std::sync::Mutex<PtySession>>,
+    session: PtySession,
 }
 
 fn reaper_tx() -> &'static SyncSender<ReapTask> {
@@ -51,10 +51,16 @@ fn reaper_tx() -> &'static SyncSender<ReapTask> {
             .name("pty-reaper".into())
             .spawn(move || {
                 for task in rx {
-                    // Drop 在此发生:ClosePseudoConsole 卡多久都只卡本线程
+                    // Drop 在此发生(按值:reaper 是唯一所有者,Drop 完成
+                    // 即 PTY 真实销毁——计数与注册表移除都在 Drop 之后,
+                    // 不提前记录回收完成)
+                    let done_pid = task.child_pid;
                     drop(task.session);
                     REAPER_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
                     REAPED_OK.fetch_add(1, Ordering::Relaxed);
+                    if let Some(pid) = done_pid {
+                        super::orphan::remove_closed_session(pid);
+                    }
                     if let Some(pid) = task.child_pid {
                         // 回收确认:Closing → Closed,记录移除
                         super::orphan::remove_closed_session(pid);
@@ -96,7 +102,7 @@ fn enqueue_with(tx: &SyncSender<ReapTask>, task: ReapTask) -> EnqueueOutcome {
 
 /// 降级 forget + 计数(通道满超时/断开):泄漏有界由 DEGRADED 故障态
 /// 保证——降级后拒绝新会话,泄漏上界 = 队列容量 + 存活 pane 数 + 1。
-fn fallback_forget(session: std::sync::Arc<std::sync::Mutex<PtySession>>) {
+fn fallback_forget(session: PtySession) {
     REAPED_FALLBACK_FORGET.fetch_add(1, Ordering::Relaxed);
     eprintln!(
         "[lifecycle] 回收通道满/断(降级 forget 累计 {} 次)——reaper 卡死或过载",
@@ -109,17 +115,6 @@ fn fallback_forget(session: std::sync::Arc<std::sync::Mutex<PtySession>>) {
 /// 防 defterm 弹窗接管——1.0.4 实证);child pid 由调用方提供
 /// (close_terminal 已取过,reap 侧不必重复查询)。
 pub fn reap_session_with_pid(child_pid: Option<u32>, session: PtySession) {
-    reap_session_arc(
-        child_pid,
-        std::sync::Arc::new(std::sync::Mutex::new(session)),
-    );
-}
-
-/// 同上,接受共享会话(T08:close_terminal 持 Arc)。
-pub fn reap_session_arc(
-    child_pid: Option<u32>,
-    session: std::sync::Arc<std::sync::Mutex<PtySession>>,
-) {
     let outcome = enqueue_with(reaper_tx(), ReapTask { child_pid, session });
     note_outcome(outcome);
 }
@@ -134,10 +129,33 @@ fn note_outcome(outcome: EnqueueOutcome) {
 }
 
 /// 故障态下拒绝创建新会话:开标签/分屏/重启/QT 在 spawn 前必须检查。
+/// 并发会话数上限(复核 8):上游背压链的最坏界按 N 计算——
+/// 16 会话 ×(512KB 源通道 + 8KB 在途)≈ 8.3MB 已知界;不设上限则
+/// "最坏合计"没有数字。达上限拒绝新建(与 DEGRADED 同一门口)。
+pub const MAX_SESSIONS: usize = 16;
+static LIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
+
 /// 恢复条件 = 某次回收重新入队成功(通道有空间);持久卡死则保持拒绝,
 /// 泄漏上界 = 队列容量 + 存活 pane 数 + 1,不随关闭次数增长。
+/// 同时要求并发会话数 < MAX_SESSIONS(上游界的 N 上限)。
 pub fn spawn_capacity_ok() -> bool {
-    !DEGRADED.load(Ordering::Relaxed)
+    !DEGRADED.load(Ordering::Relaxed) && LIVE_SESSIONS.load(Ordering::Relaxed) < MAX_SESSIONS
+}
+
+/// 会话诞生(spawn 成功后调用;超限即拒绝,见 spawn_capacity_ok)。
+pub fn session_started() {
+    LIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 会话终结(kill 之后调用;与 session_started 配对)。
+pub fn session_ended() {
+    LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// 诊断面:当前并发会话数。
+#[allow(dead_code)]
+pub fn live_sessions() -> usize {
+    LIVE_SESSIONS.load(Ordering::Relaxed)
 }
 
 /// 诊断面:已后台回收 / 降级 forget / 在途会话数 / 故障态。
@@ -159,21 +177,16 @@ pub fn reaper_stats() -> (usize, usize, usize, bool) {
 /// 3. 拆分回收:session 交 reaper(唯一阻塞面 ClosePseudoConsole 在后台),
 ///    Surface/行缓存/路由(COM)/调色板等 CPU 状态当场 Drop——config
 ///    热重载每轮都这么换 router,无内核阻塞面,有先例。
-pub fn close_terminal(t: super::Terminal) {
-    // 关闭序(T08):先关写队列(writer 线程退场,阻塞中的 enqueue 脱身)
-    // → 关输出积压(转发线程的 push 脱身;存量预算归还)→ 杀子 →
-    // 会话交 reaper。UI 侧零阻塞:全部唤醒路径就位。
+pub fn close_terminal(mut t: super::Terminal) {
+    // 关闭序(T08 二次返工):先关写队列与输出积压(全部等待者脱身;
+    // writer 若阻塞在写端,由杀子引发的管道断/EOF 退场)→ 杀子(写端
+    // 锁分离,绝不被阻塞写拖住)→ 会话**按值**交 reaper(Drop 完成 =
+    // PTY 真实销毁,计数不提前)。UI 侧零阻塞。
     t.writeq.close();
     t.pty_buf.close();
-    t.session
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .kill_child();
-    let child_pid = t
-        .session
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .child_pid();
+    session_ended(); // 并发会话计数归还
+    t.session.kill_child();
+    let child_pid = t.session.child_pid();
     if let Some(pid) = child_pid {
         super::orphan::mark_session_closing(pid);
     }
@@ -182,7 +195,7 @@ pub fn close_terminal(t: super::Terminal) {
         session,
         pty_buf,
         writeq,
-        pending_paste: _,
+        input_stage: _,
         session_gen: _,
         router,
         metrics: _,
@@ -198,7 +211,7 @@ pub fn close_terminal(t: super::Terminal) {
     } = t;
     // 会话(Arc):writer 线程持另一份;reaper drop 或 writer 退出,
     // 最后一份 Drop 时杀子+收割(非阻塞)——UI 线程不等
-    reap_session_arc(child_pid, session);
+    reap_session_with_pid(child_pid, session);
     // 输出积压/写队列与后台线程共享:此处放本端引用,预算已在 close
     // 归还;Drop 兜底(close 未触达的异常路径)不双扣(释放 0)
     drop(pty_buf);
@@ -212,7 +225,6 @@ pub fn close_terminal(t: super::Terminal) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn short_session() -> (PtySession, Option<u32>) {
@@ -250,7 +262,7 @@ mod tests {
         let (filler, _) = short_session();
         tx.try_send(ReapTask {
             child_pid: None,
-            session: Arc::new(Mutex::new(filler)),
+            session: filler,
         })
         .expect("占位入队");
         // rx 存活但永不 recv(卡死形态):第二个必须立即降级
@@ -260,7 +272,7 @@ mod tests {
             &tx,
             ReapTask {
                 child_pid: None,
-                session: Arc::new(Mutex::new(session)),
+                session,
             },
         );
         assert_eq!(out, EnqueueOutcome::FellBack);
@@ -285,7 +297,7 @@ mod tests {
             &tx,
             ReapTask {
                 child_pid: None,
-                session: Arc::new(Mutex::new(session)),
+                session,
             },
         );
         assert_eq!(out, EnqueueOutcome::FellBack, "断开不得长等");
@@ -325,7 +337,7 @@ mod tests {
                 &tx,
                 ReapTask {
                     child_pid: None,
-                    session: Arc::new(Mutex::new(session)),
+                    session,
                 },
             );
         }

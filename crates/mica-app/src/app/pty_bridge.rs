@@ -1,31 +1,31 @@
-//! 有界 PTY 桥(T08/F10,2026-11-02;同日按复核返工):
-//! **可取消背压、正常终端字节零丢弃**。
+//! 有界 PTY 桥(T08/F10,2026-11-02;2026-11-03 二次返工):
+//! **零丢弃背压 + 严格守恒预算 + 会话隔离的写队列 + 独立唤醒重试**。
 //!
-//! 复核否决的初稿形态:背压靠"截尾丢字节"——保头不保协议(丢 UTF-8
-//! 后半段/序列终止符/DSR/2026 结束符,后续拼接仍损坏状态);进程预算
-//! load-then-add 重复累计且非严格限额;每块 Post 未合并;写路径仍同步。
+//! 二次返工否决的形态(复核七条):
+//! - enqueue 不唤醒 writer(入队成功后不 notify,writer 睡死);
+//! - UI 调阻塞 enqueue——队列满即卡 UI,同线程连关闭都做不了;
+//! - SessionSink 持会话锁做阻塞写,close/kill 同锁死锁;
+//! - 写队列按"弹后再验代"——旧 writer 会持续丢弃新会话数据;
+//! - pending_paste 无界、可乱序、静默 shell 下停灌;
+//! - 唤醒重试挂在转发线程上——背压堵 push / EOF 退场后无人重试。
 //!
 //! 现行契约:
-//! 1. **零丢弃**:`PtyBacklog::push` 在预算满时**阻塞等待容量**(pane 满
-//!    等 pane 消费,进程满等任意释放),可被 close/换代取消并返回错误;
-//!    绝不截尾。上游(mica-core `sync_channel`)与下游(UI 批消费)构成
-//!    完整背压链:缓冲满 → 转发线程在 push 阻塞 → 源通道渐满 → 读线程
-//!    在 send 阻塞 → ConPTY 管道顶住 → shell 暂停产出。
-//! 2. **严格预算**:`Budget` 全局互斥 + 条件变量,持锁判限/加减——
-//!    多 pane 并发下合计严格 ≤ 上限;记账按**实际新增/移除字节**守恒:
-//!    push 预留 chunk.len、drain 释放取出量、clear/换代/关闭/Drop 释放
-//!    存量且仅一次(状态锁内单点转换)。
-//! 3. **预算范围**:应用缓冲(本模块)pane 2 MiB/进程 32 MiB 严格受限;
-//!    上游每 pane 源通道 64×8KB=512KB + 转发在途 ≤8KB 是 core 侧已知
-//!    界(文档化,不重复计量)。最坏全进程 = 32MiB + 16×(512KB+8KB)
-//!    ≈ 40.6 MiB。
-//! 4. **唤醒合并**:每 pane 至多一个 pending wake;push 装配(已 pending
-//!    则合并)、消费后"清标记→复查 has_more→补通知"、Post 失败由转发
-//!    线程轮询 `retry_wake` 恢复(最后一块失败且再无输出也能补上)。
-//! 5. **单 writer 写队列**:`WriteQueue` 有界保序(输入/粘贴/IPC 注入/
-//!    协议回复同队),writer 线程独占写 pty——shell 不读输入时**UI 不卡**
-//!    (enqueue 满则即时返回欠账,由消息循环分批续灌);关闭/换代唤醒
-//!    全部等待者。
+//! 1. **零丢弃输出链**:`PtyBacklog::push` 满则阻塞等待(pane 满/进程
+//!    满分别等待),close/换代取消;与 core 源通道构成完整背压链。
+//! 2. **严格守恒预算**:持锁判限/加减,按实际字节记账;Drop/close/
+//!    换代各释放一次,debug 断言防减穿。上游界:源通道 512KB×N +
+//!    在途 ≤8KB×N,N 由 `MAX_SESSIONS` 上限约束(见 lifecycle)。
+//! 3. **会话隔离的写队列**:`WriteQueue` 每会话一个,随会话创建/关闭
+//!    ——不存在跨代共享,旧 writer 只面对旧队列(关闭即退场),绝不
+//!    触碰新队列。**UI 侧全非阻塞**:`try_push` 装多少收多少,装不下
+//!    的进调用方的有界输入暂存(`InputStage`,统一 FIFO,消灭按键
+//!    越过粘贴欠账的乱序)。
+//! 4. **独立唤醒重试**:唤醒状态机区分"已投递待消费"与"待重试"
+//!    (retry_needed 只在投递失败时置位);专职 monitor 线程周期补投,
+//!    不依赖转发线程(背压堵 push / EOF 退场后仍自愈)。
+//! 5. 会话控制面(杀子/resize/轮询)与写端锁分离:core `PtySession`
+//!    的 writer 独立 Arc 互斥,`PtyWriterHandle` 只持写端——阻塞写
+//!    永远卡不到 kill_child。
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,15 +33,17 @@ use std::sync::{Arc, Condvar, Mutex};
 
 /// 单 pane 应用缓冲预算(字节)。
 pub const PANE_BUDGET_BYTES: usize = 2 * 1024 * 1024;
-/// 全进程应用缓冲预算(字节;严格上限,Budget 持锁判限)。
+/// 全进程应用缓冲预算(字节;严格上限,持锁判限)。
 pub const PROCESS_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
-/// UI 单次调度批上限(字节):超此让出消息循环续批。
+/// UI 单次调度批上限(字节)。
 pub const UI_BATCH_BYTES: usize = 256 * 1024;
-/// 单 pane 写队列预算(字节):粘贴/注入的待写字节上限。
+/// 单会话写队列预算(字节)。
 pub const WRITE_QUEUE_BYTES: usize = 1024 * 1024;
+/// 单 pane 输入暂存预算(字节):写队列满时的 UI 侧有界欠账。
+pub const INPUT_STAGE_BYTES: usize = 512 * 1024;
 
 // ---------------------------------------------------------------------------
-// 全局预算(严格:持锁判限,绝不 load-then-add)
+// 全局预算(严格:持锁判限 + 取消检查持同一把锁,杜绝丢唤醒)
 // ---------------------------------------------------------------------------
 
 struct Budget {
@@ -60,8 +62,9 @@ pub fn reserved_bytes() -> u64 {
 }
 
 impl Budget {
-    /// 阻塞预留:超限等待,直到有空间或 `cancelled` 为真。返回 false =
-    /// 被取消(close/换代)。持锁判限——多 pane 并发下合计严格 ≤ 上限。
+    /// 阻塞预留。取消检查发生在**持有预算锁**期间:close/换代的
+    /// notify_all 也要拿同一把锁——检查与进入等待之间不存在无锁窗口,
+    /// 丢唤醒竞态在锁序层面排除(复核 8 的结构性回答)。
     fn reserve_blocking(&self, need: u64, cancelled: &dyn Fn() -> bool) -> bool {
         let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         loop {
@@ -72,12 +75,10 @@ impl Budget {
                 *held += need;
                 return true;
             }
-            // close/换代侧也 notify_all,等待者立刻醒来复查取消
             held = self.space.wait(held).unwrap_or_else(|e| e.into_inner());
         }
     }
 
-    /// 释放(守恒:debug 断言不减穿——重复释放是记账 bug 的显式失败)。
     fn release(&self, n: u64) {
         if n == 0 {
             return;
@@ -91,22 +92,21 @@ impl Budget {
         self.space.notify_all();
     }
 
-    /// 唤醒全部等待者(close/换代用——被取消的等待者必须立即脱身)。
     fn notify_all(&self) {
         self.space.notify_all();
     }
 }
 
 // ---------------------------------------------------------------------------
-// 唤醒面(生产 = 窗口消息;测试注入假件)
+// 唤醒面
 // ---------------------------------------------------------------------------
 
-/// 唤醒投递面:返回 false = 投递失败(队列满/窗口死),调用方进入重试。
+/// 唤醒投递面:返回 false = 投递失败(队列满/窗口死),进入重试。
 pub trait WakeSink: Send + Sync {
     fn wake(&self, pane_id: u64) -> bool;
 }
 
-/// 生产实现:向窗口投渲染消息(读 SharedHwnd 哨兵;窗口不在 = false)。
+/// 生产实现:向窗口投渲染消息。
 pub struct WindowWake {
     pub slot: crate::app::SharedHwnd,
     pub msg: u32,
@@ -133,37 +133,28 @@ impl WakeSink for WindowWake {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 有界输出积压(零丢弃)
-// ---------------------------------------------------------------------------
-
-/// push/enqueue 的失败形态(取消原因)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushError {
-    /// 已关闭(会话终结):调用方(转发线程)退场
     Closed,
-    /// 会话已换代:本字节属旧会话,调用方按代退场
     StaleGeneration,
 }
 
 struct BlState {
     data: Vec<u8>,
-    /// 唤醒合并标记:一条 wake 消息在途或待重试。消费批清标记。
+    /// 一条 wake 在途(已投递待消费)或待重试。消费批清标记。
     wake_pending: bool,
 }
 
-/// 单 pane 输出积压:转发线程 `push`(阻塞等待容量,可取消),UI
-/// `drain_batch`。drop 释放全部预留(守恒)。
+/// 单 pane 输出积压:转发线程 `push`(阻塞,可取消),UI `drain_batch`。
 pub struct PtyBacklog {
     pane_id: u64,
     pane_cap: usize,
     wake: Arc<dyn WakeSink>,
-    // 取消面(原子,与 state 锁分离——预算等待的取消检查不得拿 state 锁,
-    // 否则与 drain 的 state 使用构成 ABBA)
     closed: AtomicBool,
     cur_gen: AtomicU64,
+    /// 投递失败待重试(monitor 周期补投;成功投递绝不重发——防重复)。
+    retry_needed: AtomicBool,
     state: Mutex<BlState>,
-    /// pane 满等待(drain/close/bump 唤醒)
     space: Condvar,
 }
 
@@ -175,6 +166,7 @@ impl PtyBacklog {
             wake,
             closed: AtomicBool::new(false),
             cur_gen: AtomicU64::new(0),
+            retry_needed: AtomicBool::new(false),
             state: Mutex::new(BlState {
                 data: Vec::new(),
                 wake_pending: false,
@@ -183,21 +175,42 @@ impl PtyBacklog {
         })
     }
 
+    /// 专职唤醒重试线程:独立于转发线程(背压堵 push / EOF 退场后仍
+    /// 自愈);仅在 retry_needed 时补投,已成功投递的绝不重发。
+    /// 会话关闭(close)后自然退场。
+    pub fn spawn_monitor(self: &Arc<Self>) {
+        let b = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("wake-monitor".into())
+            .spawn(move || {
+                loop {
+                    if b.closed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if b.retry_needed.load(Ordering::Acquire)
+                        && b.has_more()
+                        && b.wake.wake(b.pane_id)
+                    {
+                        b.retry_needed.store(false, Ordering::Release);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            })
+            .expect("spawn wake monitor");
+    }
+
     fn cancelled(&self, epoch: u64) -> bool {
         self.closed.load(Ordering::Acquire) || self.cur_gen.load(Ordering::Acquire) != epoch
     }
 
-    /// 转发线程追加一块。预算满则**阻塞等待**(pane 满等本 pane 消费,
-    /// 进程满等任意 pane 释放),close/换代取消并返回错误;**绝不截尾**。
+    /// 转发线程追加:满则阻塞,close/换代取消;绝不截尾。
     pub fn push(&self, epoch: u64, chunk: &[u8]) -> Result<(), PushError> {
         if chunk.is_empty() {
             return Ok(());
         }
         loop {
-            // ---- 阶段一(持 state 锁):取消检查 + pane 容量等待 ----
-            // 锁在块尾释放:预算等待(阶段二)绝不能持有 state 锁,
-            // 否则 drain 拿不到锁 → 死锁(首版 drop(&st) 只丢引用没丢锁,
-            // 并发限额测试即死锁于此)
+            // 阶段一(持 state 锁):pane 容量等待(锁在块尾释放——预算
+            // 等待绝不持 state 锁,否则 drain 死锁)
             {
                 let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
@@ -205,30 +218,27 @@ impl PtyBacklog {
                         return Err(self.err_kind());
                     }
                     if st.data.len() + chunk.len() <= self.pane_cap {
-                        break; // 有 pane 空间,释放锁去抢进程预算
+                        break;
                     }
-                    // pane 满:等本 pane 消费(drain/close/bump 都会唤醒)
                     st = self.space.wait(st).unwrap_or_else(|e| e.into_inner());
                 }
             }
-            // ---- 阶段二(无锁):进程预算阻塞预留,取消面是原子读 ----
+            // 阶段二(无锁):进程预算阻塞预留,取消检查持预算锁
             if !BUDGET.reserve_blocking(chunk.len() as u64, &|| self.cancelled(epoch)) {
                 return Err(self.err_kind());
             }
-            // ---- 阶段三(持 state 锁):入队 + 二次复核 ----
+            // 阶段三(持 state 锁):入队 + 二次复核
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if self.cancelled(epoch) {
-                BUDGET.release(chunk.len() as u64); // 预留与入队之间被取消:归还
+                BUDGET.release(chunk.len() as u64);
                 return Err(self.err_kind());
             }
             if st.data.len() + chunk.len() > self.pane_cap {
-                // 消费者在我们放锁到抢到预算的窗口没放水反而……不可能
-                // (单生产者只增),防御性重来
                 BUDGET.release(chunk.len() as u64);
                 continue;
             }
             st.data.extend_from_slice(chunk);
-            self.arm_wake(&mut st);
+            self.arm_wake_locked(&mut st);
             return Ok(());
         }
     }
@@ -241,32 +251,25 @@ impl PtyBacklog {
         }
     }
 
-    /// 装配唤醒:pending 未置则投一条(已 pending = 合并);投失败留
-    /// pending 位,由 `retry_wake` 恢复。
-    fn arm_wake(&self, st: &mut BlState) {
+    /// 装配唤醒(调用方持 state 锁;投递动作本身不持锁——Post 无锁回
+    /// 调风险为零):pending(在途或待重试)则合并;失败置 retry_needed。
+    fn arm_wake_locked(&self, st: &mut BlState) {
         if st.wake_pending {
             return;
         }
         st.wake_pending = true;
-        let _ = self.wake.wake(self.pane_id); // 失败:pending 保持,重试接手
-    }
-
-    /// 投递失败的重试(转发线程在源通道空闲期轮询):pending 在且还有
-    /// 数据就再投——最后一块 Post 失败且再无输出也能在这里补上。
-    pub fn retry_wake(&self) {
-        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.wake_pending && !st.data.is_empty() {
-            let _ = self.wake.wake(self.pane_id);
+        let ok = self.wake.wake(self.pane_id);
+        if !ok {
+            self.retry_needed.store(true, Ordering::Release);
         }
     }
 
-    /// UI 取一批(≤ max 字节)。清 pending 标记 → 释放预算 → 复查
-    /// has_more 补通知(push 可能恰在取走与清标记之间被合并)。
+    /// UI 取一批(≤ max)。清 pending/retry → 释放预算 → 复查补通知。
     pub fn drain_batch(&self, max: usize) -> Option<Vec<u8>> {
         let bytes = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if st.data.is_empty() {
-                st.wake_pending = false; // 空转唤醒:标记一并清掉
+                st.wake_pending = false;
                 return None;
             }
             let take = st.data.len().min(max);
@@ -275,10 +278,10 @@ impl PtyBacklog {
             out
         };
         BUDGET.release(bytes.len() as u64);
-        self.space.notify_all(); // pane 满的 push 可以继续
+        self.space.notify_all();
         if self.has_more() {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            self.arm_wake(&mut st);
+            self.arm_wake_locked(&mut st);
         }
         Some(bytes)
     }
@@ -292,24 +295,27 @@ impl PtyBacklog {
             .is_empty()
     }
 
-    /// 会话换代:释放存量、数据清空、代 +1,唤醒所有等待者(旧代 push
-    /// 以 StaleGeneration 脱身)。
+    /// 会话换代:**清空与代递增在同一同步边界(state 锁)内完成**——
+    /// 旧代 push 要么在锁内看到新代被拒,要么在递增前完成入队而被
+    /// 本次 clear 一并清掉,不存在"验旧代通过→换代→旧数据入新纪元"
+    /// 的窗口。预算与全部等待者在锁外统一释放/唤醒。
     pub fn bump_generation(&self) -> u64 {
+        // 清空 + 代递增在同一 state 锁临界区内(原子边界,见 doc)
         let released = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let n = st.data.len() as u64;
             st.data.clear();
             st.wake_pending = false;
-            n
+            let g = self.cur_gen.fetch_add(1, Ordering::AcqRel) + 1;
+            BUDGET.release(n); // 释放可与锁内递增同界:预算锁在 state 锁外层无持有,安全
+            g
         };
-        BUDGET.release(released);
-        let next = self.cur_gen.fetch_add(1, Ordering::AcqRel) + 1;
         BUDGET.notify_all();
         self.space.notify_all();
-        next
+        released
     }
 
-    /// 会话终结:关闭 + 释放存量 + 唤醒等待者。此后 push 一律 Err。
+    /// 会话终结:关闭 + 释放存量 + 唤醒全部等待者。
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         let released = {
@@ -327,7 +333,6 @@ impl PtyBacklog {
 
 impl Drop for PtyBacklog {
     fn drop(&mut self) {
-        // 非空 Drop 归还预算(close/bump 已清空则释放 0——守恒不双扣)
         let n = {
             let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.data.len() as u64
@@ -338,7 +343,7 @@ impl Drop for PtyBacklog {
 }
 
 // ---------------------------------------------------------------------------
-// 单 writer 有界保序写队列
+// 会话隔离的写队列(每会话一个;UI 全非阻塞)
 // ---------------------------------------------------------------------------
 
 struct WqState {
@@ -346,12 +351,9 @@ struct WqState {
     bytes: usize,
 }
 
-/// 单 pane 写队列:UI 侧 enqueue(有界,满则等待或即时欠账),writer
-/// 线程独占消费写 pty。保序;关闭/换代唤醒全部等待者。
 pub struct WriteQueue {
     cap: usize,
     closed: AtomicBool,
-    cur_gen: AtomicU64,
     state: Mutex<WqState>,
     space: Condvar,
 }
@@ -361,7 +363,6 @@ impl WriteQueue {
         Arc::new(Self {
             cap: WRITE_QUEUE_BYTES,
             closed: AtomicBool::new(false),
-            cur_gen: AtomicU64::new(0),
             state: Mutex::new(WqState {
                 queue: VecDeque::new(),
                 bytes: 0,
@@ -370,140 +371,160 @@ impl WriteQueue {
         })
     }
 
-    fn cancelled(&self, epoch: u64) -> bool {
-        self.closed.load(Ordering::Acquire) || self.cur_gen.load(Ordering::Acquire) != epoch
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
-    fn err_kind(&self) -> PushError {
-        if self.closed.load(Ordering::Acquire) {
-            PushError::Closed
-        } else {
-            PushError::StaleGeneration
+    /// UI 非阻塞入队:装多少收多少,返回**接收的字节数**(装不下的
+    /// 由调用方暂存)。关闭后接收 0。入队成功即唤醒 writer(复核 1:
+    /// 旧 enqueue 不 notify,writer 睡死)。
+    pub fn try_push(&self, bytes: &[u8]) -> usize {
+        if bytes.is_empty() || self.is_closed() {
+            return 0;
         }
-    }
-
-    /// 入队(阻塞至有空间;close/换代取消)。小写入(按键/DSR 回复/
-    /// IPC 注入)用它——容量充裕,等待极短且总可被关闭唤醒。
-    pub fn enqueue(&self, epoch: u64, bytes: &[u8]) -> Result<(), PushError> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if self.cancelled(epoch) {
-                return Err(self.err_kind());
+        let accepted = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let room = self.cap.saturating_sub(st.bytes);
+            let take = room.min(bytes.len());
+            if take == 0 {
+                return 0;
             }
-            if st.bytes + bytes.len() <= self.cap {
-                st.bytes += bytes.len();
-                st.queue.push_back(bytes.to_vec());
-                return Ok(());
-            }
-            st = self.space.wait(st).unwrap_or_else(|e| e.into_inner());
-        }
+            st.bytes += take;
+            st.queue.push_back(bytes[..take].to_vec());
+            take
+        };
+        self.space.notify_all(); // 唤醒 writer(成功入队必通知)
+        accepted
     }
 
-    /// UI 快路径:**绝不阻塞**——装得下全装;装不下装满并返回欠账
-    /// (大粘贴:欠账由调用方持有,消息循环分批续灌,UI 保持响应)。
-    pub fn enqueue_or_defer(&self, epoch: u64, bytes: &[u8]) -> Result<Vec<u8>, PushError> {
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if self.cancelled(epoch) {
-            return Err(self.err_kind());
-        }
-        let room = self.cap.saturating_sub(st.bytes);
-        if room == 0 {
-            return Ok(bytes.to_vec());
-        }
-        let take = room.min(bytes.len());
-        st.bytes += take;
-        st.queue.push_back(bytes[..take].to_vec());
-        self.space.notify_all();
-        Ok(bytes[take..].to_vec())
-    }
-
-    /// writer 线程取一块(阻塞;None = 关闭,或换代后旧数据清空完且
-    /// 再无新数据——writer 按新代重新入循环由调用方处理)。
-    fn pop_blocking(&self, want_epoch: u64) -> Option<Vec<u8>> {
+    /// writer 取一块(阻塞;None = 关闭且取空)。
+    fn pop_blocking(&self) -> Option<Vec<u8>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(front) = st.queue.pop_front() {
                 st.bytes -= front.len();
-                self.space.notify_all();
-                if self.cur_gen.load(Ordering::Acquire) != want_epoch {
-                    continue; // 换代:旧数据整队丢弃
-                }
+                self.space.notify_all(); // 腾出容量:通知续灌侧
                 return Some(front);
             }
-            if self.closed.load(Ordering::Acquire)
-                || self.cur_gen.load(Ordering::Acquire) != want_epoch
-            {
+            if self.is_closed() {
                 return None;
             }
             st = self.space.wait(st).unwrap_or_else(|e| e.into_inner());
         }
     }
 
-    /// 换代:清队、代 +1、唤醒(writer 与 enqueue 等待者按新代续行;
-    /// 旧 writer 在 pop 返回 None 后退场,由调用方挂新 writer)。
-    pub fn bump_generation(&self) -> u64 {
-        {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.queue.clear();
-            st.bytes = 0;
-        }
-        let next = self.cur_gen.fetch_add(1, Ordering::AcqRel) + 1;
-        self.space.notify_all();
-        next
-    }
-
-    /// 关闭:唤醒全部等待者(enqueue 立即 Err;writer 收 None 退场)。
+    /// 关闭:writer 在取空后自然退场;新数据一律拒收。
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.space.notify_all();
     }
 
-    /// 当前代。
-    pub fn generation(&self) -> u64 {
-        self.cur_gen.load(Ordering::Acquire)
+    #[allow(dead_code)]
+    pub fn is_closed_pub(&self) -> bool {
+        self.is_closed()
     }
 
-    /// 积压字节(诊断/测试)。
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn queued_bytes(&self) -> usize {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).bytes
     }
+
+    #[allow(dead_code)]
+    pub fn free_bytes(&self) -> usize {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.cap.saturating_sub(st.bytes)
+    }
 }
 
-/// writer 线程主体:独占消费写队列写 pty(经 `sink`;生产 = 会话,
-/// 测试 = 注入假件)。写失败(管道断)→ 关队列(后续 enqueue 报
-/// Closed,UI 不再卡等)。
-pub fn writer_loop(
-    queue: Arc<WriteQueue>,
-    sink: Arc<dyn BytesSink + Send + Sync>,
-) -> std::io::Result<()> {
-    let epoch = queue.generation();
-    while let Some(item) = queue.pop_blocking(epoch) {
+/// writer 线程主体:独占消费写队列写 pty(经 `sink`)。写失败(管道
+/// 断)→ 关队列。**每个会话一个队列一个 writer**——旧 writer 只面对
+/// 旧队列,绝不接触新会话的数据(复核 4:按代筛选会误删新数据)。
+pub fn writer_loop(queue: Arc<WriteQueue>, sink: Arc<dyn BytesSink + Send + Sync>) {
+    while let Some(item) = queue.pop_blocking() {
         if let Err(e) = sink.write_all(&item) {
             queue.close();
-            return Err(e);
+            eprintln!("[pty-writer] 写失败(管道断?):{e}");
+            return;
         }
     }
-    Ok(())
 }
 
-/// 写目标抽象(生产 = Arc<Mutex<PtySession>>;测试假件可控阻塞)。
+/// 写目标抽象(生产 = core PtyWriterHandle;测试 = 可挂起假件)。
 pub trait BytesSink: Send + Sync {
     fn write_all(&self, bytes: &[u8]) -> std::io::Result<()>;
 }
 
-/// 生产实现:PtySession 的写(&self,内部互斥——见 core pty.rs)。
-pub struct SessionSink(pub Arc<Mutex<mica_core::pty::PtySession>>);
+/// 生产适配器:**只持写端句柄,不持会话**——阻塞写只卡写端互斥,
+/// kill/resize/轮询走会话自己的字段,永不被写阻塞拖住(复核 3)。
+pub struct SessionSink(pub mica_core::pty::PtyWriterHandle);
 
 impl BytesSink for SessionSink {
     fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write(bytes)
+        self.0.write(bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UI 侧有界输入暂存(统一 FIFO:按键/DSR/IPC/粘贴同序,消灭乱序)
+// ---------------------------------------------------------------------------
+
+/// 输入暂存:写队列满时的有界欠账。语义:
+/// - `stage`:追加(非阻塞;超预算**拒绝尾部**并返回拒收字节数——
+///   有界接收/拒绝语义显式化,调用方决定反馈);
+/// - `flush_into`:把队头灌进写队列(装多少灌多少,余下保序留待下轮);
+/// - 会话关闭/换代:`clear`(旧会话的欠账不污染新会话)。
+pub struct InputStage {
+    data: Vec<u8>,
+    cap: usize,
+}
+
+impl InputStage {
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            cap: INPUT_STAGE_BYTES,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// 非阻塞追加:返回拒收字节数(超出预算的尾部)。**永不阻塞 UI**。
+    pub fn stage(&mut self, bytes: &[u8]) -> usize {
+        let room = self.cap.saturating_sub(self.data.len());
+        let take = room.min(bytes.len());
+        self.data.extend_from_slice(&bytes[..take]);
+        bytes.len() - take
+    }
+
+    /// 灌入写队列(保序:队头先走)。返回仍剩的暂存量。
+    pub fn flush_into(&mut self, q: &WriteQueue) -> usize {
+        if self.data.is_empty() {
+            return 0;
+        }
+        let accepted = q.try_push(&self.data);
+        if accepted > 0 {
+            self.data.drain(..accepted);
+        }
+        self.data.len()
+    }
+
+    /// 会话终结/换代:旧欠账作废。
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+}
+
+impl Default for InputStage {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
