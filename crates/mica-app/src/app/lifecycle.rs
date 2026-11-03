@@ -135,27 +135,54 @@ fn note_outcome(outcome: EnqueueOutcome) {
 pub const MAX_SESSIONS: usize = 16;
 static LIVE_SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
-/// 恢复条件 = 某次回收重新入队成功(通道有空间);持久卡死则保持拒绝,
-/// 泄漏上界 = 队列容量 + 存活 pane 数 + 1,不随关闭次数增长。
-/// 同时要求并发会话数 < MAX_SESSIONS(上游界的 N 上限)。
+/// **CAS 严格预留**(复核 5:load-then-add 在多窗并发下可同时通过
+/// 同一检查,超 16)。fetch 循环保证"检查+占位"原子。
+fn try_acquire_slot() -> bool {
+    let mut cur = LIVE_SESSIONS.load(Ordering::Acquire);
+    loop {
+        if cur >= MAX_SESSIONS {
+            return false;
+        }
+        match LIVE_SESSIONS.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// 会话槽位 RAII(复核 5):**acquire 在 spawn 之前**(None = 已满,
+/// 调用方直接拒绝,无回滚孤儿);Drop 归还。重启的转移序:
+/// kill 旧 → drop 旧 permit → acquire 新(旧会话先终结再占新槽,
+/// 峰值严格 ≤ MAX;acquire 失败则重启失败,pane 留无会话态可重试)。
+pub struct SessionPermit {
+    _private: (),
+}
+
+/// 获取会话槽位(spawn 前调用)。
+pub fn acquire_session() -> Option<SessionPermit> {
+    if !try_acquire_slot() {
+        return None;
+    }
+    Some(SessionPermit { _private: () })
+}
+
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        LIVE_SESSIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 恢复条件 = 未处 DEGRADED 且有空槽(仅 UI 前置提示;真正的严格
+/// 占用由 acquire_session 的 CAS 保证)。
 pub fn spawn_capacity_ok() -> bool {
-    !DEGRADED.load(Ordering::Relaxed) && LIVE_SESSIONS.load(Ordering::Relaxed) < MAX_SESSIONS
-}
-
-/// 会话诞生(spawn 成功后调用;超限即拒绝,见 spawn_capacity_ok)。
-pub fn session_started() {
-    LIVE_SESSIONS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// 会话终结(kill 之后调用;与 session_started 配对)。
-pub fn session_ended() {
-    LIVE_SESSIONS.fetch_sub(1, Ordering::Relaxed);
+    !DEGRADED.load(Ordering::Relaxed) && LIVE_SESSIONS.load(Ordering::Acquire) < MAX_SESSIONS
 }
 
 /// 诊断面:当前并发会话数。
 #[allow(dead_code)]
 pub fn live_sessions() -> usize {
-    LIVE_SESSIONS.load(Ordering::Relaxed)
+    LIVE_SESSIONS.load(Ordering::Acquire)
 }
 
 /// 诊断面:已后台回收 / 降级 forget / 在途会话数 / 故障态。
@@ -184,7 +211,6 @@ pub fn close_terminal(mut t: super::Terminal) {
     // PTY 真实销毁,计数不提前)。UI 侧零阻塞。
     t.writeq.close();
     t.pty_buf.close();
-    session_ended(); // 并发会话计数归还
     t.session.kill_child();
     let child_pid = t.session.child_pid();
     if let Some(pid) = child_pid {
@@ -193,6 +219,7 @@ pub fn close_terminal(mut t: super::Terminal) {
     let super::Terminal {
         term,
         session,
+        session_permit: _permit,
         pty_buf,
         writeq,
         input_stage: _,
@@ -216,6 +243,7 @@ pub fn close_terminal(mut t: super::Terminal) {
     // 归还;Drop 兜底(close 未触达的异常路径)不双扣(释放 0)
     drop(pty_buf);
     drop(writeq);
+    drop(_permit); // 会话槽位归还(旧会话已 kill,槽位即时释放)
     drop(term);
     drop(router);
     drop(strip_router);

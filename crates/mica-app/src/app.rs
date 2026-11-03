@@ -510,6 +510,9 @@ pub(crate) struct Terminal {
     /// 会话(控制面:kill/resize/轮询,全在 UI 线程;写端经
     /// writer_handle 分发给 writer 线程——锁分离,复核 3)
     session: PtySession,
+    /// 会话槽位(T08 复核 5:严格 ≤MAX_SESSIONS 的 RAII 占用;
+    /// 与 session 同生共死——字段顺序保证 permit 在 session 之后 drop)
+    session_permit: lifecycle::SessionPermit,
     /// 有界输出积压(T08:零丢弃背压 + 唤醒合并)
     pty_buf: Arc<pty_bridge::PtyBacklog>,
     /// 单 writer 保序写队列(T08:输入/粘贴/注入/协议回复)
@@ -1533,8 +1536,13 @@ fn restart_active_pane() -> bool {
         let new_gen = t.pty_buf.bump_generation();
         t.writeq.close();
         t.input_stage.clear(); // 旧会话的输入欠账作废
+        // 复核 5 permit 转移序:kill 旧(上方已完成)→ 放旧 permit →
+        // 取新 permit(峰值严格 ≤MAX;acquire 失败则重启失败可重试)
+        let _old_permit = std::mem::replace(
+            &mut t.session_permit,
+            lifecycle::acquire_session().expect("重启前已查 capacity(单线程 UI 无竞态)"),
+        );
         let old = std::mem::replace(&mut t.session, session);
-        lifecycle::session_ended(); // 旧会话终结(计数)
         let writeq = WriteQueue::new();
         let writer = t.session.writer_handle();
         {
@@ -1547,7 +1555,6 @@ fn restart_active_pane() -> bool {
                 .expect("spawn pty writer");
         }
         t.writeq = writeq;
-        lifecycle::session_started();
         // 旧会话交后台回收:唯一阻塞面 ClosePseudoConsole 不上 UI 线程(T03)
         lifecycle::reap_session_with_pid(old_pid, old);
         t.exited = None;
@@ -1894,7 +1901,10 @@ unsafe fn create_pane_with_size(
         cmd.cwd(std::path::PathBuf::from(dir));
     }
     // 故障态门:回收通道满/断时拒绝新会话(有界泄漏,见 lifecycle.rs)
+    let session_permit =
+        lifecycle::acquire_session().ok_or("并发会话已达上限(16)——关闭部分标签/窗口后重试")?;
     if !lifecycle::spawn_capacity_ok() {
+        // permit 由 Err 提前返回时的析构归还(RAII 回滚)
         return Err("会话回收通道故障(通道满/断),暂不能开新标签——关闭部分标签后自动恢复".into());
     }
     // spawn 前快照:差分登记宿主确切身份(复核加固)
@@ -1925,11 +1935,11 @@ unsafe fn create_pane_with_size(
             .spawn(move || pty_bridge::writer_loop(wq, Arc::new(pty_bridge::SessionSink(writer))))
             .expect("spawn pty writer");
     }
-    lifecycle::session_started(); // 并发会话计数(上游界 N 上限)
 
     let terminal = Terminal {
         term,
         session,
+        session_permit,
         pty_buf: Arc::clone(&pty_buf),
         writeq: Arc::clone(&writeq),
         input_stage: pty_bridge::InputStage::new(),
@@ -3442,8 +3452,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         } else {
                             normalized.into_bytes()
                         };
-                        // T08:统一非阻塞入口(队列满进有界暂存)
-                        let _rejected = stage_input(t, &bytes);
+                        paste_input(t, &bytes);
                     }
                 });
             }
@@ -3796,6 +3805,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // id 分流:2 = 2026 同步安全阀(D29);1 = 光标闪烁(D20);
             // 3 = 子进程退出轮询(M5b/T3);4 = 合帧去抖到期(WM_APP_RENDER);
             // 5 = strip 动画步进(focus 相位/胶囊滑移,2026-10-12)
+            if wparam.0 == 8 {
+                // T08 三次返工:输入续灌心跳(真实接线——shell 静默时
+                // WM_APP_RENDER 不来,这是欠账唯一推进者;覆盖全部 pane)
+                flush_all_panes();
+                return LRESULT(0);
+            }
             if wparam.0 == 3 && poll_exits() {
                 draw_frame();
                 return LRESULT(0);
@@ -4074,7 +4089,10 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
         }
         "send-text" => {
             let bytes = req.text.clone().unwrap_or_default().into_bytes();
-            let write_to = |t: &mut Terminal| -> bool {
+            // 复核 4:Applied 只承诺"字节已进写队列"(writer 将写出),
+            // 不承诺进暂存——CLI/IPC 用 drain_into 阻塞推进(期限 2.5s,
+            // 在 IPC 3s 预算内),期限未尽按 timeout(结果未知)报告
+            let write_to = |t: &mut Terminal| -> Result<(), pty_bridge::InputFlow> {
                 let payload = if t.term.bracketed_paste_active() {
                     let mut w = b"\x1b[200~".to_vec();
                     w.extend_from_slice(&bytes);
@@ -4083,18 +4101,36 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
                 } else {
                     bytes.clone()
                 };
-                stage_input(t, &payload) == 0
+                pty_bridge::drain_into(
+                    &mut t.input_stage,
+                    &t.writeq,
+                    &payload,
+                    std::time::Instant::now() + std::time::Duration::from_millis(2500),
+                )
+            };
+            let map = |r: Result<(), pty_bridge::InputFlow>| match r {
+                Ok(()) => IpcResponse::applied(req.id),
+                Err(pty_bridge::InputFlow::Debt(_)) => {
+                    // 欠账留给心跳推进(writer 腾空间即续灌)
+                    arm_input_flush_timer();
+                    IpcResponse::error(req.id, IpcError::Timeout)
+                }
+                Err(pty_bridge::InputFlow::RejectedOverflow) => {
+                    IpcResponse::error(req.id, IpcError::InputOverflow)
+                }
+                Err(_) => IpcResponse::error(req.id, IpcError::PtyWrite),
             };
             // 写入语义分层:目标不存在 = bad_target;存在但写失败 =
             // pty_write(QT 不存在不再是假成功,复核 3)
             match req.tab {
                 Some(-1) => {
-                    if quickterm::send_text(&bytes) {
-                        IpcResponse::applied(req.id)
-                    } else if quickterm::exists() {
-                        IpcResponse::error(req.id, IpcError::PtyWrite)
-                    } else {
+                    if !quickterm::exists() {
                         IpcResponse::error(req.id, IpcError::BadTarget)
+                    } else {
+                        match quickterm::send_text_drain(&bytes) {
+                            Ok(()) => IpcResponse::applied(req.id),
+                            Err(_) => IpcResponse::error(req.id, IpcError::Timeout),
+                        }
                     }
                 }
                 Some(n) if n >= 0 => match TABS.with(|tabs| {
@@ -4103,8 +4139,7 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
                         .and_then(|tab| tab.active_pane())
                         .map(write_to)
                 }) {
-                    Some(true) => IpcResponse::applied(req.id),
-                    Some(false) => IpcResponse::error(req.id, IpcError::PtyWrite),
+                    Some(r) => map(r),
                     None => IpcResponse::error(req.id, IpcError::BadTarget),
                 },
                 _ => match TABS.with(|tabs| {
@@ -4113,8 +4148,7 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
                         .and_then(|tab| tab.active_pane())
                         .map(write_to)
                 }) {
-                    Some(true) => IpcResponse::applied(req.id),
-                    Some(false) => IpcResponse::error(req.id, IpcError::PtyWrite),
+                    Some(r) => map(r),
                     None => IpcResponse::error(req.id, IpcError::BadTarget),
                 },
             }
@@ -4126,26 +4160,131 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
 
 /// T08:粘贴欠账续灌——写队列有余量即灌入,余下继续欠。任何 UI 心跳
 /// (WM_APP_RENDER/WM_TIMER)调用,大粘贴期间 UI 始终可响应。
-/// T08:统一 UI 输入入口(非阻塞):按键/DSR/IPC/粘贴全部经此——
-/// 先立即灌写队列(空队列常见路径零开销),装不下的进有界暂存,
-/// 由 WM_APP_RENDER/WM_TIMER 心跳续灌。返回拒收字节数(暂存也满:
-/// 上限语义显式化,粘贴类调用方可提示)。
-fn stage_input(t: &mut Terminal, bytes: &[u8]) -> usize {
-    if bytes.is_empty() {
-        return 0;
+/// 粘贴入口(复核 4):**整-fit 或整体拒绝**——部分粘贴(截尾)可能
+/// 改变输入语义(bracketed-paste 缺结束符、命令被拦腰)。预检
+/// 队列空余 + 暂存空余;不足则整体拒绝 + warn_box 用户可见反馈
+/// (按键类小输入不受影响,永不走此门)。
+fn paste_input(t: &mut Terminal, bytes: &[u8]) {
+    let fits = t.writeq.free_bytes() + t.input_stage.free_room();
+    if bytes.len() > fits {
+        eprintln!(
+            "[paste] 拒绝粘贴 {} 字节(队列空余 {} + 暂存空余 {}):输入通道饱和",
+            bytes.len(),
+            t.writeq.free_bytes(),
+            t.input_stage.free_room()
+        );
+        warn_box(&format!(
+            "粘贴内容({} KB)超出当前输入通道容量({} KB)
+
+shell 正在消化未消费的输入。
+请稍后重试或分批粘贴。",
+            bytes.len() / 1024,
+            fits / 1024,
+        ));
+        return;
     }
-    // 先灌欠账(FIFO:上一次暂存的先走),再灌本次
-    t.input_stage.flush_into(&t.writeq);
-    let accepted = t.writeq.try_push(bytes);
-    let rest = &bytes[accepted..];
-    if rest.is_empty() {
-        return 0;
+    let _ = stage_input(t, bytes);
+}
+
+/// T08(三次返工):统一 UI 输入入口(**非阻塞**)。核心顺序规则在
+/// `pty_bridge::stage_into`(与测试共用的生产组件):暂存有旧欠账时
+/// 新输入**只追加到暂存尾部**——绝不 try_push 绕过,否则 writer 腾出
+/// 的空间会被新输入越过旧欠账(复核探针实测 NEW→OLD 乱序)。
+/// 返回 InputFlow(结构化:Accepted/Debt/RejectedOverflow/Closed)。
+/// 欠账存在时武装输入续灌定时器(WM_TIMER id 8,见下)。
+fn stage_input(t: &mut Terminal, bytes: &[u8]) -> pty_bridge::InputFlow {
+    let flow = pty_bridge::stage_into(&mut t.input_stage, &t.writeq, bytes);
+    match flow {
+        pty_bridge::InputFlow::Accepted => {}
+        pty_bridge::InputFlow::Debt(_) => arm_input_flush_timer(),
+        pty_bridge::InputFlow::RejectedOverflow => {
+            eprintln!(
+                "[input] 输入暂存满,拒收 {} 字节(累计 {} )",
+                bytes.len(),
+                pty_bridge::overflow_drops()
+            );
+        }
+        pty_bridge::InputFlow::RejectedClosed => {}
     }
-    let rejected = t.input_stage.stage(rest);
-    if rejected > 0 {
-        eprintln!("[input] 输入暂存满,拒收 {rejected} 字节(有界上限)");
+    flow
+}
+
+// 输入续灌定时器(id 8,30ms):真实接线的欠账保底——shell 静默时
+// WM_APP_RENDER 不来,WM_TIMER 是唯一推进者;空闲时定时器不存在
+// (武装/撤销按需,零空闲开销)。TLS 防重复 SetTimer。
+thread_local! {
+    static INPUT_TIMER_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn arm_input_flush_timer() {
+    INPUT_TIMER_ARMED.with(|armed| {
+        if armed.get() {
+            return;
+        }
+        if let Some(raw) = SHARED_HWND
+            .with(|s| s.borrow().clone())
+            .and_then(|slot| *slot.lock().unwrap_or_else(|e| e.into_inner()))
+        {
+            // SAFETY: 目标是本线程窗口;30ms 续灌节拍
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                    Some(windows::Win32::Foundation::HWND(
+                        raw as *mut std::ffi::c_void,
+                    )),
+                    8,
+                    30,
+                    None,
+                );
+            }
+            armed.set(true);
+            if std::env::var_os("MICA_DEBUG_INPUTFLOW").is_some() {
+                eprintln!("[inputflow] timer armed (hwnd={raw})");
+            }
+        }
+    });
+}
+
+/// 全部 pane 的暂存续灌(后台标签/非焦点 pane 都覆盖)。全部清空后
+/// 撤定时器(空闲零开销)。
+fn flush_all_panes() {
+    let debug = std::env::var_os("MICA_DEBUG_INPUTFLOW").is_some();
+    let mut any_debt = false;
+    let mut debt_panes = 0usize;
+    TABS.with(|tabs| {
+        for tab in tabs.borrow_mut().iter_mut() {
+            for pane in tab.panes.iter_mut() {
+                let t = &mut pane.terminal;
+                if !t.input_stage.is_empty() {
+                    t.input_stage.flush_into(&t.writeq);
+                    if !t.input_stage.is_empty() {
+                        any_debt = true;
+                        debt_panes += 1;
+                    }
+                }
+            }
+        }
+    });
+    if debug {
+        eprintln!("[inputflow] timer-tick: debt_panes={debt_panes} armed={any_debt}");
     }
-    rejected
+    if !any_debt && INPUT_TIMER_ARMED.with(std::cell::Cell::get) {
+        if let Some(raw) = SHARED_HWND
+            .with(|s| s.borrow().clone())
+            .and_then(|slot| *slot.lock().unwrap_or_else(|e| e.into_inner()))
+        {
+            // SAFETY: 本线程窗口的定时器撤销
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(
+                    Some(windows::Win32::Foundation::HWND(
+                        raw as *mut std::ffi::c_void,
+                    )),
+                    8,
+                )
+                .ok();
+            }
+        }
+        INPUT_TIMER_ARMED.with(|a| a.set(false));
+    }
 }
 
 /// T08:续灌(消息循环心跳调用)。
@@ -4545,9 +4684,7 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 }
                 Action::Paste => {
                     if let Some(text) = clipboard::get_text() {
-                        let normalized = clipboard::normalize_paste(&text);
-                        // T08:统一非阻塞入口(队列满进有界暂存)
-                        let _rejected = stage_input(t, normalized.as_bytes());
+                        paste_input(t, clipboard::normalize_paste(&text).as_bytes());
                     }
                 }
                 Action::ScrollLine(n) => {

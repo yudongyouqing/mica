@@ -177,6 +177,9 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         eprintln!("quickterm: 会话回收通道故障态,QT 本轮禁用");
         return Err(());
     }
+    let session_permit = crate::app::lifecycle::acquire_session().ok_or_else(|| {
+        eprintln!("quickterm: 并发会话已达上限,QT 本轮禁用");
+    })?;
     let probe = crate::app::orphan::before_spawn();
     let (session, reader) = mica_core::pty::PtySession::spawn(
         mica_core::pty::command_from_str("powershell.exe -NoLogo"),
@@ -213,7 +216,6 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
             .expect("spawn qt writer");
     }
     pty_buf.spawn_monitor(); // 独立唤醒重试(不依赖转发线程)
-    crate::app::lifecycle::session_started();
     term.set_clipboard_provider(Arc::new(|| {
         crate::app::clipboard::get_text().unwrap_or_default()
     }));
@@ -221,6 +223,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     let terminal = Terminal {
         term,
         session,
+        session_permit,
         pty_buf: Arc::clone(&pty_buf),
         writeq: Arc::clone(&writeq),
         input_stage: crate::app::pty_bridge::InputStage::new(),
@@ -265,6 +268,10 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
         eprintln!("[qt] 会话回收通道故障态,本轮不重开");
         return;
     }
+    let Some(new_permit) = crate::app::lifecycle::acquire_session() else {
+        eprintln!("[qt] 并发会话已达上限,本轮不重开");
+        return;
+    };
     let probe = crate::app::orphan::before_spawn();
     match mica_core::pty::PtySession::spawn(mica_core::pty::command_from_str(&t.shell), cols, rows)
     {
@@ -281,8 +288,9 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
             let new_gen = t.pty_buf.bump_generation();
             t.writeq.close();
             t.input_stage.clear(); // 旧会话输入欠账作废
+            // kill 旧子在上方已完成(调用方契约)→ permit 换新
+            let _old_permit = std::mem::replace(&mut t.session_permit, new_permit);
             let old = std::mem::replace(&mut t.session, session);
-            crate::app::lifecycle::session_ended();
             let writeq = crate::app::pty_bridge::WriteQueue::new();
             let writer = t.session.writer_handle();
             {
@@ -298,7 +306,6 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
                     .expect("spawn qt writer");
             }
             t.writeq = writeq;
-            crate::app::lifecycle::session_started();
             // 旧会话交后台回收(T03):ClosePseudoConsole 阻塞面不上 UI 线程
             crate::app::lifecycle::reap_session_with_pid(old_pid, old);
             t.exited = None;
@@ -337,26 +344,109 @@ pub fn exists() -> bool {
     QT.with(|q| q.borrow().is_some())
 }
 
-/// 向 QT pane 注入输入。返回真实结果(复核 3):false = QT 不存在
-/// 或 pty 写失败——IPC 不再假报成功。
+/// 向 QT pane 注入输入(UI 快路径,非阻塞;当前 UI 侧 QT 输入经
+/// wndproc 直呼 stage_input,此入口留作热键/脚本路径的公共面)。
+#[allow(dead_code)]
 pub fn send_text(bytes: &[u8]) -> bool {
     QT.with(|q| {
         let mut guard = q.borrow_mut();
         let Some(st) = guard.as_mut() else {
-            return false; // QT 不存在(未建/禁用)
+            return false;
         };
         let t = &mut st.terminal;
         let payload = if t.term.bracketed_paste_active() {
-            let mut w = b"\x1b[200~".to_vec();
+            let mut w = b"[200~".to_vec();
             w.extend_from_slice(bytes);
-            w.extend_from_slice(b"\x1b[201~");
+            w.extend_from_slice(b"[201~");
             w
         } else {
             bytes.to_vec()
         };
-        crate::app::stage_input(t, &payload) == 0
+        let flow = crate::app::stage_input(t, &payload);
+        if matches!(flow, crate::app::pty_bridge::InputFlow::Debt(_)) {
+            arm_qt_flush_timer();
+        }
+        matches!(
+            flow,
+            crate::app::pty_bridge::InputFlow::Accepted
+                | crate::app::pty_bridge::InputFlow::Debt(_)
+        )
     })
 }
+
+/// 武装 QT 续灌定时器(id 7,30ms;清欠自动撤销)。
+#[allow(dead_code)]
+fn arm_qt_flush_timer() {
+    let raw = QT_HWND.with(|c| c.get());
+    if raw == 0 {
+        return;
+    }
+    // SAFETY: 本线程拥有的 QT 窗口
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            Some(windows::Win32::Foundation::HWND(
+                raw as *mut std::ffi::c_void,
+            )),
+            7,
+            30,
+            None,
+        );
+    }
+}
+
+/// IPC 路径:阻塞推进到写队列(Applied 语义同主窗,复核 4)。
+pub fn send_text_drain(bytes: &[u8]) -> Result<(), crate::app::pty_bridge::InputFlow> {
+    QT.with(|q| {
+        let mut guard = q.borrow_mut();
+        let Some(st) = guard.as_mut() else {
+            return Err(crate::app::pty_bridge::InputFlow::RejectedClosed);
+        };
+        let t = &mut st.terminal;
+        let payload = if t.term.bracketed_paste_active() {
+            let mut w = b"[200~".to_vec();
+            w.extend_from_slice(bytes);
+            w.extend_from_slice(b"[201~");
+            w
+        } else {
+            bytes.to_vec()
+        };
+        crate::app::pty_bridge::drain_into(
+            &mut t.input_stage,
+            &t.writeq,
+            &payload,
+            std::time::Instant::now() + std::time::Duration::from_millis(2500),
+        )
+    })
+}
+
+/// QT 续灌心搏:冲欠账;清空即撤定时器(空闲零开销)。
+unsafe fn quickterm_flush_tick(hwnd: HWND) {
+    flush_input();
+    if !has_input_debt() {
+        windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 7).ok();
+    }
+}
+
+/// QT 欠账续灌(被 QT 自己的 wndproc 心搏调用)。
+pub fn flush_input() {
+    QT.with(|q| {
+        if let Some(st) = q.borrow_mut().as_mut()
+            && !st.terminal.input_stage.is_empty()
+        {
+            st.terminal.input_stage.flush_into(&st.terminal.writeq);
+        }
+    });
+}
+
+/// QT 是否有输入欠账(定时器保活判定)。
+pub fn has_input_debt() -> bool {
+    QT.with(|q| {
+        q.borrow()
+            .as_ref()
+            .is_some_and(|st| !st.terminal.input_stage.is_empty())
+    })
+}
+
 pub unsafe fn toggle() {
     let raw = QT_HWND.with(|c| c.get());
     if raw == 0 {
@@ -417,6 +507,12 @@ unsafe extern "system" fn qt_wndproc(
         WM_TIMER => {
             // id 6(#37):会话退出轮询——主窗 poll_exits 轮 TABS,QT 在此
             // 自轮;命中记码 + 横幅重绘 + 停表(重开时 toggle 再起)
+            if wparam.0 == 7 {
+                // T08 三次返工:QT 输入欠账续灌(真实接线;主窗 id 8
+                // 同语义,覆盖后台标签——QT 是独立 wndproc 独立定时器)
+                quickterm_flush_tick(hwnd);
+                return LRESULT(0);
+            }
             if wparam.0 == 6 {
                 let mut hit = false;
                 QT.with(|q| {

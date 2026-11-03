@@ -109,6 +109,8 @@ pub enum IpcError {
     SpawnFailed,
     /// pty 写入失败
     PtyWrite,
+    /// 输入通道饱和(队列+暂存都满),字节被整体拒收
+    InputOverflow,
     /// 其余传输层失败
     Transport,
 }
@@ -131,6 +133,7 @@ impl IpcError {
             IpcError::Degraded => "degraded",
             IpcError::SpawnFailed => "spawn_failed",
             IpcError::PtyWrite => "pty_write",
+            IpcError::InputOverflow => "input_overflow",
             IpcError::Transport => "transport",
         }
     }

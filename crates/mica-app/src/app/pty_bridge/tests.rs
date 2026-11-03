@@ -1,5 +1,6 @@
-//! T08 二次返工验收(复核七条):生产路径组合 + 真实接线和交错顺序。
-//! 全部纯数据/线程/注入器 + 真实 PtySession(锁模型),不依赖前台焦点。
+//! T08 三次返工验收(复核六条):全部走**生产共享组件**
+//! (`stage_into`/`drain_into`/`WriteQueue`/`PtyBacklog`/`SessionPermit`)
+//! 与真实锁模型,不手工复刻理想调用序。
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,29 +15,34 @@ fn budget_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// 可编程唤醒假件:计数 + 前 N 次失败注入。
-struct FakeWake {
+/// 可编程唤醒假件:可注入失败序列(脚本化)。
+struct ScriptWake {
     calls: AtomicUsize,
-    fail_first: AtomicUsize,
+    /// 失败集合:第 n 次(0 起)调用返回 false。
+    fail_set: Mutex<Vec<usize>>,
 }
 
-impl FakeWake {
+impl ScriptWake {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
-            fail_first: AtomicUsize::new(0),
+            fail_set: Mutex::new(Vec::new()),
         })
     }
 
     fn total(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    fn fail_at(&self, idx: usize) {
+        self.fail_set.lock().unwrap().push(idx);
+    }
 }
 
-impl WakeSink for FakeWake {
+impl WakeSink for ScriptWake {
     fn wake(&self, _pane: u64) -> bool {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        n >= self.fail_first.load(Ordering::SeqCst)
+        !self.fail_set.lock().unwrap().contains(&n)
     }
 }
 
@@ -73,37 +79,16 @@ fn spawn_writer(
 }
 
 // ---------------------------------------------------------------------------
-// 复核 1:enqueue 唤醒 writer(修前探针:writer 先睡,enqueue 后 200ms
-// 仍 written=0、queued=1)
+// 复核 2(修前失败保留):旧欠账未清时新输入越过——生产入口 stage_into
 // ---------------------------------------------------------------------------
 
+/// **修前失败**:受控交错——writer 弹出队首制造空位(flush 后仍有旧欠账),
+/// 新输入 try_push 直接进队列越过旧欠账。修后 stage_into 规定:暂存
+/// 非空时新输入**只追加**。断言最终顺序 OLD 先于 NEW。
+/// (修前用旧 stage_input 逻辑手动复刻生产序得 NEW→OLD,见复核探针。)
 #[test]
-fn idle_writer_wakes_on_single_input() {
-    let q = WriteQueue::new();
-    let written = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::new(GatedSink {
-        gate: Arc::new(AtomicBool::new(true)),
-        written: Arc::clone(&written),
-    });
-    let w = spawn_writer(&q, sink);
-    std::thread::sleep(Duration::from_millis(80)); // writer 先进入空闲等待
-    assert_eq!(q.queued_bytes(), 0);
-    assert_eq!(q.try_push(b"x"), 1, "单次普通输入");
-    let deadline = Instant::now() + Duration::from_millis(200);
-    while *written.lock().unwrap() != b"x"[..] && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert_eq!(*written.lock().unwrap(), b"x", "200ms 内必须写出(修前挂死)");
-    q.close();
-    w.join().unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// 复核 2:UI 全非阻塞 + 有界接收/拒绝/欠账(InputStage 语义)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn ui_input_paths_never_block_on_full_queue() {
+fn new_input_never_bypasses_old_debt() {
+    // 无 writer + gate 控制:排水由测试精确控制(受控交错的确定性)
     let q = WriteQueue::new();
     let gate = Arc::new(AtomicBool::new(false)); // shell 不读
     let written = Arc::new(Mutex::new(Vec::new()));
@@ -112,212 +97,329 @@ fn ui_input_paths_never_block_on_full_queue() {
         written: Arc::clone(&written),
     });
     let w = spawn_writer(&q, sink);
-    assert_eq!(
-        q.try_push(&vec![b'p'; WRITE_QUEUE_BYTES]),
-        WRITE_QUEUE_BYTES
-    );
-    // 生产 stage_input 序列(满队列下的按键/DSR/粘贴)
+    // 制造旧欠账:小块填满队列(writer 只能弹一块挂住)+ 暂存
     let mut stage = InputStage::new();
-    let t0 = Instant::now();
-    let key = b"key\r";
-    let acc = q.try_push(key);
-    assert!(acc <= key.len(), "writer 弹出队首后可能空出少量位");
-    assert_eq!(stage.stage(&key[acc..]), 0);
-
-    // Z 串贴满暂存:若按键部分进了暂存,预算相应少收(有界)
-    assert_eq!(stage.stage(&vec![b'Z'; INPUT_STAGE_BYTES]), key.len() - acc);
-    let stage_len_at_full = stage.len(); // = INPUT_STAGE_BYTES(恰好贴满)
-    let rejected = stage.stage(b"overflow-tail"); // 超暂存预算:显式拒绝
-    assert_eq!(rejected, b"overflow-tail".len(), "有界拒绝语义");
+    let old_total = WRITE_QUEUE_BYTES + 64 * 1024;
+    let old = vec![b'O'; old_total];
+    // 先小块填队列(4KiB × N),一次 stage_into 会整块进队列被 writer
+    // 一次弹空——分块保证 writer 只挂住一块,队列回到近满
+    for chunk in old.chunks(4 * 1024) {
+        stage_into(&mut stage, &q, chunk);
+    }
+    assert!(!stage.is_empty(), "旧欠账在(队列近满 + writer 挂住一块)");
+    // **受控交错**:flush 尝试推进(writer 弹出的空位只够装回很少)
+    stage.flush_into(&q);
     assert!(
-        t0.elapsed() < Duration::from_millis(20),
-        "全部非阻塞,耗时 {:?}",
-        t0.elapsed()
+        !stage.is_empty(),
+        "欠账仍在(writer 只挂住一块,空位远小于欠账)"
     );
-    let t1 = Instant::now();
-    q.close(); // 关闭即时完成(不等 gate)
-    assert!(t1.elapsed() < Duration::from_millis(10));
+    // 新输入经生产入口
+    let flow = stage_into(&mut stage, &q, b"NEW");
+    assert!(
+        matches!(flow, InputFlow::Debt(_)),
+        "旧欠账在时新输入必须入暂存(不得 Accepted 绕过),得 {flow:?}"
+    );
+    // 放水清空:最终顺序 OLD 全部先于 NEW
+    gate.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !stage.is_empty() && Instant::now() < deadline {
+        stage.flush_into(&q);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    q.close();
+    w.join().unwrap();
+    let out = written.lock().unwrap().clone();
+    assert_eq!(out.len(), old.len() + 3, "零丢失");
+    assert!(out[..old.len()].iter().all(|&b| b == b'O'), "OLD 全部在前");
+    assert_eq!(&out[old.len()..], b"NEW", "NEW 严格在 OLD 之后");
+}
+
+// ---------------------------------------------------------------------------
+// 复核 4:结构化结果 / 关闭拒收 / 溢出计数 / drain_into 语义
+// ---------------------------------------------------------------------------
+
+#[test]
+fn closed_queue_reports_rejected_not_silent() {
+    let q = WriteQueue::new();
+    q.close();
+    let mut stage = InputStage::new();
+    // 修前:try_push 返回 0,stage_input 仍收进暂存并"返回成功"
+    assert_eq!(
+        stage_into(&mut stage, &q, b"typed"),
+        InputFlow::RejectedClosed,
+        "关闭必须结构化拒收(不得静默进暂存)"
+    );
+    assert!(stage.is_empty(), "关闭后暂存不收");
+}
+
+#[test]
+fn overflow_counted_and_visible() {
+    let q = WriteQueue::new();
+    let mut stage = InputStage::new();
+    let before = overflow_drops();
+    // 超过 队列(1MiB)+ 暂存(512KiB)总量才触发溢出拒收
+    let big = vec![b'X'; WRITE_QUEUE_BYTES + INPUT_STAGE_BYTES + 100];
+    assert_eq!(
+        stage_into(&mut stage, &q, &big),
+        InputFlow::RejectedOverflow,
+        "总量超队列+暂存必须整体拒收(得见计数)"
+    );
+    assert!(overflow_drops() >= before + 100, "溢出计数可见");
+}
+
+/// CLI/IPC 语义:drain_into 全部进队列 → Ok;关闭 → Err(Closed)。
+#[test]
+fn drain_into_applied_means_fully_queued() {
+    let q = WriteQueue::new();
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::new(GatedSink {
+        gate: Arc::new(AtomicBool::new(true)),
+        written: Arc::clone(&written),
+    });
+    let w = spawn_writer(&q, sink);
+    let mut stage = InputStage::new();
+    let data = vec![b'D'; WRITE_QUEUE_BYTES + 128 * 1024]; // 超容量
+    let r = drain_into(
+        &mut stage,
+        &q,
+        &data,
+        Instant::now() + Duration::from_secs(30),
+    );
+    assert!(r.is_ok(), "writer 排水期内应全部进队列(得 {r:?})");
+    q.close();
+    w.join().unwrap();
+    assert_eq!(written.lock().unwrap().len(), data.len(), "全量写达");
+    // 关闭后:立即 Err(Closed)
+    let r2 = drain_into(
+        &mut stage,
+        &q,
+        b"more",
+        Instant::now() + Duration::from_millis(100),
+    );
+    assert_eq!(r2, Err(InputFlow::RejectedClosed));
+}
+
+/// drain_into 期限:shell 永不读 → Err(Debt)(IPC 据此报 timeout,
+/// 不再假 Applied)。
+#[test]
+fn drain_into_deadline_reports_debt() {
+    let q = WriteQueue::new();
+    let gate = Arc::new(AtomicBool::new(false)); // 永不读
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::new(GatedSink {
+        gate: Arc::clone(&gate),
+        written: Arc::clone(&written),
+    });
+    let w = spawn_writer(&q, sink);
+    let mut stage = InputStage::new();
+    // 小块填满队列(writer 挂一块)+ 欠账:drain_into 在期限内无法清空
+    let data = vec![b'W'; WRITE_QUEUE_BYTES + 32 * 1024];
+    for chunk in data.chunks(4 * 1024) {
+        let _ = stage_into(&mut stage, &q, chunk);
+    }
+    assert!(!stage.is_empty());
+    // 追加一段走 drain_into(带着存量欠账,期限内清不完)
+    let r = drain_into(
+        &mut stage,
+        &q,
+        b"tail",
+        Instant::now() + Duration::from_millis(300),
+    );
+    assert!(
+        matches!(r, Err(InputFlow::Debt(_))),
+        "期限未尽必须报 Debt(得 {r:?})"
+    );
+    q.close();
     gate.store(true, Ordering::SeqCst);
     w.join().unwrap();
-    // 放水后 writer 把"已入队的全部"写达:填充 1MiB + 本次被接收的按键
-    // (在途块在关闭后仍由 writer 正常写完——关闭只拒新,不弃旧)
-    let total_written = written.lock().unwrap().len();
-    assert_eq!(total_written, WRITE_QUEUE_BYTES + acc, "关闭不丢已入队字节");
-    assert_eq!(q.queued_bytes(), 0, "writer 取空退场");
-    // 欠账续灌(新队列 = 下一会话形态):FIFO 保序。期望内容在 flush
-    // 前构造(按键部分若进暂存则在前,Z 填到暂存预算为止)——两种
-    // 竞态形态(acc=0 或 4)都被同一断言覆盖
-    let key_tail = key.len() - acc;
-    let mut expected = key[acc..].to_vec();
-    expected.extend_from_slice(&vec![b'Z'; INPUT_STAGE_BYTES - key_tail]);
-    debug_assert_eq!(expected.len(), stage_len_at_full);
-    let q2 = WriteQueue::new();
-    let written2 = Arc::new(Mutex::new(Vec::new()));
-    let sink2 = Arc::new(GatedSink {
-        gate: Arc::new(AtomicBool::new(true)),
-        written: Arc::clone(&written2),
-    });
-    let h2 = spawn_writer(&q2, sink2);
-    let left = stage.flush_into(&q2);
-    assert_eq!(stage.len(), left);
-    q2.close();
-    h2.join().unwrap();
-    let out = written2.lock().unwrap().clone();
-    assert_eq!(out, expected, "暂存内容按原序完整写达");
 }
 
 // ---------------------------------------------------------------------------
-// 复核 3:真实会话锁模型——写端阻塞不拖 kill_child
+// 复核 1:丢唤醒屏障(受控交错:检查后、挂起前 close)
 // ---------------------------------------------------------------------------
 
+/// **修前失败形态**:等待者通过取消检查→close 发通知→等待者才挂起→
+/// 丢失(直到无关释放)。修后 Budget.notify_all 持锁——通知方阻塞在
+/// held 上直到等待者挂起。这里用真实线程时序(等待者持锁窗口由
+/// reserve 内部保证),断言 close 后 <500ms 返回(不依赖后续释放)。
 #[test]
-fn real_session_sink_kill_child_not_blocked_by_writer() {
-    use mica_core::pty::{PtySession, command_from_str};
-    let (mut session, reader) =
-        PtySession::spawn(command_from_str("cmd.exe"), 80, 24).expect("pty");
-    drop(reader);
-    {
-        // 锁住写端(等价 writer 阻塞在 write)——同锁下控制面调用不受阻:
-        // resize(&self) 即时返回;写端互斥与会话控制字段完全分离。
-        let _guard = session.block_writer_for_test();
-        let t = Instant::now();
-        session.resize(100, 30).expect("resize 不被写端锁拖住");
-        assert!(
-            t.elapsed() < Duration::from_millis(500),
-            "控制面不得被阻塞写拖住,耗时 {:?}",
-            t.elapsed()
-        );
-    }
-    // guard 已释放:kill_child(&mut)走正常路径
-    session.kill_child();
-    let h = session.writer_handle();
-    assert!(h.write(b"").is_ok());
-    session.kill_child();
-}
-
-// ---------------------------------------------------------------------------
-// 复核 4:会话隔离——旧 writer 与新代数据并存不误删
-// ---------------------------------------------------------------------------
-
-#[test]
-fn old_writer_never_consumes_new_session_data() {
-    let q_old = WriteQueue::new();
-    let gate = Arc::new(AtomicBool::new(false));
-    let w_old_written = Arc::new(Mutex::new(Vec::new()));
-    let sink_old = Arc::new(GatedSink {
-        gate: Arc::clone(&gate),
-        written: Arc::clone(&w_old_written),
-    });
-    let w_old = spawn_writer(&q_old, sink_old);
-    q_old.try_push(b"OLD-1");
-    q_old.try_push(b"OLD-2");
-    // "重启":新队列 + 新 writer(真实交错:旧 writer 仍活、旧数据滞留)
-    let q_new = WriteQueue::new();
-    let w_new_written = Arc::new(Mutex::new(Vec::new()));
-    let sink_new = Arc::new(GatedSink {
-        gate: Arc::new(AtomicBool::new(true)),
-        written: Arc::clone(&w_new_written),
-    });
-    let w_new = spawn_writer(&q_new, sink_new);
-    q_old.close();
-    q_new.try_push(b"NEW"); // 修前:旧 writer 弹后验代会把新数据丢掉
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while *w_new_written.lock().unwrap() != b"NEW"[..] && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(*w_new_written.lock().unwrap(), b"NEW");
-    gate.store(true, Ordering::SeqCst);
-    let done = Instant::now() + Duration::from_secs(10);
-    while !w_old.is_finished() && Instant::now() < done {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(w_old.is_finished(), "旧 writer 取空退场");
-    assert_eq!(*w_old_written.lock().unwrap(), b"OLD-1OLD-2");
-    q_new.close();
-    w_new.join().unwrap();
-}
-
-// ---------------------------------------------------------------------------
-// 复核 6:唤醒重试独立于生产者
-// ---------------------------------------------------------------------------
-
-/// 首投失败 + 持续输出直到 pane 满(转发线程堵在 push)——monitor 补投,
-/// 数据逐字节一致。
-#[test]
-fn wake_retry_survives_backpressured_forwarder() {
+fn budget_cancel_no_lost_wakeup_close_vs_wait_race() {
     let _g = budget_guard();
-    let wake = FakeWake::new();
-    wake.fail_first.store(1, Ordering::SeqCst);
-    let b = PtyBacklog::new(7, 64 * 1024, wake.clone());
-    b.spawn_monitor();
-    let input: Vec<u8> = (0u8..=255).cycle().take(128 * 1024).collect();
-    let producer = {
-        let b = Arc::clone(&b);
-        let d = input.clone();
+    // 用另一个 pane 占住全部进程预算
+    let holders: Vec<Arc<PtyBacklog>> = (0..(PROCESS_BUDGET_BYTES / PANE_BUDGET_BYTES as u64))
+        .map(|i| PtyBacklog::new(50 + i, PANE_BUDGET_BYTES, ScriptWake::new()))
+        .collect();
+    for h in &holders {
+        h.push(0, &vec![1u8; PANE_BUDGET_BYTES]).unwrap();
+    }
+    let victim = PtyBacklog::new(70, PANE_BUDGET_BYTES, ScriptWake::new());
+    let v = Arc::clone(&victim);
+    let producer = std::thread::spawn(move || v.push(0, b"x"));
+    // 等待者确定进入预算等待(检查已过、已挂起或正要挂起)
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(!producer.is_finished());
+    // **窗口注入**:close 在等待者检查后立刻发生(若 notify 无锁屏障,
+    // 此刻发射即丢失——修前复现点;修后通知方等锁,等待者必醒)
+    let t = Instant::now();
+    victim.close();
+    assert_eq!(
+        producer.join().unwrap(),
+        Err(PushError::Closed),
+        "close 必须唤醒预算等待者"
+    );
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "即时唤醒(修前要等无关释放,耗时 {:?})",
+        t.elapsed()
+    );
+    // WriteQueue::close 同屏障:阻塞中的 drain_into 被即时取消。
+    // **无 writer**(队列保持满——有 writer 会立刻弹出队首制造空位,
+    // drain 反而能完成):确定性制造"队列满+欠账"的阻塞形态
+    let q = WriteQueue::new();
+    let mut stage = InputStage::new();
+    let big = vec![b'Q'; WRITE_QUEUE_BYTES + 64 * 1024];
+    for chunk in big.chunks(4 * 1024) {
+        let _ = stage_into(&mut stage, &q, chunk);
+    }
+    assert!(q.queued_bytes() >= WRITE_QUEUE_BYTES - 8 * 1024, "队列满");
+    assert!(!stage.is_empty(), "欠账在");
+    let drainer = {
+        let q = Arc::clone(&q);
+        let mut stage = stage;
         std::thread::spawn(move || {
-            for c in d.chunks(8 * 1024) {
-                if b.push(0, c).is_err() {
-                    return;
-                }
-            }
+            drain_into(
+                &mut stage,
+                &q,
+                b"tail",
+                Instant::now() + Duration::from_secs(60),
+            )
         })
     };
-    let mut got = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !producer.is_finished() && Instant::now() < deadline {
-        if let Some(c) = b.drain_batch(16 * 1024) {
-            got.extend_from_slice(&c);
-        } else {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+    std::thread::sleep(Duration::from_millis(80));
+    let t2 = Instant::now();
+    q.close();
+    assert_eq!(
+        drainer.join().unwrap(),
+        Err(InputFlow::RejectedClosed),
+        "队列关闭同样即时唤醒等待者"
+    );
+    assert!(t2.elapsed() < Duration::from_millis(500));
+    for h in &holders {
+        drain_all(h);
     }
-    producer.join().unwrap();
-    got.extend_from_slice(&drain_all(&b));
-    assert!(wake.total() >= 2, "首投失败后有补投");
-    assert_eq!(got, input, "逐字节一致(零丢字节)");
-    b.close();
 }
 
-/// 最后一块输出后立即 EOF:转发线程退场,首投失败的数据由 monitor 补投。
+// ---------------------------------------------------------------------------
+// 复核 6:monitor 状态机——旧成功不清新失败(受控脚本)
+// ---------------------------------------------------------------------------
+
+/// 脚本:wake[0] 失败(push A 置 retry)→ monitor 补投成功(清)→
+/// push B 再次失败(置)→ 旧成功**不得**清掉新失败 → retry 保持,
+/// 直到下一次成功。锁内转换保证。
 #[test]
-fn last_output_then_eof_still_delivered() {
+fn monitor_success_does_not_clear_newer_failure() {
     let _g = budget_guard();
-    let wake = FakeWake::new();
-    wake.fail_first.store(1, Ordering::SeqCst);
-    let b = PtyBacklog::new(8, PANE_BUDGET_BYTES, wake.clone());
+    let wake = ScriptWake::new();
+    wake.fail_at(0); // push A 的装配投递失败
+    wake.fail_at(2); // push B 的装配投递失败(0=失败,1=monitor 补投成功,2=失败)
+    let b = PtyBacklog::new(80, PANE_BUDGET_BYTES, wake.clone());
     b.spawn_monitor();
-    b.push(0, b"final bytes").unwrap(); // "最后一块后 EOF":无更多 push
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while wake.total() < 2 && Instant::now() < deadline {
+    // push A:arm 失败 → retry=true
+    b.push(0, b"A").unwrap();
+    assert!(b.retry_pending(), "首投失败置 retry");
+    // 等 monitor 补投成功(第 1 次 call)清 retry
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while b.retry_pending() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(wake.total() >= 2, "EOF 后 monitor 补投");
-    assert_eq!(drain_all(&b), b"final bytes", "数据送达(修前滞留)");
+    assert!(!b.retry_pending(), "monitor 成功后清 retry");
+    // 消费 A(wake_pending 清)→ push B:第 2 次 call 失败 → retry=true
+    assert_eq!(drain_all(&b), b"A");
+    b.push(0, b"B").unwrap();
+    assert!(b.retry_pending(), "新失败必须置位");
+    // **关键窗口**:即便 monitor 紧随其后成功(第 3 次 call)也只清
+    // 自己这次成功之后的位——锁内序保证不丢
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while (b.retry_pending() || b.has_more()) && Instant::now() < deadline {
+        if !b.retry_pending() && b.has_more() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // B 最终送达(monitor 或后续成功路径)
+    let got = drain_all(&b);
+    assert_eq!(got, b"B");
     b.close();
 }
 
-/// 唤醒合并 + 失败后不重复投递成功消息。
+// ---------------------------------------------------------------------------
+// 复核 5:permit 严格上限(并发争抢最后一槽)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concurrent_permit_race_never_exceeds_max() {
+    let start = Arc::new(AtomicBool::new(false));
+    let mut handles = Vec::new();
+    for _ in 0..64 {
+        let start = Arc::clone(&start);
+        handles.push(std::thread::spawn(move || {
+            while !start.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            crate::app::lifecycle::acquire_session()
+        }));
+    }
+    start.store(true, Ordering::SeqCst);
+    let granted: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let ok = granted.iter().filter(|p| p.is_some()).count();
+    assert_eq!(
+        ok,
+        crate::app::lifecycle::MAX_SESSIONS,
+        "并发争抢:恰 MAX 个成功(修前 load-then-add 可超)"
+    );
+    // Drop 全部 permit → 计数归零
+    drop(granted);
+    assert_eq!(crate::app::lifecycle::live_sessions(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 承前契约:唤醒合并 / EOF 后送达 / 静默 shell 保序(生产入口)
+// ---------------------------------------------------------------------------
+
 #[test]
 fn wakes_coalesce_and_no_duplicate_after_success() {
     let _g = budget_guard();
-    let wake = FakeWake::new();
+    let wake = ScriptWake::new();
     let b = PtyBacklog::new(6, PANE_BUDGET_BYTES, wake.clone());
     b.spawn_monitor();
     for i in 0..100u32 {
         b.push(0, format!("c{i}").as_bytes()).unwrap();
     }
-    assert_eq!(wake.total(), 1, "100 push 1 wake(全成功则不重发)");
-    std::thread::sleep(Duration::from_millis(120)); // monitor 空转数轮
+    assert_eq!(wake.total(), 1, "100 push 1 wake");
+    std::thread::sleep(Duration::from_millis(120));
     assert_eq!(wake.total(), 1, "成功投递绝不重发");
     drain_all(&b);
     b.push(0, b"n").unwrap();
-    assert_eq!(wake.total(), 2, "消费后重新装配");
+    assert_eq!(wake.total(), 2);
     b.close();
 }
 
-// ---------------------------------------------------------------------------
-// 复核 7 组合:静默 shell 大粘贴续灌 + 随后输入保序(真实交错)
-// ---------------------------------------------------------------------------
+#[test]
+fn last_output_then_eof_still_delivered() {
+    let _g = budget_guard();
+    let wake = ScriptWake::new();
+    wake.fail_at(0);
+    let b = PtyBacklog::new(8, PANE_BUDGET_BYTES, wake.clone());
+    b.spawn_monitor();
+    b.push(0, b"final bytes").unwrap(); // 之后立即 EOF(无更多 push)
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while wake.total() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(wake.total() >= 2, "EOF 后 monitor 补投");
+    assert_eq!(drain_all(&b), b"final bytes");
+    b.close();
+}
 
 #[test]
 fn silent_shell_paste_then_keys_preserve_order() {
@@ -329,37 +431,34 @@ fn silent_shell_paste_then_keys_preserve_order() {
         written: Arc::clone(&written),
     });
     let w = spawn_writer(&q, sink);
-    // 大粘贴(超队列容量 → 欠账)
     let paste: Vec<u8> = vec![b'P'; WRITE_QUEUE_BYTES + 300 * 1024];
     let mut stage = InputStage::new();
-    let acc = q.try_push(&paste);
-    assert_eq!(stage.stage(&paste[acc..]), 0, "暂存预算内全收");
-    // 欠账未清时按键——按生产 stage_input 的顺序纪律:**先冲欠账再收
-    // 新输入**(直接 try_push 会越过暂存里的粘贴尾,测试必须复刻生产序)
-    let key = b"after-paste\r";
-    let flushed = stage.flush_into(&q);
-    let _ = flushed;
-    let acc = q.try_push(key);
-    assert!(acc <= key.len());
-    assert_eq!(stage.stage(&key[acc..]), 0);
-    // shell 恢复读取:writer 冲队列;心跳续灌(多次 flush = WM_TIMER 节奏)
+    match stage_into(&mut stage, &q, &paste) {
+        InputFlow::Debt(_) => {}
+        other => panic!("大粘贴应欠账,得 {other:?}"),
+    }
+    // 欠账未清时按键(生产入口——顺序规则内在)
+    match stage_into(&mut stage, &q, b"after-paste\r") {
+        InputFlow::Debt(_) => {}
+        other => panic!("按键必须排在欠账后,得 {other:?}"),
+    }
     gate.store(true, Ordering::SeqCst);
     let deadline = Instant::now() + Duration::from_secs(30);
     while !stage.is_empty() && Instant::now() < deadline {
         stage.flush_into(&q);
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(stage.len(), 0, "欠账全部灌入(静默期由心跳推进)");
+    assert!(stage.is_empty());
     q.close();
     w.join().unwrap();
     let out = written.lock().unwrap().clone();
-    assert_eq!(out.len(), paste.len() + b"after-paste\r".len(), "零丢失");
-    assert!(out.starts_with(&paste), "粘贴先");
-    assert!(out.ends_with(b"after-paste\r"), "按键严格在粘贴之后");
+    assert_eq!(out.len(), paste.len() + b"after-paste\r".len());
+    assert!(out.starts_with(&paste));
+    assert!(out.ends_with(b"after-paste\r"));
 }
 
 // ---------------------------------------------------------------------------
-// 预算守恒/严格限额/取消无丢唤醒(承前次返工契约)
+// 预算守恒/限额(承前)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -367,15 +466,14 @@ fn budget_exact_conservation_across_small_pushes() {
     let _g = budget_guard();
     let before = reserved_bytes();
     {
-        let wake = FakeWake::new();
-        let b = PtyBacklog::new(1, PANE_BUDGET_BYTES, wake);
+        let b = PtyBacklog::new(1, PANE_BUDGET_BYTES, ScriptWake::new());
         b.push(0, b"a").unwrap();
         b.push(0, b"b").unwrap();
         assert_eq!(reserved_bytes() - before, 2);
         assert_eq!(drain_all(&b), b"ab");
         assert_eq!(reserved_bytes() - before, 0);
     }
-    assert_eq!(reserved_bytes(), before, "Drop 不留账");
+    assert_eq!(reserved_bytes(), before);
 }
 
 #[test]
@@ -383,26 +481,23 @@ fn drop_clear_bump_close_all_release_exactly_once() {
     let _g = budget_guard();
     let before = reserved_bytes();
     {
-        let wake = FakeWake::new();
-        let b = PtyBacklog::new(1, PANE_BUDGET_BYTES, wake);
+        let b = PtyBacklog::new(1, PANE_BUDGET_BYTES, ScriptWake::new());
         b.push(0, &vec![7u8; 1024]).unwrap();
     }
-    assert_eq!(reserved_bytes(), before, "非空 Drop 归还");
+    assert_eq!(reserved_bytes(), before);
     {
-        let wake = FakeWake::new();
-        let b = PtyBacklog::new(1, PANE_BUDGET_BYTES, wake);
+        let b = PtyBacklog::new(1, PANE_BUDGET_BYTES, ScriptWake::new());
         b.push(0, &vec![7u8; 512]).unwrap();
         b.close();
         b.close();
         assert_eq!(reserved_bytes(), before, "close 归还且不双扣");
     }
     {
-        let wake = FakeWake::new();
-        let b = PtyBacklog::new(1, PANE_BUDGET_BYTES, wake);
+        let b = PtyBacklog::new(1, PANE_BUDGET_BYTES, ScriptWake::new());
         b.push(0, &vec![7u8; 256]).unwrap();
         let g1 = b.bump_generation();
         assert_eq!(g1, 1);
-        assert!(!b.has_more(), "换代清空旧数据");
+        assert!(!b.has_more());
         b.push(g1, b"new session").unwrap();
         assert_eq!(reserved_bytes() - before, 11);
         assert_eq!(b.push(0, b"stale"), Err(PushError::StaleGeneration));
@@ -417,7 +512,7 @@ fn multi_pane_concurrent_reservation_strictly_bounded() {
     const PANES: usize = 8;
     let stop = Arc::new(AtomicBool::new(false));
     let panes: Vec<Arc<PtyBacklog>> = (0..PANES)
-        .map(|i| PtyBacklog::new(i as u64, PANE_BUDGET_BYTES, FakeWake::new()))
+        .map(|i| PtyBacklog::new(i as u64, PANE_BUDGET_BYTES, ScriptWake::new()))
         .collect();
     let consumers: Vec<_> = panes
         .iter()
@@ -491,8 +586,7 @@ fn multi_pane_concurrent_reservation_strictly_bounded() {
 fn over_budget_producer_blocks_then_output_is_byte_identical() {
     let _g = budget_guard();
     let before = reserved_bytes();
-    let wake = FakeWake::new();
-    let b = PtyBacklog::new(9, 64 * 1024, wake);
+    let b = PtyBacklog::new(9, 64 * 1024, ScriptWake::new());
     let input: Vec<u8> = (0u8..=255).cycle().take(512 * 1024).collect();
     let producer = {
         let b = Arc::clone(&b);
@@ -519,42 +613,59 @@ fn over_budget_producer_blocks_then_output_is_byte_identical() {
     assert_eq!(reserved_bytes(), before);
 }
 
-/// 复核 8:取消通知无丢唤醒——阻塞在**进程预算**预留中的 push 被
-/// close/换代即时唤醒(pane 满路径同验)。
+/// 真实会话锁模型(承前):写端被占,控制面不受阻。
 #[test]
-fn process_budget_wait_cancelled_by_close_without_lost_wakeup() {
-    let _g = budget_guard();
-    // 占满进程预算(不消费):pane 上限 2MiB,16 个恰好 32MiB(单 pane
-    // 塞不下 30MiB——上一版 holder2 卡在 pane 空间等待而非进程预算)
-    let holders: Vec<Arc<PtyBacklog>> = (0..(PROCESS_BUDGET_BYTES / PANE_BUDGET_BYTES as u64))
-        .map(|i| PtyBacklog::new(20 + i, PANE_BUDGET_BYTES, FakeWake::new()))
-        .collect();
-    for h in &holders {
-        h.push(0, &vec![1u8; PANE_BUDGET_BYTES]).unwrap();
+fn real_session_sink_kill_child_not_blocked_by_writer() {
+    use mica_core::pty::{PtySession, command_from_str};
+    let (mut session, reader) =
+        PtySession::spawn(command_from_str("cmd.exe"), 80, 24).expect("pty");
+    drop(reader);
+    {
+        let _guard = session.block_writer_for_test();
+        let t = Instant::now();
+        session.resize(100, 30).expect("resize 不被写端锁拖住");
+        assert!(t.elapsed() < Duration::from_millis(500));
     }
-    let victim = PtyBacklog::new(22, PANE_BUDGET_BYTES, FakeWake::new());
-    let v = Arc::clone(&victim);
-    let producer = std::thread::spawn(move || v.push(0, b"blocked"));
-    std::thread::sleep(Duration::from_millis(80));
-    assert!(!producer.is_finished(), "应阻塞在进程预算");
-    let t = Instant::now();
-    victim.close();
-    assert_eq!(producer.join().unwrap(), Err(PushError::Closed));
-    assert!(t.elapsed() < Duration::from_secs(1), "即时唤醒(无丢唤醒)");
-    // 先释放 holder 预算(full 段的 push 也要走进程预算)
-    for h in &holders {
-        drain_all(h);
+    session.kill_child();
+    let h = session.writer_handle();
+    assert!(h.write(b"").is_ok());
+    session.kill_child();
+}
+
+/// 会话隔离(承前):旧 writer 不吃新代数据。
+#[test]
+fn old_writer_never_consumes_new_session_data() {
+    let q_old = WriteQueue::new();
+    let gate = Arc::new(AtomicBool::new(false));
+    let w_old_written = Arc::new(Mutex::new(Vec::new()));
+    let sink_old = Arc::new(GatedSink {
+        gate: Arc::clone(&gate),
+        written: Arc::clone(&w_old_written),
+    });
+    let w_old = spawn_writer(&q_old, sink_old);
+    q_old.try_push(b"OLD-1");
+    q_old.try_push(b"OLD-2");
+    let q_new = WriteQueue::new();
+    let w_new_written = Arc::new(Mutex::new(Vec::new()));
+    let sink_new = Arc::new(GatedSink {
+        gate: Arc::new(AtomicBool::new(true)),
+        written: Arc::clone(&w_new_written),
+    });
+    let w_new = spawn_writer(&q_new, sink_new);
+    q_old.close();
+    q_new.try_push(b"NEW");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while *w_new_written.lock().unwrap() != b"NEW"[..] && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
     }
-    let full = PtyBacklog::new(23, 1024, FakeWake::new());
-    full.push(0, &vec![1u8; 1024]).unwrap();
-    let f = Arc::clone(&full);
-    let p2 = std::thread::spawn(move || f.push(0, b"overflow"));
-    std::thread::sleep(Duration::from_millis(50));
-    let t2 = Instant::now();
-    full.bump_generation();
-    assert_eq!(p2.join().unwrap(), Err(PushError::StaleGeneration));
-    assert!(t2.elapsed() < Duration::from_secs(1));
-    for h in &holders {
-        drain_all(h);
+    assert_eq!(*w_new_written.lock().unwrap(), b"NEW");
+    gate.store(true, Ordering::SeqCst);
+    let done = Instant::now() + Duration::from_secs(10);
+    while !w_old.is_finished() && Instant::now() < done {
+        std::thread::sleep(Duration::from_millis(5));
     }
+    assert!(w_old.is_finished());
+    assert_eq!(*w_old_written.lock().unwrap(), b"OLD-1OLD-2");
+    q_new.close();
+    w_new.join().unwrap();
 }

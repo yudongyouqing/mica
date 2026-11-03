@@ -92,7 +92,12 @@ impl Budget {
         self.space.notify_all();
     }
 
+    /// **持锁通知**(丢唤醒屏障):等待者在持 `held` 期间检查取消谓词,
+    /// `wait()` 原子释放锁挂起;通知方先取 `held` 再 notify——若等待者
+    /// 刚检查完尚未挂起,通知方阻塞在锁上直到其挂起,通知必然送达。
+    /// 修前无锁 notify 在"检查后、挂起前"窗口发射,受控交错复现丢失。
     fn notify_all(&self) {
+        let _held = self.held.lock().unwrap_or_else(|e| e.into_inner());
         self.space.notify_all();
     }
 }
@@ -143,6 +148,9 @@ struct BlState {
     data: Vec<u8>,
     /// 一条 wake 在途(已投递待消费)或待重试。消费批清标记。
     wake_pending: bool,
+    /// 投递失败待重试。与 wake_pending 同在 state 锁——monitor 的
+    /// "读→补投→清位"与 arm 的"投递→置位"串行化,旧成功不清新失败。
+    retry_needed: bool,
 }
 
 /// 单 pane 输出积压:转发线程 `push`(阻塞,可取消),UI `drain_batch`。
@@ -152,8 +160,6 @@ pub struct PtyBacklog {
     wake: Arc<dyn WakeSink>,
     closed: AtomicBool,
     cur_gen: AtomicU64,
-    /// 投递失败待重试(monitor 周期补投;成功投递绝不重发——防重复)。
-    retry_needed: AtomicBool,
     state: Mutex<BlState>,
     space: Condvar,
 }
@@ -166,10 +172,10 @@ impl PtyBacklog {
             wake,
             closed: AtomicBool::new(false),
             cur_gen: AtomicU64::new(0),
-            retry_needed: AtomicBool::new(false),
             state: Mutex::new(BlState {
                 data: Vec::new(),
                 wake_pending: false,
+                retry_needed: false,
             }),
             space: Condvar::new(),
         })
@@ -187,11 +193,13 @@ impl PtyBacklog {
                     if b.closed.load(Ordering::Acquire) {
                         return;
                     }
-                    if b.retry_needed.load(Ordering::Acquire)
-                        && b.has_more()
-                        && b.wake.wake(b.pane_id)
+                    // 整个"读 retry→补投→清位"在 state 锁内:与
+                    // arm_wake 的"投递→置位"互斥,旧成功不清新失败(复核 6)
                     {
-                        b.retry_needed.store(false, Ordering::Release);
+                        let mut st = b.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if st.retry_needed && !st.data.is_empty() && b.wake.wake(b.pane_id) {
+                            st.retry_needed = false;
+                        }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(40));
                 }
@@ -260,7 +268,7 @@ impl PtyBacklog {
         st.wake_pending = true;
         let ok = self.wake.wake(self.pane_id);
         if !ok {
-            self.retry_needed.store(true, Ordering::Release);
+            st.retry_needed = true;
         }
     }
 
@@ -270,11 +278,13 @@ impl PtyBacklog {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if st.data.is_empty() {
                 st.wake_pending = false;
+                st.retry_needed = false;
                 return None;
             }
             let take = st.data.len().min(max);
             let out: Vec<u8> = st.data.drain(..take).collect();
             st.wake_pending = false;
+            st.retry_needed = false;
             out
         };
         BUDGET.release(bytes.len() as u64);
@@ -284,6 +294,15 @@ impl PtyBacklog {
             self.arm_wake_locked(&mut st);
         }
         Some(bytes)
+    }
+
+    /// 测试/诊断面:是否有待重试的唤醒。
+    #[allow(dead_code)]
+    pub fn retry_pending(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retry_needed
     }
 
     pub fn has_more(&self) -> bool {
@@ -306,6 +325,7 @@ impl PtyBacklog {
             let n = st.data.len() as u64;
             st.data.clear();
             st.wake_pending = false;
+            st.retry_needed = false;
             let g = self.cur_gen.fetch_add(1, Ordering::AcqRel) + 1;
             BUDGET.release(n); // 释放可与锁内递增同界:预算锁在 state 锁外层无持有,安全
             g
@@ -323,6 +343,7 @@ impl PtyBacklog {
             let n = st.data.len() as u64;
             st.data.clear();
             st.wake_pending = false;
+            st.retry_needed = false;
             n
         };
         BUDGET.release(released);
@@ -415,7 +436,11 @@ impl WriteQueue {
 
     /// 关闭:writer 在取空后自然退场;新数据一律拒收。
     pub fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        {
+            // 持锁置位(丢唤醒屏障,与 Budget.notify_all 同理)
+            let _st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.closed.store(true, Ordering::Release);
+        }
         self.space.notify_all();
     }
 
@@ -468,11 +493,106 @@ impl BytesSink for SessionSink {
 // UI 侧有界输入暂存(统一 FIFO:按键/DSR/IPC/粘贴同序,消灭乱序)
 // ---------------------------------------------------------------------------
 
+/// UI 输入流的结构化结果(复核 4:区分 Closed / 容量不足 / 已接受,
+/// 不再用"返回拒收字节数"折叠语义)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFlow {
+    /// 全部字节已进写队列(writer 将写出)。
+    Accepted,
+    /// 已接收但部分/全部在有界暂存中(返回当前欠账字节数)。
+    /// **不是失败**——心跳续灌会推进;但 Applied 语义只属于 Accepted。
+    Debt(usize),
+    /// 暂存预算已满,字节被拒收(计数见 overflow_drops)。
+    RejectedOverflow,
+    /// 会话已关闭(旧代/已终结)——字节不可投递。
+    RejectedClosed,
+}
+
+/// 因暂存溢出被拒收的字节累计(诊断面:退出日志可见,不静默)。
+static OVERFLOW_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// 诊断面:暂存溢出累计拒收字节。
+pub fn overflow_drops() -> u64 {
+    OVERFLOW_DROPS.load(Ordering::Relaxed)
+}
+
+/// **生产输入入口的共享核心**(app::stage_input 与测试共用,复核 7:
+/// 测试必须打生产路径而非手工复刻理想序)。顺序规则(复核 2):
+/// 暂存非空(存在旧欠账)时,**新输入只追加到暂存尾部**——绝不
+/// try_push 绕过(writer 腾出的空间只允许 flush 消费旧欠账使用,
+/// 否则新输入越过旧欠账造成乱序,复核探针实测 NEW→OLD)。
+pub fn stage_into(stage: &mut InputStage, queue: &WriteQueue, bytes: &[u8]) -> InputFlow {
+    if bytes.is_empty() {
+        return if queue.is_closed() {
+            InputFlow::RejectedClosed
+        } else {
+            InputFlow::Accepted
+        };
+    }
+    if queue.is_closed() {
+        return InputFlow::RejectedClosed;
+    }
+    if stage.is_empty() {
+        let acc = queue.try_push(bytes);
+        if acc == bytes.len() {
+            return InputFlow::Accepted;
+        }
+        let rest = &bytes[acc..];
+        let rejected = stage.stage(rest);
+        return if rejected > 0 {
+            OVERFLOW_DROPS.fetch_add(rejected as u64, Ordering::Relaxed);
+            InputFlow::RejectedOverflow
+        } else {
+            InputFlow::Debt(stage.len())
+        };
+    }
+    // 旧欠账在:只追加,不绕过
+    let rejected = stage.stage(bytes);
+    if rejected > 0 {
+        OVERFLOW_DROPS.fetch_add(rejected as u64, Ordering::Relaxed);
+        return InputFlow::RejectedOverflow;
+    }
+    InputFlow::Debt(stage.len())
+}
+
+/// CLI/IPC 的阻塞投递(复核 4:Applied 只在字节全部进队列时成立):
+/// 循环"冲欠账→收新输入"直到清空、关闭或期限。返回最终欠账量
+/// (0 = 全部进队列;>0 = 期限未尽,调用方按 timeout 报告)。
+pub fn drain_into(
+    stage: &mut InputStage,
+    queue: &WriteQueue,
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> Result<(), InputFlow> {
+    // 先按序接收(可能全部进队列或部分暂存)
+    match stage_into(stage, queue, bytes) {
+        InputFlow::Accepted => return Ok(()),
+        InputFlow::RejectedClosed => return Err(InputFlow::RejectedClosed),
+        InputFlow::RejectedOverflow => return Err(InputFlow::RejectedOverflow),
+        InputFlow::Debt(_) => {}
+    }
+    // 暂存有欠账:等 writer 腾空间,逐轮续灌直到清空或期限
+    while !stage.is_empty() {
+        if std::time::Instant::now() >= deadline {
+            return Err(InputFlow::Debt(stage.len()));
+        }
+        if queue.is_closed() {
+            return Err(InputFlow::RejectedClosed);
+        }
+        stage.flush_into(queue);
+        if !stage.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    Ok(())
+}
+
 /// 输入暂存:写队列满时的有界欠账。语义:
-/// - `stage`:追加(非阻塞;超预算**拒绝尾部**并返回拒收字节数——
-///   有界接收/拒绝语义显式化,调用方决定反馈);
+/// - `stage`:追加(非阻塞;超预算拒收尾部并返回拒收字节数);
 /// - `flush_into`:把队头灌进写队列(装多少灌多少,余下保序留待下轮);
 /// - 会话关闭/换代:`clear`(旧会话的欠账不污染新会话)。
+///
+/// 顺序纪律见 `stage_into`(生产入口,勿直接绕过)。
 pub struct InputStage {
     data: Vec<u8>,
     cap: usize,
@@ -519,6 +639,11 @@ impl InputStage {
     /// 会话终结/换代:旧欠账作废。
     pub fn clear(&mut self) {
         self.data.clear();
+    }
+
+    /// 尚可追加的字节数(粘贴整-fit 预检用)。
+    pub fn free_room(&self) -> usize {
+        self.cap.saturating_sub(self.data.len())
     }
 }
 
