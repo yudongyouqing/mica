@@ -223,7 +223,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     let terminal = Terminal {
         term,
         session,
-        session_permit,
+        session_permit: Some(session_permit),
         pty_buf: Arc::clone(&pty_buf),
         writeq: Arc::clone(&writeq),
         input_stage: crate::app::pty_bridge::InputStage::new(),
@@ -289,7 +289,8 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
             t.writeq.close();
             t.input_stage.clear(); // 旧会话输入欠账作废
             // kill 旧子在上方已完成(调用方契约)→ permit 换新
-            let _old_permit = std::mem::replace(&mut t.session_permit, new_permit);
+            drop(t.session_permit.take());
+            t.session_permit = Some(new_permit);
             let old = std::mem::replace(&mut t.session, session);
             let writeq = crate::app::pty_bridge::WriteQueue::new();
             let writer = t.session.writer_handle();
@@ -362,7 +363,7 @@ pub fn send_text(bytes: &[u8]) -> bool {
         } else {
             bytes.to_vec()
         };
-        let flow = crate::app::stage_input(t, &payload);
+        let flow = accept_qt_input(t, &payload);
         if matches!(flow, crate::app::pty_bridge::InputFlow::Debt(_)) {
             arm_qt_flush_timer();
         }
@@ -394,33 +395,47 @@ fn arm_qt_flush_timer() {
     }
 }
 
-/// IPC 路径:阻塞推进到写队列(Applied 语义同主窗,复核 4)。
-pub fn send_text_drain(bytes: &[u8]) -> Result<(), crate::app::pty_bridge::InputFlow> {
+fn accept_qt_input(
+    t: &mut crate::app::Terminal,
+    payload: &[u8],
+) -> crate::app::pty_bridge::InputFlow {
+    let flow = crate::app::pty_bridge::stage_into(&mut t.input_stage, &t.writeq, payload);
+    if matches!(flow, crate::app::pty_bridge::InputFlow::Debt(_)) {
+        arm_qt_flush_timer();
+    }
+    flow
+}
+
+/// QT 输入的生产入口(四轮返工复核 5):**非阻塞接收 + 武装 QT 自己
+/// 的续灌定时器(id 7)**——所属输入目标 → 所属续灌调度。QT 的按键、
+/// DSR 回复、IPC send-text 三条真实路径都经此(不再借用主窗的
+/// stage_input——那会武装主窗 id 8,而 flush_all_panes 只遍历 TABS,
+/// QT 欠账无人推进)。
+pub fn accept_qt(bytes: &[u8]) -> crate::app::pty_bridge::InputFlow {
     QT.with(|q| {
         let mut guard = q.borrow_mut();
         let Some(st) = guard.as_mut() else {
-            return Err(crate::app::pty_bridge::InputFlow::RejectedClosed);
+            return crate::app::pty_bridge::InputFlow::RejectedClosed;
         };
         let t = &mut st.terminal;
         let payload = if t.term.bracketed_paste_active() {
-            let mut w = b"[200~".to_vec();
+            let mut w = b"\x1b[200~".to_vec();
             w.extend_from_slice(bytes);
-            w.extend_from_slice(b"[201~");
+            w.extend_from_slice(b"\x1b[201~");
             w
         } else {
             bytes.to_vec()
         };
-        crate::app::pty_bridge::drain_into(
-            &mut t.input_stage,
-            &t.writeq,
-            &payload,
-            std::time::Instant::now() + std::time::Duration::from_millis(2500),
-        )
+        let flow = crate::app::pty_bridge::stage_into(&mut t.input_stage, &t.writeq, &payload);
+        if matches!(flow, crate::app::pty_bridge::InputFlow::Debt(_)) {
+            arm_qt_flush_timer();
+        }
+        flow
     })
 }
 
-/// QT 续灌心搏:冲欠账;清空即撤定时器(空闲零开销)。
-unsafe fn quickterm_flush_tick(hwnd: HWND) {
+/// QT 续灌心搏(WM_TIMER id 7):冲欠账;清空即撤定时器(空闲零开销)。
+unsafe fn qt_flush_tick(hwnd: HWND) {
     flush_input();
     if !has_input_debt() {
         windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 7).ok();
@@ -510,7 +525,7 @@ unsafe extern "system" fn qt_wndproc(
             if wparam.0 == 7 {
                 // T08 三次返工:QT 输入欠账续灌(真实接线;主窗 id 8
                 // 同语义,覆盖后台标签——QT 是独立 wndproc 独立定时器)
-                quickterm_flush_tick(hwnd);
+                qt_flush_tick(hwnd);
                 return LRESULT(0);
             }
             if wparam.0 == 6 {
@@ -555,7 +570,7 @@ unsafe extern "system" fn qt_wndproc(
                 };
                 st.terminal.term.feed(&bytes);
                 for reply in st.terminal.term.take_pty_writes() {
-                    let _ = crate::app::stage_input(&mut st.terminal, reply.as_bytes());
+                    let _ = accept_qt(reply.as_bytes());
                 }
                 if let Some(t) = st.terminal.term.take_title() {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(

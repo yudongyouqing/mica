@@ -358,6 +358,7 @@ fn monitor_success_does_not_clear_newer_failure() {
 
 #[test]
 fn concurrent_permit_race_never_exceeds_max() {
+    let _g = budget_guard();
     let start = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     for _ in 0..64 {
@@ -668,4 +669,127 @@ fn old_writer_never_consumes_new_session_data() {
     assert_eq!(*w_old_written.lock().unwrap(), b"OLD-1OLD-2");
     q_new.close();
     w_new.join().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 四轮返工:事务零副作用(复核 2/3)
+// ---------------------------------------------------------------------------
+
+/// 修前形态:超限 100 字节返回 RejectedOverflow,但前缀 1MiB+512KiB
+/// 已被接收(部分提交)。修后:整体拒绝且**队列/暂存内容逐字节不变**。
+#[test]
+fn overflow_rejection_has_zero_side_effects() {
+    let q = WriteQueue::new();
+    let mut stage = InputStage::new();
+    // 预置旧内容:队列填满 + 暂存留 debt(两个面都验零副作用)
+    let fill = vec![0u8; WRITE_QUEUE_BYTES];
+    assert_eq!(stage_into(&mut stage, &q, &fill), InputFlow::Accepted);
+    assert_eq!(stage_into(&mut stage, &q, b"debt"), InputFlow::Debt(4));
+    let q_before = q.queued_bytes();
+    let s_before = stage.len();
+    let too_big = vec![b'X'; WRITE_QUEUE_BYTES + INPUT_STAGE_BYTES];
+    assert_eq!(
+        stage_into(&mut stage, &q, &too_big),
+        InputFlow::RejectedOverflow
+    );
+    assert_eq!(q.queued_bytes(), q_before, "队列不变");
+    assert_eq!(stage.len(), s_before, "暂存不变");
+    assert_eq!(stage.last_bytes(), b"debt", "暂存内容原样(零副作用)");
+}
+
+/// 容量规则只看暂存空余(FIFO 禁绕过),整体拒绝零副作用(修前外围
+/// 预检按队列+暂存估,误判可容纳,实际部分拒收)。
+#[test]
+fn paste_with_old_debt_uses_stage_capacity_only() {
+    let q = WriteQueue::new();
+    let mut stage = InputStage::new();
+    // 队列占满 → 1 字节进暂存成旧欠账(队列空时 Accepted 会进队列)
+    let fill = vec![0u8; WRITE_QUEUE_BYTES];
+    assert_eq!(stage_into(&mut stage, &q, &fill), InputFlow::Accepted);
+    assert_eq!(stage_into(&mut stage, &q, b"A"), InputFlow::Debt(1));
+    let big = vec![b'P'; 600_000];
+    assert_eq!(
+        stage_into(&mut stage, &q, &big),
+        InputFlow::RejectedOverflow,
+        "600KB 超出暂存空余:整体拒绝"
+    );
+    assert_eq!(stage.last_bytes(), b"A", "旧欠账原样,零副作用");
+    assert_eq!(q.queued_bytes(), WRITE_QUEUE_BYTES, "队列不变");
+}
+
+/// 事务接受边界:恰等于容量的输入必须完整落位(不因边界 off-by-one
+/// 拒绝或部分接收);UTF-8 多字节/bracketed 包裹/带回车命令都按字节
+/// 流原样保序(整体接受)。
+#[test]
+fn transactional_accept_exact_boundary_and_content() {
+    let q = WriteQueue::new();
+    let mut stage = InputStage::new();
+    let exact = WRITE_QUEUE_BYTES; // 队列空 + 暂存空:恰好装满队列
+    let data: Vec<u8> = vec![b'K'; exact];
+    assert_eq!(stage_into(&mut stage, &q, &data), InputFlow::Accepted);
+    assert_eq!(q.queued_bytes(), exact);
+
+    // 暂存路径的 UTF-8/包裹/回车内容(整体接受后原样可取)
+    let q2 = WriteQueue::new();
+    let mut st2 = InputStage::new();
+    // 先占满队列,逼后续进暂存
+    let fill = vec![0u8; WRITE_QUEUE_BYTES];
+    assert_eq!(stage_into(&mut st2, &q2, &fill), InputFlow::Accepted);
+    let payload = "中文\r\n\x1b[200~粘贴\x1b[201~echo 你好\r".as_bytes();
+    match stage_into(&mut st2, &q2, payload) {
+        InputFlow::Debt(_) => {}
+        other => panic!("应欠账暂存,得 {other:?}"),
+    }
+    assert_eq!(st2.last_bytes(), payload, "暂存内容与输入逐字节一致");
+}
+
+// ---------------------------------------------------------------------------
+// 四轮返工:permit 转移(复核 4)
+// ---------------------------------------------------------------------------
+
+/// 满 16 会话时的原地重启:自己的槽位 kill 后转移给自己——必须成功
+/// (修前 spawn_capacity_ok 前置检查会阻止已满时的原地重启)。
+#[test]
+fn restart_transfers_own_slot_when_full() {
+    let _g = budget_guard();
+    use crate::app::lifecycle::{self, MAX_SESSIONS};
+    // MAX-1 个他人 permit + 自持 1 = 恰好满(满时原地重启的形态)
+    let others: Vec<_> = (0..MAX_SESSIONS - 1)
+        .map(|_| lifecycle::acquire_session())
+        .collect();
+    let mut own = lifecycle::acquire_session();
+    assert!(own.is_some());
+    assert_eq!(lifecycle::live_sessions(), MAX_SESSIONS);
+    // 重启序:kill 旧(permit 放掉)→ 再取(自己的槽位回到池中)
+    drop(own.take());
+    own = lifecycle::acquire_session();
+    assert!(own.is_some(), "自持槽位转移必须成功");
+    drop(own);
+    drop(others);
+    assert_eq!(lifecycle::live_sessions(), 0);
+}
+
+/// 槽位被抢:释放后其他窗口立即占用 → 重启方拿不到 → 可恢复失败
+/// (无 expect/panic),计数守恒。
+#[test]
+fn restart_slot_stolen_is_recoverable_failure() {
+    let _g = budget_guard();
+    use crate::app::lifecycle::{self, MAX_SESSIONS};
+    let others: Vec<_> = (0..MAX_SESSIONS - 1)
+        .map(|_| lifecycle::acquire_session())
+        .collect();
+    let mut own = lifecycle::acquire_session();
+    // 重启序:放旧 → 竞争者抢走 → 取新失败
+    drop(own.take());
+    let thief = lifecycle::acquire_session(); // 另一窗口抢走
+    assert!(thief.is_some(), "竞争者拿到刚释放的槽位");
+    let retry = lifecycle::acquire_session();
+    assert!(retry.is_none(), "重启方可恢复失败(非 panic)");
+    drop(thief);
+    // 释放后重试成功(用户可重试重启)
+    let again = lifecycle::acquire_session();
+    assert!(again.is_some(), "槽位回来后重启可重试");
+    drop(again);
+    drop(others);
+    assert_eq!(lifecycle::live_sessions(), 0);
 }

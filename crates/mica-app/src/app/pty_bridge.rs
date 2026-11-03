@@ -375,6 +375,8 @@ struct WqState {
 pub struct WriteQueue {
     cap: usize,
     closed: AtomicBool,
+    /// writer 累计弹出(=已交给 write_all 的字节;GUI 验收守恒断言用)。
+    popped_total: AtomicU64,
     state: Mutex<WqState>,
     space: Condvar,
 }
@@ -384,6 +386,7 @@ impl WriteQueue {
         Arc::new(Self {
             cap: WRITE_QUEUE_BYTES,
             closed: AtomicBool::new(false),
+            popped_total: AtomicU64::new(0),
             state: Mutex::new(WqState {
                 queue: VecDeque::new(),
                 bytes: 0,
@@ -424,6 +427,8 @@ impl WriteQueue {
         loop {
             if let Some(front) = st.queue.pop_front() {
                 st.bytes -= front.len();
+                self.popped_total
+                    .fetch_add(front.len() as u64, Ordering::Relaxed);
                 self.space.notify_all(); // 腾出容量:通知续灌侧
                 return Some(front);
             }
@@ -447,6 +452,13 @@ impl WriteQueue {
     #[allow(dead_code)]
     pub fn is_closed_pub(&self) -> bool {
         self.is_closed()
+    }
+
+    #[allow(dead_code)]
+    /// writer 累计弹出字节(守恒断言:stage+queued+popped == 已接收)。
+    #[allow(dead_code)]
+    pub fn popped_total(&self) -> u64 {
+        self.popped_total.load(Ordering::Relaxed)
     }
 
     #[allow(dead_code)]
@@ -532,6 +544,20 @@ pub fn stage_into(stage: &mut InputStage, queue: &WriteQueue, bytes: &[u8]) -> I
     if queue.is_closed() {
         return InputFlow::RejectedClosed;
     }
+    // **事务语义(复核 2/3)**:先按与提交完全相同的容量规则预判,
+    // 装不下 → 整体拒绝且**零副作用**(队列/暂存原样)。容量规则与
+    // 提交路径同源:暂存空 = 队列空余+暂存空余;暂存非空(旧欠账
+    // 在,FIFO 禁绕过)= 仅暂存空余。
+    let capacity = if stage.is_empty() {
+        queue.free_bytes() + stage.free_room()
+    } else {
+        stage.free_room()
+    };
+    if bytes.len() > capacity {
+        OVERFLOW_DROPS.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        return InputFlow::RejectedOverflow;
+    }
+    // 容量内:提交必然完整落位(不再有部分接收后溢出的形态)
     if stage.is_empty() {
         let acc = queue.try_push(bytes);
         if acc == bytes.len() {
@@ -539,39 +565,52 @@ pub fn stage_into(stage: &mut InputStage, queue: &WriteQueue, bytes: &[u8]) -> I
         }
         let rest = &bytes[acc..];
         let rejected = stage.stage(rest);
-        return if rejected > 0 {
-            OVERFLOW_DROPS.fetch_add(rejected as u64, Ordering::Relaxed);
-            InputFlow::RejectedOverflow
-        } else {
-            InputFlow::Debt(stage.len())
-        };
+        debug_assert_eq!(
+            rejected, 0,
+            "事务预判通过后不允许部分拒收(容量计算与提交不一致的 bug)"
+        );
+        return InputFlow::Debt(stage.len());
     }
     // 旧欠账在:只追加,不绕过
     let rejected = stage.stage(bytes);
-    if rejected > 0 {
-        OVERFLOW_DROPS.fetch_add(rejected as u64, Ordering::Relaxed);
-        return InputFlow::RejectedOverflow;
-    }
+    debug_assert_eq!(rejected, 0, "事务预判通过后不允许部分拒收");
     InputFlow::Debt(stage.len())
 }
 
-/// CLI/IPC 的阻塞投递(复核 4:Applied 只在字节全部进队列时成立):
-/// 循环"冲欠账→收新输入"直到清空、关闭或期限。返回最终欠账量
-/// (0 = 全部进队列;>0 = 期限未尽,调用方按 timeout 报告)。
+/// CLI/测试用的阻塞推进(生产 UI/IPC 已改异步 completer,不再调用)。
+/// 期限语义:Ok = 全部进队列;Err(Debt) = 期限未尽(结果未知——字节
+/// 已接收,仍会随后续排水写出,调用方按"仍在推进"报告,不得重发);
+/// Err(RejectedClosed/Overflow) = 未接收任何字节。内部按 64KiB 分块
+/// 提交,大输入在事务语义下也能渐进(每块整体接受或整体拒绝)。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn drain_into(
     stage: &mut InputStage,
     queue: &WriteQueue,
     bytes: &[u8],
     deadline: std::time::Instant,
 ) -> Result<(), InputFlow> {
-    // 先按序接收(可能全部进队列或部分暂存)
-    match stage_into(stage, queue, bytes) {
-        InputFlow::Accepted => return Ok(()),
-        InputFlow::RejectedClosed => return Err(InputFlow::RejectedClosed),
-        InputFlow::RejectedOverflow => return Err(InputFlow::RejectedOverflow),
-        InputFlow::Debt(_) => {}
+    const CHUNK: usize = 64 * 1024;
+    for chunk in bytes.chunks(CHUNK) {
+        // 先冲旧欠账(块提交前尽量腾暂存)
+        while !stage.is_empty() {
+            if std::time::Instant::now() >= deadline {
+                return Err(InputFlow::Debt(stage.len()));
+            }
+            if queue.is_closed() {
+                return Err(InputFlow::RejectedClosed);
+            }
+            stage.flush_into(queue);
+            if !stage.is_empty() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        match stage_into(stage, queue, chunk) {
+            InputFlow::Accepted | InputFlow::Debt(_) => {}
+            InputFlow::RejectedClosed => return Err(InputFlow::RejectedClosed),
+            InputFlow::RejectedOverflow => return Err(InputFlow::RejectedOverflow),
+        }
     }
-    // 暂存有欠账:等 writer 腾空间,逐轮续灌直到清空或期限
+    // 尾段欠账清空
     while !stage.is_empty() {
         if std::time::Instant::now() >= deadline {
             return Err(InputFlow::Debt(stage.len()));
@@ -596,6 +635,8 @@ pub fn drain_into(
 pub struct InputStage {
     data: Vec<u8>,
     cap: usize,
+    /// 累计灌入写队列的字节(GUI 验收观测面:MICA_DEBUG_INPUTFLOW 日志)。
+    flushed_total: std::cell::Cell<u64>,
 }
 
 impl InputStage {
@@ -603,7 +644,13 @@ impl InputStage {
         Self {
             data: Vec::new(),
             cap: INPUT_STAGE_BYTES,
+            flushed_total: std::cell::Cell::new(0),
         }
+    }
+
+    /// 累计灌入写队列的字节(GUI 验收:最终应等于全部已接收输入)。
+    pub fn flushed_total(&self) -> u64 {
+        self.flushed_total.get()
     }
 
     #[allow(dead_code)]
@@ -631,6 +678,8 @@ impl InputStage {
         }
         let accepted = q.try_push(&self.data);
         if accepted > 0 {
+            self.flushed_total
+                .set(self.flushed_total.get() + accepted as u64);
             self.data.drain(..accepted);
         }
         self.data.len()
@@ -644,6 +693,12 @@ impl InputStage {
     /// 尚可追加的字节数(粘贴整-fit 预检用)。
     pub fn free_room(&self) -> usize {
         self.cap.saturating_sub(self.data.len())
+    }
+
+    /// 测试面:暂存内容的只读视图(零副作用断言用)。
+    #[cfg(test)]
+    pub fn last_bytes(&self) -> &[u8] {
+        &self.data
     }
 }
 

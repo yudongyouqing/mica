@@ -511,8 +511,9 @@ pub(crate) struct Terminal {
     /// writer_handle 分发给 writer 线程——锁分离,复核 3)
     session: PtySession,
     /// 会话槽位(T08 复核 5:严格 ≤MAX_SESSIONS 的 RAII 占用;
-    /// 与 session 同生共死——字段顺序保证 permit 在 session 之后 drop)
-    session_permit: lifecycle::SessionPermit,
+    /// None = pane 无活会话(重启槽位被抢的失败态,可重试)。
+    /// 字段顺序保证 permit 在 session 之后 drop。
+    session_permit: Option<lifecycle::SessionPermit>,
     /// 有界输出积压(T08:零丢弃背压 + 唤醒合并)
     pty_buf: Arc<pty_bridge::PtyBacklog>,
     /// 单 writer 保序写队列(T08:输入/粘贴/注入/协议回复)
@@ -1536,12 +1537,17 @@ fn restart_active_pane() -> bool {
         let new_gen = t.pty_buf.bump_generation();
         t.writeq.close();
         t.input_stage.clear(); // 旧会话的输入欠账作废
-        // 复核 5 permit 转移序:kill 旧(上方已完成)→ 放旧 permit →
-        // 取新 permit(峰值严格 ≤MAX;acquire 失败则重启失败可重试)
-        let _old_permit = std::mem::replace(
-            &mut t.session_permit,
-            lifecycle::acquire_session().expect("重启前已查 capacity(单线程 UI 无竞态)"),
-        );
+        // 复核 5(四轮返工)permit 转移:**kill 旧 → 放旧 permit →
+        // 取新**——峰值严格 ≤MAX;槽位被其他窗口抢走时返回可恢复失败
+        // (无 expect):pane 无会话态,用户可重试重启
+        drop(t.session_permit.take());
+        let Some(new_permit) = lifecycle::acquire_session() else {
+            eprintln!("[restart] 槽位被其他窗口占用,重启失败——pane 暂无会话,可重试");
+            // 旧会话已 kill;新 spawn 的会话对象在此丢弃(子进程随其
+            // Drop 终结),reader 一并释放——不留孤儿
+            return;
+        };
+        t.session_permit = Some(new_permit);
         let old = std::mem::replace(&mut t.session, session);
         let writeq = WriteQueue::new();
         let writer = t.session.writer_handle();
@@ -1939,7 +1945,7 @@ unsafe fn create_pane_with_size(
     let terminal = Terminal {
         term,
         session,
-        session_permit,
+        session_permit: Some(session_permit),
         pty_buf: Arc::clone(&pty_buf),
         writeq: Arc::clone(&writeq),
         input_stage: pty_bridge::InputStage::new(),
@@ -4012,7 +4018,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 };
                 let Some(incoming) = incoming else { break };
                 let resp = unsafe { apply_ipc_request(hwnd, &incoming.req) };
-                incoming.reply(resp);
+                if let Some(resp) = resp {
+                    incoming.reply(resp);
+                }
             }
             // activate 语义:前置既有窗口
             let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd) };
@@ -4054,136 +4062,150 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 /// T06:应用一条 IPC 请求并生成应答。参数校验在这里(服务端只挡未知
 /// op);send-text 成功仅承诺字节写入 PTY——不承诺 shell 执行完毕。
-unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> IpcResponse {
+unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> Option<IpcResponse> {
     match req.op.as_str() {
-        "activate" => IpcResponse::applied(req.id),
+        "activate" => Some(IpcResponse::applied(req.id)),
         // new-window 是异步派发(窗口线程创建),此刻无法确知创建结果——
         // 如实回 Queued(复核 3:仅派发线程不得回 Applied)
         "new-window" => {
             spawn_window(None);
-            IpcResponse::queued(req.id)
+            Some(IpcResponse::queued(req.id))
         }
         "new-tab" => {
             if let Some(fs) = req.font_size
                 && (!fs.is_finite() || !(6.0..=72.0).contains(&fs))
             {
-                return IpcResponse::error(req.id, IpcError::BadFontSize);
+                return Some(IpcResponse::error(req.id, IpcError::BadFontSize));
             }
             if let Some(profile) = req.profile.as_deref() {
                 let known = mica_core::profile::scan_all()
                     .iter()
                     .any(|p| p.name.eq_ignore_ascii_case(profile));
                 if !known {
-                    return IpcResponse::error(req.id, IpcError::BadProfile);
+                    return Some(IpcResponse::error(req.id, IpcError::BadProfile));
                 }
             }
             // 真实结果(复核 3):创建失败(DEGRADED/spawn 失败)回错误,
             // 不再假报 Applied
-            match start_tab_with_profile(hwnd, req.profile.as_deref(), req.font_size) {
-                true => IpcResponse::applied(req.id),
-                false if !lifecycle::spawn_capacity_ok() => {
-                    IpcResponse::error(req.id, IpcError::Degraded)
-                }
-                false => IpcResponse::error(req.id, IpcError::SpawnFailed),
-            }
-        }
-        "send-text" => {
-            let bytes = req.text.clone().unwrap_or_default().into_bytes();
-            // 复核 4:Applied 只承诺"字节已进写队列"(writer 将写出),
-            // 不承诺进暂存——CLI/IPC 用 drain_into 阻塞推进(期限 2.5s,
-            // 在 IPC 3s 预算内),期限未尽按 timeout(结果未知)报告
-            let write_to = |t: &mut Terminal| -> Result<(), pty_bridge::InputFlow> {
-                let payload = if t.term.bracketed_paste_active() {
-                    let mut w = b"\x1b[200~".to_vec();
-                    w.extend_from_slice(&bytes);
-                    w.extend_from_slice(b"\x1b[201~");
-                    w
-                } else {
-                    bytes.clone()
-                };
-                pty_bridge::drain_into(
-                    &mut t.input_stage,
-                    &t.writeq,
-                    &payload,
-                    std::time::Instant::now() + std::time::Duration::from_millis(2500),
-                )
-            };
-            let map = |r: Result<(), pty_bridge::InputFlow>| match r {
-                Ok(()) => IpcResponse::applied(req.id),
-                Err(pty_bridge::InputFlow::Debt(_)) => {
-                    // 欠账留给心跳推进(writer 腾空间即续灌)
-                    arm_input_flush_timer();
-                    IpcResponse::error(req.id, IpcError::Timeout)
-                }
-                Err(pty_bridge::InputFlow::RejectedOverflow) => {
-                    IpcResponse::error(req.id, IpcError::InputOverflow)
-                }
-                Err(_) => IpcResponse::error(req.id, IpcError::PtyWrite),
-            };
-            // 写入语义分层:目标不存在 = bad_target;存在但写失败 =
-            // pty_write(QT 不存在不再是假成功,复核 3)
-            match req.tab {
-                Some(-1) => {
-                    if !quickterm::exists() {
-                        IpcResponse::error(req.id, IpcError::BadTarget)
-                    } else {
-                        match quickterm::send_text_drain(&bytes) {
-                            Ok(()) => IpcResponse::applied(req.id),
-                            Err(_) => IpcResponse::error(req.id, IpcError::Timeout),
-                        }
+            Some(
+                match start_tab_with_profile(hwnd, req.profile.as_deref(), req.font_size) {
+                    true => IpcResponse::applied(req.id),
+                    false if !lifecycle::spawn_capacity_ok() => {
+                        IpcResponse::error(req.id, IpcError::Degraded)
                     }
-                }
-                Some(n) if n >= 0 => match TABS.with(|tabs| {
-                    tabs.borrow_mut()
-                        .get_mut(n as usize)
-                        .and_then(|tab| tab.active_pane())
-                        .map(write_to)
-                }) {
-                    Some(r) => map(r),
-                    None => IpcResponse::error(req.id, IpcError::BadTarget),
+                    false => IpcResponse::error(req.id, IpcError::SpawnFailed),
                 },
-                _ => match TABS.with(|tabs| {
-                    tabs.borrow_mut()
-                        .get_mut(ACTIVE.get())
-                        .and_then(|tab| tab.active_pane())
-                        .map(write_to)
-                }) {
-                    Some(r) => map(r),
-                    None => IpcResponse::error(req.id, IpcError::BadTarget),
-                },
-            }
+            )
         }
+        "send-text" => send_text_ipc(req),
         // 服务端已挡未知 op;防御性兜底
-        _ => IpcResponse::error(req.id, IpcError::UnknownOp),
+        _ => Some(IpcResponse::error(req.id, IpcError::UnknownOp)),
     }
 }
 
-/// T08:粘贴欠账续灌——写队列有余量即灌入,余下继续欠。任何 UI 心跳
-/// (WM_APP_RENDER/WM_TIMER)调用,大粘贴期间 UI 始终可响应。
-/// 粘贴入口(复核 4):**整-fit 或整体拒绝**——部分粘贴(截尾)可能
-/// 改变输入语义(bracketed-paste 缺结束符、命令被拦腰)。预检
-/// 队列空余 + 暂存空余;不足则整体拒绝 + warn_box 用户可见反馈
-/// (按键类小输入不受影响,永不走此门)。
-fn paste_input(t: &mut Terminal, bytes: &[u8]) {
-    let fits = t.writeq.free_bytes() + t.input_stage.free_room();
-    if bytes.len() > fits {
-        eprintln!(
-            "[paste] 拒绝粘贴 {} 字节(队列空余 {} + 暂存空余 {}):输入通道饱和",
-            bytes.len(),
-            t.writeq.free_bytes(),
-            t.input_stage.free_room()
-        );
-        warn_box(&format!(
-            "粘贴内容({} KB)超出当前输入通道容量({} KB)
-
-shell 正在消化未消费的输入。
-请稍后重试或分批粘贴。",
-            bytes.len() / 1024,
-            fits / 1024,
-        ));
-        return;
+/// send-text 的 IPC 语义(四轮返工复核 1/5):**UI 只做一次非阻塞接收**
+/// (stage_into,零等待)——窗口线程绝不阻塞在排水上;期间输入、关闭、
+/// 绘制与续灌定时器照常(生产入口回归见 input_flow_gui.rs 的
+/// saturated_send_keeps_window_responsive)。
+/// - Accepted → Applied(字节全部在写队列,writer 将写出)。
+/// - Debt → **Queued**:字节已接收、仍会随 writer 排水写出(心跳
+///   续灌推进,与客户端是否等待无关);不承诺 Applied,也绝不取消
+///   ——CLI 文案明示"已接收仍在推进,勿盲目重发"。等待/完成不在
+///   窗口线程上发生。
+/// - RejectedOverflow/Closed → 精确错误码(input_overflow/pty_write),
+///   事务零副作用(未接收任何字节)。
+fn send_text_ipc(req: &IpcRequest) -> Option<IpcResponse> {
+    let bytes = req.text.clone().unwrap_or_default().into_bytes();
+    let payload_for = |t: &mut Terminal| -> Vec<u8> {
+        if t.term.bracketed_paste_active() {
+            let mut w = b"\x1b[200~".to_vec();
+            w.extend_from_slice(&bytes);
+            w.extend_from_slice(b"\x1b[201~");
+            w
+        } else {
+            bytes.clone()
+        }
+    };
+    match req.tab {
+        Some(-1) => {
+            // QT:所属续灌调度 = QT id 7;错误码精确区分三种拒绝
+            if !quickterm::exists() {
+                return Some(IpcResponse::error(req.id, IpcError::BadTarget));
+            }
+            match quickterm::accept_qt(&bytes) {
+                pty_bridge::InputFlow::Accepted => Some(IpcResponse::applied(req.id)),
+                pty_bridge::InputFlow::Debt(_) => Some(IpcResponse::queued(req.id)),
+                pty_bridge::InputFlow::RejectedOverflow => {
+                    Some(IpcResponse::error(req.id, IpcError::InputOverflow))
+                }
+                pty_bridge::InputFlow::RejectedClosed => {
+                    Some(IpcResponse::error(req.id, IpcError::PtyWrite))
+                }
+            }
+        }
+        target => {
+            let flow = TABS.with(|tabs| {
+                let mut guard = tabs.borrow_mut();
+                let t = match target {
+                    Some(n) if n >= 0 => {
+                        guard.get_mut(n as usize).and_then(|tab| tab.active_pane())
+                    }
+                    _ => guard
+                        .get_mut(ACTIVE.get())
+                        .and_then(|tab| tab.active_pane()),
+                };
+                let t = t?;
+                let payload = payload_for(t);
+                Some(stage_input(t, &payload)) // stage_input 内武装主窗 id 8
+            });
+            let Some(flow) = flow else {
+                return Some(IpcResponse::error(req.id, IpcError::BadTarget));
+            };
+            Some(match flow {
+                pty_bridge::InputFlow::Accepted => IpcResponse::applied(req.id),
+                pty_bridge::InputFlow::Debt(_) => IpcResponse::queued(req.id),
+                pty_bridge::InputFlow::RejectedOverflow => {
+                    IpcResponse::error(req.id, IpcError::InputOverflow)
+                }
+                pty_bridge::InputFlow::RejectedClosed => {
+                    IpcResponse::error(req.id, IpcError::PtyWrite)
+                }
+            })
+        }
     }
-    let _ = stage_input(t, bytes);
+}
+
+/// 粘贴入口(复核 3/4):**与提交同一个事务组件**——`stage_into`
+/// 自身就是整体接受/整体拒绝(预判与提交同源,FIFO 与容量规则内在),
+/// 不在外围另行估算容量(修前外围按"队列+暂存"估算,漏了旧欠账时新
+/// 输入只准进暂存的 FIFO 规则——暂存 1 字节欠账 + 600KB 粘贴预检
+/// 通过、实际部分拒收)。拒绝零副作用 + warn_box 用户可见反馈。
+fn paste_input(t: &mut Terminal, bytes: &[u8]) {
+    match stage_input(t, bytes) {
+        pty_bridge::InputFlow::Accepted | pty_bridge::InputFlow::Debt(_) => {}
+        pty_bridge::InputFlow::RejectedOverflow => {
+            eprintln!(
+                "[paste] 拒绝粘贴 {} 字节(当前可用 {} B):输入通道饱和,零副作用",
+                bytes.len(),
+                paste_capacity(t),
+            );
+            warn_box(&format!(
+                "粘贴内容({} KB)超出当前输入通道容量({} KB)\n\nshell 正在消化未消费的输入,已接收内容不受影响。\n请稍后重试或分批粘贴。",
+                bytes.len() / 1024,
+                paste_capacity(t) / 1024,
+            ));
+        }
+        pty_bridge::InputFlow::RejectedClosed => {}
+    }
+}
+
+/// 当前可整体接收的粘贴容量(与 stage_into 容量规则同源)。
+fn paste_capacity(t: &Terminal) -> usize {
+    if t.input_stage.is_empty() {
+        t.writeq.free_bytes() + t.input_stage.free_room()
+    } else {
+        t.input_stage.free_room()
+    }
 }
 
 /// T08(三次返工):统一 UI 输入入口(**非阻塞**)。核心顺序规则在
@@ -4265,7 +4287,26 @@ fn flush_all_panes() {
         }
     });
     if debug {
-        eprintln!("[inputflow] timer-tick: debt_panes={debt_panes} armed={any_debt}");
+        let (flushed, queued, staged, popped): (u64, u64, u64, u64) = TABS.with(|tabs| {
+            let g = tabs.borrow();
+            let mut f = 0u64;
+            let mut q = 0u64;
+            let mut s2 = 0u64;
+            let mut p2 = 0u64;
+            for tab in g.iter() {
+                for pane in tab.panes.iter() {
+                    let t = &pane.terminal;
+                    f += t.input_stage.flushed_total();
+                    q += t.writeq.queued_bytes() as u64;
+                    s2 += t.input_stage.len() as u64;
+                    p2 += t.writeq.popped_total();
+                }
+            }
+            (f, q, s2, p2)
+        });
+        eprintln!(
+            "[inputflow] timer-tick: debt_panes={debt_panes} armed={any_debt} flushed={flushed} q={queued} s={staged} popped={popped}"
+        );
     }
     if !any_debt && INPUT_TIMER_ARMED.with(std::cell::Cell::get) {
         if let Some(raw) = SHARED_HWND
