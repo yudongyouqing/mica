@@ -614,7 +614,7 @@ unsafe extern "system" fn qt_wndproc(
                 } else {
                     ch.to_string().into_bytes()
                 };
-                let _ = crate::app::stage_input(&mut st.terminal, &bytes);
+                let _ = accept_qt_input(&mut st.terminal, &bytes);
             });
             LRESULT(0)
         }
@@ -641,12 +641,12 @@ unsafe extern "system" fn qt_wndproc(
                     && let Some(bytes) =
                         mica_core::protocol::kitty::kitty_encode(key, mods, kind, flags)
                 {
-                    let _ = crate::app::stage_input(&mut st.terminal, &bytes);
+                    let _ = accept_qt_input(&mut st.terminal, &bytes);
                     return;
                 }
                 if let Some(bytes) = super::vkey_bytes(vk, mods, st.terminal.term.app_cursor_mode())
                 {
-                    let _ = crate::app::stage_input(&mut st.terminal, &bytes);
+                    let _ = accept_qt_input(&mut st.terminal, &bytes);
                 }
             });
             LRESULT(0)
