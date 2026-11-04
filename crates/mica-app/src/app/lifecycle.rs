@@ -179,6 +179,29 @@ pub fn spawn_capacity_ok() -> bool {
     !DEGRADED.load(Ordering::Relaxed) && LIVE_SESSIONS.load(Ordering::Acquire) < MAX_SESSIONS
 }
 
+/// **共享重启帮手**(r5-2):主窗与 QT 的重启都走同一契约——
+/// **kill 旧 → 放旧 permit → 取新 permit → spawn 新 PTY**。
+/// - 满额时原地重启:自己的旧槽在 spawn 前释放,竞争失败可恢复
+///   (不查 spawn_capacity_ok——它查的是"是否满"会阻止原地重启)。
+/// - spawn 失败:已持有的新 permit 随 Err 提前返回的 RAII 归还。
+/// - 旧 PTY 的关闭(阻塞面 ClosePseudoConsole)由调用方交 reaper;
+///   本函数不碰 UI 线程。
+///
+/// 调用方契约:`kill_old` 必须先终止旧会话的子进程(非阻塞)并返回
+/// 旧 pid;`spawn` 在新 permit 到手后才被调用。
+/// 主窗/QT 共用的重启槽位转移:kill_old(调用方已完成)→ 放旧 → 取新。
+/// 返回 acquire 结果;spawn 由调用方执行(permit 到手后再 spawn,
+/// spawn 失败调用方 drop 返回的 permit 即回滚)。
+pub fn restart_transfer(old: &mut Option<SessionPermit>) -> Option<SessionPermit> {
+    if DEGRADED.load(Ordering::Relaxed) {
+        return None;
+    }
+    // 先放旧(自持槽回到池中——满额时原地重启由此可行)
+    drop(old.take());
+    // 再取新(其他窗口可能抢走——返回 None 即 SlotStolen)
+    acquire_session()
+}
+
 /// 诊断面:当前并发会话数。
 #[allow(dead_code)]
 pub fn live_sessions() -> usize {

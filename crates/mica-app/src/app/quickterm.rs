@@ -264,32 +264,30 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 /// 挂新转发线程 + 重启退出轮询。调用前须已 kill 旧子
 unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     let (cols, rows) = (t.cols, t.rows);
-    if !crate::app::lifecycle::spawn_capacity_ok() {
-        eprintln!("[qt] 会话回收通道故障态,本轮不重开");
-        return;
+    // **r5-2 统一重启序**(同主窗):kill → drop 旧 → acquire 新 → spawn。
+    // 修前 QT 反序(先 acquire 后 drop):峰值多占一槽,且 spawn 失败
+    // 时新 permit 泄漏(旧 permit 已被换掉)
+    t.session.kill_child(); // 调用方契约中的"kill 旧子"在此完成
+    let old_pid = t.session.child_pid();
+    if let Some(pid) = old_pid {
+        crate::app::orphan::mark_session_closing(pid); // Closing:回收确认才移除
     }
-    let Some(new_permit) = crate::app::lifecycle::acquire_session() else {
-        eprintln!("[qt] 并发会话已达上限,本轮不重开");
+    let new_permit = crate::app::lifecycle::restart_transfer(&mut t.session_permit);
+    let Some(new_permit) = new_permit else {
+        eprintln!("[qt] 槽位被抢或 DEGRADED——本轮不重开,可重试");
         return;
     };
     let probe = crate::app::orphan::before_spawn();
     match mica_core::pty::PtySession::spawn(mica_core::pty::command_from_str(&t.shell), cols, rows)
     {
         Ok((session, reader)) => {
-            let old_pid = t.session.child_pid();
-            if let Some(pid) = old_pid {
-                crate::app::orphan::mark_session_closing(pid); // Closing:回收确认才移除
-            }
             if let Some(new_pid) = session.child_pid() {
                 crate::app::orphan::track_session_since(&probe, new_pid);
             }
-            // T08 二次返工:会话隔离(同主窗)——旧队列关、旧 writer
-            // 只面对旧队列取空退场,新队列/新 writer 随新会话诞生
+            // 换代 + 会话隔离(旧队列关闭,旧 writer 只面对旧队列)
             let new_gen = t.pty_buf.bump_generation();
             t.writeq.close();
             t.input_stage.clear(); // 旧会话输入欠账作废
-            // kill 旧子在上方已完成(调用方契约)→ permit 换新
-            drop(t.session_permit.take());
             t.session_permit = Some(new_permit);
             let old = std::mem::replace(&mut t.session, session);
             let writeq = crate::app::pty_bridge::WriteQueue::new();

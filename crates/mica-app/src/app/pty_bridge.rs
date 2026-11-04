@@ -427,8 +427,9 @@ impl WriteQueue {
         loop {
             if let Some(front) = st.queue.pop_front() {
                 st.bytes -= front.len();
-                self.popped_total
-                    .fetch_add(front.len() as u64, Ordering::Relaxed);
+                // popped_total **不在弹出时计**(复核 r5-3):弹出只证明
+                // writer 取走,不证明写入成功——计数在 writer_loop 的
+                // write_all 成功后由 note_written() 增加
                 self.space.notify_all(); // 腾出容量:通知续灌侧
                 return Some(front);
             }
@@ -471,6 +472,12 @@ impl WriteQueue {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.cap.saturating_sub(st.bytes)
     }
+
+    /// writer 报告一段写出成功(在 write_all 返回 Ok 后调用)。
+    /// popped_total 的语义 = "已成功交给 pty 管道"。
+    fn note_written(&self, bytes: usize) {
+        self.popped_total.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
 }
 
 /// writer 线程主体:独占消费写队列写 pty(经 `sink`)。写失败(管道
@@ -483,6 +490,9 @@ pub fn writer_loop(queue: Arc<WriteQueue>, sink: Arc<dyn BytesSink + Send + Sync
             eprintln!("[pty-writer] 写失败(管道断?):{e}");
             return;
         }
+        // 写出成功才计数(不是弹出时计)——popped 的语义是"已交给
+        // popped 的语义 = "已成功交给 pty 管道"(不是"writer 取走了")
+        queue.note_written(item.len());
     }
 }
 
@@ -563,6 +573,14 @@ pub fn stage_into(stage: &mut InputStage, queue: &WriteQueue, bytes: &[u8]) -> I
         if acc == bytes.len() {
             return InputFlow::Accepted;
         }
+        // **关闭竞态**(复核 r5-1):入口的 closed 检查与 try_push 之间
+        // writer 可能已 close——try_push 返回 0 且 acc==0 时复查;若
+        // 已关闭,**整体拒绝零副作用**(队列未收任何字节,暂存未动)。
+        // 修前直接塞暂存:600000 字节塞 512KiB 暂存,debug 断言 panic,
+        // release 丢 75712 字节还报 Debt(假接收)
+        if acc == 0 && queue.is_closed() {
+            return InputFlow::RejectedClosed;
+        }
         let rest = &bytes[acc..];
         let rejected = stage.stage(rest);
         debug_assert_eq!(
@@ -571,7 +589,11 @@ pub fn stage_into(stage: &mut InputStage, queue: &WriteQueue, bytes: &[u8]) -> I
         );
         return InputFlow::Debt(stage.len());
     }
-    // 旧欠账在:只追加,不绕过
+    // 旧欠账在:只追加,不绕过。追加前同样复查关闭(旧欠账在暂存,
+    // 关闭后 clear() 也会清——但新字节在已关闭会话里没有意义)
+    if queue.is_closed() {
+        return InputFlow::RejectedClosed;
+    }
     let rejected = stage.stage(bytes);
     debug_assert_eq!(rejected, 0, "事务预判通过后不允许部分拒收");
     InputFlow::Debt(stage.len())

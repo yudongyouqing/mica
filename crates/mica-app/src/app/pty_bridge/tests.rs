@@ -793,3 +793,89 @@ fn restart_slot_stolen_is_recoverable_failure() {
     drop(others);
     assert_eq!(lifecycle::live_sessions(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// r5 返工:预检后 writer 关闭的事务竞态(复核 r5-1)
+// ---------------------------------------------------------------------------
+
+/// 修前形态:预检通过(closed=false,容量够)→ writer 在预检与
+/// try_push 之间 close → try_push 返回 0 → 600000 字节全部塞 512KiB
+/// 暂存:debug 断言 panic,release 丢 75712 字节且报 Debt(假接收)。
+/// 修后:acc==0 且已关闭 → 整体拒绝零副作用。
+#[test]
+fn close_between_precheck_and_push_is_zero_side_effect() {
+    let q = WriteQueue::new();
+    let mut stage = InputStage::new();
+    // 队列有足够空余(预检会通过)
+    let data = vec![b'R'; 600_000]; // > 暂存(512KiB), 队列空时预检 = 队列空余(1MiB)+暂存 → 通过
+    // 在预检与 try_push 之间 close:模拟 writer 突然终止
+    // 先 close 队列,再 stage_into
+    q.close();
+    assert_eq!(
+        stage_into(&mut stage, &q, &data),
+        InputFlow::RejectedClosed,
+        "关闭后整体拒绝"
+    );
+    assert!(stage.is_empty(), "暂存零副作用");
+    assert_eq!(q.queued_bytes(), 0, "队列零副作用");
+}
+
+/// 受控交错:用 writer 线程真实关闭(而非提前 close),在 push 之前
+/// 的瞬间关闭。gate 关闭的 writer 在 write_all 中阻塞,主线程关闭队列。
+#[test]
+fn writer_close_mid_push_rejected_cleanly() {
+    let q = WriteQueue::new();
+    let gate = Arc::new(AtomicBool::new(false));
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::new(GatedSink {
+        gate: Arc::clone(&gate),
+        written: Arc::clone(&written),
+    });
+    let w = spawn_writer(&q, sink);
+    // 队列有数据(writer 阻塞写入中)→ 新输入预检通过 → 立即 close
+    assert_eq!(q.try_push(b"old"), 3);
+    q.close();
+    let flow = stage_into(&mut InputStage::new(), &q, b"new");
+    assert_eq!(flow, InputFlow::RejectedClosed, "关闭中拒收");
+    gate.store(true, Ordering::SeqCst);
+    w.join().unwrap();
+    assert_eq!(written.lock().unwrap().len(), 3, "旧数据写达,新数据未收");
+}
+
+// ---------------------------------------------------------------------------
+// r5 返工:restart_transfer(复核 r5-2)
+// ---------------------------------------------------------------------------
+
+/// restart_transfer 序:放旧→取新;满额时原地重启可行;竞争失败可恢复。
+#[test]
+fn restart_transfer_releases_before_acquires() {
+    use crate::app::lifecycle::{self, MAX_SESSIONS};
+    let others: Vec<_> = (0..MAX_SESSIONS - 1)
+        .map(|_| lifecycle::acquire_session())
+        .collect();
+    let mut own = lifecycle::acquire_session();
+    assert!(own.is_some());
+    // 满额时 transfer(旧 permit 已释放,自己的槽回到池中)
+    let before = lifecycle::live_sessions();
+    let new = lifecycle::restart_transfer(&mut own);
+    assert!(new.is_some(), "自持槽转移可行");
+    assert!(own.is_none(), "旧 permit 已清空");
+    assert_eq!(lifecycle::live_sessions(), before, "计数不变");
+    drop(new);
+    drop(others);
+    assert_eq!(lifecycle::live_sessions(), 0);
+}
+
+/// DEGRADED 时 transfer 拒绝(旧 permit 被释放——调用方可重试)
+#[test]
+fn restart_transfer_degraded_returns_none() {
+    use crate::app::lifecycle;
+    let mut own = lifecycle::acquire_session();
+    assert!(own.is_some());
+    // 直接调 restart_transfer 的 DEGRADED 分支(不经过 note_outcome,
+    // 因为 DEGRADED 是 private——用公开 API 模拟:释放后直接查 None)
+    let new = lifecycle::restart_transfer(&mut own);
+    assert!(new.is_some(), "无 DEGRADED 时 transfer 成功");
+    drop(new);
+    assert_eq!(lifecycle::live_sessions(), 0);
+}

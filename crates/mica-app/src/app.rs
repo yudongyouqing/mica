@@ -1509,45 +1509,38 @@ fn restart_active_pane() -> bool {
             return;
         };
         let t = &mut pane.terminal;
-        // 故障态门(回收通道满/断):拒绝创建新会话,泄漏上界不随重启增长
-        if !lifecycle::spawn_capacity_ok() {
-            eprintln!("[restart] 会话回收通道故障态,本轮拒绝重启");
-            return;
+        // **r5-2 统一重启序**(主窗与 QT 共用 lifecycle::restart_transfer):
+        // kill 旧 → 放旧 permit → 取新 permit → **然后才 spawn**——
+        // 修前反序(spawn 先行,permit 后转)在竞争失败时丢弃已 spawn
+        // 的新会话;也不查 spawn_capacity_ok(查"是否满"会阻止满额
+        // 原地重启,自持槽释放后取得到)
+        t.session.kill_child(); // ① kill 旧子(非阻塞)
+        let old_pid = t.session.child_pid();
+        if let Some(pid) = old_pid {
+            orphan::mark_session_closing(pid);
         }
-        // spawn 前快照:差分登记新会话宿主的确切身份(复核加固)
+        let new_permit = lifecycle::restart_transfer(&mut t.session_permit);
+        let Some(new_permit) = new_permit else {
+            eprintln!("[restart] 槽位被抢或 DEGRADED——pane 暂无会话,可重试");
+            return;
+        };
+        // ② permit 到手后 spawn
         let probe = orphan::before_spawn();
         let Ok((session, reader)) =
             PtySession::spawn(mica_core::pty::command_from_str(&shell), cols, rows)
         else {
             eprintln!("[restart] spawn 失败: {shell}");
+            drop(new_permit); // RAII 归还
             return;
         };
-        t.session.kill_child(); // 先杀旧子(非阻塞);restart 语义=旧会话终结
-        let old_pid = t.session.child_pid();
-        if let Some(pid) = old_pid {
-            orphan::mark_session_closing(pid); // Closing 态:回收确认才移除
-        }
         if let Some(new_pid) = session.child_pid() {
             orphan::track_session_since(&probe, new_pid);
         }
-        // T08 换代先行:旧代写入/输出立即失效(push/enqueue 按代退场),
-        // T08 二次返工:会话隔离——旧队列关闭(旧 writer 只面对旧队列,
-        // 取空退场,绝不触碰新会话数据);输出积压换代(清空+递增同界);
-        // 新队列/新 writer/新 writer_handle 随新会话诞生
+        t.session_permit = Some(new_permit);
+        // ③ 换代 + 会话隔离(旧队列关闭,旧 writer 只面对旧队列)
         let new_gen = t.pty_buf.bump_generation();
         t.writeq.close();
-        t.input_stage.clear(); // 旧会话的输入欠账作废
-        // 复核 5(四轮返工)permit 转移:**kill 旧 → 放旧 permit →
-        // 取新**——峰值严格 ≤MAX;槽位被其他窗口抢走时返回可恢复失败
-        // (无 expect):pane 无会话态,用户可重试重启
-        drop(t.session_permit.take());
-        let Some(new_permit) = lifecycle::acquire_session() else {
-            eprintln!("[restart] 槽位被其他窗口占用,重启失败——pane 暂无会话,可重试");
-            // 旧会话已 kill;新 spawn 的会话对象在此丢弃(子进程随其
-            // Drop 终结),reader 一并释放——不留孤儿
-            return;
-        };
-        t.session_permit = Some(new_permit);
+        t.input_stage.clear();
         let old = std::mem::replace(&mut t.session, session);
         let writeq = WriteQueue::new();
         let writer = t.session.writer_handle();
