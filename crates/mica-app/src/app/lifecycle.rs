@@ -120,8 +120,9 @@ pub fn reap_session_with_pid(child_pid: Option<u32>, session: PtySession) {
 }
 
 /// 副作用登记:Reaped → 清除故障态;FellBack → 置故障态。
-/// 独立成函数保证降级/恢复语义可确定性测试。
-fn note_outcome(outcome: EnqueueOutcome) {
+/// 独立成函数保证降级/恢复语义可确定性测试(pub(crate):重启失败
+/// 分支的测试用它注入真实 DEGRADED 态)。
+pub(crate) fn note_outcome(outcome: EnqueueOutcome) {
     match outcome {
         EnqueueOutcome::Reaped => DEGRADED.store(false, Ordering::Relaxed),
         EnqueueOutcome::FellBack => DEGRADED.store(true, Ordering::Relaxed),
@@ -193,13 +194,163 @@ pub fn spawn_capacity_ok() -> bool {
 /// 返回 acquire 结果;spawn 由调用方执行(permit 到手后再 spawn,
 /// spawn 失败调用方 drop 返回的 permit 即回滚)。
 pub fn restart_transfer(old: &mut Option<SessionPermit>) -> Option<SessionPermit> {
+    // 先放旧(自持槽回到池中——满额时原地重启由此可行)。DEGRADED
+    // 拒绝也必须放旧:调用方(restart_session_fields)此前已 kill 旧会话,
+    // 槽位随会话走,故障态不得多占(r5-2 修前 DEGRADED 早退在 take
+    // 之前,旧 permit 悬留)
+    drop(old.take());
+    // r5-2 测试注入点:放旧之后、取新之前(测试模拟另一窗口在此窗口
+    // 抢走刚释放的槽位——真实竞争窗口,生产无操作)
+    #[cfg(test)]
+    on_permit_released();
     if DEGRADED.load(Ordering::Relaxed) {
         return None;
     }
-    // 先放旧(自持槽回到池中——满额时原地重启由此可行)
-    drop(old.take());
     // 再取新(其他窗口可能抢走——返回 None 即 SlotStolen)
     acquire_session()
+}
+
+// r5-2 注入点载体(同 pty_bridge 的 PUSH_LOCKED_HOOK 模式):restart_
+// transfer 放旧与取新之间的窗口,测试注入并发抢槽。pub(crate):测试
+// 模块在 pty_bridge::tests(兄弟模块),须跨模块可见。
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PERMIT_RELEASED_HOOK: std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn on_permit_released() {
+    PERMIT_RELEASED_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
+}
+
+/// 重启失败原因(全部可重试——pane 留 Stopped 态,再次调用本流即可)。
+#[derive(Debug)]
+pub enum RestartFailure {
+    /// permit 转移失败:DEGRADED 故障态或槽位被其他窗口抢走
+    /// (旧 permit 已释放,旧会话已回收——重试即可恢复)。
+    DegradedOrSlotStolen,
+    /// 新会话 spawn 失败(shell 命令无效/系统资源不足)。
+    /// 新 permit 已 RAII 归还。
+    SpawnFailed(String),
+}
+
+impl std::fmt::Display for RestartFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DegradedOrSlotStolen => write!(
+                f,
+                "会话槽位被抢或回收通道故障(DEGRADED)——pane 已停止,可重试"
+            ),
+            Self::SpawnFailed(e) => write!(f, "新会话启动失败({e})——pane 已停止,可重试"),
+        }
+    }
+}
+
+/// 把旧会话换出并交后台回收(r5-2:**所有**重启路径——成功与失败——
+/// 都回收旧 PTY,ClosePseudoConsole 不上 UI 线程;占位会话无子可收,
+/// 直接丢弃,Drop 无阻塞面)。
+fn swap_out_old(session: &mut mica_core::pty::PtySession, old_pid: Option<u32>) {
+    let old = std::mem::replace(session, mica_core::pty::PtySession::detached());
+    match old_pid {
+        Some(pid) => reap_session_with_pid(Some(pid), old),
+        None => drop(old),
+    }
+}
+
+/// **生产共享重启流**(T08 r5-2;主窗 `restart_active_pane` 与 QT
+/// `qt_respawn` 的唯一会话路径——按字段传入而非 `&mut Terminal`,
+/// 是为了失败/恢复分支可用真实 PTY 走生产函数测试,不必构造整个
+/// Terminal(GPU 路由等重建成本))。
+///
+/// 契约(任一步失败,pane 都已处于安全的 **Stopped 态**且可重试):
+/// 1. kill 旧子(非阻塞;detached 占位时为空操作);
+/// 2. **Stopped 化**:关旧写队列(`stage_into` → RejectedClosed,停止
+///    接受输入)+ 欠账作废 + 输出积压换代(旧 forwarder 出局);
+/// 3. permit 转移(放旧 → 取新;DEGRADED/槽位被抢 → 失败);
+/// 4. spawn 新会话(失败 → permit RAII 归还);
+/// 5. **回收旧 PTY** 并组装新会话/新写队列/新 writer。
+///
+/// 失败分支同样回收旧 PTY(不再等新 spawn 成功才回收——r5-2:失败
+/// 时旧 writeq/欠账/积压的终结同样完成);permit 转移先于回收:reap
+/// 成功会自愈 DEGRADED,若回收先行,通道健康时 DEGRADED 分支永远
+/// 打不到(与"故障态 ⇒ Stopped"的语义冲突)。失败不回滚已完成的
+/// 终结(旧子已 kill,半开状态只会更糟);调用方拿到 `Err` 后 pane
+/// 输入一律拒绝、`child_pid` 恒 None,重试即从步骤 1 走全流程。
+/// 成功返回 `(reader, new_gen)`,渲染侧接线(新 Surface/forwarder)
+/// 由调用方完成。
+#[allow(clippy::too_many_arguments)]
+pub fn restart_session_fields(
+    session: &mut mica_core::pty::PtySession,
+    permit: &mut Option<SessionPermit>,
+    writeq: &mut std::sync::Arc<super::pty_bridge::WriteQueue>,
+    input_stage: &mut super::pty_bridge::InputStage,
+    pty_buf: &super::pty_bridge::PtyBacklog,
+    shell: &str,
+    cols: u16,
+    rows: u16,
+    exited: &mut Option<u32>,
+) -> Result<(mica_core::pty::PtyReader, u64), RestartFailure> {
+    // ① kill 旧子(非阻塞;detached 占位无子,空操作)
+    session.kill_child();
+    let old_pid = session.child_pid();
+    if let Some(pid) = old_pid {
+        super::orphan::mark_session_closing(pid);
+    }
+    // ② Stopped 化:停止接受输入 + 欠账作废 + 换代(此后任何失败都安全)
+    writeq.close();
+    input_stage.clear();
+    let new_gen = pty_buf.bump_generation();
+    // ③ permit 转移:放旧 → 取新(DEGRADED/被抢 → 可重试失败;
+    // 失败分支同样回收旧 PTY,pane 留 Stopped 态)
+    let new_permit = restart_transfer(permit);
+    let Some(new_permit) = new_permit else {
+        swap_out_old(session, old_pid);
+        return Err(RestartFailure::DegradedOrSlotStolen);
+    };
+    // ④ spawn 新会话(失败:permit RAII 归还,pane 留 Stopped 可重试)
+    let probe = super::orphan::before_spawn();
+    let (new_session, reader) = match mica_core::pty::PtySession::spawn(
+        mica_core::pty::command_from_str(shell),
+        cols,
+        rows,
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            drop(new_permit);
+            swap_out_old(session, old_pid);
+            return Err(RestartFailure::SpawnFailed(e.to_string()));
+        }
+    };
+    if let Some(new_pid) = new_session.child_pid() {
+        super::orphan::track_session_since(&probe, new_pid);
+    }
+    // ⑤ 回收旧 PTY + 组装新会话/新队列/writer(旧 writer 只面对旧
+    //    队列,close 后自然退场)
+    swap_out_old(session, old_pid);
+    *session = new_session;
+    *permit = Some(new_permit);
+    *exited = None;
+    let fresh = super::pty_bridge::WriteQueue::new();
+    let writer = session.writer_handle();
+    {
+        let wq = std::sync::Arc::clone(&fresh);
+        std::thread::Builder::new()
+            .name("pty-writer".into())
+            .spawn(move || {
+                super::pty_bridge::writer_loop(
+                    wq,
+                    std::sync::Arc::new(super::pty_bridge::SessionSink(writer)),
+                )
+            })
+            .expect("spawn pty writer");
+    }
+    *writeq = fresh;
+    Ok((reader, new_gen))
 }
 
 /// 诊断面:当前并发会话数。
@@ -274,9 +425,34 @@ pub fn close_terminal(mut t: super::Terminal) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    /// 测试串行闸:reaper/槽位/DEGRADED 都是进程级全局——pty_bridge
+    /// 的 budget_guard 委托到这里,两个模块的测试共用一把锁,消灭
+    /// 跨模块并发的全局态互踩(回收积压超时/槽位断言踩数/DEGRADED
+    /// 翻转竞态)。
+    pub(crate) fn global_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static G: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        G.get_or_init(|| {
+            // portable-pty prefers a bare "conpty.dll" over kernel32. The
+            // lib harness does not enter app::run's PATH sanitization, so a
+            // third-party terminal on PATH can silently supply its host/DLL.
+            // Restrict only this test process's loader before its first PTY;
+            // do not mutate PATH concurrently with Rust test threads.
+            use windows::Win32::System::LibraryLoader::{
+                LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
+            };
+            // SAFETY: process-local loader policy, initialized once before
+            // tests using this guard create any ConPTY. No paths/handles move.
+            unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) }
+                .expect("set test DLL search policy");
+            std::sync::Mutex::new(())
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    }
 
     fn short_session() -> (PtySession, Option<u32>) {
         let (mut s, r) = PtySession::spawn(
@@ -291,17 +467,21 @@ mod tests {
         (s, pid)
     }
 
-    /// 真 pty 会话交回收器:在途归零 = 后台 Drop 完成(不卡 UI)。
+    /// 真 pty 会话交回收器:REAPED_OK 增量出现 = 本会话后台 Drop 完成
+    /// (不卡 UI)。r5 改增量断言:全局 in-flight 归零受并行测试的回收
+    /// 积压影响(每任务 ClosePseudoConsole 秒级),轮到本会话可能超
+    /// 10s——增量证明"交后台且确实回收",不与他人积压耦合。
     #[test]
     fn session_is_dropped_off_thread() {
+        let _g = global_test_guard();
+        let reaped_before = reaper_stats().0;
         let (session, pid) = short_session();
         reap_session_with_pid(pid, session);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while reaper_stats().2 > 0 {
+        while reaper_stats().0 <= reaped_before {
             assert!(Instant::now() < deadline, "10s 内未完成后台回收");
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(reaper_stats().0 >= 1);
     }
 
     /// 满通道(消费者卡死不 recv):**立即**降级 forget,零阻塞——
@@ -310,14 +490,17 @@ mod tests {
     #[test]
     fn full_channel_falls_back_immediately_without_blocking() {
         let (tx, rx) = sync_channel::<ReapTask>(1);
-        let (filler, _) = short_session();
+        // This test deliberately forgets the rejected task. A real ConPTY
+        // would therefore leave its host alive after the test process exits.
+        // No OS resource is needed to test the queue's full/disconnected arms.
+        let filler = PtySession::detached();
         tx.try_send(ReapTask {
             child_pid: None,
             session: filler,
         })
         .expect("占位入队");
         // rx 存活但永不 recv(卡死形态):第二个必须立即降级
-        let (session, _) = short_session();
+        let session = PtySession::detached();
         let start = Instant::now();
         let out = enqueue_with(
             &tx,
@@ -342,7 +525,7 @@ mod tests {
     fn disconnected_channel_falls_back_immediately() {
         let (tx, rx) = sync_channel::<ReapTask>(4);
         drop(rx);
-        let (session, _) = short_session();
+        let session = PtySession::detached();
         let start = Instant::now();
         let out = enqueue_with(
             &tx,
@@ -357,8 +540,10 @@ mod tests {
     }
 
     /// 故障态语义:FellBack → spawn_capacity_ok=false;Reaped → 恢复 true。
+    /// 持串行闸:DEGRADED 是进程级全局,restart 系测试同时翻转。
     #[test]
     fn degraded_state_gate_and_recovery() {
+        let _g = global_test_guard();
         note_outcome(EnqueueOutcome::FellBack);
         assert!(!spawn_capacity_ok(), "降级后必须拒绝新会话");
         note_outcome(EnqueueOutcome::Reaped);
@@ -383,7 +568,10 @@ mod tests {
             }
         });
         for _ in 0..50 {
-            let (session, _) = short_session();
+            // This is a channel/accounting test, not a ConPTY teardown test.
+            // A slow host Drop can fill the channel and intentionally forget
+            // later tasks; detached tasks cannot leak busy-looping hosts.
+            let session = PtySession::detached();
             enqueue_with(
                 &tx,
                 ReapTask {

@@ -79,8 +79,11 @@ pub struct PtySession {
     /// 写端独立 Arc 互斥:句柄可在会话外分发(writer 线程),会话的
     /// write 同源;控制面(kill/resize/wait)不碰这把锁。
     writer: std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    /// None = detached 占位(重启失败后的 Stopped 态,见 [`Self::detached`])。
+    master: Option<Box<dyn MasterPty + Send>>,
+    /// None = detached 占位:kill/try_wait 退化为无害操作,child_pid
+    /// 恒 None(孤儿注册表/回收按"无子"处理)。
+    child: Option<Box<dyn Child + Send + Sync>>,
 }
 
 /// 命令行字符串(exe + 空格分隔参数)→ CommandBuilder(M3a profile 用;
@@ -178,11 +181,23 @@ impl PtySession {
         Ok((
             Self {
                 writer: std::sync::Arc::new(std::sync::Mutex::new(writer)),
-                master: pair.master,
-                child,
+                master: Some(pair.master),
+                child: Some(child),
             },
             PtyReader { rx },
         ))
+    }
+
+    /// 无会话占位(**Stopped 态**,T08 r5-2:重启失败后 pane 持有它直到
+    /// 下次重试成功)。master/child 均空——kill/try_wait 无害空操作、
+    /// child_pid 恒 None、resize 报错、Drop 无阻塞面(无 ConPTY 可关);
+    /// 写端是黑洞(Vec):管道不存在,写入无人消费也不报错。
+    pub fn detached() -> Self {
+        Self {
+            writer: std::sync::Arc::new(std::sync::Mutex::new(Box::new(Vec::new()))),
+            master: None,
+            child: None,
+        }
     }
 
     /// Bytes typed by the user. `&self`(T08):写端内部互斥。
@@ -207,12 +222,16 @@ impl PtySession {
     }
 
     /// 子进程 PID(孤儿会话注册表按 PID+创建时间证明归属,2026-11 T02)。
+    /// detached 占位恒 None。
     pub fn child_pid(&self) -> Option<u32> {
-        self.child.process_id()
+        self.child.as_ref().and_then(|c| c.process_id())
     }
 
     pub fn resize(&self, columns: u16, rows: u16) -> anyhow::Result<()> {
-        self.master.resize(PtySize {
+        let Some(master) = self.master.as_ref() else {
+            anyhow::bail!("detached 会话(Stopped 态)无 pty 可 resize");
+        };
+        master.resize(PtySize {
             rows,
             cols: columns,
             pixel_width: 0,
@@ -226,13 +245,21 @@ impl PtySession {
     /// 清杀只杀 OpenConsole,powershell 失宿主被 defterm 重派终端
     /// (WT 弹窗/0xC0000142,"第二次启动报错"的真身)。kill 是
     /// TerminateProcess 非阻塞,try_wait 收割不等待——永不挂。
+    /// detached 占位无子,空操作。
     pub fn kill_child(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.try_wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.try_wait();
+        }
     }
 
+    /// detached 占位恒 `Ok(None)`(无子可等——Stopped 态 pane 不触发
+    /// 退出事件,重试入口保持可用)。
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        match self.child.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
+        }
     }
 }
 
@@ -243,8 +270,11 @@ impl Drop for PtySession {
         // 计划 T9,UX 处理归 M2。
         // portable-pty 的 kill 是 SIGHUP→轮询→SIGKILL 升级,但 SIGKILL 路径
         // 不 wait —— 补一次收割,否则 trap 了 HUP 的子进程每个留一个僵尸。
-        let _ = self.child.kill();
-        let _ = self.child.try_wait();
+        // detached 占位无子,空操作(Drop 无阻塞面)。
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.try_wait();
+        }
     }
 }
 

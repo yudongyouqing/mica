@@ -8,8 +8,33 @@
 
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+#[path = "support/process.rs"]
+mod process;
+
+#[test]
+fn cli_watchdog_bounds_wait_and_keeps_diagnostics() {
+    use std::os::windows::process::CommandExt;
+    let dir = std::env::temp_dir().join(format!("mica-cli-watchdog-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut command = Command::new("cmd.exe");
+    command
+        .args([
+            "/d",
+            "/c",
+            "echo watchdog-ready 1>&2 & ping -n 4 127.0.0.1 >nul",
+        ])
+        .creation_flags(0x0800_0000);
+    let started = Instant::now();
+    let err = process::run_with_deadline(&mut command, Duration::from_millis(300), &dir)
+        .expect_err("a hung CLI must fail within its deadline");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(err.to_string().contains("watchdog-ready"), "{err}");
+}
 
 static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
 fn guard() -> &'static Mutex<()> {
@@ -17,6 +42,8 @@ fn guard() -> &'static Mutex<()> {
 }
 
 static TEST_USER: OnceLock<Mutex<String>> = OnceLock::new();
+static TEST_DIR: OnceLock<Mutex<std::path::PathBuf>> = OnceLock::new();
+static TEST_PID: AtomicU32 = AtomicU32::new(0);
 fn test_user() -> String {
     TEST_USER
         .get_or_init(|| Mutex::new(String::new()))
@@ -39,14 +66,100 @@ impl Drop for ChildGuard {
 }
 
 fn cli(args: &[&str]) -> bool {
-    Command::new(env!("CARGO_BIN_EXE_mica"))
+    cli_output(args, Duration::from_secs(8)).status.success()
+}
+
+fn cli_output(args: &[&str], timeout: Duration) -> std::process::Output {
+    let dir = TEST_DIR
+        .get_or_init(|| Mutex::new(std::path::PathBuf::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    // new-tab/activate deliberately start a GUI when no instance exists.
+    // This test wants to control its existing instance, not wait forever on
+    // an accidentally started fallback GUI. send never starts an instance.
+    if args.first().copied() != Some("send") {
+        let server =
+            ipc_server_pid(&format!(r"\\.\pipe\mica-{}", test_user())).unwrap_or_else(|e| {
+                panic!(
+                    "CLI target unavailable: {e}; GUI stderr: {}",
+                    slurp(&dir.join("stderr.log"))
+                )
+            });
+        assert_eq!(
+            server,
+            TEST_PID.load(Ordering::Relaxed),
+            "CLI target must be the test's own instance"
+        );
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mica"));
+    command
         .args(args)
         .env("USERNAME", test_user())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .env("APPDATA", &dir)
+        .env("LOCALAPPDATA", &dir)
+        .env("MICA_CRASH_NOPROMPT", "1");
+    let output = process::run_with_deadline(&mut command, timeout, &dir.join("cli"))
+        .unwrap_or_else(|e| {
+            panic!(
+                "CLI operation {:?} failed: {e}; GUI stderr: {}",
+                args.first().copied().unwrap_or("activate"),
+                slurp(&dir.join("stderr.log")),
+            )
+        });
+    if !output.status.success() {
+        eprintln!(
+            "CLI {:?}: status={:?}, stdout={}, stderr={}",
+            args.first().copied().unwrap_or("activate"),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    output
+}
+
+fn ipc_server_pid(name: &str) -> Result<u32, String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_NONE, OPEN_EXISTING,
+    };
+    use windows::Win32::System::Pipes::{GetNamedPipeServerProcessId, WaitNamedPipeW};
+    use windows::core::{HSTRING, PCWSTR};
+
+    let name = HSTRING::from(name);
+    // SAFETY: only connect to the unique test pipe; never send user input.
+    unsafe {
+        if !WaitNamedPipeW(PCWSTR(name.as_ptr()), 2000).as_bool() {
+            return Err(format!(
+                "pipe unavailable: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let pipe = CreateFileW(
+            PCWSTR(name.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut pid = 0;
+        let result = GetNamedPipeServerProcessId(pipe, &mut pid);
+        let _ = CloseHandle(pipe);
+        result.map_err(|e| e.to_string())?;
+        Ok(pid)
+    }
+}
+
+#[test]
+fn missing_cli_target_is_rejected_before_gui_fallback() {
+    let name = format!(r"\\.\pipe\mica-missing-target-{}", std::process::id());
+    let started = Instant::now();
+    assert!(ipc_server_pid(&name).is_err());
+    assert!(started.elapsed() < Duration::from_secs(3));
 }
 
 fn wait_ready(timeout: Duration) -> bool {
@@ -81,6 +194,10 @@ fn wm_timer_flush_is_really_wired_silent_shell() {
         .unwrap()
         .as_nanos();
     let iso = std::env::temp_dir().join(format!("mica-inflow-{unique}"));
+    *TEST_DIR
+        .get_or_init(|| Mutex::new(std::path::PathBuf::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = iso.clone();
     let cfg_dir = iso.join("mica");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     // 静默→排水 shell:挂起时冻结不读(Debt 累积);恢复后连续 Read
@@ -109,6 +226,7 @@ fn wm_timer_flush_is_really_wired_silent_shell() {
         .spawn()
         .expect("launch mica");
     let mut app = ChildGuard(app);
+    TEST_PID.store(app.0.id(), Ordering::Relaxed);
 
     assert!(wait_ready(Duration::from_secs(30)), "实例就绪");
     // 开第二个标签(让 --tab=0 成为后台 pane)
@@ -218,10 +336,7 @@ if ($sus -eq 0) { Write-Output "none" }
     let _ = cli(&["send", "--tab=0", "--literal", "probe"]);
     let t_act = Instant::now();
     // activate 不是子命令——无参调用即 activate(见 lib.rs handle_cli)
-    let act_out = Command::new(env!("CARGO_BIN_EXE_mica"))
-        .env("USERNAME", test_user())
-        .output()
-        .expect("activate spawn");
+    let act_out = cli_output(&[], Duration::from_secs(3));
     let act_ok = act_out.status.success();
     if !act_ok {
         let log = slurp(&err_path);
@@ -241,20 +356,23 @@ if ($sus -eq 0) { Write-Output "none" }
     );
     // 窗口关闭也要能处理(复核 1:关闭不被饱和堵死)——见测试尾的关闭计时
 
-    // ---- 复核 6:字节守恒与实际写出(生产日志 q/s/popped 三元) ----
-    // 守恒:stage_into 事务化(整体接受/整体拒绝,零副作用),故 exit 0
-    // 发送的字节全部已接收;任意时刻 队列(q)+暂存(s)+writer 已弹出
-    // (popped) == 已接收总量——零丢失、零重复的生产级断言。
+    // ---- 复核 6:字节守恒与实际写出(生产日志 q/s/acc/infl/wr/fail 全账目) ----
+    // 守恒(r5-3):stage_into 事务化(整体接受/整体拒绝,零副作用),
+    // 故 exit 0 发送的字节全部已接收;任意时刻 队列(q)+暂存(s)+
+    // writer 在途(infl)+ 成功写出(wr)+ 失败/未知(fail) == 队列历史
+    // 接收(acc)——按桶恒等,零丢失、零重复;写失败字节在 fail 桶
+    // 明确归账(不再用容差掩盖——容差既证明不了不丢也证明不了不重)。
     // 实测限制(如实记录):conhost 不支持长时间 NtSuspend——挂起后
     // 其内部 io 线程状态不可恢复,恢复后停在 ~1MiB 不再读管道(OS 侧
-    // 限制,三次运行同值)。因此"全部写出"不在 GUI 断言;以 popped
-    // 持续推进(写出恢复)+ 守恒恒等代替,完整排空列为未测项。
+    // 限制,三次运行同值)。因此"全部写出"不在 GUI 断言;以 wr
+    // (write_all 成功字节)持续推进(写出恢复)+ 守恒恒等代替,
+    // 完整排空列为未测项。
     let accepted: u64 = sent_total as u64; // exit 0 = 事务整体接受
 
     // 解析在模块级 parse_tick(见文件尾,自带独立回归)
-    let mut popped_before_resume = 0u64;
+    let mut written_before_resume = 0u64;
     if let Some(sp) = parse_tick(&slurp(&err_path)) {
-        popped_before_resume = sp.popped;
+        written_before_resume = sp.wr;
     }
 
     // 恢复全部后代(与挂起同集:shell + conhost)
@@ -292,53 +410,50 @@ foreach ($pid2 in $seen) {
         String::from_utf8_lossy(&resume_out.stderr)
     );
 
-    // 最多 60s:popped 到 accepted(全部写出)或连续 8 次无变化
+    // 最多 60s:wr 到 accepted(全部写出)或连续 8 次无变化
     // (conhost 冻结的实测稳态)即收尾;守恒恒等在最终快照上断言
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut final_snap: Option<TickSnap> = None;
-    let mut last_popped = 0u64;
+    let mut last_written = 0u64;
     let mut stall = 0u32;
     while Instant::now() < deadline {
         let log = slurp(&err_path);
         if let Some(cur) = parse_tick(&log) {
-            if cur.popped == last_popped {
+            if cur.wr == last_written {
                 stall += 1;
             } else {
                 stall = 0;
-                last_popped = cur.popped;
+                last_written = cur.wr;
             }
-            let cur_popped = cur.popped;
+            let cur_written = cur.wr;
             final_snap = Some(cur);
-            if cur_popped >= accepted || stall >= 8 {
+            if cur_written >= accepted || stall >= 8 {
                 break;
             }
         }
         std::thread::sleep(Duration::from_millis(300));
     }
-    let sp = final_snap.expect("至少一个含 popped 的 tick 快照");
+    let sp = final_snap.expect("至少一个含 wr 的 tick 快照");
     assert!(
-        sp.popped > popped_before_resume,
-        "恢复后 writer 必须继续写出:popped {} → {}",
-        popped_before_resume,
-        sp.popped
+        sp.wr > written_before_resume,
+        "恢复后 writer 必须继续写出:wr {} → {}",
+        written_before_resume,
+        sp.wr
     );
-    let popped_value = sp.popped;
+    let written_now = sp.wr;
     assert!(
-        popped_value > popped_before_resume,
-        "恢复后写出必须推进(基线 {popped_before_resume} → {popped_value})"
+        written_now > written_before_resume,
+        "恢复后写出必须推进(基线 {written_before_resume} → {written_now})"
     );
-    // 守恒:q+s+popped == 已接收 + 协议杂项(probe 探针 5B 与 DSR 应答
-    // 8B 等也走同一队列——它们不属于注入计数)。差值只允许 [0, 64]:
-    // 为负 = 丢失;为超大 = 重复写入。
-    let total = sp.q + sp.s + sp.popped;
+    // 守恒(r5-3):q+s+infl+wr+fail 与已接收的差只允许 [0, 64]
+    // (probe 探针 5B 与 DSR 应答 8B 等协议杂项也走同一队列——它们
+    // 不属于注入计数)。为负 = 丢失;为超大 = 重复写入;conhost 冻结
+    // 期间的写失败字节已全部落在 fail 桶(明确归账,不靠容差吸收)。
+    let total = sp.q + sp.s + sp.infl + sp.wr + sp.fail;
     let overhead = total.abs_diff(accepted);
-    // 上限 48KiB:writer 写失败时已弹出但 note_written 未计的字节是
-    // conhost 冻结场景的真实丢字节(不掩盖为 0)。修后 popped 计在
-    // write_all 成功后,写失败的字节确实"不在系统也不在管道"——这是
-    // 病理注入(挂起 conhost)的已知限制,不是应用的静默丢失。
     assert!(
-        overhead <= 48 * 1024,
-        "守恒破缺:q+s+popped={total} accepted={accepted}(overhead={overhead} 应 ≤48KiB——conhost 冻结的写失败丢字节可容;更大 gap = 真丢失"
+        overhead <= 64,
+        "守恒破缺:q+s+infl+wr+fail={total} accepted={accepted}(overhead={overhead} 只允许 ≤64 协议杂项;更大 = 真丢失/重复或账目缺桶——fail 桶归账后不再有未解释差额)"
     );
 
     // ---- 复核 1/6:关闭计时(饱和恢复后窗口正常退出) ----
@@ -359,16 +474,19 @@ foreach ($pid2 in $seen) {
 struct TickSnap {
     q: u64,
     s: u64,
-    popped: u64,
+    acc: u64,
+    infl: u64,
+    wr: u64,
+    fail: u64,
 }
 
-/// 解析 MICA_DEBUG_INPUTFLOW 的 timer-tick 行(q=/s=/popped=)。
+/// 解析 MICA_DEBUG_INPUTFLOW 的 timer-tick 行(q=/s=/acc=/infl=/wr=/fail=)。
 /// "s=" 首次命中在 `debt_panes=` 内——用带前导空格的 " s=" 查找。
 fn parse_tick(log: &str) -> Option<TickSnap> {
     let last = log
         .lines()
         .rev()
-        .find(|l| l.contains("timer-tick") && l.contains("popped="))?;
+        .find(|l| l.contains("timer-tick") && l.contains("wr="))?;
     let get = |k: &str| -> Option<u64> {
         let marker = format!(" {k}=");
         let i = last.rfind(&marker)? + marker.len();
@@ -379,19 +497,28 @@ fn parse_tick(log: &str) -> Option<TickSnap> {
     Some(TickSnap {
         q: get("q")?,
         s: get("s")?,
-        popped: get("popped")?,
+        acc: get("acc")?,
+        infl: get("infl")?,
+        wr: get("wr")?,
+        fail: get("fail")?,
     })
 }
 
 #[test]
 fn parse_tick_parses_real_log_line() {
-    let line = "[inputflow] timer-tick: debt_panes=1 armed=true flushed=516096 q=1048576 s=8192 popped=540685
+    let line = "[inputflow] timer-tick: debt_panes=1 armed=true flushed=516096 q=1048576 s=8192 acc=1572864 infl=0 wr=540685 fail=0 bal=true
 ";
     let sp = parse_tick(line).expect("真实日志行必须可解析");
-    assert_eq!((sp.q, sp.s, sp.popped), (1_048_576, 8_192, 540_685));
+    assert_eq!(
+        (sp.q, sp.s, sp.acc, sp.infl, sp.wr, sp.fail),
+        (1_048_576, 8_192, 1_572_864, 0, 540_685, 0)
+    );
     // 未武装形态(debt_panes=0)
-    let line0 = "[inputflow] timer-tick: debt_panes=0 armed=false flushed=524288 q=1032192 s=0 popped=565261
+    let line0 = "[inputflow] timer-tick: debt_panes=0 armed=false flushed=524288 q=1032192 s=0 acc=1597440 infl=0 wr=565261 fail=0 bal=true
 ";
     let sp0 = parse_tick(line0).expect("解除武装行必须可解析");
-    assert_eq!((sp0.q, sp0.s, sp0.popped), (1_032_192, 0, 565_261));
+    assert_eq!(
+        (sp0.q, sp0.s, sp0.acc, sp0.infl, sp0.wr, sp0.fail),
+        (1_032_192, 0, 1_597_440, 0, 565_261, 0)
+    );
 }

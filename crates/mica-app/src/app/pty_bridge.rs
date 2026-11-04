@@ -367,16 +367,86 @@ impl Drop for PtyBacklog {
 // 会话隔离的写队列(每会话一个;UI 全非阻塞)
 // ---------------------------------------------------------------------------
 
+// r5-1 测试注入点:try_push/append_if_open 取得 state 锁之后、关闭
+// 复查之前触发。测试用它模拟"预检 open → close 在别处完成持锁置位 →
+// 提交"的准确交错——注入的 store 等价于 close() 在我们加锁前提交,
+// 若关闭复查在锁内(正确实现)必看到并拒收;若在锁外(修前实现)
+// 则假接受。thread_local:注入只影响当前测试线程,无需跨线程同步。
+#[cfg(test)]
+thread_local! {
+    static PUSH_LOCKED_HOOK: std::cell::RefCell<Option<std::rc::Rc<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn on_push_locked() {
+    PUSH_LOCKED_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
+}
+
 struct WqState {
     queue: VecDeque<Vec<u8>>,
     bytes: usize,
 }
 
+/// try_push 的结构化结果(复核 r5-1:关闭判定必须与接收提交在同一
+/// 锁临界区内——锁外预检的 closed 存在"预检 open → close 提交 →
+/// 锁内入队"的假接受窗口,故障注入实测 Accepted+closed+数据无人消费)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushFlow {
+    /// 已接收 n 字节进队列(n 可小于请求长度——余量由调用方暂存)。
+    Accepted(usize),
+    /// 队列已满:本次接收 0 字节(调用方暂存后重试)。
+    Full,
+    /// 队列已关闭:本次接收 0 字节,**不得**再暂存(整体拒绝)。
+    Closed,
+}
+
+/// 写队列账目快照(复核 r5-3:守恒断言不再用容差代替)。
+/// 恒等式:`accepted == queued + inflight + written + failed_unknown`
+/// 在任意时刻成立(各桶计数与队列变动同在 state 锁临界区内递增)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WqAccounting {
+    /// 历史接收进队列的字节(提交点计数,含已消费)。
+    pub accepted: u64,
+    /// 现存队列字节。
+    pub queued: u64,
+    /// writer 已取出、write_all 尚未定论的字节。
+    pub inflight: u64,
+    /// write_all 返回 Ok 的字节(= 已成功交给管道)。
+    pub written: u64,
+    /// write_all 返回 Err 的整块字节 + 写失败后遗弃的滞留队列字节。
+    /// **结果未知**:io::Write::write_all 出错时可能已写入部分字节,
+    /// 这些字节"在系统外也可能在管道里"——不得断言整块未达管道。
+    pub failed_unknown: u64,
+}
+
+impl WqAccounting {
+    /// 守恒恒等式(无故障测试要求精确成立;故障注入要求差额全部
+    /// 落在 failed_unknown 桶)。
+    pub fn balanced(&self) -> bool {
+        self.accepted == self.queued + self.inflight + self.written + self.failed_unknown
+    }
+}
+
 pub struct WriteQueue {
     cap: usize,
     closed: AtomicBool,
-    /// writer 累计弹出(=已交给 write_all 的字节;GUI 验收守恒断言用)。
+    /// 历史接收字节(锁内提交点累计)。
+    accepted_total: AtomicU64,
+    /// writer 累计弹出(取出队列、待 write_all 定论;锁内与弹出同界)。
     popped_total: AtomicU64,
+    /// write_all 成功字节。
+    written_total: AtomicU64,
+    /// write_all 失败的整块字节(已弹出;结果未知——部分可能已达管道)。
+    failed_blocks: AtomicU64,
+    /// 写失败后从滞留队列遗弃的字节(已接收、从未弹出、永不出队)。
+    /// 与 failed_blocks 分开计:inflight 推导自 popped,混入未弹出
+    /// 字节会破坏恒等式(r5-3)。
+    stranded: AtomicU64,
     state: Mutex<WqState>,
     space: Condvar,
 }
@@ -386,7 +456,11 @@ impl WriteQueue {
         Arc::new(Self {
             cap: WRITE_QUEUE_BYTES,
             closed: AtomicBool::new(false),
+            accepted_total: AtomicU64::new(0),
             popped_total: AtomicU64::new(0),
+            written_total: AtomicU64::new(0),
+            failed_blocks: AtomicU64::new(0),
+            stranded: AtomicU64::new(0),
             state: Mutex::new(WqState {
                 queue: VecDeque::new(),
                 bytes: 0,
@@ -399,37 +473,70 @@ impl WriteQueue {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// UI 非阻塞入队:装多少收多少,返回**接收的字节数**(装不下的
-    /// 由调用方暂存)。关闭后接收 0。入队成功即唤醒 writer(复核 1:
-    /// 旧 enqueue 不 notify,writer 睡死)。
-    pub fn try_push(&self, bytes: &[u8]) -> usize {
-        if bytes.is_empty() || self.is_closed() {
-            return 0;
+    /// UI 非阻塞入队:装多少收多少(装不下的由调用方暂存)。入队成功
+    /// 即唤醒 writer(复核 1:旧 enqueue 不 notify,writer 睡死)。
+    ///
+    /// **关闭判定在 state 锁内**(r5-1):与 `close` 的持锁置位互斥——
+    /// 要么 close 先提交(此处看到 closed → `PushFlow::Closed`,零接收),
+    /// 要么本推送先提交(close 之后落位,writer 取空才退场,数据仍会
+    /// 写出)。不存在"预检 open → close 提交 → 锁内假接受"的窗口。
+    pub fn try_push(&self, bytes: &[u8]) -> PushFlow {
+        if bytes.is_empty() {
+            return if self.is_closed() {
+                PushFlow::Closed
+            } else {
+                PushFlow::Accepted(0)
+            };
         }
         let accepted = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            // r5-1 注入点:取得锁之后、关闭复查之前(测试模拟 close 在
+            // 预检后、提交前完成持锁置位的准确交错;见 tests.rs)
+            #[cfg(test)]
+            on_push_locked();
+            if self.is_closed() {
+                return PushFlow::Closed;
+            }
             let room = self.cap.saturating_sub(st.bytes);
             let take = room.min(bytes.len());
             if take == 0 {
-                return 0;
+                return PushFlow::Full;
             }
             st.bytes += take;
             st.queue.push_back(bytes[..take].to_vec());
+            self.accepted_total
+                .fetch_add(take as u64, Ordering::Relaxed);
             take
         };
         self.space.notify_all(); // 唤醒 writer(成功入队必通知)
-        accepted
+        PushFlow::Accepted(accepted)
     }
 
-    /// writer 取一块(阻塞;None = 关闭且取空)。
+    /// 在与 close/try_push 同一锁临界区内执行 `f`,仅当未关闭。
+    /// 返回 false = 已关闭且 f 未执行(r5-1:stage_into 旧欠账追加
+    /// 路径的关闭事务——追加与关闭判定原子,杜绝"检查后、追加前
+    /// 关闭"导致的关闭后残留新输入)。
+    pub fn append_if_open(&self, f: impl FnOnce()) -> bool {
+        let _st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        on_push_locked();
+        if self.is_closed() {
+            return false;
+        }
+        f();
+        true
+    }
+
+    /// writer 取一块(阻塞;None = 关闭且取空)。弹出与 popped 计数
+    /// 同在 state 锁内(r5-3:账目快照不会观察到"队列已减、计数未加"
+    /// 的撕裂中间态)。
     fn pop_blocking(&self) -> Option<Vec<u8>> {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(front) = st.queue.pop_front() {
                 st.bytes -= front.len();
-                // popped_total **不在弹出时计**(复核 r5-3):弹出只证明
-                // writer 取走,不证明写入成功——计数在 writer_loop 的
-                // write_all 成功后由 note_written() 增加
+                self.popped_total
+                    .fetch_add(front.len() as u64, Ordering::Relaxed);
                 self.space.notify_all(); // 腾出容量:通知续灌侧
                 return Some(front);
             }
@@ -450,16 +557,46 @@ impl WriteQueue {
         self.space.notify_all();
     }
 
-    #[allow(dead_code)]
-    pub fn is_closed_pub(&self) -> bool {
-        self.is_closed()
+    /// writer 写失败后的收尾(r5-3:滞留字节明确归账):关闭 + 剩余
+    /// 队列字节整批归入 stranded——writer 即将退场,这些字节永不出队,
+    /// 不归账就会以"队列存量"伪装成会继续写出。
+    fn abandon_on_write_failure(&self) {
+        let n = {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.closed.store(true, Ordering::Release);
+            let n = st.bytes as u64;
+            st.queue.clear();
+            st.bytes = 0;
+            n
+        };
+        if n > 0 {
+            self.stranded.fetch_add(n, Ordering::Relaxed);
+        }
+        self.space.notify_all();
     }
 
-    #[allow(dead_code)]
-    /// writer 累计弹出字节(守恒断言:stage+queued+popped == 已接收)。
-    #[allow(dead_code)]
-    pub fn popped_total(&self) -> u64 {
-        self.popped_total.load(Ordering::Relaxed)
+    /// 账目快照(r5-3:queued 在锁内读,与各桶计数同界)。
+    /// 推导:accepted = queued + stranded + popped(守恒拆分),
+    /// popped = written + failed_blocks + inflight →
+    /// accepted = queued + inflight + written + failed_unknown(恒等)。
+    /// 快照是**非原子**的多计数读取:writer 推进中可能撕裂(popped
+    /// 读完后 write_all 完成、written 才读)——静止/收尾态(writer
+    /// 已 join)恒等精确成立;运动中 inflight 用 saturating 扣减,
+    /// 撕裂瞬间计 0 而非 debug 下溢 panic(GUI 调试日志逐 tick 调用,
+    /// 运动中采样是常态)。
+    pub fn accounting(&self) -> WqAccounting {
+        let queued = self.state.lock().unwrap_or_else(|e| e.into_inner()).bytes as u64;
+        let popped = self.popped_total.load(Ordering::Relaxed);
+        let written = self.written_total.load(Ordering::Relaxed);
+        let failed_blocks = self.failed_blocks.load(Ordering::Relaxed);
+        let stranded = self.stranded.load(Ordering::Relaxed);
+        WqAccounting {
+            accepted: self.accepted_total.load(Ordering::Relaxed),
+            queued,
+            inflight: popped.saturating_sub(written + failed_blocks),
+            written,
+            failed_unknown: failed_blocks + stranded,
+        }
     }
 
     #[allow(dead_code)]
@@ -467,31 +604,36 @@ impl WriteQueue {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).bytes
     }
 
-    #[allow(dead_code)]
     pub fn free_bytes(&self) -> usize {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.cap.saturating_sub(st.bytes)
     }
 
     /// writer 报告一段写出成功(在 write_all 返回 Ok 后调用)。
-    /// popped_total 的语义 = "已成功交给 pty 管道"。
     fn note_written(&self, bytes: usize) {
-        self.popped_total.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.written_total
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 
 /// writer 线程主体:独占消费写队列写 pty(经 `sink`)。写失败(管道
-/// 断)→ 关队列。**每个会话一个队列一个 writer**——旧 writer 只面对
-/// 旧队列,绝不接触新会话的数据(复核 4:按代筛选会误删新数据)。
+/// 断)→ 关队列并**归账滞留字节**(failed_unknown)。**每个会话一个
+/// 队列一个 writer**——旧 writer 只面对旧队列,绝不接触新会话的数据
+/// (复核 4:按代筛选会误删新数据)。
 pub fn writer_loop(queue: Arc<WriteQueue>, sink: Arc<dyn BytesSink + Send + Sync>) {
     while let Some(item) = queue.pop_blocking() {
         if let Err(e) = sink.write_all(&item) {
-            queue.close();
+            // 整块归入 failed_blocks:write_all 出错时部分字节可能已
+            // 达管道(r5-3——不断言"整块没到管道")
+            queue
+                .failed_blocks
+                .fetch_add(item.len() as u64, Ordering::Relaxed);
+            queue.abandon_on_write_failure();
             eprintln!("[pty-writer] 写失败(管道断?):{e}");
             return;
         }
-        // 写出成功才计数(不是弹出时计)——popped 的语义是"已交给
-        // popped 的语义 = "已成功交给 pty 管道"(不是"writer 取走了")
+        // 写出成功才计数——written 的语义是"已成功交给 pty 管道"
+        // (r5-3:弹出只证明取走,不证明写达)
         queue.note_written(item.len());
     }
 }
@@ -569,33 +711,41 @@ pub fn stage_into(stage: &mut InputStage, queue: &WriteQueue, bytes: &[u8]) -> I
     }
     // 容量内:提交必然完整落位(不再有部分接收后溢出的形态)
     if stage.is_empty() {
-        let acc = queue.try_push(bytes);
-        if acc == bytes.len() {
-            return InputFlow::Accepted;
+        match queue.try_push(bytes) {
+            PushFlow::Accepted(n) if n == bytes.len() => return InputFlow::Accepted,
+            // 锁内复查看到关闭:整体拒绝零副作用(队列未收任何字节,
+            // 暂存未动)。修前直接塞暂存:600000 字节塞 512KiB 暂存,
+            // debug 断言 panic,release 丢 75712 字节还报 Debt(假接收)
+            PushFlow::Closed => return InputFlow::RejectedClosed,
+            // 部分进队列(writer 消费中),余量进暂存;Full = 预判与
+            // 提交之间被同队列其它生产者占满(同会话生产者全在 UI 线程,
+            // 理论不可达——debug 断言兜底容量计算不一致的 bug)
+            PushFlow::Accepted(acc) => {
+                let rest = &bytes[acc..];
+                let rejected = stage.stage(rest);
+                debug_assert_eq!(
+                    rejected, 0,
+                    "事务预判通过后不允许部分拒收(容量计算与提交不一致的 bug)"
+                );
+                return InputFlow::Debt(stage.len());
+            }
+            PushFlow::Full => {
+                let rejected = stage.stage(bytes);
+                debug_assert_eq!(rejected, 0, "事务预判通过后不允许部分拒收");
+                return InputFlow::Debt(stage.len());
+            }
         }
-        // **关闭竞态**(复核 r5-1):入口的 closed 检查与 try_push 之间
-        // writer 可能已 close——try_push 返回 0 且 acc==0 时复查;若
-        // 已关闭,**整体拒绝零副作用**(队列未收任何字节,暂存未动)。
-        // 修前直接塞暂存:600000 字节塞 512KiB 暂存,debug 断言 panic,
-        // release 丢 75712 字节还报 Debt(假接收)
-        if acc == 0 && queue.is_closed() {
-            return InputFlow::RejectedClosed;
-        }
-        let rest = &bytes[acc..];
-        let rejected = stage.stage(rest);
-        debug_assert_eq!(
-            rejected, 0,
-            "事务预判通过后不允许部分拒收(容量计算与提交不一致的 bug)"
-        );
-        return InputFlow::Debt(stage.len());
     }
-    // 旧欠账在:只追加,不绕过。追加前同样复查关闭(旧欠账在暂存,
-    // 关闭后 clear() 也会清——但新字节在已关闭会话里没有意义)
-    if queue.is_closed() {
+    // 旧欠账在:只追加,不绕过。追加与关闭判定同锁界(r5-1:
+    // append_if_open)——"检查后、追加前关闭"的交错下整体拒绝,
+    // 不残留关闭后的新输入
+    let appended = queue.append_if_open(|| {
+        let rejected = stage.stage(bytes);
+        debug_assert_eq!(rejected, 0, "事务预判通过后不允许部分拒收");
+    });
+    if !appended {
         return InputFlow::RejectedClosed;
     }
-    let rejected = stage.stage(bytes);
-    debug_assert_eq!(rejected, 0, "事务预判通过后不允许部分拒收");
     InputFlow::Debt(stage.len())
 }
 
@@ -693,16 +843,20 @@ impl InputStage {
         bytes.len() - take
     }
 
-    /// 灌入写队列(保序:队头先走)。返回仍剩的暂存量。
+    /// 灌入写队列(保序:队头先走)。返回仍剩的暂存量。关闭后
+    /// (PushFlow::Closed)保持暂存原样——欠账的作废由会话换代的
+    /// `clear` 负责,不在灌入路径隐式丢弃。
     pub fn flush_into(&mut self, q: &WriteQueue) -> usize {
         if self.data.is_empty() {
             return 0;
         }
-        let accepted = q.try_push(&self.data);
-        if accepted > 0 {
-            self.flushed_total
-                .set(self.flushed_total.get() + accepted as u64);
-            self.data.drain(..accepted);
+        match q.try_push(&self.data) {
+            PushFlow::Accepted(accepted) if accepted > 0 => {
+                self.flushed_total
+                    .set(self.flushed_total.get() + accepted as u64);
+                self.data.drain(..accepted);
+            }
+            _ => {}
         }
         self.data.len()
     }

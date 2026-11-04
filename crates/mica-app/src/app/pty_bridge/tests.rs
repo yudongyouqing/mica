@@ -3,16 +3,15 @@
 //! 与真实锁模型,不手工复刻理想调用序。
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::*;
 
 fn budget_guard() -> std::sync::MutexGuard<'static, ()> {
-    static G: OnceLock<Mutex<()>> = OnceLock::new();
-    G.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    // 委托 lifecycle 的全局测试闸:reaper/槽位/DEGRADED 是进程级全局,
+    // 两个测试模块(reaper 回收测试、槽位/重启测试)必须共用一把锁
+    crate::app::lifecycle::tests::global_test_guard()
 }
 
 /// 可编程唤醒假件:可注入失败序列(脚本化)。
@@ -751,6 +750,8 @@ fn transactional_accept_exact_boundary_and_content() {
 /// (修前 spawn_capacity_ok 前置检查会阻止已满时的原地重启)。
 #[test]
 fn restart_transfers_own_slot_when_full() {
+    // budget_guard:与本文件重启流测试(持真实会话槽位)串行——槽位
+    // 断言对全局 LIVE_SESSIONS 敏感
     let _g = budget_guard();
     use crate::app::lifecycle::{self, MAX_SESSIONS};
     // MAX-1 个他人 permit + 自持 1 = 恰好满(满时原地重启的形态)
@@ -833,7 +834,7 @@ fn writer_close_mid_push_rejected_cleanly() {
     });
     let w = spawn_writer(&q, sink);
     // 队列有数据(writer 阻塞写入中)→ 新输入预检通过 → 立即 close
-    assert_eq!(q.try_push(b"old"), 3);
+    assert_eq!(q.try_push(b"old"), PushFlow::Accepted(3));
     q.close();
     let flow = stage_into(&mut InputStage::new(), &q, b"new");
     assert_eq!(flow, InputFlow::RejectedClosed, "关闭中拒收");
@@ -849,6 +850,7 @@ fn writer_close_mid_push_rejected_cleanly() {
 /// restart_transfer 序:放旧→取新;满额时原地重启可行;竞争失败可恢复。
 #[test]
 fn restart_transfer_releases_before_acquires() {
+    let _g = budget_guard();
     use crate::app::lifecycle::{self, MAX_SESSIONS};
     let others: Vec<_> = (0..MAX_SESSIONS - 1)
         .map(|_| lifecycle::acquire_session())
@@ -866,16 +868,473 @@ fn restart_transfer_releases_before_acquires() {
     assert_eq!(lifecycle::live_sessions(), 0);
 }
 
-/// DEGRADED 时 transfer 拒绝(旧 permit 被释放——调用方可重试)
+/// DEGRADED 时 transfer 拒绝(旧 permit 被释放——调用方可重试)。
+/// r5-2 修前:本测试没设 DEGRADED、断言 is_some,没验证名字声称的
+/// 失败分支;现经生产 API `note_outcome`(FellBack = reaper 降级同款
+/// 路径)真实置位。
 #[test]
 fn restart_transfer_degraded_returns_none() {
     use crate::app::lifecycle;
+    let _g = budget_guard(); // 槽位/DEGRADED 全局态:与槽位类测试串行
     let mut own = lifecycle::acquire_session();
     assert!(own.is_some());
-    // 直接调 restart_transfer 的 DEGRADED 分支(不经过 note_outcome,
-    // 因为 DEGRADED 是 private——用公开 API 模拟:释放后直接查 None)
+    lifecycle::note_outcome(lifecycle::EnqueueOutcome::FellBack); // 真实置位
     let new = lifecycle::restart_transfer(&mut own);
-    assert!(new.is_some(), "无 DEGRADED 时 transfer 成功");
-    drop(new);
+    assert!(new.is_none(), "DEGRADED 必须拒绝取新");
+    assert!(own.is_none(), "旧 permit 已随旧会话释放(修前悬留)");
+    lifecycle::note_outcome(lifecycle::EnqueueOutcome::Reaped); // 恢复
+    let retry = lifecycle::restart_transfer(&mut own);
+    assert!(retry.is_some(), "恢复后转移可行(可重试)");
+    drop(retry);
     assert_eq!(lifecycle::live_sessions(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// r5 收尾 1:关闭判定与接收提交同锁界(注入点覆盖准确窗口)
+// ---------------------------------------------------------------------------
+
+/// 注入 r5-1 关闭竞态钩子(Drop 撤钩——防泄漏到后续 try_push)。
+struct PushLockedHook;
+impl PushLockedHook {
+    fn install(f: impl Fn() + 'static) -> Self {
+        super::PUSH_LOCKED_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::rc::Rc::new(f));
+        });
+        PushLockedHook
+    }
+}
+impl Drop for PushLockedHook {
+    fn drop(&mut self) {
+        super::PUSH_LOCKED_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// 准确窗口:try_push 取得 state 锒之后、关闭复查之前,注入"close 已
+/// 在别处提交"(直接置位 closed = close() 在预检后、加锁前完成持锁
+/// 置位的等价交错)。锁内复查(修后)必看到并拒收;修前(锁外预检)
+/// 此形态假接受——故障注入实测 Accepted、closed=true、queued=9、
+/// 数据无人消费。
+#[test]
+fn try_push_rechecks_closed_inside_state_lock() {
+    let q = WriteQueue::new();
+    let q2 = Arc::clone(&q);
+    let _hook = PushLockedHook::install(move || {
+        q2.closed.store(true, Ordering::Release);
+    });
+    assert_eq!(q.try_push(b"data-9b"), PushFlow::Closed);
+    assert_eq!(q.queued_bytes(), 0, "关闭后不得有字节进队列");
+    let acct = q.accounting();
+    assert_eq!(acct.accepted, 0, "零接收(不是假接受)");
+    assert!(acct.balanced());
+}
+
+/// 同窗口过生产入口 stage_into(队列为空路径):整体拒绝零副作用。
+#[test]
+fn stage_into_close_between_precheck_and_push_zero_side_effect() {
+    let q = WriteQueue::new();
+    let mut stage = InputStage::new();
+    let q2 = Arc::clone(&q);
+    let _hook = PushLockedHook::install(move || {
+        q2.closed.store(true, Ordering::Release);
+    });
+    let flow = stage_into(&mut stage, &q, b"NEW");
+    assert_eq!(flow, InputFlow::RejectedClosed, "锁内看到关闭必须整体拒绝");
+    assert!(stage.is_empty(), "暂存零副作用");
+    assert_eq!(q.queued_bytes(), 0, "队列零副作用");
+}
+
+/// 同窗口的旧欠账追加路径(append_if_open):关闭后不残留新输入,
+/// 旧欠账原样保留(其作废属会话换代的 clear,不在此路径隐式丢)。
+#[test]
+fn stage_into_append_path_close_rejected_no_residue() {
+    let q = WriteQueue::new();
+    let mut stage = InputStage::new();
+    assert_eq!(stage.stage(b"OLD-DEBT"), 0); // 旧欠账 8 字节
+    let q2 = Arc::clone(&q);
+    let _hook = PushLockedHook::install(move || {
+        q2.closed.store(true, Ordering::Release);
+    });
+    let flow = stage_into(&mut stage, &q, b"NEW");
+    assert_eq!(
+        flow,
+        InputFlow::RejectedClosed,
+        "追加路径锁内看到关闭必须整体拒绝"
+    );
+    assert_eq!(stage.len(), 8, "旧欠账保留,新字节零残留");
+    assert_eq!(q.queued_bytes(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// r5 收尾 3:字节守恒——精确恒等 + 故障差额明确归属(无容差)
+// ---------------------------------------------------------------------------
+
+/// 可编程失败写假件:第 fail_on 次(1 起)write_all 写一半后失败
+/// (write_all 出错时部分字节可能已达管道——r5-3 的关键形态);其余
+/// 全部成功。gate=false 阻塞(控制 writer 消费时序)。
+struct FailingSink {
+    gate: Arc<AtomicBool>,
+    calls: std::sync::atomic::AtomicUsize,
+    fail_on: usize,
+    receipt: Arc<Mutex<Vec<u8>>>,
+}
+
+impl BytesSink for FailingSink {
+    fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        while !self.gate.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut sink = self.receipt.lock().unwrap_or_else(|e| e.into_inner());
+        if n == self.fail_on {
+            let half = bytes.len() / 2;
+            sink.extend_from_slice(&bytes[..half]);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "注入写失败",
+            ));
+        }
+        sink.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// 无故障:**精确守恒**(零容差)——全部字节经生产入口 stage_into
+/// (含 Debt 路径)进队列、writer 全量写达,各中间桶全空。
+#[test]
+fn conservation_exact_without_fault() {
+    let q = WriteQueue::new();
+    let sink_written = Arc::new(Mutex::new(Vec::new()));
+    let w = spawn_writer(
+        &q,
+        Arc::new(GatedSink {
+            gate: Arc::new(AtomicBool::new(true)),
+            written: Arc::clone(&sink_written),
+        }),
+    );
+    let mut stage = InputStage::new();
+    // 1.5MiB > 队列 1MiB:必然经过 Debt/续灌路径
+    let payload = vec![b'X'; WRITE_QUEUE_BYTES + WRITE_QUEUE_BYTES / 2];
+    for chunk in payload.chunks(256 * 1024) {
+        match stage_into(&mut stage, &q, chunk) {
+            InputFlow::Accepted | InputFlow::Debt(_) => {}
+            other => panic!("无故障路径不得拒绝:{other:?}"),
+        }
+        // 生产由 WM_TIMER 驱动续灌,此处直接驱动同一组件
+        while !stage.is_empty() {
+            stage.flush_into(&q);
+        }
+    }
+    q.close();
+    w.join().unwrap();
+    let acct = q.accounting();
+    assert!(acct.balanced(), "守恒恒等式必须精确成立:{acct:?}");
+    assert_eq!(acct.accepted, payload.len() as u64);
+    assert_eq!(acct.written, payload.len() as u64, "全部写达");
+    assert_eq!((acct.queued, acct.inflight, acct.failed_unknown), (0, 0, 0));
+    assert_eq!(
+        sink_written.lock().unwrap().len(),
+        payload.len(),
+        "sink 实收 = 全量(端到端零丢失)"
+    );
+}
+
+/// 故障注入:write_all 失败于半块之后——失败块归 failed_unknown
+/// (不断言"整块没到管道"),sink 实收落在 [written, written+failed]
+/// 区间(部分已达管道的实证);恒等式仍精确成立,无容差。
+#[test]
+fn conservation_write_failure_attributed_not_tolerated() {
+    let q = WriteQueue::new();
+    let receipt = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::new(FailingSink {
+        gate: Arc::new(AtomicBool::new(false)),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        fail_on: 2, // 第一块成功,第二块写一半后失败
+        receipt: Arc::clone(&receipt),
+    });
+    let sink_dyn: Arc<dyn BytesSink + Send + Sync> = sink.clone();
+    let w = spawn_writer(&q, sink_dyn);
+    // writer 弹出 A 并挂在 gate 上(时序确定性);B 在队列滞留
+    assert_eq!(q.try_push(&[b'A'; 8]), PushFlow::Accepted(8));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while q.accounting().inflight != 8 {
+        assert!(Instant::now() < deadline, "writer 未取出首块");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(q.try_push(&[b'B'; 100]), PushFlow::Accepted(100));
+    sink.gate.store(true, Ordering::SeqCst); // 放行:A 成功,B 半写后失败
+    w.join().unwrap();
+    let acct = q.accounting();
+    assert!(acct.balanced(), "故障下恒等式仍精确:{acct:?}");
+    assert_eq!(acct.accepted, 108);
+    assert_eq!(acct.written, 8, "仅成功的 A 计入 written");
+    assert_eq!(acct.failed_unknown, 100, "失败块整块归 unknown 桶");
+    assert_eq!((acct.queued, acct.inflight), (0, 0));
+    let got = receipt.lock().unwrap().len();
+    assert_eq!(got, 8 + 50, "B 的一半确实到了管道(write_all 半写后失败)");
+    assert!(
+        acct.written as usize <= got && got <= (acct.written + acct.failed_unknown) as usize,
+        "实收必须落在 [written, written+failed]——失败块部分可达"
+    );
+    // writer 失败后队列关闭:新输入拒绝,不再假接受
+    assert_eq!(q.try_push(b"post"), PushFlow::Closed);
+}
+
+/// 故障注入:writer 失败退场后,**滞留队列字节**归 stranded(并入
+/// failed_unknown 桶)——不以"队列存量"伪装会继续写出;恒等式精确。
+#[test]
+fn conservation_stranded_queue_attributed_on_write_failure() {
+    let q = WriteQueue::new();
+    let receipt = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::new(FailingSink {
+        gate: Arc::new(AtomicBool::new(false)),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        fail_on: 1, // 首块即失败
+        receipt: Arc::clone(&receipt),
+    });
+    let sink_dyn: Arc<dyn BytesSink + Send + Sync> = sink.clone();
+    let w = spawn_writer(&q, sink_dyn);
+    assert_eq!(q.try_push(&[b'A'; 8]), PushFlow::Accepted(8));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while q.accounting().inflight != 8 {
+        assert!(Instant::now() < deadline, "writer 未取出首块");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(q.try_push(&[b'B'; 10]), PushFlow::Accepted(10));
+    assert_eq!(q.try_push(&[b'C'; 12]), PushFlow::Accepted(12));
+    sink.gate.store(true, Ordering::SeqCst); // 放行:A 半写后失败 → 退场
+    w.join().unwrap();
+    let acct = q.accounting();
+    assert!(acct.balanced(), "遗弃归账后恒等式精确:{acct:?}");
+    assert_eq!(acct.accepted, 30);
+    assert_eq!(acct.written, 0);
+    assert_eq!(
+        acct.failed_unknown, 30,
+        "失败块(8)+ 滞留遗弃(B+C=22)全部归 unknown 桶"
+    );
+    assert_eq!(acct.queued, 0, "滞留字节不得以队列存量伪装在途");
+    assert_eq!(receipt.lock().unwrap().len(), 4, "A 的半块确实已达管道");
+    assert_eq!(q.try_push(b"post"), PushFlow::Closed);
+}
+
+// ---------------------------------------------------------------------------
+// r5 收尾 2:生产共享重启流的失败分支与恢复(restart_session_fields)
+// ---------------------------------------------------------------------------
+
+/// 重启流的最小会话族(真实 PTY + 生产组件)。共享流按字段传入正是
+/// 为了这里能走生产函数,不必构造 Terminal 的 GPU/路由面。
+struct RestartFields {
+    session: mica_core::pty::PtySession,
+    permit: Option<crate::app::lifecycle::SessionPermit>,
+    writeq: Arc<WriteQueue>,
+    stage: InputStage,
+    pty_buf: Arc<PtyBacklog>,
+    exited: Option<u32>,
+}
+
+impl Drop for RestartFields {
+    fn drop(&mut self) {
+        // 与生产 close_terminal 同序:关队列 → kill → 交 reaper
+        self.writeq.close();
+        self.session.kill_child();
+        let pid = self.session.child_pid();
+        let old = std::mem::replace(&mut self.session, mica_core::pty::PtySession::detached());
+        if pid.is_some() {
+            crate::app::lifecycle::reap_session_with_pid(pid, old);
+        } else {
+            drop(old);
+        }
+        self.permit = None;
+        self.pty_buf.close();
+        // Unlike a long-lived GUI, this test executable can exit immediately
+        // after the fixture. Do not strand real ConPTYs in a detached reaper:
+        // process exit interrupts teardown and leaves busy-looping hosts.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::app::lifecycle::reaper_stats().2 != 0 {
+            if Instant::now() >= deadline {
+                if std::thread::panicking() {
+                    eprintln!("restart fixture: reaper did not finish during unwind");
+                    break;
+                }
+                panic!("restart fixture must finish real PTY teardown before test exit");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn restart_fields(shell: &str) -> RestartFields {
+    let (session, _reader) =
+        mica_core::pty::PtySession::spawn(mica_core::pty::command_from_str(shell), 80, 24)
+            .expect("spawn test pty");
+    RestartFields {
+        session,
+        permit: crate::app::lifecycle::acquire_session(),
+        writeq: WriteQueue::new(),
+        stage: InputStage::new(),
+        pty_buf: PtyBacklog::new(1, PANE_BUDGET_BYTES, ScriptWake::new()),
+        exited: None,
+    }
+}
+
+/// 共享流的调用形参打包(减少每处调用的样板;expr 碎片先落局部再
+/// 取字段——宏卫生)。
+macro_rules! restart_call {
+    ($f:expr, $shell:expr) => {{
+        let fields: &mut RestartFields = &mut $f;
+        crate::app::lifecycle::restart_session_fields(
+            &mut fields.session,
+            &mut fields.permit,
+            &mut fields.writeq,
+            &mut fields.stage,
+            &fields.pty_buf,
+            $shell,
+            80,
+            24,
+            &mut fields.exited,
+        )
+    }};
+}
+
+/// DEGRADED(生产 API note_outcome 真实置位)→ Err + **Stopped 态**:
+/// 输入整体拒绝、欠账清空、旧 PTY 已回收(detached 占位)、槽位已放;
+/// 故障恢复后重试成功,新会话/新队列就位。
+#[test]
+fn restart_flow_degraded_stops_pane_and_recovers() {
+    let _g = budget_guard();
+    let mut f = restart_fields("cmd.exe /k");
+    assert_eq!(f.stage.stage(b"OLD-DEBT"), 0, "预置旧欠账");
+    crate::app::lifecycle::note_outcome(crate::app::lifecycle::EnqueueOutcome::FellBack);
+    let r = restart_call!(f, "cmd.exe /k");
+    assert!(
+        matches!(
+            r,
+            Err(crate::app::lifecycle::RestartFailure::DegradedOrSlotStolen)
+        ),
+        "DEGRADED 必须可恢复失败"
+    );
+    // Stopped 态契约(r5-2)
+    assert_eq!(
+        stage_into(&mut f.stage, &f.writeq, b"x"),
+        InputFlow::RejectedClosed,
+        "停止接受旧会话输入"
+    );
+    assert!(f.stage.is_empty(), "欠账已处理");
+    assert!(
+        f.session.child_pid().is_none(),
+        "旧 PTY 已回收(detached 占位)"
+    );
+    assert!(f.permit.is_none(), "槽位已随旧会话释放");
+    // 恢复(reap 成功已自愈 DEGRADED;显式清态保证确定性)→ 重试成功
+    crate::app::lifecycle::note_outcome(crate::app::lifecycle::EnqueueOutcome::Reaped);
+    let r2 = restart_call!(f, "cmd.exe /k");
+    assert!(
+        r2.is_ok(),
+        "重试必须恢复({:?})",
+        r2.as_ref().err().map(|e| e.to_string())
+    );
+    assert!(f.session.child_pid().is_some(), "新会话就位");
+    assert_eq!(
+        stage_into(&mut f.stage, &f.writeq, b"x"),
+        InputFlow::Accepted,
+        "新队列恢复接受输入"
+    );
+    drop(r2.unwrap().0); // reader
+}
+
+/// spawn 失败 → Err + Stopped 态;修正 shell 重试恢复(可重试契约)。
+#[test]
+fn restart_flow_spawn_failure_stops_pane_then_retry_succeeds() {
+    let _g = budget_guard();
+    let mut f = restart_fields("cmd.exe /k");
+    let r = restart_call!(f, "no-such-exe-mica-test");
+    assert!(
+        matches!(
+            r,
+            Err(crate::app::lifecycle::RestartFailure::SpawnFailed(_))
+        ),
+        "spawn 失败必须可恢复失败"
+    );
+    assert_eq!(
+        stage_into(&mut f.stage, &f.writeq, b"x"),
+        InputFlow::RejectedClosed,
+        "Stopped:拒绝输入"
+    );
+    assert!(f.session.child_pid().is_none(), "旧 PTY 已回收");
+    assert!(f.permit.is_none(), "新 permit 已 RAII 归还");
+    // 重试(shell 修正)恢复
+    let r2 = restart_call!(f, "cmd.exe /k");
+    assert!(
+        r2.is_ok(),
+        "重试必须恢复({:?})",
+        r2.as_ref().err().map(|e| e.to_string())
+    );
+    assert_eq!(
+        stage_into(&mut f.stage, &f.writeq, b"x"),
+        InputFlow::Accepted
+    );
+    drop(r2.unwrap().0);
+}
+
+/// 注入 r5-2 抢槽钩子(Drop 撤钩)。
+struct PermitReleasedHook;
+impl PermitReleasedHook {
+    fn install(f: impl Fn() + 'static) -> Self {
+        crate::app::lifecycle::PERMIT_RELEASED_HOOK.with(|h| {
+            *h.borrow_mut() = Some(std::rc::Rc::new(f));
+        });
+        PermitReleasedHook
+    }
+}
+impl Drop for PermitReleasedHook {
+    fn drop(&mut self) {
+        crate::app::lifecycle::PERMIT_RELEASED_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// 槽位被抢(注入点:放旧后、取新前另一窗口 acquire——真实竞争窗口
+/// 的确定性形态)→ Err + Stopped 态;槽位归还后重试恢复。
+#[test]
+fn restart_flow_slot_stolen_then_retry_succeeds() {
+    let _g = budget_guard();
+    let mut f = restart_fields("cmd.exe /k");
+    // 他人先占满剩余槽位(自身 1 + 15 = 满,放旧瞬间才有槽可抢)
+    let others: Vec<_> = (0..crate::app::lifecycle::MAX_SESSIONS - 1)
+        .map(|_| crate::app::lifecycle::acquire_session())
+        .collect();
+    assert!(others.iter().all(|p| p.is_some()), "预填他人槽位");
+    let thief = Arc::new(Mutex::new(None));
+    let thief_slot = Arc::clone(&thief);
+    let _hook = PermitReleasedHook::install(move || {
+        // 另一窗口在"放旧后、取新前"抢走刚释放的槽位
+        *thief_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+            crate::app::lifecycle::acquire_session();
+    });
+    let r = restart_call!(f, "cmd.exe /k");
+    assert!(
+        matches!(
+            r,
+            Err(crate::app::lifecycle::RestartFailure::DegradedOrSlotStolen)
+        ),
+        "槽位被抢必须可恢复失败"
+    );
+    let stolen = thief.lock().unwrap_or_else(|e| e.into_inner()).take();
+    assert!(stolen.is_some(), "注入的竞争者确实抢到了槽位");
+    assert_eq!(
+        stage_into(&mut f.stage, &f.writeq, b"x"),
+        InputFlow::RejectedClosed,
+        "Stopped:拒绝输入"
+    );
+    assert!(
+        f.session.child_pid().is_none(),
+        "旧 PTY 已回收(失败分支同样回收)"
+    );
+    drop(stolen); // 竞争者释放
+    drop(others);
+    let r2 = restart_call!(f, "cmd.exe /k");
+    assert!(
+        r2.is_ok(),
+        "槽位归还后重试必须恢复({:?})",
+        r2.as_ref().err().map(|e| e.to_string())
+    );
+    drop(r2.unwrap().0);
 }

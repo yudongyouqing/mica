@@ -261,57 +261,30 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 }
 
 /// 重开 QT 会话(#37):同 shell 新 pty + 干净 Surface(复用 pane 槽),
-/// 挂新转发线程 + 重启退出轮询。调用前须已 kill 旧子
+/// 挂新转发线程 + 重启退出轮询。会话族(permit/写队列/回收)全走
+/// `lifecycle::restart_session_fields` 共享流——失败留 Stopped 态可重试
 unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     let (cols, rows) = (t.cols, t.rows);
-    // **r5-2 统一重启序**(同主窗):kill → drop 旧 → acquire 新 → spawn。
-    // 修前 QT 反序(先 acquire 后 drop):峰值多占一槽,且 spawn 失败
-    // 时新 permit 泄漏(旧 permit 已被换掉)
-    t.session.kill_child(); // 调用方契约中的"kill 旧子"在此完成
-    let old_pid = t.session.child_pid();
-    if let Some(pid) = old_pid {
-        crate::app::orphan::mark_session_closing(pid); // Closing:回收确认才移除
-    }
-    let new_permit = crate::app::lifecycle::restart_transfer(&mut t.session_permit);
-    let Some(new_permit) = new_permit else {
-        eprintln!("[qt] 槽位被抢或 DEGRADED——本轮不重开,可重试");
-        return;
-    };
-    let probe = crate::app::orphan::before_spawn();
-    match mica_core::pty::PtySession::spawn(mica_core::pty::command_from_str(&t.shell), cols, rows)
-    {
-        Ok((session, reader)) => {
-            if let Some(new_pid) = session.child_pid() {
-                crate::app::orphan::track_session_since(&probe, new_pid);
-            }
-            // 换代 + 会话隔离(旧队列关闭,旧 writer 只面对旧队列)
-            let new_gen = t.pty_buf.bump_generation();
-            t.writeq.close();
-            t.input_stage.clear(); // 旧会话输入欠账作废
-            t.session_permit = Some(new_permit);
-            let old = std::mem::replace(&mut t.session, session);
-            let writeq = crate::app::pty_bridge::WriteQueue::new();
-            let writer = t.session.writer_handle();
-            {
-                let wq = Arc::clone(&writeq);
-                std::thread::Builder::new()
-                    .name("qt-pty-writer".into())
-                    .spawn(move || {
-                        crate::app::pty_bridge::writer_loop(
-                            wq,
-                            Arc::new(crate::app::pty_bridge::SessionSink(writer)),
-                        );
-                    })
-                    .expect("spawn qt writer");
-            }
-            t.writeq = writeq;
-            // 旧会话交后台回收(T03):ClosePseudoConsole 阻塞面不上 UI 线程
-            crate::app::lifecycle::reap_session_with_pid(old_pid, old);
-            t.exited = None;
+    // **r5-2 统一重启序**(同主窗):kill → Stopped 化 → 回收旧 PTY →
+    // 放旧 permit → 取新 permit → spawn。修前 QT 反序(先 acquire 后
+    // drop):峰值多占一槽,且 spawn 失败时新 permit 泄漏
+    let restarted = crate::app::lifecycle::restart_session_fields(
+        &mut t.session,
+        &mut t.session_permit,
+        &mut t.writeq,
+        &mut t.input_stage,
+        &t.pty_buf,
+        &t.shell,
+        cols,
+        rows,
+        &mut t.exited,
+    );
+    match restarted {
+        Ok((reader, new_gen)) => {
             crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), 0xFF00, new_gen);
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 6, 1000, None);
         }
-        Err(e) => eprintln!("[qt] 重开失败:{e}"),
+        Err(e) => eprintln!("[qt] {e}——本轮不重开"),
     }
 }
 

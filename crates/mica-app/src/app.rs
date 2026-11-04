@@ -1488,12 +1488,14 @@ fn poll_exits() -> bool {
 
 /// 重开活跃 pane(M5b/T3):同 shell 新 pty,复用 pane 槽/id/图集/网格;
 /// surface 换新(旧画面属旧会话,重开即干净起步),退出态清零。
+/// 会话族(permit/写队列/回收)全走 `lifecycle::restart_session_fields`
+/// 共享流——失败 pane 留 Stopped 态可重试,渲染侧接线只属本窗。
 fn restart_active_pane() -> bool {
-    let Some((shell, cols, rows)) = TABS.with(|tabs| {
+    let Some((cols, rows)) = TABS.with(|tabs| {
         tabs.borrow_mut()
             .get_mut(ACTIVE.get())
             .and_then(|tab| tab.active_pane())
-            .map(|t| (t.shell.clone(), t.cols, t.rows))
+            .map(|t| (t.cols, t.rows))
     }) else {
         return false;
     };
@@ -1509,54 +1511,25 @@ fn restart_active_pane() -> bool {
             return;
         };
         let t = &mut pane.terminal;
-        // **r5-2 统一重启序**(主窗与 QT 共用 lifecycle::restart_transfer):
-        // kill 旧 → 放旧 permit → 取新 permit → **然后才 spawn**——
-        // 修前反序(spawn 先行,permit 后转)在竞争失败时丢弃已 spawn
-        // 的新会话;也不查 spawn_capacity_ok(查"是否满"会阻止满额
-        // 原地重启,自持槽释放后取得到)
-        t.session.kill_child(); // ① kill 旧子(非阻塞)
-        let old_pid = t.session.child_pid();
-        if let Some(pid) = old_pid {
-            orphan::mark_session_closing(pid);
-        }
-        let new_permit = lifecycle::restart_transfer(&mut t.session_permit);
-        let Some(new_permit) = new_permit else {
-            eprintln!("[restart] 槽位被抢或 DEGRADED——pane 暂无会话,可重试");
+        // **r5-2 统一重启序**(主窗与 QT 共用 lifecycle::restart_session_fields):
+        // kill 旧 → Stopped 化(关队列/清欠账/换代)→ 回收旧 PTY →
+        // 放旧 permit → 取新 permit → spawn——任一步失败 pane 留
+        // Stopped 态(输入拒绝、旧会话已回收),可重试
+        let restarted = lifecycle::restart_session_fields(
+            &mut t.session,
+            &mut t.session_permit,
+            &mut t.writeq,
+            &mut t.input_stage,
+            &t.pty_buf,
+            &t.shell,
+            cols,
+            rows,
+            &mut t.exited,
+        );
+        let Ok((reader, new_gen)) = restarted else {
+            eprintln!("[restart] {:?}", restarted.err().unwrap());
             return;
         };
-        // ② permit 到手后 spawn
-        let probe = orphan::before_spawn();
-        let Ok((session, reader)) =
-            PtySession::spawn(mica_core::pty::command_from_str(&shell), cols, rows)
-        else {
-            eprintln!("[restart] spawn 失败: {shell}");
-            drop(new_permit); // RAII 归还
-            return;
-        };
-        if let Some(new_pid) = session.child_pid() {
-            orphan::track_session_since(&probe, new_pid);
-        }
-        t.session_permit = Some(new_permit);
-        // ③ 换代 + 会话隔离(旧队列关闭,旧 writer 只面对旧队列)
-        let new_gen = t.pty_buf.bump_generation();
-        t.writeq.close();
-        t.input_stage.clear();
-        let old = std::mem::replace(&mut t.session, session);
-        let writeq = WriteQueue::new();
-        let writer = t.session.writer_handle();
-        {
-            let wq = Arc::clone(&writeq);
-            std::thread::Builder::new()
-                .name("pty-writer".into())
-                .spawn(move || {
-                    pty_bridge::writer_loop(wq, Arc::new(pty_bridge::SessionSink(writer)))
-                })
-                .expect("spawn pty writer");
-        }
-        t.writeq = writeq;
-        // 旧会话交后台回收:唯一阻塞面 ClosePseudoConsole 不上 UI 线程(T03)
-        lifecycle::reap_session_with_pid(old_pid, old);
-        t.exited = None;
         // 干净起步:新 Surface 重置网格(度量/调色板/剪贴板 provider 同建)
         let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
         term.set_cell_metrics(
@@ -4280,25 +4253,34 @@ fn flush_all_panes() {
         }
     });
     if debug {
-        let (flushed, queued, staged, popped): (u64, u64, u64, u64) = TABS.with(|tabs| {
-            let g = tabs.borrow();
-            let mut f = 0u64;
-            let mut q = 0u64;
-            let mut s2 = 0u64;
-            let mut p2 = 0u64;
-            for tab in g.iter() {
-                for pane in tab.panes.iter() {
-                    let t = &pane.terminal;
-                    f += t.input_stage.flushed_total();
-                    q += t.writeq.queued_bytes() as u64;
-                    s2 += t.input_stage.len() as u64;
-                    p2 += t.writeq.popped_total();
+        // 全账目(r5-3):accepted == q + infl + wr + fail 恒等(每 pane
+        // 内部同界计数;跨 pane 求和后仍成立)——GUI 验收按桶断言,
+        // 不再用容差代替守恒。bal 是瞬时诊断:writer 推进中快照可能
+        // 撕裂(queued 已减、计数未读),静止/收尾态必为 true
+        let (flushed, q, s, acc, infl, wr, fail, bal): (u64, u64, u64, u64, u64, u64, u64, bool) =
+            TABS.with(|tabs| {
+                let g = tabs.borrow();
+                let (mut f, mut q, mut s2, mut a, mut i, mut w, mut fl) =
+                    (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+                let mut bal = true;
+                for tab in g.iter() {
+                    for pane in tab.panes.iter() {
+                        let t = &pane.terminal;
+                        let acct = t.writeq.accounting();
+                        bal &= acct.balanced();
+                        f += t.input_stage.flushed_total();
+                        q += acct.queued;
+                        s2 += t.input_stage.len() as u64;
+                        a += acct.accepted;
+                        i += acct.inflight;
+                        w += acct.written;
+                        fl += acct.failed_unknown;
+                    }
                 }
-            }
-            (f, q, s2, p2)
-        });
+                (f, q, s2, a, i, w, fl, bal)
+            });
         eprintln!(
-            "[inputflow] timer-tick: debt_panes={debt_panes} armed={any_debt} flushed={flushed} q={queued} s={staged} popped={popped}"
+            "[inputflow] timer-tick: debt_panes={debt_panes} armed={any_debt} flushed={flushed} q={q} s={s} acc={acc} infl={infl} wr={wr} fail={fail} bal={bal}"
         );
     }
     if !any_debt && INPUT_TIMER_ARMED.with(std::cell::Cell::get) {
