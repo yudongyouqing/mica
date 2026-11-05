@@ -8,6 +8,7 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
 use alacritty_terminal::selection::{Selection, SelectionRange};
 
+use crate::protocol::sidecar::SidecarEvent;
 /// 滚动指令直通类型(重导出避免壳层直依赖 alacritty_terminal)。
 pub use alacritty_terminal::grid::Scroll as ScrollCommand;
 /// 选择相关直通类型(同上,app 只认 mica-core 的名字;pub use 亦供本模块内部使用)。
@@ -19,8 +20,13 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 /// 消费方按 Block/Underline/Beam 三类归一)。
 pub use alacritty_terminal::vte::ansi::CursorShape;
 
-/// OSC 7 `file://host/path` → 本机路径(宽容:剥 scheme/authority、
-/// 百分号解码;Windows 盘符形如 file:///C:/Users 或 file://host/C:/)
+/// OSC 7 `file://host/path` → 本机路径。T07 修复两处:
+/// - 百分号解码先产**字节**再按 UTF-8 解码(旧实现逐字节转 char,中文
+///   路径的 %E4%B8%AD 变 latin-1 乱码"ä¸…");
+/// - Windows 盘符前的 '/' 剥除(`file:///C:/x` → `C:/x`,与计划用例的
+///   接口约定一致)。
+///
+/// 非 UTF-8 字节序列(坏广播)lossy 降级为 U+FFFD,不阻塞。
 fn osc7_to_path(url: &str) -> String {
     let rest = url.strip_prefix("file://").unwrap_or(url);
     // 剥 authority(到第一个 '/';无 authority(///)则空)
@@ -29,22 +35,27 @@ fn osc7_to_path(url: &str) -> String {
         Some(i) => &rest[i + 1..],
         None => rest,
     };
-    let mut out = String::with_capacity(path.len());
+    // 盘符形 `/C:` → `C:`(host 侧根形式;UNC `//server/share` 保留)
+    let path = match path.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => &path[1..],
+        _ => path,
+    };
     let bytes = path.as_bytes();
+    let mut decoded: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
             if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                out.push(v as char);
+                decoded.push(v);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        decoded.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 /// 鼠标上报模式(DECSET 1000/1002/1003,2026-10-07 补课):Off = 本地
@@ -256,40 +267,47 @@ impl Surface {
     /// Feed raw pty output into the terminal state machine.
     /// 同段字节也过 sidecar(M4b):2026/OSC 133 旁路监听。
     pub fn feed(&mut self, bytes: &[u8]) {
+        // T07 流序契约:sidecar 产**有序带偏移**事件。按偏移把 Term 的
+        // 喂入切成段:先喂 bytes[..off] 再在当前位置记录 mark——行号随
+        // 事件真实位置,不再依赖块起点(整块/逐块 feed 可观察状态一致)。
+        // sync/cwd 是零宽度事件(不挪光标),按序赋值即天然 last-wins
+        // (修前 begin/end 计数各自独立应用,`l` 后 `h` 被折叠成关)。
         let events = self.sidecar.scan(bytes);
-        if events.sync_begin > 0 {
-            self.sync_output = true;
-        }
-        if let Some(url) = events.cwd {
-            let path = osc7_to_path(&url);
-            if std::env::var_os("MICA_DEBUG_CWD").is_some() {
-                eprintln!("[osc7] cwd <- {path}");
+        let mut last = 0usize;
+        for le in &events.events {
+            match &le.event {
+                SidecarEvent::SyncBegin => self.sync_output = true,
+                SidecarEvent::SyncEnd => {
+                    // 幂等:end 在超时后到(HELD 已 false)只画不重置
+                    // (D29 竞态缓解)——赋值语义即"最后事件赢"
+                    self.sync_output = false;
+                }
+                SidecarEvent::Cwd(url) => {
+                    let path = osc7_to_path(url);
+                    if std::env::var_os("MICA_DEBUG_CWD").is_some() {
+                        eprintln!("[osc7] cwd <- {path}");
+                    }
+                    self.cwd = Some(path);
+                }
+                SidecarEvent::Mark(mark) => {
+                    // 先喂到事件位置,光标即标记行(视口坐标,0=顶)
+                    self.parser.advance(&mut self.term, &bytes[last..le.offset]);
+                    last = le.offset;
+                    let line = self.term.grid().cursor.point.line.0;
+                    let epoch = self.term.grid().history_size();
+                    self.marks.push(MarkRecord {
+                        mark: *mark,
+                        line,
+                        epoch,
+                    });
+                    let overflow = self.marks.len().saturating_sub(MAX_MARKS);
+                    if overflow > 0 {
+                        self.marks.drain(..overflow);
+                    }
+                }
             }
-            self.cwd = Some(path);
         }
-        if events.sync_end > 0 {
-            // 幂等:end 在超时后到(HELD 已 false)只画不重置(D29 竞态缓解)。
-            self.sync_output = false;
-        }
-        if !events.marks.is_empty() {
-            // 行号 = 本块开始时的光标行(视口坐标,0=顶,与 Damage 同系)。
-            // sidecar 不产字节偏移,块内多个标记共用同一行——块粒度近似,
-            // 典型 shell 集成每个标记独立 write,实践偏差为零。
-            let line = self.term.grid().cursor.point.line.0;
-            let epoch = self.term.grid().history_size();
-            self.marks
-                .extend(
-                    events
-                        .marks
-                        .into_iter()
-                        .map(|mark| MarkRecord { mark, line, epoch }),
-                );
-            let overflow = self.marks.len().saturating_sub(MAX_MARKS);
-            if overflow > 0 {
-                self.marks.drain(..overflow);
-            }
-        }
-        self.parser.advance(&mut self.term, bytes);
+        self.parser.advance(&mut self.term, &bytes[last..]);
     }
 
     /// 当前是否处于同步输出窗口(2026h 起 2026l/超时止)。app 的

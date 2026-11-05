@@ -15,7 +15,12 @@ pub fn run() {
 /// - `new-tab [profile]` / `wsl [distro]` / `list-profiles`
 #[cfg(windows)]
 pub fn handle_cli() -> i32 {
-    use mica_core::ipc::IpcMessage;
+    use mica_core::ipc::{IpcError, IpcRequest, IpcStatus};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REQ_ID: AtomicU64 = AtomicU64::new(1);
+    fn next_id() -> u64 {
+        REQ_ID.fetch_add(1, Ordering::Relaxed)
+    }
     // 崩溃档案(M5b/T1):任何后续 panic 都有 dmp——先于一切安装
     app::crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,7 +56,9 @@ pub fn handle_cli() -> i32 {
                 Some(name) => {
                     // mica wsl <distro> → IPC new-tab(名字直接给,服务端
                     // scan_all 匹配;wsl distro 名本身就是 profile 名)
-                    dispatch_ipc(IpcMessage::new_tab(Some(name)), String::new())
+                    let mut req = IpcRequest::new(next_id(), "new-tab");
+                    req.profile = Some(name);
+                    dispatch_ipc(req, String::new())
                 }
             }
         }
@@ -73,12 +80,12 @@ pub fn handle_cli() -> i32 {
                 }
                 i += 1;
             }
-            dispatch_ipc(
-                IpcMessage::new_tab_with(profile, font_size),
-                "powershell.exe -NoLogo".into(),
-            )
+            let mut req = IpcRequest::new(next_id(), "new-tab");
+            req.profile = profile;
+            req.font_size = font_size;
+            dispatch_ipc(req, "powershell.exe -NoLogo".into())
         }
-        Some("new-window") => dispatch_ipc(IpcMessage::new_window(), String::new()),
+        Some("new-window") => dispatch_ipc(IpcRequest::new(next_id(), "new-window"), String::new()),
         // #44:向运行中的实例注入输入(tmux send-keys 同义)。
         // `mica send [--tab=N | --qt] [--literal] 文本...`;默认展开转义
         // (\r=回车 \e=Esc \\=反斜杠);连不上实例 = 错误退出,绝不自启
@@ -111,10 +118,30 @@ pub fn handle_cli() -> i32 {
             } else {
                 String::from_utf8_lossy(&mica_core::ipc::unescape_send(&joined)).into_owned()
             };
-            match app::ipc::send(&IpcMessage::send_text(text, tab), 3_000) {
-                Ok(()) => 0,
-                Err(_) => {
+            let mut req = IpcRequest::new(next_id(), "send-text");
+            req.text = Some(text);
+            req.tab = tab;
+            match app::ipc::send_request(&req, 3_000) {
+                Ok(resp) => match resp.status {
+                    IpcStatus::Applied | IpcStatus::Queued => 0,
+                    IpcStatus::Error => {
+                        eprintln!(
+                            "mica send: 被拒绝({})",
+                            resp.detail.as_deref().unwrap_or("unknown")
+                        );
+                        1
+                    }
+                },
+                Err(IpcError::NoInstance) => {
                     eprintln!("mica send: 无运行中的 mica 实例(IPC 不通)");
+                    1
+                }
+                Err(IpcError::Disconnected) => {
+                    eprintln!("mica send: 连接在请求送达后断开——文本可能已注入,请勿盲目重试");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("mica send: 失败({})", e.code());
                     1
                 }
             }
@@ -133,25 +160,55 @@ pub fn handle_cli() -> i32 {
             );
             2
         }
-        None => dispatch_ipc(IpcMessage::activate(), "powershell.exe -NoLogo".into()),
+        None => dispatch_ipc(
+            IpcRequest::new(next_id(), "activate"),
+            "powershell.exe -NoLogo".into(),
+        ),
     }
 }
 
 /// IPC 分发核心:连得上→发帧退出;连不上→有 profile 就带环境变量自启动,
 /// 无 profile 就纯 GUI 启动。
 #[cfg(windows)]
-fn dispatch_ipc(msg: mica_core::ipc::IpcMessage, fallback_shell: String) -> i32 {
-    if app::ipc::send(&msg, 3_000).is_ok() {
-        return 0; // 已有实例受理
+fn dispatch_ipc(req: mica_core::ipc::IpcRequest, fallback_shell: String) -> i32 {
+    match app::ipc::send_request(&req, 3_000) {
+        // 已有实例应答:applied/queued 均算受理成功
+        Ok(resp) => {
+            if resp.status == mica_core::ipc::IpcStatus::Error {
+                eprintln!(
+                    "mica: 请求被拒绝({})",
+                    resp.detail.as_deref().unwrap_or("unknown")
+                );
+                return 1; // 真实错误:非零退出,不再谎报成功
+            }
+            0
+        }
+        // 管道不存在(无实例):**唯一**可安全自启的形态。Busy/
+        // AccessDenied/Timeout/Disconnected 都说明实例活着或结果未知——
+        // 自启会造双实例或重复操作(复核 2)
+        Err(mica_core::ipc::IpcError::NoInstance) => {
+            let _ = &fallback_shell;
+            if let Some(p) = &req.profile {
+                // SAFETY: 多线程前调用(单线程 CLI)
+                unsafe { std::env::set_var("MICA_START_PROFILE", p) };
+            }
+            app::run();
+            0
+        }
+        // 结果未知类:请求可能已被执行,明确警示勿盲目重试
+        Err(mica_core::ipc::IpcError::Disconnected) => {
+            eprintln!("mica: 连接在请求送达后断开——请求可能已执行,请勿盲目重试");
+            1
+        }
+        Err(mica_core::ipc::IpcError::Timeout) => {
+            eprintln!("mica: 实例未在期限内应答——请求可能已执行,请勿盲目重试");
+            1
+        }
+        Err(e) => {
+            eprintln!("mica: IPC 失败({})", e.code());
+            1
+        }
     }
-    // 连不上:自启动(GUI);profile 经环境变量带给 run()(比改 run 签名轻;
-    // 启动后即读即清,后续标签不受影响)。set_var 在多线程前调用(单线程 CLI)安全。
-    let _ = &fallback_shell;
-    if let Some(p) = &msg.profile {
-        unsafe { std::env::set_var("MICA_START_PROFILE", p) };
-    }
-    app::run();
-    0
 }
 
 #[cfg(not(windows))]

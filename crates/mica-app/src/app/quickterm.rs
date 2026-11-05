@@ -22,9 +22,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW,
-    PostQuitMessage, RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP,
-    WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER,
-    WNDCLASSEXW, WS_POPUP, WS_VISIBLE,
+    RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR,
+    WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
+    WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
@@ -172,6 +172,15 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     );
     term.set_palette(&palette);
     // QT shell 恒 PowerShell(下拉终端语义;profile 化 M4)
+    if !crate::app::lifecycle::spawn_capacity_ok() {
+        // 故障态门:拒绝新会话(有界泄漏);QT 是增强件,禁用即可
+        eprintln!("quickterm: 会话回收通道故障态,QT 本轮禁用");
+        return Err(());
+    }
+    let session_permit = crate::app::lifecycle::acquire_session().ok_or_else(|| {
+        eprintln!("quickterm: 并发会话已达上限,QT 本轮禁用");
+    })?;
+    let probe = crate::app::orphan::before_spawn();
     let (session, reader) = mica_core::pty::PtySession::spawn(
         mica_core::pty::command_from_str("powershell.exe -NoLogo"),
         cols,
@@ -179,7 +188,34 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     )
     .inspect_err(|e| eprintln!("quickterm: pty 失败 {e:?},QT 禁用"))
     .map_err(|_| ())?;
-    let pty_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    if let Some(pid) = session.child_pid() {
+        crate::app::orphan::track_session_since(&probe, pid); // 入注册表(T02,同主窗)
+    }
+    // T08:QT 输出积压/写队列(WPARAM 0xFF00 寻址 QT 窗口)
+    let pty_buf = crate::app::pty_bridge::PtyBacklog::new(
+        0xFF00,
+        crate::app::pty_bridge::PANE_BUDGET_BYTES,
+        Arc::new(crate::app::pty_bridge::WindowWake {
+            slot: crate::app::shared_hwnd_for_quickterm()
+                .unwrap_or_else(|| Arc::new(Mutex::new(None))),
+            msg: WM_APP,
+        }),
+    );
+    let writeq = crate::app::pty_bridge::WriteQueue::new();
+    let writer = session.writer_handle(); // 锁分离(复核 3):只持写端
+    {
+        let wq = Arc::clone(&writeq);
+        std::thread::Builder::new()
+            .name("qt-pty-writer".into())
+            .spawn(move || {
+                crate::app::pty_bridge::writer_loop(
+                    wq,
+                    Arc::new(crate::app::pty_bridge::SessionSink(writer)),
+                );
+            })
+            .expect("spawn qt writer");
+    }
+    pty_buf.spawn_monitor(); // 独立唤醒重试(不依赖转发线程)
     term.set_clipboard_provider(Arc::new(|| {
         crate::app::clipboard::get_text().unwrap_or_default()
     }));
@@ -187,7 +223,11 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     let terminal = Terminal {
         term,
         session,
+        session_permit: Some(session_permit),
         pty_buf: Arc::clone(&pty_buf),
+        writeq: Arc::clone(&writeq),
+        input_stage: crate::app::pty_bridge::InputStage::new(),
+        session_gen: 0,
         router,
         metrics,
         palette,
@@ -212,9 +252,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     });
 
     // 转发线程(与主窗同款;WPARAM 用 QT 专属 id 0xFF00——不与 pane id 冲突)
-    if let Some(slot) = crate::app::shared_hwnd_for_quickterm() {
-        crate::app::spawn_qt_forwarder(reader, pty_buf, slot);
-    }
+    crate::app::spawn_qt_forwarder(reader, pty_buf, 0xFF00, 0);
     // #37:会话退出轮询(1s;命中即停表)——QT 无 strip,主窗的
     // poll_exits 轮不到它
     let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd_qt), 6, 1000, None);
@@ -223,52 +261,133 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 }
 
 /// 重开 QT 会话(#37):同 shell 新 pty + 干净 Surface(复用 pane 槽),
-/// 挂新转发线程 + 重启退出轮询。调用前须已 kill 旧子
+/// 挂新转发线程 + 重启退出轮询。会话族(permit/写队列/回收)全走
+/// `lifecycle::restart_session_fields` 共享流——失败留 Stopped 态可重试
 unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     let (cols, rows) = (t.cols, t.rows);
-    match mica_core::pty::PtySession::spawn(mica_core::pty::command_from_str(&t.shell), cols, rows)
-    {
-        Ok((session, reader)) => {
-            let old = std::mem::replace(&mut t.session, session);
-            std::mem::forget(old); // 脏退出哲学:不 drop(坏驱动栈会卡)
-            t.exited = None;
-            let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
-            term.set_cell_metrics(
-                t.metrics.cell_width.round() as u16,
-                t.metrics.line_height.round() as u16,
-            );
-            term.set_palette(&t.palette);
-            t.term = term;
-            t.row_insts.clear();
-            t.force_full = true;
-            t.pty_buf.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            if let Some(slot) = crate::app::shared_hwnd_for_quickterm() {
-                crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), slot);
-            }
+    // **r5-2 统一重启序**(同主窗):kill → Stopped 化 → 回收旧 PTY →
+    // 放旧 permit → 取新 permit → spawn。修前 QT 反序(先 acquire 后
+    // drop):峰值多占一槽,且 spawn 失败时新 permit 泄漏
+    let restarted = crate::app::lifecycle::restart_session_fields(
+        &mut t.session,
+        &mut t.session_permit,
+        &mut t.writeq,
+        &mut t.input_stage,
+        &t.pty_buf,
+        &t.shell,
+        cols,
+        rows,
+        &mut t.exited,
+    );
+    match restarted {
+        Ok((reader, new_gen)) => {
+            crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), 0xFF00, new_gen);
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 6, 1000, None);
         }
-        Err(e) => eprintln!("[qt] 重开失败:{e}"),
+        Err(e) => eprintln!("[qt] {e}——本轮不重开"),
     }
 }
 
-/// 退出序取走 QT 状态(调用方 mem::forget——故意泄漏换可靠退出,见
-/// message_loop 退出序注释;teardown drop 在坏驱动栈上会陷内核卡死)。
+/// 退出序取走 QT 状态(T03 收窄绕行面):终端态走 close_terminal 统一
+/// 回收(杀子/标 Closing/交 reaper);**只 forget renderer/wgpu_surface
+/// (GPU 对象)**——坏驱动栈上 wgpu teardown 陷内核(1.0.2 实证),这是
+/// 与主窗同款的最后绕行。
 pub fn forget_state() {
-    // 取到的 QtState:先杀 pty 子进程(与 TABS 退出序同款——否则 QT 的
-    // powershell 泄漏成孤儿,下次启动被清杀时 defterm 弹窗/142,
-    // "第二次启动报错"的 QT 分支),再 forget
-    if let Some(mut st) = QT.with(|q| q.borrow_mut().take()) {
-        st.terminal.session.kill_child();
-        std::mem::forget(st);
+    if let Some(st) = QT.with(|q| q.borrow_mut().take()) {
+        let QtState {
+            terminal,
+            renderer,
+            wgpu_surface,
+            config,
+            pending_surrogate: _,
+            atlas_revision: _,
+        } = st;
+        std::mem::forget(renderer);
+        std::mem::forget(wgpu_surface);
+        std::mem::forget(config);
+        crate::app::lifecycle::close_terminal(terminal);
     }
 }
 
 /// 切换:可见→隐藏;隐藏→显示+置顶激活。
 /// #44 send-text 的 QT 入口:向 QT pane 注入输入(bracketed paste 自动包)
-pub fn send_text(bytes: &[u8]) {
+/// QT 是否已建(供 IPC 区分 bad_target 与 pty_write)。
+pub fn exists() -> bool {
+    QT.with(|q| q.borrow().is_some())
+}
+
+/// 向 QT pane 注入输入(UI 快路径,非阻塞;当前 UI 侧 QT 输入经
+/// wndproc 直呼 stage_input,此入口留作热键/脚本路径的公共面)。
+#[allow(dead_code)]
+pub fn send_text(bytes: &[u8]) -> bool {
     QT.with(|q| {
         let mut guard = q.borrow_mut();
-        let Some(st) = guard.as_mut() else { return };
+        let Some(st) = guard.as_mut() else {
+            return false;
+        };
+        let t = &mut st.terminal;
+        let payload = if t.term.bracketed_paste_active() {
+            let mut w = b"[200~".to_vec();
+            w.extend_from_slice(bytes);
+            w.extend_from_slice(b"[201~");
+            w
+        } else {
+            bytes.to_vec()
+        };
+        let flow = accept_qt_input(t, &payload);
+        if matches!(flow, crate::app::pty_bridge::InputFlow::Debt(_)) {
+            arm_qt_flush_timer();
+        }
+        matches!(
+            flow,
+            crate::app::pty_bridge::InputFlow::Accepted
+                | crate::app::pty_bridge::InputFlow::Debt(_)
+        )
+    })
+}
+
+/// 武装 QT 续灌定时器(id 7,30ms;清欠自动撤销)。
+#[allow(dead_code)]
+fn arm_qt_flush_timer() {
+    let raw = QT_HWND.with(|c| c.get());
+    if raw == 0 {
+        return;
+    }
+    // SAFETY: 本线程拥有的 QT 窗口
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+            Some(windows::Win32::Foundation::HWND(
+                raw as *mut std::ffi::c_void,
+            )),
+            7,
+            30,
+            None,
+        );
+    }
+}
+
+fn accept_qt_input(
+    t: &mut crate::app::Terminal,
+    payload: &[u8],
+) -> crate::app::pty_bridge::InputFlow {
+    let flow = crate::app::pty_bridge::stage_into(&mut t.input_stage, &t.writeq, payload);
+    if matches!(flow, crate::app::pty_bridge::InputFlow::Debt(_)) {
+        arm_qt_flush_timer();
+    }
+    flow
+}
+
+/// QT 输入的生产入口(四轮返工复核 5):**非阻塞接收 + 武装 QT 自己
+/// 的续灌定时器(id 7)**——所属输入目标 → 所属续灌调度。QT 的按键、
+/// DSR 回复、IPC send-text 三条真实路径都经此(不再借用主窗的
+/// stage_input——那会武装主窗 id 8,而 flush_all_panes 只遍历 TABS,
+/// QT 欠账无人推进)。
+pub fn accept_qt(bytes: &[u8]) -> crate::app::pty_bridge::InputFlow {
+    QT.with(|q| {
+        let mut guard = q.borrow_mut();
+        let Some(st) = guard.as_mut() else {
+            return crate::app::pty_bridge::InputFlow::RejectedClosed;
+        };
         let t = &mut st.terminal;
         let payload = if t.term.bracketed_paste_active() {
             let mut w = b"\x1b[200~".to_vec();
@@ -278,8 +397,40 @@ pub fn send_text(bytes: &[u8]) {
         } else {
             bytes.to_vec()
         };
-        let _ = t.session.write(&payload);
+        let flow = crate::app::pty_bridge::stage_into(&mut t.input_stage, &t.writeq, &payload);
+        if matches!(flow, crate::app::pty_bridge::InputFlow::Debt(_)) {
+            arm_qt_flush_timer();
+        }
+        flow
+    })
+}
+
+/// QT 续灌心搏(WM_TIMER id 7):冲欠账;清空即撤定时器(空闲零开销)。
+unsafe fn qt_flush_tick(hwnd: HWND) {
+    flush_input();
+    if !has_input_debt() {
+        windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 7).ok();
+    }
+}
+
+/// QT 欠账续灌(被 QT 自己的 wndproc 心搏调用)。
+pub fn flush_input() {
+    QT.with(|q| {
+        if let Some(st) = q.borrow_mut().as_mut()
+            && !st.terminal.input_stage.is_empty()
+        {
+            st.terminal.input_stage.flush_into(&st.terminal.writeq);
+        }
     });
+}
+
+/// QT 是否有输入欠账(定时器保活判定)。
+pub fn has_input_debt() -> bool {
+    QT.with(|q| {
+        q.borrow()
+            .as_ref()
+            .is_some_and(|st| !st.terminal.input_stage.is_empty())
+    })
 }
 
 pub unsafe fn toggle() {
@@ -342,16 +493,29 @@ unsafe extern "system" fn qt_wndproc(
         WM_TIMER => {
             // id 6(#37):会话退出轮询——主窗 poll_exits 轮 TABS,QT 在此
             // 自轮;命中记码 + 横幅重绘 + 停表(重开时 toggle 再起)
+            if wparam.0 == 7 {
+                // T08 三次返工:QT 输入欠账续灌(真实接线;主窗 id 8
+                // 同语义,覆盖后台标签——QT 是独立 wndproc 独立定时器)
+                qt_flush_tick(hwnd);
+                return LRESULT(0);
+            }
             if wparam.0 == 6 {
                 let mut hit = false;
                 QT.with(|q| {
                     let mut guard = q.borrow_mut();
                     let Some(st) = guard.as_mut() else { return };
-                    let t = &mut st.terminal;
-                    if t.exited.is_none()
-                        && let Ok(Some(s)) = t.session.try_wait()
-                    {
-                        t.exited = Some(s.exit_code());
+                    let exited_now = {
+                        let t = &mut st.terminal;
+                        if t.exited.is_none()
+                            && let Ok(Some(s)) = t.session.try_wait()
+                        {
+                            t.exited = Some(s.exit_code());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if exited_now {
                         hit = true;
                         qt_draw(st);
                     }
@@ -367,14 +531,17 @@ unsafe extern "system" fn qt_wndproc(
             QT.with(|q| {
                 let mut guard = q.borrow_mut();
                 let Some(st) = guard.as_mut() else { return };
-                let bytes =
-                    std::mem::take(&mut *st.terminal.pty_buf.lock().expect("qt buf poisoned"));
-                if bytes.is_empty() {
+                // T08 批预算(同主窗):drain_batch 内含补通知(含续批)
+                let Some(bytes) = st
+                    .terminal
+                    .pty_buf
+                    .drain_batch(crate::app::pty_bridge::UI_BATCH_BYTES)
+                else {
                     return;
-                }
+                };
                 st.terminal.term.feed(&bytes);
                 for reply in st.terminal.term.take_pty_writes() {
-                    let _ = st.terminal.session.write(reply.as_bytes());
+                    let _ = accept_qt(reply.as_bytes());
                 }
                 if let Some(t) = st.terminal.term.take_title() {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
@@ -418,7 +585,7 @@ unsafe extern "system" fn qt_wndproc(
                 } else {
                     ch.to_string().into_bytes()
                 };
-                let _ = st.terminal.session.write(&bytes);
+                let _ = accept_qt_input(&mut st.terminal, &bytes);
             });
             LRESULT(0)
         }
@@ -445,12 +612,12 @@ unsafe extern "system" fn qt_wndproc(
                     && let Some(bytes) =
                         mica_core::protocol::kitty::kitty_encode(key, mods, kind, flags)
                 {
-                    let _ = st.terminal.session.write(&bytes);
+                    let _ = accept_qt_input(&mut st.terminal, &bytes);
                     return;
                 }
                 if let Some(bytes) = super::vkey_bytes(vk, mods, st.terminal.term.app_cursor_mode())
                 {
-                    let _ = st.terminal.session.write(&bytes);
+                    let _ = accept_qt_input(&mut st.terminal, &bytes);
                 }
             });
             LRESULT(0)
@@ -465,8 +632,9 @@ unsafe extern "system" fn qt_wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            // T04:QT 与主窗同线程——QT 销毁绝不能 PostQuitMessage(会把
+            // 主窗消息循环一并掐死,主窗沦为未销毁的假退出)。QT 随进程退出
             let _ = unregister_hotkey();
-            PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

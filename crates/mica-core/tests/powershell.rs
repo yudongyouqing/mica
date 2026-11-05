@@ -8,7 +8,7 @@ use portable_pty::CommandBuilder;
 
 #[test]
 fn powershell_echo_roundtrip() {
-    let (mut session, reader) =
+    let (session, reader) =
         PtySession::spawn(CommandBuilder::new("powershell.exe"), 80, 24).expect("spawn powershell");
     session.write(b"echo psmarker_42\r\n").expect("write");
 
@@ -40,7 +40,7 @@ fn powershell_echo_roundtrip() {
 /// 注意断言必须匹配完整 `\x1b_G`——命令回显文本含 "_G" 字面量,是假阳性源。
 #[test]
 fn conpty_strips_apc_today_canary() {
-    let (mut session, reader) =
+    let (session, reader) =
         PtySession::spawn(CommandBuilder::new("powershell.exe"), 80, 24).expect("spawn powershell");
     // kitty graphics 探测序列原样输出(1x1 RGB,t=d,带应答请求 i=31)
     let cmd = concat!(
@@ -106,7 +106,7 @@ fn os_build() -> u32 {
 /// 金丝雀:任一档位行为翻向都变红 = 边界移动,更新边界文档。
 #[test]
 fn conpty_strips_osc133_today_canary() {
-    let (mut session, reader) =
+    let (session, reader) =
         PtySession::spawn(CommandBuilder::new("powershell.exe"), 80, 24).expect("spawn powershell");
     let cmd = concat!(
         "$e=[char]27; ",
