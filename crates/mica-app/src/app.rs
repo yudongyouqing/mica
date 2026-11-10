@@ -5017,7 +5017,7 @@ fn search_rescan() {
     let query = SEARCH_QUERY.with(|q| q.borrow().clone());
     let mut matches: Vec<(i32, usize, usize)> = Vec::new();
     if !query.is_empty() {
-        let needle: Vec<char> = query.to_lowercase().chars().collect();
+        let needle = mica_render::frame::fold_search(&query);
         TABS.with(|tabs| {
             let guard = tabs.borrow();
             if let Some(t) = guard

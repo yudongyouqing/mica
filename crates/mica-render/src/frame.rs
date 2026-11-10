@@ -504,7 +504,6 @@ pub fn row_fold(grid: &Grid<Cell>, line: i32) -> (Vec<char>, Vec<(usize, usize)>
     let cols = grid.columns();
     let mut hay = Vec::with_capacity(cols);
     let mut spans = Vec::with_capacity(cols);
-    let mut col = 0usize;
     for c in 0..cols {
         let cell = &grid[Line(line)][Column(c)];
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -515,18 +514,30 @@ pub fn row_fold(grid: &Grid<Cell>, line: i32) -> (Vec<char>, Vec<(usize, usize)>
         } else {
             1
         };
-        let start = col;
-        for lc in cell.c.to_lowercase() {
+        // DCH/ICH can leave an orphan spacer. Derive positions from the grid,
+        // rather than assuming every skipped spacer has a preceding wide cell.
+        for lc in fold_search_char(cell.c) {
             hay.push(lc);
-            spans.push((start, w));
+            spans.push((c, w));
         }
-        col += w;
     }
     (hay, spans)
 }
 
+/// Shared case-insensitive search folding for grid characters and queries.
+/// Normalize final sigma as well, so Σ/σ/ς match independently of word position.
+/// Unlike str::to_lowercase, this does not apply a different contextual mapping
+/// to a multi-character query than to characters extracted from terminal cells.
+pub fn fold_search(text: &str) -> Vec<char> {
+    text.chars().flat_map(fold_search_char).collect()
+}
+
+fn fold_search_char(c: char) -> impl Iterator<Item = char> {
+    c.to_lowercase().map(|lc| if lc == 'ς' { 'σ' } else { lc })
+}
+
 /// 在 row_fold 产物上找全部命中(非重叠推进):返回 (起始列, 占列宽)。
-/// needle 需调用方先小写化。宽度按列计:命中跨宽字符时含其双列
+/// needle 需调用方先经 fold_search。宽度按列计:命中跨宽字符时含其双列
 /// (高亮矩形直接乘 cell_width,见 app 侧消费)。
 pub fn find_row_matches(
     hay: &[char],
@@ -1506,6 +1517,42 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CellInstance, bg), 48);
     }
 
+    #[test]
+    fn row_fold_uses_real_columns_after_deleting_half_a_wide_cell() {
+        use mica_core::surface::{ScreenSize, Surface};
+        let mut s = Surface::new(ScreenSize::new(10, 2));
+        // DCH operates on cells and can leave a spacer without its wide lead.
+        s.feed("你a\r\x1b[P".as_bytes());
+        let (_, _, grid) = s.grid_dims();
+        assert!(
+            grid[Line(0)][Column(0)]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+        );
+        assert_eq!(grid[Line(0)][Column(1)].c, 'a');
+        let (hay, spans) = row_fold(grid, 0);
+        assert_eq!(find_row_matches(&hay, &spans, &['a']), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn row_fold_matches_all_greek_sigma_forms() {
+        use mica_core::surface::{ScreenSize, Surface};
+        for text in ["ΟΣ", "οσ", "ος"] {
+            let mut s = Surface::new(ScreenSize::new(10, 2));
+            s.feed(text.as_bytes());
+            let (_, _, grid) = s.grid_dims();
+            let (hay, spans) = row_fold(grid, 0);
+            for query in ["ΟΣ", "οσ", "ος"] {
+                let needle = fold_search(query);
+                assert_eq!(
+                    find_row_matches(&hay, &spans, &needle),
+                    vec![(0, 2)],
+                    "text={text:?}, query={query:?}"
+                );
+            }
+        }
+    }
+
     /// #57 搜索列映射:真 parser 喂出的 WIDE_CHAR/SPACER 标志下,
     /// 命中的列号/列宽必须按屏幕列计(旧实现字节偏移当列、字符数当宽,
     /// CJK/emoji 双错位)。喂真实 VT 序列,不手搓 cell。
@@ -1526,7 +1573,7 @@ mod tests {
             &(7..20).map(|c| (c, 1)).collect::<Vec<_>>()[..],
             "🙂 后空白格逐列 7..20"
         );
-        let n = |q: &str| q.to_lowercase().chars().collect::<Vec<char>>();
+        let n = fold_search;
         // ASCII:与旧实现的字节偏移语义一致(回归保护)
         assert_eq!(find_row_matches(&hay, &spans, &n("ab")), vec![(0, 2)]);
         // 宽字符命中:你 = 2 列
@@ -1554,7 +1601,7 @@ mod tests {
         assert_eq!(&hay[..4], &['i', '\u{307}', 'a', 'b'], "İ 折叠成 i+U+0307");
         assert_eq!(hay.len(), 11, "折叠 4 字符占 3 列 + 7 空白列");
         assert_eq!(&spans[..4], &[(0, 1), (0, 1), (1, 1), (2, 1)]);
-        let n = |q: &str| q.to_lowercase().chars().collect::<Vec<char>>();
+        let n = fold_search;
         // 旧实现:hay="i̇AB"(a 在字节 3)→ 报列 3;正解列 1
         assert_eq!(find_row_matches(&hay, &spans, &n("ab")), vec![(1, 2)]);
     }
