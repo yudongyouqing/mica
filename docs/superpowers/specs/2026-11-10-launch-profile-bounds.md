@@ -59,7 +59,16 @@ On Windows 10.0.26300.9711, the existing OSC 133 test failed 3/3 runs both in
 the original `5217d0a` source snapshot and with these changes because it accepted
 the injected command's PSReadLine echo as completion. Runtime-built completion
 markers restore actual-execution assertions; all three PowerShell protocol
-tests then passed without changing the OS-build expectations or user profile.
+tests then passed on that client without changing the user profile.
+
+The first completed-execution CI probe (run 42820078822) on Server 2025
+build 26100, image windows-2025-vs2026/20261103.298.1, also contained the
+complete OSC 133 payload. The previous claim that every build below 26300
+stripped it was therefore unsupported by the old echo-based test. Windows CI
+now explicitly pins passthrough with MICA_CONPTY_OSC133_EXPECT; a loss of that
+capability still fails. Verified 26300+ clients retain their strict regression;
+other unverified older builds report their measured capability without
+inventing a new universal version cutoff. Invalid expectation values fail.
 
 An isolated GUI fault-injection run used a 30-second-sleeping `wsl.exe` fixture
 beside the separately built test Mica executable. While enumeration was still

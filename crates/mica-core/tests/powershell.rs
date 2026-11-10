@@ -83,16 +83,19 @@ fn conpty_strips_apc_today_canary() {
     );
 }
 
-/// OS build 号(`cmd /c ver` 的 `[Version 10.0.XXXXX]` 段):OSC 133 边界
-/// 随系统走——26300(客户端实测)透传,26100(CI Server 2025 实测)剥离,
-/// 金丝雀按 build 分档断言(两类环境都保有警戒语义)。
-fn os_build() -> u32 {
+/// Record the complete observed OS version; a major build alone does not
+/// identify every ConPTY implementation or servicing revision.
+fn os_version() -> String {
     let out = std::process::Command::new("cmd")
         .args(["/c", "ver"])
         .output()
         .expect("cmd /c ver");
-    let s = String::from_utf8_lossy(&out.stdout).to_string();
-    s.split('[')
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn os_build(version: &str) -> u32 {
+    version
+        .split('[')
         .nth(1)
         .and_then(|v| {
             v.trim_start_matches("Version ")
@@ -104,12 +107,20 @@ fn os_build() -> u32 {
         .unwrap_or(0)
 }
 
-/// ConPTY 对 OSC 133 的处置(2026-10-12 定档):**随 OS build 走**——
-/// ≥26300 完整透传(客户端 Win11 实测,jump/exit 状态点可达);26100 及
-/// 以下剥离(CI Server 2025 实测,毁引导符+载荷泄漏,与 APC 同款)。
-/// 金丝雀:任一档位行为翻向都变红 = 边界移动,更新边界文档。
+/// Known CI capability is explicitly pinned; verified 26300+ clients retain
+/// their strict passthrough regression. Older unverified builds are probes.
+/// Runtime completion must be observed before classifying transport behavior.
 #[test]
-fn conpty_strips_osc133_today_canary() {
+fn conpty_osc133_transport_canary() {
+    let version = os_version();
+    let configured = std::env::var("MICA_CONPTY_OSC133_EXPECT").ok();
+    let expected = match configured.as_deref() {
+        Some("passthrough") => Some(true),
+        Some("stripped") => Some(false),
+        Some(other) => panic!("invalid MICA_CONPTY_OSC133_EXPECT={other:?}"),
+        None if os_build(&version) >= 26300 => Some(true),
+        None => None,
+    };
     let (session, reader) =
         PtySession::spawn(CommandBuilder::new("powershell.exe"), 80, 24).expect("spawn powershell");
     let cmd = concat!(
@@ -132,21 +143,16 @@ fn conpty_strips_osc133_today_canary() {
             }
             answered = pending;
             if all.windows(11).any(|w| w == b"OSC133-DONE") {
-                // 透传判据 = 完整六字节 `ESC ] 1 3 3 ;`(剥离态把引导符
-                // ESC] 毁成 ST(ESC\),载荷 ]133;... 以纯文本泄漏——与 APC 同款)
-                let passed = all.windows(6).any(|w| w[0] == 0x1b && &w[1..] == b"]133;");
-                if os_build() >= 26300 {
-                    assert!(
+                let probe = b"\x1b]133;D;err=0\x07";
+                let passed = all.windows(probe.len()).any(|bytes| bytes == probe);
+                eprintln!(
+                    "OSC133 OS={version:?} configured={configured:?} expected={expected:?} observed_passthrough={passed}"
+                );
+                if let Some(expected) = expected {
+                    assert_eq!(
                         passed,
-                        "build ≥26300 回到剥离 OSC 133 了!边界又动——jump/exit \
-                         状态点降级,更新边界文档;{}",
-                        String::from_utf8_lossy(&all)
-                    );
-                } else {
-                    assert!(
-                        !passed,
-                        "build <26300 开始透传 OSC 133 了!边界下移——低版本 \
-                         jump/exit 状态点即刻可用,更新边界文档;{}",
+                        expected,
+                        "OSC133 transport changed: OS={version:?}; configured={configured:?}; output={}",
                         String::from_utf8_lossy(&all)
                     );
                 }
