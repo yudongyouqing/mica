@@ -10,7 +10,11 @@ use portable_pty::CommandBuilder;
 fn powershell_echo_roundtrip() {
     let (session, reader) =
         PtySession::spawn(CommandBuilder::new("powershell.exe"), 80, 24).expect("spawn powershell");
-    session.write(b"echo psmarker_42\r\n").expect("write");
+    // Build the marker in the shell: PSReadLine's input echo must not be
+    // mistaken for evidence that PowerShell executed the command.
+    session
+        .write(b"[Console]::Write('psmarker_'+'42')\r\n")
+        .expect("write");
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut all = Vec::new();
@@ -46,7 +50,7 @@ fn conpty_strips_apc_today_canary() {
     let cmd = concat!(
         "$e=[char]27; ",
         "[Console]::Write(\"$e\"+'_Gq=1,i=31,s=1,v=1,t=d,f=24;AAAA'+\"$e\"+'\\\\'); ",
-        "Write-Output PROBE-DONE\r\n"
+        "Write-Output ('PROBE-'+'DONE')\r\n"
     );
     session.write(cmd.as_bytes()).expect("write");
 
@@ -112,7 +116,7 @@ fn conpty_strips_osc133_today_canary() {
         "$e=[char]27; ",
         "[Console]::Write(\"$e\"+'_Gq=1'+\"$e\"+'\\\\'); ", // APC 探测先行(参照)
         "[Console]::Write(\"$e\"+']133;D;err=0'+[char]7); ",
-        "Write-Output OSC133-DONE\r\n"
+        "Write-Output ('OSC133-'+'DONE')\r\n"
     );
     session.write(cmd.as_bytes()).expect("write");
 

@@ -165,6 +165,20 @@ fn process_request(pipe: HANDLE, tx: &mpsc::Sender<IncomingRequest>) -> IpcRespo
         return IpcResponse::error(req.id, IpcError::UnknownOp);
     }
 
+    let request_started = Instant::now();
+    if req.op == "new-tab"
+        && let Some(name) = req.profile.as_deref()
+    {
+        // Only the IPC worker may wait for an explicit unknown profile. Join
+        // the same single-flight refresh as the UI; reserve most of the
+        // existing 3s client budget for PTY creation and response delivery.
+        match mica_core::profile::find_profile(name, Duration::from_millis(750)) {
+            Ok(Some(_)) => {}
+            Ok(None) => return IpcResponse::error(req.id, IpcError::BadProfile),
+            Err(_) => return IpcResponse::error(req.id, IpcError::Timeout),
+        }
+    }
+
     // ---- 入队 → 唤醒(顺序即修复:先 send 后 Post)----
     let (reply_tx, reply_rx) = mpsc::sync_channel::<IpcResponse>(1);
     if tx
@@ -189,7 +203,7 @@ fn process_request(pipe: HANDLE, tx: &mpsc::Sender<IncomingRequest>) -> IpcRespo
 
     // ---- 等应答(UI 处理后 reply;超时只承诺"未确认",不谎报成功;
     // 请求可能已被执行——客户端文案明确"结果未知")----
-    match reply_rx.recv_timeout(REPLY_DEADLINE) {
+    match reply_rx.recv_timeout(REPLY_DEADLINE.saturating_sub(request_started.elapsed())) {
         Ok(r) => r,
         Err(_) => IpcResponse::error(req.id, IpcError::Timeout),
     }

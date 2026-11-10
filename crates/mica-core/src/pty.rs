@@ -86,8 +86,6 @@ pub struct PtySession {
     child: Option<Box<dyn Child + Send + Sync>>,
 }
 
-/// 命令行字符串(exe + 空格分隔参数)→ CommandBuilder(M3a profile 用;
-/// 引号语义不支持——profile 命令都是受控生成,不含带空格路径)。
 /// ConPTY 宿主消毒(1.0.6):Windows 的 CreatePseudoConsole 在系统内部
 /// 解析宿主 exe(OpenConsole/conhost),解析会扫进程 PATH——装了 WezTerm
 /// 的机器上 F:\WezTerm 的 OpenConsole 抢位成功,我们的 ConPTY 会话寄生
@@ -112,15 +110,111 @@ pub fn sanitize_conpty_host_path() {
 }
 
 pub fn command_from_str(cmd: &str) -> CommandBuilder {
-    let mut parts = cmd.split_whitespace();
-    let Some(exe) = parts.next() else {
+    let cmd = cmd.trim_matches([' ', '\t']);
+    // A whole `shell = C:\Program Files\...\shell.exe` setting may name
+    // an executable directly, even without command-line quotes.
+    if std::path::Path::new(cmd).is_file() {
+        return CommandBuilder::new(cmd);
+    }
+    let Some((exe, mut rest)) = next_windows_arg(cmd) else {
         return default_shell_command();
     };
-    let mut builder = CommandBuilder::new(exe);
-    for arg in parts {
+    let powershell = exe.rsplit(['/', '\\']).next().is_some_and(|name| {
+        ["powershell", "powershell.exe", "pwsh", "pwsh.exe"]
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    });
+    let mut builder = CommandBuilder::new(&exe);
+    while let Some((arg, tail)) = next_windows_arg(rest) {
+        let script =
+            powershell && (arg.eq_ignore_ascii_case("-Command") || arg.eq_ignore_ascii_case("-c"));
         builder.arg(arg);
+        rest = tail;
+        if script {
+            // PowerShell treats the remainder as source code. Parsing each
+            // token would remove quotes inside ordinary -Command scripts.
+            let source = rest.trim_start_matches([' ', '\t']);
+            if let Some((arg, tail)) = next_windows_arg(source) {
+                if source.starts_with('"') && tail.trim().is_empty() {
+                    builder.arg(arg); // one explicitly quoted script argument
+                } else {
+                    builder.arg(source);
+                }
+            }
+            break;
+        }
     }
     builder
+}
+
+/// Windows CRT argument quoting: whitespace separates outside quotes;
+/// 2n backslashes before a quote produce n backslashes + a quote delimiter,
+/// 2n+1 produce n backslashes + a literal quote. Empty quoted args survive.
+fn next_windows_arg(input: &str) -> Option<(String, &str)> {
+    let input = input.trim_start_matches([' ', '\t']);
+    if input.is_empty() {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !quoted && matches!(bytes[i], b' ' | b'\t') {
+            break;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'\\' {
+            i += 1;
+        }
+        let slashes = i - start;
+        if i < bytes.len() && bytes[i] == b'"' {
+            out.extend(std::iter::repeat_n(b'\\', slashes / 2));
+            if slashes % 2 == 1 {
+                out.push(b'"');
+            } else if quoted && bytes.get(i + 1) == Some(&b'"') {
+                out.push(b'"');
+                i += 1;
+            } else {
+                quoted = !quoted;
+            }
+            i += 1;
+        } else {
+            out.extend(std::iter::repeat_n(b'\\', slashes));
+            if !quoted && bytes.get(i).is_some_and(|b| matches!(b, b' ' | b'\t')) {
+                break;
+            }
+            if i < bytes.len() {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    Some((
+        String::from_utf8(out).expect("only ASCII delimiters removed"),
+        &input[i..],
+    ))
+}
+
+/// Quote one generated argument using the inverse of the Windows CRT rules.
+pub fn quote_windows_arg(arg: &str) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            slashes += 1;
+        } else {
+            out.extend(std::iter::repeat_n(
+                '\\',
+                if c == '"' { slashes * 2 + 1 } else { slashes },
+            ));
+            out.push(c);
+            slashes = 0;
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', slashes * 2));
+    out.push('"');
+    out
 }
 
 /// The shell a new tab gets: PowerShell on Windows (spec M0), sh elsewhere
@@ -280,6 +374,53 @@ impl Drop for PtySession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_line_keeps_non_ascii_whitespace_as_argument_data() {
+        let cmd = super::command_from_str("shell.exe value\u{3000}");
+        assert_eq!(cmd.get_argv()[1], "value\u{3000}");
+    }
+    #[test]
+    fn command_line_backslash_does_not_escape_unquoted_whitespace() {
+        let cmd = super::command_from_str(r#"shell.exe a\ b "a""b" ''"#);
+        assert_eq!(
+            cmd.get_argv(),
+            &["shell.exe", "a\\", "b", "a\"b", "''"].map(std::ffi::OsString::from)
+        );
+    }
+    #[test]
+    fn command_line_preserves_windows_quotes_backslashes_and_empty_arguments() {
+        let cmd = super::command_from_str(
+            r#""C:\Program Files\shell.exe" "two words" "" "say \"hi\"" "C:\dir\\" plain"#,
+        );
+        let argv: Vec<_> = cmd
+            .get_argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                r"C:\Program Files\shell.exe",
+                "two words",
+                "",
+                "say \"hi\"",
+                "C:\\dir\\",
+                "plain"
+            ]
+        );
+    }
+
+    #[test]
+    fn command_line_preserves_unquoted_powershell_command_script() {
+        let cmd = super::command_from_str(
+            r#"powershell.exe -NoLogo -Command Write-Output "two words"; $x = 'keep me'; Write-Output $x"#,
+        );
+        assert_eq!(
+            cmd.get_argv()[3],
+            r#"Write-Output "two words"; $x = 'keep me'; Write-Output $x"#
+        );
+    }
+
     use super::*;
     use portable_pty::CommandBuilder;
     use std::sync::mpsc;
