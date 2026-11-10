@@ -189,6 +189,19 @@ fn dispatch_ipc(req: mica_core::ipc::IpcRequest, fallback_shell: String) -> i32 
         Err(mica_core::ipc::IpcError::NoInstance) => {
             let _ = &fallback_shell;
             if let Some(p) = &req.profile {
+                // Still on the CLI thread, before any GUI/message loop:
+                // validate and prime the snapshot for the first WSL tab.
+                let built_in = mica_core::profile::scan_static()
+                    .iter()
+                    .any(|profile| profile.name.eq_ignore_ascii_case(p));
+                if !built_in
+                    && !mica_core::profile::scan_all()
+                        .iter()
+                        .any(|profile| profile.name.eq_ignore_ascii_case(p))
+                {
+                    eprintln!("mica: 未知 profile `{p}`(WSL 枚举失败或超时也可能导致此错误)");
+                    return 1;
+                }
                 // SAFETY: 多线程前调用(单线程 CLI)
                 unsafe { std::env::set_var("MICA_START_PROFILE", p) };
             }

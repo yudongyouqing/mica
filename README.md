@@ -151,12 +151,13 @@ panic 详情(`.txt`),弹窗提示路径。**永不上传**——发 issue 时可
 
 ## 已知边界(如实陈述)
 
-ConPTY 在 Windows 侧消费以下协议序列,终端侧管线正确但收不到源头
-(直连 pty 场景即生效;边界移动由金丝雀测试看守):
+ConPTY 会影响部分协议。以下是本机与 CI 探针的已知边界,
+不代表所有 Windows 版本(直连 pty 场景与 ConPTY 也可能不同):
 
 - DECSET 2026(同步输出)—— ConPTY 自带缓冲兜底
-- OSC 133(shell integration):**随 OS build 走**——≥26300 完整
-  透传(prompt 跳转/退出码点可用),26100 及以下剥离
+- OSC 133(shell integration):本机 build 26300 与当前 CI Server 2025
+  build 26100 均实测完整透传。此前“26100 及以下剥离”的测试依据
+  受输入回显早退影响,已撤回;未知旧版本需实际探测
 - kitty graphics 的 APC 载荷(不实现,预研文档在库)
 - OSC 52(剪贴板,疑被拦截,tmux 复验在票)
 

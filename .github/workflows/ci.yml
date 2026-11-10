@@ -43,6 +43,9 @@ jobs:
         env:
           TMP: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
+          # Observed on windows-2025-vs2026/20261103.298.1 (build 26100).
+          # Pin the runner capability, not an unverified all-Windows build cutoff.
+          MICA_CONPTY_OSC133_EXPECT: passthrough
       - name: Preserve isolated GUI test diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v7
