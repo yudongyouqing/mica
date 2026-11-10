@@ -4,6 +4,9 @@
 
 #![cfg(windows)]
 
+#[path = "support/process.rs"]
+mod process;
+
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -269,14 +272,26 @@ fn both_windows_reload_from_broadcast() {
 /// 注意:除 send 外的 IPC 命令在管道不通时会**自启 GUI**(dispatch_ipc
 /// 兜底),就绪探测只能用 send——它失败时干净退出 1,绝不自启。
 fn cli(args: &[&str]) -> bool {
-    Command::new(env!("CARGO_BIN_EXE_mica"))
-        .args(args)
-        .env("USERNAME", test_user())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let log_dir = std::env::temp_dir().join(format!("mica-winlife-cli-{}", test_user()));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mica"));
+    command.args(args).env("USERNAME", test_user());
+    match process::run_with_deadline(&mut command, Duration::from_secs(8), &log_dir) {
+        Ok(output) => {
+            if !output.status.success() {
+                eprintln!(
+                    "CLI {args:?} failed: {}; logs: {}; stderr: {}",
+                    output.status,
+                    log_dir.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            output.status.success()
+        }
+        Err(error) => {
+            eprintln!("CLI {args:?}: {error}");
+            false
+        }
+    }
 }
 
 /// 等 IPC 管道就绪:send 受理(exit 0)即就绪;连不上 exit 1 不自启。
