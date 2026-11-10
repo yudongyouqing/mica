@@ -317,7 +317,7 @@ pub fn exists() -> bool {
 }
 
 /// 向 QT pane 注入输入(UI 快路径,非阻塞;当前 UI 侧 QT 输入经
-/// wndproc 直呼 stage_input,此入口留作热键/脚本路径的公共面)。
+/// wndproc 直呼 accept_qt_input,此入口留作热键/脚本路径的公共面)。
 #[allow(dead_code)]
 pub fn send_text(bytes: &[u8]) -> bool {
     QT.with(|q| {
@@ -377,11 +377,13 @@ fn accept_qt_input(
     flow
 }
 
-/// QT 输入的生产入口(四轮返工复核 5):**非阻塞接收 + 武装 QT 自己
-/// 的续灌定时器(id 7)**——所属输入目标 → 所属续灌调度。QT 的按键、
-/// DSR 回复、IPC send-text 三条真实路径都经此(不再借用主窗的
-/// stage_input——那会武装主窗 id 8,而 flush_all_panes 只遍历 TABS,
-/// QT 欠账无人推进)。
+/// QT 输入的 IPC 生产入口(send-text `--qt`):bracketed paste 包装 +
+/// **非阻塞接收**(stage_into,零等待)+ 武装 QT 自己的续灌定时器
+/// (id 7)——所属输入目标 → 所属续灌调度(不借主窗 stage_input,那会
+/// 武装主窗 id 8,而 flush_all_panes 只遍历 TABS,QT 欠账无人推进)。
+/// 按键与应答回写走 `accept_qt_input`(手持引用):WM_APP/WM_CHAR 处
+/// 理中已持 QT.borrow_mut(),这里再进全局面即双重借用 panic(2026-11-10
+/// 修复,回归见本模块 tests)。
 pub fn accept_qt(bytes: &[u8]) -> crate::app::pty_bridge::InputFlow {
     QT.with(|q| {
         let mut guard = q.borrow_mut();
@@ -430,6 +432,18 @@ pub fn has_input_debt() -> bool {
         q.borrow()
             .as_ref()
             .is_some_and(|st| !st.terminal.input_stage.is_empty())
+    })
+}
+
+/// 测试面:QT 输出积压的注入把手。ConPTY 会剥离查询序列,端到端喂
+/// 不进来;注入点在转发线程下游(backlog.push 之后),自 WM_APP 消费
+/// 起仍是全真生产路径。
+#[cfg(test)]
+pub(crate) fn backlog_for_test() -> Option<Arc<crate::app::pty_bridge::PtyBacklog>> {
+    QT.with(|q| {
+        q.borrow()
+            .as_ref()
+            .map(|st| Arc::clone(&st.terminal.pty_buf))
     })
 }
 
@@ -540,8 +554,13 @@ unsafe extern "system" fn qt_wndproc(
                     return;
                 };
                 st.terminal.term.feed(&bytes);
+                // 应答必须写回 pty(否则 shell 卡在等应答)。走手持引用的
+                // 内入口而非 accept_qt 全局面:WM_APP 此处已持 QT 的
+                // borrow_mut,全局面再借即 panic(生产路径条件性崩溃,
+                // 回归见本模块 tests);且应答是协议字节,不得包
+                // bracketed paste——与主窗 stage_input 同语义
                 for reply in st.terminal.term.take_pty_writes() {
-                    let _ = accept_qt(reply.as_bytes());
+                    let _ = accept_qt_input(&mut st.terminal, reply.as_bytes());
                 }
                 if let Some(t) = st.terminal.term.take_title() {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
@@ -718,4 +737,45 @@ fn qt_draw(st: &mut QtState) {
         st.atlas_revision = revision;
     }
     st.renderer.draw(&st.wgpu_surface, &st.config, &instances);
+}
+
+#[cfg(test)]
+mod tests {
+    //! WM_APP 应答回写回归(2026-11-10 审计 P1):应答写回曾走 accept_qt
+    //! 全局面,而 WM_APP 已持 QT.borrow_mut()——双重借用 panic 于 wndproc,
+    //! 进程 abort(生产路径条件性崩溃:shell 发查询 → 终端应答 → 炸)。
+    //! 真 init(真窗口/真 GPU/真会话)后向 backlog 注入 DSR 查询、
+    //! SendMessage 同步分发 WM_APP:修复前本测试以进程 abort 告红,存活
+    //! 到断言即绿。注入理由:ConPTY 剥离查询序列,端到端喂不进来;注入
+    //! 点在转发线程下游,自 WM_APP 消费起仍是全真生产路径。
+
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CLOSE};
+
+    #[test]
+    fn reply_writeback_survives_held_qt_borrow() {
+        crate::app::seed_tls_for_tests(&mica_core::config::settings::Settings::default());
+        // SAFETY: 本线程创建并拥有 QT 窗口;hwnd_main 仅用于显示器查询
+        // (null → 默认显示器)。测试尾走 WM_CLOSE → DestroyWindow 收尾
+        unsafe { init(HWND(std::ptr::null_mut())) }.expect("quickterm init");
+        let raw = QT_HWND.with(|c| c.get());
+        assert_ne!(raw, 0, "init 应登记 QT hwnd");
+        let hwnd = HWND(raw as *mut std::ffi::c_void);
+        let backlog = backlog_for_test().expect("QT 状态已装载");
+
+        // 两条 DSR 查询一批到达:feed 产生两条应答,覆盖应答 for 循环
+        backlog.push(0, b"\x1b[6n\x1b[6n").expect("注入查询");
+        // SAFETY: 同线程同步分发;修复前 panic 于此后 abort,到不了断言
+        unsafe { SendMessageW(hwnd, WM_APP, Some(WPARAM(0xFF00)), Some(LPARAM(0))) };
+        assert!(backlog_for_test().is_some(), "应答循环后 QT 状态仍可借用");
+
+        // 第二轮:路径可重复进入(连续查询场景)
+        backlog.push(0, b"\x1b[6n").expect("再注入");
+        unsafe { SendMessageW(hwnd, WM_APP, Some(WPARAM(0xFF00)), Some(LPARAM(0))) };
+
+        // SAFETY: 创建线程同步关窗(WM_DESTROY 注销热键),forget_state
+        // 杀子回收会话(真 powershell 子进程不留孤儿)
+        unsafe { SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))) };
+        forget_state();
+    }
 }
