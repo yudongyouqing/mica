@@ -136,19 +136,32 @@ second atlas, then verifies recovery with the original unchanged working-set key
 
 The post-change isolated DirectWrite replay retained the same 104,857,600 bitmap
 bytes. A PowerShell parent sampled the probe child `PrivateMemorySize64` every
-20 ms: 44 samples, peak 120,336,384 B (114.76 MiB), successful exit, 1.433 s inside
+20 ms: 44 samples, sampled peak 120,336,384 B (114.76 MiB), successful exit, 1.433 s inside
 the test / 1.596 s wall time. These are measurements of this probe process, not
 of the user's Mica process. Font/system caches and concurrent machine load were
 not controlled between runs, so elapsed values are not a speedup claim. Bitmap,
 index and cache budgets are retained-resource ceilings, not a 128 MiB limit on
 total Private Bytes.
 
-At this revision, `cargo test -j2 -p mica-render --lib -- --test-threads=1`
-reported 75 passed / 2 ignored, including real GPU pixel/upload/retirement paths.
-Workspace Clippy with all targets and `-D warnings` passed. The earlier full
-workspace run passed app units, crash/input/IPC/window lifecycle integrations and
-core units, then stopped at the pre-existing PowerShell OSC133 canary's echoed
-marker early return. That test correction belongs to #107/#114, not this fix.
-Final combined gate results will be appended after synchronizing that correction.
+The final combined revision includes dev `1bc7652` (#111 watcher, #113 background
+image budgets and #114 profile/ConPTY completion-marker corrections). On the final
+code commit `9884d3e`, `cargo test -j2 --workspace -- --test-threads=1` completed with
+**337 passed, 0 failed, 5 ignored**, including render **76 passed / 2 ignored**,
+all seven window lifecycle tests, QT scheduling units, IPC, crash/input GUI paths,
+and corrected PowerShell transport canaries. The full output was saved by the
+runner to `%TEMP%/mica-render-final-workspace.log`.
+
+`cargo clippy -j2 --workspace --all-targets -- -D warnings`, `cargo fmt --all --
+--check`, and `git diff --check` passed. The last narrow regression demonstrated
+metadata quota denial followed by pixel quota denial in the same generation:
+recovery initially inspected the old budget and failed; explicitly recording the
+latest pixel-budget owner made the same-key recovery test pass. The full combined
+suite was rerun after that one-line correction.
+
+The earlier complete run stopped at the pre-existing PowerShell OSC133 canary's
+PSReadLine-echo marker bug. That correction was synchronized from #114; no core
+canary was weakened or changed by this resource-budget fix. The final combined
+run passes its corrected strict capability check on this host.
+
 Full 8-hour soak and physical driver-memory profiling are not performed by these
-short tests.
+short tests. Remote CI/PR/merge are the parent agent's remaining integration work.
