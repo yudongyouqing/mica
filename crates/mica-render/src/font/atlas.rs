@@ -510,6 +510,7 @@ impl GlyphAtlas {
                 return None;
             }
             if !self.permit.grow(extra) {
+                self.blocked_budget = Some(self.permit.budget.clone());
                 self.blocked_extra = Some(extra);
                 self.failed_available = self
                     .permit
@@ -585,6 +586,35 @@ impl GlyphAtlas {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_tracks_latest_denied_budget_after_metadata_then_pixel_pressure() {
+        let pixels = ByteBudget::new(64 * 320 * 4);
+        let pixel_blocker = pixels.reserve(64 * 64 * 4).unwrap();
+        let mut a = GlyphAtlas::with_budget(64, 64, 64 * 320 * 4, pixels).unwrap();
+        let size = std::mem::size_of::<AtlasEntry>();
+        let metadata = ByteBudget::new(size);
+        let metadata_blocker = metadata.reserve(size).unwrap();
+        a.index_permit = metadata.reserve(0).unwrap();
+        a.index_max_bytes = size;
+        let glyph = bmp(40, 100, 200);
+        a.insert(&glyph);
+        assert!(a.prepare_frame(11, 8192));
+        a.insert(&glyph);
+        assert!(!a.prepare_frame(11, 8192));
+        drop(metadata_blocker);
+        assert_eq!(
+            a.insert(&glyph),
+            a.fallback_rect(),
+            "index can now fit, but bitmap page still cannot"
+        );
+        drop(pixel_blocker);
+        assert!(
+            a.prepare_frame(11, 8192),
+            "recovery must now inspect pixel quota rather than the old index quota"
+        );
+        assert_ne!(a.insert(&glyph), a.fallback_rect());
+    }
+
     #[test]
     fn hash_collisions_compare_full_bitmap_before_reusing_uv() {
         let mut a = GlyphAtlas::new(64, 64);
