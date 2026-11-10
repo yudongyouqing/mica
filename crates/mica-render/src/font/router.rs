@@ -117,3 +117,42 @@ impl<K: Eq + std::hash::Hash, V> BoundedCache<K, V> {
         self.entries.len()
     }
 }
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::font::atlas::ByteBudget;
+    #[test]
+    fn lru_hits_protect_hot_keys_and_process_quota_is_returned() {
+        let budget = ByteBudget::new(1024);
+        let mut cache = BoundedCache::new(1024, 2, budget.clone());
+        cache.insert(1, "hot", 512);
+        cache.insert(2, "cold", 512);
+        assert_eq!(cache.get(&1), Some(&"hot"));
+        cache.insert(3, "new", 512);
+        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.get(&1), Some(&"hot"));
+        assert!(budget.used() <= 1024);
+        let mut other = BoundedCache::new(1024, 2, budget.clone());
+        other.insert(4, "uncached", 512);
+        assert_eq!(other.len(), 0);
+        cache.clear();
+        assert_eq!(budget.used(), 0);
+        other.insert(4, "retained", 512);
+        assert_eq!(other.get(&4), Some(&"retained"));
+        drop(other);
+        assert_eq!(budget.used(), 0);
+    }
+    #[test]
+    fn unique_large_values_obey_bytes_even_below_entry_limit() {
+        let budget = ByteBudget::new(4096);
+        let mut cache = BoundedCache::new(4096, 1024, budget.clone());
+        for key in 0..100 {
+            cache.insert(key, vec![key; 700], 1212);
+        }
+        assert!(cache.len() <= 3);
+        assert!(budget.used() <= 4096);
+        cache.insert(200, vec![0; 9000], 9512);
+        assert_eq!(cache.get(&200), None);
+    }
+}

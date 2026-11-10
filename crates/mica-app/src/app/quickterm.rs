@@ -38,9 +38,6 @@ struct QtState {
     config: wgpu::SurfaceConfiguration,
     /// 输入辅助:QT 窗口自己的代理对暂存(与主窗共用 TLS 会串号,故本地)
     pending_surrogate: u32,
-    /// QT renderer 装载的图集修订号(单 pane 独占窗口,无跨标签共享——
-    /// 主窗的窗口级所有权方案见 WindowGpu::atlas_owner)
-    atlas_revision: u64,
 }
 
 thread_local! {
@@ -160,7 +157,9 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
             .expect("non-srgb");
     }
     wgpu_surface.configure(&ctx.device, &config);
-    let mut renderer = Renderer::new(&ctx, config.format);
+    let mut renderer = Renderer::new(&ctx, config.format)
+        .inspect_err(|e| eprintln!("quickterm: atlas quota failed {e}, QT disabled"))
+        .map_err(|_| ())?;
     renderer.set_clear_color(&palette);
 
     let cols = ((w_px as f32 / metrics.cell_width).max(1.0)) as u16;
@@ -247,7 +246,6 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
             wgpu_surface,
             config,
             pending_surrogate: 0,
-            atlas_revision: u64::MAX,
         })
     });
 
@@ -300,8 +298,9 @@ pub fn forget_state() {
             wgpu_surface,
             config,
             pending_surrogate: _,
-            atlas_revision: _,
         } = st;
+        let mut renderer = renderer;
+        renderer.release_atlas_resources();
         std::mem::forget(renderer);
         std::mem::forget(wgpu_surface);
         std::mem::forget(config);
@@ -671,6 +670,18 @@ unsafe fn unregister_hotkey() -> windows::core::Result<()> {
 
 fn qt_draw(st: &mut QtState) {
     let t = &mut st.terminal;
+    let fingerprint = if t.router.needs_resource_recovery() {
+        mica_render::frame::resource_fingerprint(&t.term) ^ t.exited.unwrap_or(0) as u64
+    } else {
+        0
+    };
+    t.router
+        .prepare_frame(fingerprint, st.renderer.max_atlas_dimension());
+    let version = t.router.atlas_version();
+    if version != t.last_atlas_ver {
+        t.last_atlas_ver = version;
+        t.force_full = true;
+    }
     let damage = if std::mem::take(&mut t.force_full) {
         let _ = t.term.take_damage();
         Damage::Full
@@ -730,12 +741,9 @@ fn qt_draw(st: &mut QtState) {
             x += t.metrics.cell_width;
         }
     }
-    let revision = t.router.atlas_revision();
-    let atlas = t.router.atlas();
-    if st.atlas_revision != revision {
-        st.renderer.set_atlas(&atlas);
-        st.atlas_revision = revision;
-    }
+    // Always bind by true atlas identity; also retries GPU quota recovery when
+    // the CPU revision has not changed. Renderer handles no-upload cache hits.
+    st.renderer.set_atlas(&t.router.atlas());
     st.renderer.draw(&st.wgpu_surface, &st.config, &instances);
 }
 

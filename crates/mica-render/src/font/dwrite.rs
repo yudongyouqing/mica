@@ -62,7 +62,7 @@ pub struct DwriteRouter {
     /// 图集**——单次 draw 只绑一张纹理的硬约束(2026-10-12 共享图集
     /// 重构;此前每路由私有一份,strip 换 UI 字体必然两张图集)
     atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
-    /// 图集版本哨兵:grow 会重排搬动全部条目,缓存里的 UV 是按当时尺寸归一的
+    /// Generation sentinel; both caches are invalid after frame-boundary reset.
     last_atlas_version: u64,
     cache: BoundedCache<(char, u8), GlyphInfo>,
     /// 连字 shaping(M2b/T4):启动探测(主字体对 =>/>= 系列产合成字形)
@@ -274,10 +274,8 @@ impl DwriteRouter {
         self.atlas.borrow().revision()
     }
 
-    /// 仅 grow 重排递增——app 侧据此作废行级实例缓存(2026-10-08:
-    /// row_insts 的 UV 是按当时图集布局烘焙的,grow 重排后全表位移,
-    /// 未重建的行 = 画到别人的字形上 = "一块一块/乱码"。新实例测不出
-    /// ——要会话内字符量把图集撑大才触发,claude+omp+精灵必中)
+    /// Layout generation: app must fully rebuild row instances when it changes.
+    /// Append-only growth changes content revision, never existing pixel UVs.
     pub fn atlas_version(&self) -> u64 {
         self.atlas.borrow().version()
     }
@@ -550,7 +548,15 @@ impl DwriteRouter {
             if bw == 0 || bh == 0 {
                 continue; // 空层跳过
             }
-            if layers.len() >= 64 || !Self::raster_dimensions_ok(bw as u32, bh as u32) {
+            let retained_coverage: usize = layers
+                .iter()
+                .map(|(_, coverage, _)| coverage.capacity())
+                .sum();
+            if retained_coverage.saturating_add((bw as usize).saturating_mul(bh as usize))
+                > 512 * 512
+                || layers.len() >= 64
+                || !Self::raster_dimensions_ok(bw as u32, bh as u32)
+            {
                 return Some(self.replacement());
             }
             let mut raw = vec![0u8; (bw * bh) as usize * 3];
@@ -709,7 +715,7 @@ impl GlyphRouter for DwriteRouter {
         }
         let bytes = key.0.capacity() * std::mem::size_of::<char>()
             + layouts.capacity() * std::mem::size_of::<ClusterLayout>()
-            + 256;
+            + 512;
         self.run_cache.insert(key, layouts.clone(), bytes);
         Some(layouts)
     }
@@ -746,7 +752,7 @@ impl GlyphRouter for DwriteRouter {
             // 会每帧重画重插,图集无限膨胀+重排,revision 逐帧变把未脏行
             // 的缓存 UV 全部作废(乱码)乃至纹理爆掉(黑屏/崩)。
             // 2026-10-07 sprite 首版漏了这条,真机十分钟翻车
-            self.cache.insert(key, info, 256);
+            self.cache.insert(key, info, 512);
             return info;
         }
         let mut info = self.rasterize(ch, style).unwrap_or_else(blank_glyph);
@@ -770,7 +776,7 @@ impl GlyphRouter for DwriteRouter {
             info.offset_px[1] += (info.size_px[1] - new_h) / 2.0;
             info.size_px = [cw, new_h];
         }
-        self.cache.insert(key, info, 256);
+        self.cache.insert(key, info, 512);
         info
     }
 }
@@ -904,6 +910,79 @@ fn shape_run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unique_long_runs_obey_byte_budget_and_oversized_input_falls_back_to_characters() {
+        let mut r = super::DwriteRouter::new(12.0, &["Consolas"]).unwrap();
+        r.ligatures = true;
+        for n in 0..64 {
+            let text: Vec<char> = format!("{:>3000} value_{n}", "a").chars().collect();
+            assert!(
+                super::GlyphRouter::route_run(&mut r, &text, super::GlyphStyle::PLAIN).is_some()
+            );
+        }
+        assert!(
+            r.run_cache.len() < 64,
+            "byte budget must evict below the entry ceiling"
+        );
+        let retained = r.run_cache.len();
+        assert!(
+            super::GlyphRouter::route_run(&mut r, &vec!['a'; 4097], super::GlyphStyle::PLAIN)
+                .is_none()
+        );
+        assert_eq!(r.run_cache.len(), retained);
+        assert!(super::GlyphRouter::route(&mut r, 'a', super::GlyphStyle::PLAIN).size_px[0] > 0.0);
+    }
+
+    #[test]
+    fn shared_grid_strip_generation_clears_character_and_shaping_caches() {
+        let budget = super::super::atlas::ByteBudget::new(512 * 512 * 4);
+        let atlas = std::rc::Rc::new(std::cell::RefCell::new(
+            super::GlyphAtlas::with_budget(512, 512, 512 * 512 * 4, budget).unwrap(),
+        ));
+        let mut grid =
+            super::DwriteRouter::new_with_atlas(12.0, &["Consolas"], atlas.clone()).unwrap();
+        let mut strip =
+            super::DwriteRouter::new_with_atlas(9.5, &["Consolas"], atlas.clone()).unwrap();
+        grid.ligatures = true;
+        super::GlyphRouter::route(&mut grid, 'A', super::GlyphStyle::PLAIN);
+        super::GlyphRouter::route(&mut strip, 'B', super::GlyphStyle::PLAIN);
+        super::GlyphRouter::route_run(&mut grid, &['a', 'b'], super::GlyphStyle::PLAIN);
+        assert!(grid.run_cache.len() > 0);
+        let identity = atlas.borrow().identity();
+        atlas
+            .borrow_mut()
+            .insert(&super::GlyphBitmap::from_coverage(
+                500,
+                500,
+                vec![255; 500 * 500],
+            ));
+        atlas
+            .borrow_mut()
+            .insert(&super::GlyphBitmap::from_coverage(
+                500,
+                500,
+                vec![255; 500 * 500],
+            ));
+        assert!(grid.prepare_frame(10, 8192));
+        assert_eq!(grid.cache.len(), 0);
+        assert_eq!(grid.run_cache.len(), 0);
+        super::GlyphRouter::route(&mut strip, 'C', super::GlyphStyle::PLAIN);
+        assert_eq!(
+            strip.cache.len(),
+            1,
+            "sibling router lazily discards its old generation"
+        );
+        assert_eq!(atlas.borrow().identity(), identity);
+        assert_eq!(atlas.borrow().version(), 1);
+        let fresh_dpi = super::DwriteRouter::new(18.0, &["Consolas"]).unwrap();
+        assert_ne!(
+            fresh_dpi.atlas().identity(),
+            identity,
+            "DPI rebuild cannot collide at equal revision"
+        );
+        assert_eq!(fresh_dpi.atlas().revision(), 0);
+    }
+
     #[test]
     fn shaping_unique_lines_have_bounded_cache() {
         let mut r = super::DwriteRouter::new(12.0, &["Consolas"]).unwrap();

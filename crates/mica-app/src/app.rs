@@ -747,8 +747,16 @@ pub fn run() {
             } else {
                 settings.font_families.iter().map(String::as_str).collect()
             };
-            let router = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families)
-                .expect("no fonts resolved");
+            let router = match DwriteRouter::new(scaled_pt(settings.font_size_pt), &families) {
+                Ok(router) => router,
+                Err(error) => {
+                    warn_box(&format!("Font/atlas resource unavailable: {error}"));
+                    // WM_DESTROY decrements the count, even before registration.
+                    WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                    return;
+                }
+            };
             eprintln!("font families in use: {:?}", router.families_in_use());
             let metrics = router.metrics();
             eprintln!(
@@ -797,7 +805,14 @@ pub fn run() {
             .with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
         STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
         CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
-        let gpu = init_window_gpu(hwnd);
+        let gpu = match init_window_gpu(hwnd) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                warn_box(&format!("GPU atlas resource unavailable: {error}"));
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                return;
+            }
+        };
         GPU.with(|g| *g.borrow_mut() = Some(gpu));
 
         // M3a:单实例 IPC 服务(管道被占说明已有实例——main 侧已分流,这里
@@ -959,8 +974,15 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 } else {
                     settings.font_families.iter().map(String::as_str).collect()
                 };
-                let router = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families)
-                    .expect("no fonts resolved");
+                let router = match DwriteRouter::new(scaled_pt(settings.font_size_pt), &families) {
+                    Ok(router) => router,
+                    Err(error) => {
+                        warn_box(&format!("Font/atlas resource unavailable: {error}"));
+                        WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                        return;
+                    }
+                };
                 let metrics = router.metrics();
                 let mut rect = RECT {
                     left: 0,
@@ -994,7 +1016,14 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
             });
             STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
             CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
-            let gpu = init_window_gpu(hwnd);
+            let gpu = match init_window_gpu(hwnd) {
+                Ok(gpu) => gpu,
+                Err(error) => {
+                    warn_box(&format!("GPU atlas resource unavailable: {error}"));
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                    return;
+                }
+            };
             GPU.with(|g| *g.borrow_mut() = Some(gpu));
             let start_profile = std::env::var("MICA_START_PROFILE").ok();
             if start_profile.is_some() {
@@ -1377,7 +1406,7 @@ unsafe fn reload_config(hwnd: HWND) {
 /// 初始化终端状态,返回 (pty 读端, 共享输出缓冲):读端连同缓冲交给转发
 /// 线程(T7),缓冲同时存进 Terminal 供 WM_APP_RENDER 取空。
 /// 窗口级 GPU 一次建:TAB_SEED 供 NewTab 复用启动设置。
-unsafe fn init_window_gpu(hwnd: HWND) -> WindowGpu {
+unsafe fn init_window_gpu(hwnd: HWND) -> anyhow::Result<WindowGpu> {
     // wgpu 30:display handle 挂在 Instance 上,窗口路线用无显示构造
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     // SAFETY: hwnd 活到进程结束,长于 wgpu_surface
@@ -1426,13 +1455,13 @@ unsafe fn init_window_gpu(hwnd: HWND) -> WindowGpu {
         std::sync::Arc::new(|e: wgpu::Error| eprintln!("[wgpu] uncaptured error: {e}"));
     ctx.device.on_uncaptured_error(err_handler);
     // T4:Globals 不再携带 cell/shader v2 纯矩形化,Renderer::new 退掉 cell 参
-    let renderer = Renderer::new(&ctx, config.format).expect("initial GPU atlas quota");
-    WindowGpu {
+    let renderer = Renderer::new(&ctx, config.format)?;
+    Ok(WindowGpu {
         ctx,
         renderer,
         wgpu_surface,
         config,
-    }
+    })
 }
 
 /// device lost 后整套重建 GPU 资源(M5b/T2)。旧 WindowGpu 先 drop(旧
@@ -1448,7 +1477,14 @@ fn rebuild_gpu_after_loss() {
     };
     // SAFETY: 哨兵非空即窗口存活(run() 退出序先置 None)
     unsafe {
-        let gpu = init_window_gpu(HWND(raw as _));
+        let gpu = match init_window_gpu(HWND(raw as _)) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                eprintln!("GPU atlas rebuild deferred: {error}");
+                GPU_LOST.store(true, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
         GPU.with(|g| *g.borrow_mut() = Some(gpu));
     }
     TABS.with(|tabs| {
@@ -1834,7 +1870,8 @@ unsafe fn create_pane_with_size(
     } else {
         families.iter().map(String::as_str).collect()
     };
-    let router = DwriteRouter::new(size_pt, &families).expect("no fonts resolved");
+    let router = DwriteRouter::new(size_pt, &families)
+        .map_err(|e| format!("Font/atlas resource unavailable: {e}"))?;
     let metrics = router.metrics();
     let palette = CURRENT_PALETTE.with(|p| *p.borrow());
 
@@ -2122,7 +2159,11 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
             lifecycle::close_terminal(pane.terminal);
         }
     }
-    std::mem::forget(GPU.with(|g| g.borrow_mut().take()));
+    let mut gpu = GPU.with(|g| g.borrow_mut().take());
+    if let Some(gpu) = gpu.as_mut() {
+        gpu.renderer.release_atlas_resources();
+    }
+    std::mem::forget(gpu);
     crate::app::quickterm::forget_state();
     orphan::clear_sessions_for_exit(); // 干净退出:本进程注册表条目全清(T02)
     let (ok, fallback, inflight, degraded) = lifecycle::reaper_stats();
@@ -2680,7 +2721,7 @@ fn draw_frame() {
     });
     // ---- T05 分批绘制:一次取帧、一次 clear、每批各绑各的图集、
     // 一次 present。图集在批间经 TABS 短借获取(Ref 与 set_atlas 同闭包,
-    // 期间无 mut 借用)。门控仍是窗口级所有权 (pane_id, revision)——
+    // 期间无 mut 借用)。Renderer gates by atlas identity/generation/revision.
     // 1.0.10 修切标签乱码的身份门语义不变,只是从"每帧一次"变"每批一次"
     GPU.with(|g| {
         let mut gpu_guard = g.borrow_mut();
