@@ -3,7 +3,7 @@
 
 use super::GlyphStyle;
 
-/// 一个已就位的字形:uv 已归一化(0..1),offset 相对格左上。
+/// 一个已就位的字形:uv 为图集纹素坐标,offset 相对格左上。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlyphInfo {
     pub uv: [f32; 4],

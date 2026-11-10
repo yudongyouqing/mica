@@ -728,7 +728,7 @@ fn qt_draw(st: &mut QtState) {
     tests::DRAW_COUNT.with(|n| n.set(n.get() + 1));
     let t = &mut st.terminal;
     let fingerprint = if t.router.needs_resource_recovery() {
-        mica_render::frame::resource_fingerprint(&t.term) ^ t.exited.unwrap_or(0) as u64
+        mica_render::frame::resource_fingerprint(&t.term, &t.exited)
     } else {
         0
     };

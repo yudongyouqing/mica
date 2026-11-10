@@ -2324,12 +2324,20 @@ fn draw_frame() {
                     .map_or(8192, |gpu| gpu.renderer.max_atlas_dimension())
             });
             let fingerprint = if t.router.needs_resource_recovery() {
-                use std::hash::{Hash, Hasher};
-                let mut hash = std::collections::hash_map::DefaultHasher::new();
-                mica_render::frame::resource_fingerprint(&t.term).hash(&mut hash);
-                titles.hash(&mut hash);
-                SEARCH_QUERY.with(|q| q.borrow().hash(&mut hash));
-                hash.finish()
+                // Only the focused atlas also owns strip/overlay text. Anchor,
+                // cursor and animation changes do not change the glyph working set.
+                let shared_ui = (pane.id == focused_pane_id).then(|| {
+                    (
+                        &titles,
+                        SEARCH_OPEN.with(std::cell::Cell::get),
+                        SEARCH_QUERY.with(|q| q.borrow().clone()),
+                        HOVER_URL.with(|h| h.borrow().as_ref().map(|(url, _, _)| url.clone())),
+                        RENAME_OPEN.with(std::cell::Cell::get),
+                        RENAME_QUERY.with(|q| q.borrow().clone()),
+                        t.exited,
+                    )
+                });
+                mica_render::frame::resource_fingerprint(&t.term, &shared_ui)
             } else {
                 0
             };

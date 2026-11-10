@@ -20,7 +20,7 @@ use crate::font::router::GlyphRouter;
 
 /// Visible glyph/style working set, evaluated only under resource pressure.
 /// Scrollback outside the viewport cannot force resource-recovery rebuilds.
-pub fn resource_fingerprint(surface: &Surface) -> u64 {
+pub fn resource_fingerprint(surface: &Surface, shared_ui: &impl std::hash::Hash) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     let grid = surface.grid();
@@ -36,11 +36,12 @@ pub fn resource_fingerprint(surface: &Surface) -> u64 {
                 .hash(&mut hash);
         }
     }
+    shared_ui.hash(&mut hash);
     hash.finish()
 }
 
-/// One drawable quad. `pos_uv = [x_px, y_px, u, v]`(uv 为图集内左上,0..1),
-/// `size_uv = [w_px, h_px, uw, uvh]`(像素尺寸 + uv 尺寸,0..1)。
+/// One drawable quad. `pos_uv = [x_px, y_px, u, v]` (u/v are atlas pixel coordinates),
+/// `size_uv = [w_px, h_px, uw, uvh]` (screen pixels + atlas pixel extent).
 /// 背景 quad 与空白格均用 `blank` 形态:uv 尺寸 0,shader 墨恒 0。
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1464,6 +1465,39 @@ pub fn repack(rows: &[RowInst]) -> Vec<CellInstance> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changed_shared_ui_recovers_a_full_atlas_with_unchanged_grid() {
+        use crate::font::atlas::{ByteBudget, GlyphAtlas, GlyphBitmap};
+        use mica_core::surface::{ScreenSize, Surface};
+        let surface = Surface::new(ScreenSize::new(2, 2));
+        let mut atlas =
+            GlyphAtlas::with_budget(64, 64, 64 * 64 * 4, ByteBudget::new(64 * 64 * 4)).unwrap();
+        let large = GlyphBitmap::from_coverage(40, 40, vec![255; 40 * 40]);
+        let other = GlyphBitmap::from_coverage(40, 40, vec![200; 40 * 40]);
+        let key = |hover: &str, rename: &str, exited: Option<u32>| {
+            super::resource_fingerprint(&surface, &(hover, rename, exited))
+        };
+        atlas.insert(&large);
+        atlas.insert(&other);
+        assert!(atlas.prepare_frame(key("old tooltip", "old rename", None), 8192));
+        atlas.insert(&large);
+        atlas.insert(&other);
+        assert!(!atlas.prepare_frame(key("old tooltip", "old rename", None), 8192));
+        assert!(atlas.prepare_frame(key("new tooltip", "old rename", None), 8192));
+        atlas.insert(&large);
+        atlas.insert(&other);
+        assert!(atlas.prepare_frame(key("new tooltip", "new rename", None), 8192));
+        assert_ne!(
+            key("", "", None),
+            key("", "", Some(0)),
+            "QT successful exit adds banner glyphs"
+        );
+        assert_ne!(
+            atlas.insert(&GlyphBitmap::from_coverage(10, 10, vec![255; 100])),
+            atlas.fallback_rect()
+        );
+    }
+
     use super::*;
     use crate::font::sprite::draw;
 

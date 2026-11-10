@@ -5,7 +5,7 @@
 //! old UVs or silently dropping ordinary glyphs.
 
 /// 位图格式:Coverage = 灰度覆盖(进 A 通道);ColorRgba = 彩色原色。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GlyphFormat {
     Coverage,
     ColorRgba,
@@ -150,6 +150,18 @@ pub(crate) fn character_budget() -> Arc<ByteBudget> {
         .clone()
 }
 
+#[derive(Clone, Copy)]
+struct AtlasEntry {
+    hash: u64,
+    rect: Rect,
+}
+fn index_budget() -> Arc<ByteBudget> {
+    static BUDGET: OnceLock<Arc<ByteBudget>> = OnceLock::new();
+    BUDGET
+        .get_or_init(|| ByteBudget::new(16 * 1024 * 1024))
+        .clone()
+}
+
 struct Shelf {
     y: u32,
     height: u32,
@@ -169,6 +181,11 @@ pub struct GlyphAtlas {
     data: Vec<u8>,
     permit: BytePermit,
     shelves: Vec<Shelf>,
+    // Sorted metadata can move; bitmap pixel UVs never do. Full byte comparison
+    // resolves hash collisions, so an LRU miss cannot append duplicate ink.
+    index: Vec<AtlasEntry>,
+    index_permit: BytePermit,
+    index_max_bytes: usize,
     version: u64,
     revision: u64,
     dirty: VecDeque<(u64, Rect)>,
@@ -177,6 +194,7 @@ pub struct GlyphAtlas {
     recovery_key: Option<u64>,
     blocked_extra: Option<usize>,
     failed_available: usize,
+    blocked_budget: Option<Arc<ByteBudget>>,
 }
 impl GlyphAtlas {
     pub fn new(width: u32, height: u32) -> Self {
@@ -222,6 +240,11 @@ impl GlyphAtlas {
             data,
             permit,
             shelves: Vec::new(),
+            index: Vec::new(),
+            index_permit: index_budget()
+                .reserve(0)
+                .expect("zero-byte index reservation"),
+            index_max_bytes: 2 * 1024 * 1024,
             version: 0,
             revision: 0,
             dirty: VecDeque::new(),
@@ -230,6 +253,7 @@ impl GlyphAtlas {
             recovery_key: None,
             blocked_extra: None,
             failed_available: 0,
+            blocked_budget: None,
         };
         atlas.seed_fallback();
         Ok(atlas)
@@ -326,11 +350,8 @@ impl GlyphAtlas {
     /// cause generation/rebuild storms; quota release or changed content retries.
     pub fn prepare_frame(&mut self, fingerprint: u64, max_dimension: u32) -> bool {
         self.max_height = max_dimension.min(8192).max(self.initial_height);
-        let available = self
-            .permit
-            .budget
-            .limit
-            .saturating_sub(self.permit.budget.used());
+        let budget = self.blocked_budget.as_ref().unwrap_or(&self.permit.budget);
+        let available = budget.limit.saturating_sub(budget.used());
         let quota_recovered = self
             .blocked_extra
             .is_some_and(|extra| available >= extra && available > self.failed_available);
@@ -349,6 +370,9 @@ impl GlyphAtlas {
         self.height = self.initial_height;
         self.data.fill(0);
         self.shelves.clear();
+        self.index.clear();
+        self.index.shrink_to_fit();
+        self.index_permit.shrink(self.index_permit.bytes());
         self.seed_fallback();
         self.version += 1;
         self.dirty.clear();
@@ -362,6 +386,7 @@ impl GlyphAtlas {
         self.recovery_key = Some(fingerprint);
         self.blocked_extra = None;
         self.failed_available = 0;
+        self.blocked_budget = None;
         true
     }
     pub fn insert(&mut self, bmp: &GlyphBitmap) -> Rect {
@@ -386,6 +411,68 @@ impl GlyphAtlas {
         self.fallback_rect()
     }
     fn try_insert(&mut self, bmp: &GlyphBitmap) -> Option<Rect> {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (bmp.width, bmp.height, bmp.format).hash(&mut hash);
+        bmp.pixels.hash(&mut hash);
+        self.try_insert_with_hash(bmp, hash.finish())
+    }
+    fn same_bitmap(&self, rect: Rect, bmp: &GlyphBitmap) -> bool {
+        if rect.w != bmp.width || rect.h != bmp.height {
+            return false;
+        }
+        (0..rect.h).all(|y| {
+            let dst = (((rect.v + y) * self.width + rect.u) * 4) as usize;
+            let src = (y * bmp.width * 4) as usize;
+            let len = (rect.w * 4) as usize;
+            self.data[dst..dst + len] == bmp.pixels[src..src + len]
+        })
+    }
+    fn reserve_index_entry(&mut self) -> bool {
+        if self.index.len() < self.index.capacity() {
+            return true;
+        }
+        let size = std::mem::size_of::<AtlasEntry>();
+        let max_entries = self.index_max_bytes / size;
+        if self.index.len() >= max_entries {
+            return false;
+        }
+        let target = (self.index.len() + 1)
+            .next_multiple_of(256)
+            .min(max_entries);
+        let extra = (target - self.index.capacity()) * size;
+        if !self.index_permit.grow(extra) {
+            self.blocked_extra = Some(extra);
+            self.blocked_budget = Some(self.index_permit.budget.clone());
+            self.failed_available = self
+                .index_permit
+                .budget
+                .limit
+                .saturating_sub(self.index_permit.budget.used());
+            return false;
+        }
+        if self
+            .index
+            .try_reserve_exact(target - self.index.len())
+            .is_err()
+        {
+            self.index_permit.shrink(extra);
+            return false;
+        }
+        let actual = self.index.capacity() * size;
+        if actual > self.index_max_bytes
+            || !self
+                .index_permit
+                .grow(actual.saturating_sub(self.index_permit.bytes()))
+        {
+            self.index.shrink_to_fit();
+            self.index_permit
+                .shrink(self.index_permit.bytes() - self.index.capacity() * size);
+            return false;
+        }
+        true
+    }
+    fn try_insert_with_hash(&mut self, bmp: &GlyphBitmap, hash: u64) -> Option<Rect> {
         if Self::byte_len(bmp.width, bmp.height)? != bmp.pixels.len() {
             return None;
         }
@@ -394,11 +481,22 @@ impl GlyphAtlas {
         if w > self.width || h > self.max_height {
             return None;
         }
+        let mut slot = self.index.partition_point(|entry| entry.hash < hash);
+        while let Some(entry) = self.index.get(slot).filter(|entry| entry.hash == hash) {
+            if self.same_bitmap(entry.rect, bmp) {
+                return Some(entry.rect);
+            }
+            slot += 1;
+        }
+        if !self.reserve_index_entry() {
+            return None;
+        }
         loop {
             if let Some(mut rect) = self.try_place(w, h) {
                 rect.w = bmp.width;
                 rect.h = bmp.height;
                 self.blit(bmp, rect);
+                self.index.insert(slot, AtlasEntry { hash, rect });
                 self.changed(rect);
                 return Some(rect);
             }
@@ -488,6 +586,75 @@ impl GlyphAtlas {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn hash_collisions_compare_full_bitmap_before_reusing_uv() {
+        let mut a = GlyphAtlas::new(64, 64);
+        let first = bmp(10, 10, 40);
+        let second = bmp(10, 10, 90);
+        let r1 = a.try_insert_with_hash(&first, 7).unwrap();
+        let r2 = a.try_insert_with_hash(&second, 7).unwrap();
+        assert_ne!(r1, r2);
+        let revision = a.revision();
+        assert_eq!(a.try_insert_with_hash(&first, 7), Some(r1));
+        assert_eq!(a.try_insert_with_hash(&second, 7), Some(r2));
+        assert_eq!(a.revision(), revision);
+        assert_eq!(tex_alpha(&a, r1.u, r1.v), 40);
+        assert_eq!(tex_alpha(&a, r2.u, r2.v), 90);
+    }
+    #[test]
+    fn metadata_capacity_is_bounded_and_released_with_generation_and_drop() {
+        let size = std::mem::size_of::<AtlasEntry>();
+        let budget = ByteBudget::new(2 * size);
+        let mut a = GlyphAtlas::new(64, 64);
+        a.index_permit = budget.reserve(0).unwrap();
+        a.index_max_bytes = 2 * size;
+        let first = a.insert(&bmp(10, 10, 40));
+        a.insert(&bmp(10, 10, 50));
+        assert_eq!(budget.used(), a.index.capacity() * size);
+        assert_eq!(a.insert(&bmp(10, 10, 60)), a.fallback_rect());
+        assert_eq!(tex_alpha(&a, first.u, first.v), 40);
+        assert!(a.prepare_frame(1, 8192));
+        assert_eq!(budget.used(), 0);
+        assert_ne!(a.insert(&bmp(10, 10, 60)), a.fallback_rect());
+        drop(a);
+        assert_eq!(budget.used(), 0);
+        // A live atlas with an unchanged working set also recovers when another
+        // atlas releases the *metadata* process quota, not just pixel quota.
+        let shared = ByteBudget::new(size);
+        let mut active = GlyphAtlas::new(64, 64);
+        active.index_permit = shared.reserve(0).unwrap();
+        active.index_max_bytes = size;
+        let mut other = GlyphAtlas::new(64, 64);
+        other.index_permit = shared.reserve(0).unwrap();
+        other.index_max_bytes = size;
+        other.insert(&bmp(10, 10, 70));
+        let glyph = bmp(10, 10, 80);
+        assert_eq!(active.insert(&glyph), active.fallback_rect());
+        assert!(active.prepare_frame(10, 8192));
+        active.insert(&glyph);
+        assert!(!active.prepare_frame(10, 8192));
+        drop(other);
+        assert!(active.prepare_frame(10, 8192));
+        assert_ne!(active.insert(&glyph), active.fallback_rect());
+        assert_eq!(shared.used(), active.index.capacity() * size);
+        drop(active);
+        assert_eq!(shared.used(), 0);
+    }
+
+    #[test]
+    fn repeated_bitmaps_do_not_consume_space_after_router_cache_eviction() {
+        let mut a = GlyphAtlas::new(64, 64);
+        let glyph = bmp(20, 20, 255);
+        let first = a.insert(&glyph);
+        let revision = a.revision();
+        for _ in 0..10000 {
+            assert_eq!(a.insert(&glyph), first);
+        }
+        assert_eq!(a.revision(), revision);
+        assert_eq!(a.height(), 64);
+        assert!(!a.exhausted());
+    }
+
+    #[test]
     fn process_quota_recovery_requires_enough_newly_available_bytes() {
         let budget = ByteBudget::new(64 * 320 * 4);
         let mut a = GlyphAtlas::with_budget(64, 64, 64 * 320 * 4, budget.clone()).unwrap();
@@ -506,16 +673,15 @@ mod tests {
         let budget = ByteBudget::new(2 * 64 * 320 * 4);
         let mut a = GlyphAtlas::with_budget(64, 64, 64 * 320 * 4, budget.clone()).unwrap();
         let mut b = GlyphAtlas::with_budget(64, 64, 64 * 320 * 4, budget).unwrap();
-        let large = bmp(40, 100, 255);
         for pane in [&mut a, &mut b] {
-            for _ in 0..4 {
-                pane.insert(&large);
+            for tag in 0..4 {
+                pane.insert(&bmp(40, 100, tag));
             }
         }
         for pane in [&mut a, &mut b] {
             assert!(pane.prepare_frame(1, 8192));
-            for _ in 0..4 {
-                pane.insert(&large);
+            for tag in 0..4 {
+                pane.insert(&bmp(40, 100, tag));
             }
         }
         for _ in 0..30 {
@@ -529,8 +695,10 @@ mod tests {
     fn device_rebuild_with_lower_dimension_invalidates_layout_at_frame_boundary() {
         let budget = ByteBudget::new(8 * 1024 * 1024);
         let mut a = GlyphAtlas::with_budget(512, 512, 8 * 1024 * 1024, budget).unwrap();
-        for _ in 0..1000 {
-            a.insert(&bmp(40, 40, 2));
+        for n in 0..1000u32 {
+            let mut glyph = bmp(40, 40, 2);
+            glyph.pixels[..4].copy_from_slice(&n.to_le_bytes());
+            a.insert(&glyph);
         }
         assert!(a.height() > 2048);
         assert!(!a.exhausted());
@@ -585,8 +753,10 @@ mod tests {
             "one renderer cannot clear another's dirty state"
         );
         assert_eq!(a.dirty_since(a.revision()), None);
-        for _ in 0..300 {
-            a.insert(&bmp(1, 1, 1));
+        for n in 0..300u32 {
+            let mut glyph = bmp(1, 1, 1);
+            glyph.pixels.copy_from_slice(&n.to_le_bytes());
+            a.insert(&glyph);
         }
         assert!(a.dirty.len() <= 256);
         assert_eq!(
@@ -615,8 +785,9 @@ mod tests {
     #[test]
     fn atlas_default_stops_at_device_safe_budget() {
         let mut atlas = GlyphAtlas::new(512, 512);
-        let glyph = bmp(40, 40, 255);
-        for _ in 0..10000 {
+        let mut glyph = bmp(40, 40, 255);
+        for n in 0..10000u32 {
+            glyph.pixels[..4].copy_from_slice(&n.to_le_bytes());
             atlas.insert(&glyph);
         }
         assert!(
@@ -660,7 +831,7 @@ mod tests {
     fn insert_pads_zero_border_right_bottom() {
         let mut a = GlyphAtlas::new(64, 64);
         let r1 = a.insert(&bmp(10, 10, 0xff));
-        let r2 = a.insert(&bmp(10, 10, 0xff));
+        let r2 = a.insert(&bmp(10, 10, 0xfe));
         assert_eq!(r2.u, r1.u + 11, "同 shelf 布局推进 = w+1(含填充)");
         assert_eq!(tex_alpha(&a, r1.u + 10, r1.v), 0, "右侧 padding 零墨");
         assert_eq!(tex_alpha(&a, r1.u, r1.v + 10), 0, "下侧 padding 零墨");
