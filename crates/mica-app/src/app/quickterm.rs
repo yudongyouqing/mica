@@ -21,10 +21,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_NOREPEAT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_OEM_3,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW,
-    RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR,
-    WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_POPUP, WS_VISIBLE,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, IsWindowVisible,
+    LoadCursorW, RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP,
+    WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
@@ -47,6 +47,9 @@ thread_local! {
     static QT: RefCell<Option<QtState>> = const { RefCell::new(None) };
     /// QT 的 hwnd(主线程持;热键处理用)
     static QT_HWND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// QT 合帧定时器(id 8)已武装(与主窗 DRAW_ARMED 同语义:只武装
+    /// 一次,续批不顺延)
+    static QT_DRAW_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// 创建 Quick Terminal(主窗 run() 尾调用;失败仅记日志——QT 是增强件)。
@@ -483,6 +486,13 @@ pub unsafe fn toggle() {
                 | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
         );
         let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        // 隐藏期不绘(damage 留存):显示即刻补一帧,不等新输出
+        QT.with(|q| {
+            let mut guard = q.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            st.terminal.force_full = true;
+            qt_draw(st);
+        });
     }
 }
 
@@ -505,6 +515,19 @@ unsafe extern "system" fn qt_wndproc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_TIMER => {
+            // id 8:合帧到期(id 6 注释见下;隐藏竞态下只撤武装不绘)
+            if wparam.0 == 8 {
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 8).ok();
+                QT_DRAW_PENDING.with(|p| p.set(false));
+                if IsWindowVisible(hwnd).as_bool() {
+                    QT.with(|q| {
+                        if let Some(st) = q.borrow_mut().as_mut() {
+                            qt_draw(st);
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
             // id 6(#37):会话退出轮询——主窗 poll_exits 轮 TABS,QT 在此
             // 自轮;命中记码 + 横幅重绘 + 停表(重开时 toggle 再起)
             if wparam.0 == 7 {
@@ -568,7 +591,14 @@ unsafe extern "system" fn qt_wndproc(
                         &HSTRING::from(format!("QT: {t}")),
                     );
                 }
-                qt_draw(st);
+                // 隐藏不绘(数据/应答照常——shell 不等画面;damage 留存,
+                // 显示时 force_full 兜底):旧版隐藏期照绘,失焦收起后
+                // 后台 shell 的输出仍持续上屏。可见时合帧(与主窗同款
+                // "只武装一次"语义,续批不顺延;id 8 到期绘)
+                if IsWindowVisible(hwnd).as_bool() && !QT_DRAW_PENDING.with(|p| p.replace(true)) {
+                    let _ =
+                        windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 8, 5, None);
+                }
             });
             LRESULT(0)
         }
