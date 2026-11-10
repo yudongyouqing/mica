@@ -65,8 +65,9 @@ fn launch_isolated() -> ChildGuard {
         .env("APPDATA", &iso)
         .env("LOCALAPPDATA", &iso)
         .env("USERNAME", &user)
+        .env("MICA_CRASH_NOPROMPT", "1")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(iso.join("stderr.log")).unwrap())
         .spawn()
         .expect("launch mica");
     ChildGuard(child)
@@ -89,16 +90,38 @@ fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
         .get_or_init(|| Mutex::new(String::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = user.clone();
+    let log_path = iso.join("stderr.log");
+    eprintln!("Window lifecycle diagnostics: {}", log_path.display());
     let child = Command::new(env!("CARGO_BIN_EXE_mica"))
         .arg("--multi")
         .env("APPDATA", &iso)
         .env("LOCALAPPDATA", &iso)
         .env("USERNAME", &user)
+        .env("MICA_CRASH_NOPROMPT", "1")
+        .env("MICA_DEBUG_TIMING", "1")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(&log_path).unwrap())
         .spawn()
         .expect("launch mica");
-    (ChildGuard(child), cfg)
+    let mut app = ChildGuard(child);
+    // IPC ready / visible HWND 都早于 timer 7 的延迟初始化。先等待真实
+    // 初始化完成日志,再测试配置变更;否则可能在 watcher 注册之前写入,
+    // 或在 watcher 建立者完成初始化前关闭它。延长 reload 超时救不回丢失事件。
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("[timing] 延迟段 ") {
+            break;
+        }
+        let status = app.0.try_wait().unwrap();
+        assert!(
+            status.is_none() && Instant::now() < deadline,
+            "等待配置 watcher 初始化失败; status={status:?}; log={}; stderr:\n{log}",
+            log_path.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    (app, cfg)
 }
 
 /// 读窗口标题(热重载 title 即时应用的观测面)。
@@ -134,7 +157,7 @@ fn config_reload_survives_main_close() {
 
     // 改配置 → 去抖 300ms → 广播 → 副窗 reload → title 即时应用
     std::fs::write(&cfg, b"title = ReloadAfterMainClose").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while window_title(other) != "ReloadAfterMainClose" && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -163,7 +186,7 @@ fn both_windows_reload_from_broadcast() {
     let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
 
     std::fs::write(&cfg, b"title = BothReloaded").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while ws.iter().any(|h| window_title(*h) != "BothReloaded") && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
     }

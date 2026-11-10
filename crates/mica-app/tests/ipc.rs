@@ -59,14 +59,18 @@ fn launch_isolated() -> ChildGuard {
         .get_or_init(|| Mutex::new(String::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = user.clone();
+    let log_path = iso.join("stderr.log");
+    eprintln!("IPC instance diagnostics: {}", log_path.display());
     ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_mica"))
             .arg("--multi")
             .env("APPDATA", &iso)
             .env("LOCALAPPDATA", &iso)
             .env("USERNAME", &user)
+            .env("MICA_CRASH_NOPROMPT", "1")
+            .env("MICA_DEBUG_TIMING", "1")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(log_path).unwrap())
             .spawn()
             .expect("launch mica"),
     )
@@ -373,30 +377,54 @@ fn client_disconnect_mid_frame_keeps_server() {
 }
 
 /// 100 并发客户端:全部被服务(单实例管道排队逐个处理),无饥饿。
+/// 连接期限包含前方客户端的排队时间;单次响应收紧到 5s,不放宽
+/// 生产端的 3s UI 应答期限。失败保留客户端 id、阶段和实测耗时。
 #[test]
 fn hundred_concurrent_clients_all_served() {
     let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
     let _app = launch_isolated();
     assert!(wait_ready(Duration::from_secs(20)));
+    const CLIENTS: u32 = 100;
+    let queue_budget = Duration::from_secs(20) + Duration::from_millis(250) * CLIENTS;
+    let started = Instant::now();
+    let deadline = started + queue_budget;
     let mut handles = Vec::new();
-    for i in 0..100u64 {
+    for i in 0..u64::from(CLIENTS) {
         handles.push(std::thread::spawn(move || {
-            let Some(h) = connect(Duration::from_secs(20)) else {
-                return false;
+            let Some(h) = connect(deadline.saturating_duration_since(Instant::now())) else {
+                return Err(format!("id={} connect timed out after {:?}", 1000 + i, started.elapsed()));
             };
+            let connected_after = started.elapsed();
             let ok = write_bytes(h, &encode_frame(&IpcRequest::new(1000 + i, "activate")));
-            let resp = read_response(h, Duration::from_secs(20));
+            let resp = if ok {
+                read_response(h, Duration::from_secs(5).min(deadline.saturating_duration_since(Instant::now())))
+            } else {
+                None
+            };
             // SAFETY: 线程内句柄
             unsafe { windows::Win32::Foundation::CloseHandle(h).ok() };
-            ok && resp.is_some_and(|r| r.id == 1000 + i && r.status == IpcStatus::Applied)
+            match resp {
+                Some(r) if r.id == 1000 + i && r.status == IpcStatus::Applied => Ok(()),
+                other => Err(format!(
+                    "id={} connected_after={connected_after:?} elapsed={:?} write_ok={ok} response={other:?}",
+                    1000 + i, started.elapsed()
+                )),
+            }
         }));
     }
-    let served = handles
+    let failures: Vec<_> = handles
         .into_iter()
         .map(|h| h.join().unwrap())
-        .filter(|&ok| ok)
-        .count();
-    assert_eq!(served, 100, "全部并发客户端都应被服务");
+        .filter_map(Result::err)
+        .collect();
+    eprintln!(
+        "{CLIENTS} concurrent clients completed in {:?} (queue budget {queue_budget:?})",
+        started.elapsed()
+    );
+    assert!(
+        failures.is_empty(),
+        "全部 {CLIENTS} 个并发客户端都应被服务; failures={failures:#?}"
+    );
 }
 
 /// CLI 级:send 错目标 → 非零退出;新协议下错误真实可见。
