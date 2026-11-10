@@ -18,6 +18,27 @@ use crate::font::GlyphStyle;
 use crate::font::metrics::FontMetrics;
 use crate::font::router::GlyphRouter;
 
+/// Visible glyph/style working set, evaluated only under resource pressure.
+/// Scrollback outside the viewport cannot force resource-recovery rebuilds.
+pub fn resource_fingerprint(surface: &Surface) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let grid = surface.grid();
+    grid.columns().hash(&mut hash);
+    grid.screen_lines().hash(&mut hash);
+    for row in 0..grid.screen_lines() {
+        let line = Line(row as i32 - surface.display_offset() as i32);
+        for col in 0..grid.columns() {
+            let cell = &grid[line][Column(col)];
+            cell.c.hash(&mut hash);
+            (cell.flags & (Flags::BOLD | Flags::ITALIC | Flags::WIDE_CHAR))
+                .bits()
+                .hash(&mut hash);
+        }
+    }
+    hash.finish()
+}
+
 /// One drawable quad. `pos_uv = [x_px, y_px, u, v]`(uv 为图集内左上,0..1),
 /// `size_uv = [w_px, h_px, uw, uvh]`(像素尺寸 + uv 尺寸,0..1)。
 /// 背景 quad 与空白格均用 `blank` 形态:uv 尺寸 0,shader 墨恒 0。

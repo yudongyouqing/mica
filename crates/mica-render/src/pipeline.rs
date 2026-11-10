@@ -94,6 +94,25 @@ fn bg_clear_color(palette: &Palette) -> wgpu::Color {
     }
 }
 
+/// Cumulative counters from the actual wgpu upload/allocation path.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AtlasStats {
+    pub uploads: usize,
+    pub upload_bytes: u64,
+    pub texture_creations: usize,
+    pub bind_group_creations: usize,
+    pub cache_hits: usize,
+}
+struct AtlasResource {
+    texture: wgpu::Texture,
+    bind_group: Option<wgpu::BindGroup>,
+    revision: u64,
+    generation: u64,
+    touched: u64,
+    life: std::sync::Weak<()>,
+    permit: crate::font::atlas::BytePermit,
+}
+
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -112,6 +131,15 @@ pub struct Renderer {
     atlas_uploads: usize,
     /// 持有当前图集纹理供 bind group 引用(替换时旧纹理随之释放)
     atlas_texture: Option<wgpu::Texture>,
+    atlas_cache: std::collections::HashMap<u64, AtlasResource>,
+    atlas_tick: u64,
+    atlas_stats: AtlasStats,
+    atlas_budget: std::sync::Arc<crate::font::atlas::ByteBudget>,
+    atlas_window_limit: usize,
+    glyph_sampler: wgpu::Sampler,
+    fallback_texture: wgpu::Texture,
+    _fallback_permit: crate::font::atlas::BytePermit,
+    atlas_degraded: bool,
     clear_color: wgpu::Color,
     /// #77 背景图纹理(持有供 bind group;None = 无图)
     bg_texture: Option<wgpu::Texture>,
@@ -135,7 +163,7 @@ struct FrameTarget {
 }
 
 impl Renderer {
-    pub fn new(ctx: &GpuContext, format: wgpu::TextureFormat) -> Self {
+    pub fn new(ctx: &GpuContext, format: wgpu::TextureFormat) -> anyhow::Result<Self> {
         // shader 不做 gamma 转换:sRGB swapchain 会把颜色二次编码
         // (深底洗浅、全色偏色)。宁可启动即失败,不可静默偏色。
         assert!(
@@ -265,7 +293,45 @@ impl Renderer {
             cache: None,
         });
 
-        Self {
+        let atlas_budget = crate::font::atlas::gpu_atlas_budget();
+        let fallback_permit = atlas_budget
+            .reserve(4)
+            .ok_or_else(|| anyhow::anyhow!("process GPU atlas budget exhausted"))?;
+        let fallback_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas budget replacement"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        ctx.queue.write_texture(
+            fallback_texture.as_image_copy(),
+            &[255, 0, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let glyph_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("glyphs"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..wgpu::SamplerDescriptor::default()
+        });
+        Ok(Self {
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
             pipeline,
@@ -277,6 +343,15 @@ impl Renderer {
             atlas_revision: 0,
             atlas_uploads: 0,
             atlas_texture: None,
+            atlas_cache: std::collections::HashMap::new(),
+            atlas_tick: 0,
+            atlas_stats: AtlasStats::default(),
+            atlas_budget,
+            atlas_window_limit: crate::font::atlas::WINDOW_GPU_ATLAS_BYTES,
+            glyph_sampler,
+            fallback_texture,
+            _fallback_permit: fallback_permit,
+            atlas_degraded: false,
             clear_color: bg_clear_color(&Palette::DEFAULT),
             bg_texture: None,
             bg_view: None,
@@ -284,7 +359,7 @@ impl Renderer {
             bg_param: [0.0, 1.0, 1.0, 0.0],
             frame: None,
             frame_extent: (0, 0),
-        }
+        })
     }
 
     /// 换肤时同步清屏色(app 在 `surface.set_palette` 后调用);
@@ -293,71 +368,205 @@ impl Renderer {
         self.clear_color = bg_clear_color(palette);
     }
 
-    /// 图集上传(无条件执行;首次调用建立纹理与 bind group)。
-    /// 1.0.10 教训:这里曾按"revision 数值相等"早退——但窗口级纹理会被
-    /// 多个 pane 的图集轮流占用,字符集相似的两个标签 revision 计数完全
-    /// 可能相同,数值门必撞车漏传(用户稳定复现:多标签点回第一个全
-    /// 乱码;app 层 a883e6e 的身份门被这道内门废掉)。"GPU 里装的是谁
-    /// 的图集"只有调用方知道(app 的 WindowGpu::atlas_owner 按 pane
-    /// 身份判断),本函数只忠实上传。insert 改纹理内容、grow 改尺寸,
-    /// 都由调用方的 revision 触发到这里,无内门则永不漏。
+    pub fn atlas_stats(&self) -> AtlasStats {
+        self.atlas_stats
+    }
+    pub fn max_atlas_dimension(&self) -> u32 {
+        self.device.limits().max_texture_dimension_2d
+    }
+    fn atlas_bytes(&self) -> usize {
+        self.atlas_cache.values().map(|r| r.permit.bytes()).sum()
+    }
+    fn evict_atlas(&mut self) -> bool {
+        let oldest = self
+            .atlas_cache
+            .iter()
+            .min_by_key(|(_, r)| r.touched)
+            .map(|(&id, _)| id);
+        oldest.is_some_and(|id| self.atlas_cache.remove(&id).is_some())
+    }
+    /// True atlas identity, generation and committed revision are separate keys.
+    /// Cached textures survive pane switches; append-only growth copies old GPU
+    /// texels, then uploads only changes after that texture's committed revision.
     pub fn set_atlas(&mut self, atlas: &GlyphAtlas) {
+        self.atlas_tick += 1;
         self.atlas_revision = atlas.revision();
-        self.atlas_uploads += 1;
+        // Drop active clones before evicting so permits track live ownership.
+        self.atlas_texture = None;
+        self.bind_group = None;
+        self.atlas_cache.retain(|_, r| r.life.strong_count() != 0);
+        if self.bg_sampler.is_none() {
+            self.bg_sampler = Some(
+                self.device
+                    .create_sampler(&wgpu::SamplerDescriptor::default()),
+            );
+        }
+        let id = atlas.identity();
+        let mut old = self.atlas_cache.remove(&id);
         let size = wgpu::Extent3d {
             width: atlas.width(),
             height: atlas.height(),
             depth_or_array_layers: 1,
         };
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("glyph atlas"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm, // RGBA 图集(D19):灰度 RGB 白 A=coverage,彩色原色
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        // wgpu 对所有纹理拷贝(含 write_texture)要求 bytes_per_row 按
-        // COPY_BYTES_PER_ROW_ALIGNMENT(256)对齐,1 字节纹素也不例外。
-        // GlyphAtlas 的宽度约定为 ≥256 的 2 的幂(初始值与 grow 的
-        // next_power_of_two 都满足),故 width 本身即对齐行距,可零填充直传。
-        // 若未来出现非 256 倍数的宽度,这里 debug 构建立即报错;修复路径是
-        // padded 暂存上传(div_ceil(256)*256 逐行拷贝,参考旧 Atlas 上传)。
-        // RGBA8:每行 = width*4 字节;宽度恒为 256 的幂 → ×4 仍 256 对齐
-        debug_assert_eq!(
-            (atlas.width() * 4) % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
-            0,
-            "atlas width*4 {} 不满足 bytes_per_row 的 256 对齐",
-            atlas.width() * 4
-        );
+        let same_size = old
+            .as_ref()
+            .is_some_and(|r| r.texture.size() == size && r.generation == atlas.version());
+        let mut resource = if same_size {
+            old.take().expect("same size requires resource")
+        } else {
+            let bytes = atlas.texture().len();
+            let valid_size = atlas.width() <= self.max_atlas_dimension()
+                && atlas.height() <= self.max_atlas_dimension();
+            while self.atlas_bytes() + old.as_ref().map_or(0, |r| r.permit.bytes()) + bytes + 4
+                > self.atlas_window_limit
+            {
+                if !self.evict_atlas() {
+                    old = None;
+                    break;
+                }
+            }
+            let mut permit = if valid_size && bytes + 4 <= self.atlas_window_limit {
+                self.atlas_budget.reserve(bytes)
+            } else {
+                None
+            };
+            while permit.is_none() && self.evict_atlas() {
+                permit = self.atlas_budget.reserve(bytes);
+            }
+            if permit.is_none() && old.is_some() {
+                old = None;
+                permit = self.atlas_budget.reserve(bytes);
+            }
+            let Some(permit) =
+                permit.filter(|_| valid_size && bytes + 4 <= self.atlas_window_limit)
+            else {
+                if !self.atlas_degraded {
+                    eprintln!(
+                        "Mica: GPU atlas resource limit; visible magenta replacements until quota is released"
+                    );
+                }
+                self.atlas_degraded = true;
+                let view = self
+                    .fallback_texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                self.bind_group = Some(self.rebuild_bind_group(&view, &self.glyph_sampler));
+                self.atlas_texture = Some(self.fallback_texture.clone());
+                return;
+            };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("glyph atlas"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.atlas_stats.texture_creations += 1;
+            let mut revision = 0;
+            if let Some(previous) = old.as_ref().filter(|r| {
+                r.generation == atlas.version()
+                    && r.texture.width() == atlas.width()
+                    && r.texture.height() <= atlas.height()
+            }) {
+                let mut encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                encoder.copy_texture_to_texture(
+                    previous.texture.as_image_copy(),
+                    texture.as_image_copy(),
+                    previous.texture.size(),
+                );
+                self.queue.submit([encoder.finish()]);
+                revision = previous.revision;
+            }
+            // New images need the pinned fallback even if revision == 0.
+            if revision == 0 {
+                self.upload_atlas_rect(
+                    &texture,
+                    atlas,
+                    crate::font::atlas::Rect {
+                        u: 0,
+                        v: 0,
+                        w: atlas.width(),
+                        h: atlas.height(),
+                    },
+                );
+                revision = atlas.revision();
+            }
+            AtlasResource {
+                texture,
+                bind_group: None,
+                revision,
+                generation: atlas.version(),
+                touched: self.atlas_tick,
+                life: atlas.lifetime(),
+                permit,
+            }
+        };
+        self.atlas_degraded = false;
+        if resource.revision != atlas.revision() {
+            if let Some(rect) = atlas.dirty_since(resource.revision) {
+                self.upload_atlas_rect(&resource.texture, atlas, rect);
+            }
+            // write_texture validation succeeded; each renderer commits independently.
+            resource.revision = atlas.revision();
+        } else {
+            self.atlas_stats.cache_hits += usize::from(same_size);
+        }
+        if resource.bind_group.is_none() {
+            let view = resource
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            resource.bind_group = Some(self.rebuild_bind_group(&view, &self.glyph_sampler));
+            self.atlas_stats.bind_group_creations += 1;
+        }
+        resource.touched = self.atlas_tick;
+        self.atlas_texture = Some(resource.texture.clone());
+        self.bind_group = resource.bind_group.clone();
+        self.atlas_cache.insert(id, resource);
+    }
+    fn upload_atlas_rect(
+        &mut self,
+        texture: &wgpu::Texture,
+        atlas: &GlyphAtlas,
+        rect: crate::font::atlas::Rect,
+    ) {
+        if rect.w == 0 || rect.h == 0 {
+            return;
+        }
+        let offset = ((rect.v * atlas.width() + rect.u) * 4) as usize;
+        // Queue::write_texture permits an unaligned row stride (wgpu 30); unlike
+        // encoder buffer copies it does not require 256-byte row alignment.
         self.queue.write_texture(
-            texture.as_image_copy(),
-            atlas.texture(),
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: rect.u,
+                    y: rect.v,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.texture()[offset..],
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(atlas.width() * 4),
-                rows_per_image: Some(atlas.height()),
+                rows_per_image: Some(rect.h),
             },
-            size,
+            wgpu::Extent3d {
+                width: rect.w,
+                height: rect.h,
+                depth_or_array_layers: 1,
+            },
         );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("glyphs"),
-            mag_filter: wgpu::FilterMode::Linear, // 灰度 AA 需要
-            min_filter: wgpu::FilterMode::Linear,
-            ..wgpu::SamplerDescriptor::default()
-        });
-        // 重建 bind_group(新 view/sampler);texture 存字段供 drop
-        if self.bg_sampler.is_none() {
-            self.bg_sampler = Some(self.device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("bg"),
-                ..wgpu::SamplerDescriptor::default()
-            }));
-        }
-        self.bind_group = Some(self.rebuild_bind_group(&view, &sampler));
-        self.atlas_texture = Some(texture);
+        self.atlas_uploads += 1;
+        self.atlas_stats.uploads += 1;
+        self.atlas_stats.upload_bytes += u64::from(rect.w) * u64::from(rect.h) * 4;
     }
 
     /// 用当前 globals 槽 + 给定的图集 view/sampler 重建 bind group。
@@ -496,6 +705,9 @@ impl Renderer {
 
     /// #77 bg 变更后重建 bind group(用已存图集 view 的克隆)
     fn rebind_after_bg(&mut self) {
+        for resource in self.atlas_cache.values_mut() {
+            resource.bind_group = None;
+        }
         let Some(tex) = self.atlas_texture.clone() else {
             return;
         };
@@ -779,7 +991,7 @@ mod tests {
             device: device.clone(),
             queue: queue.clone(),
         };
-        let mut renderer = Renderer::new(&ctx, TextureFormat::Bgra8Unorm);
+        let mut renderer = Renderer::new(&ctx, TextureFormat::Bgra8Unorm).unwrap();
 
         // 两个全新图集,首个插入位相同 → 相同 UV 槽;A 红 B 蓝
         let mk_atlas = |rgb: [u8; 3]| {
@@ -917,7 +1129,7 @@ mod tests {
         };
         // 非面格式(测试无 surface),非 sRGB 满足构造断言;
         // 管线创建会校验 shader 与 4×Float32x4 布局的一致性
-        let mut renderer = Renderer::new(&ctx, TextureFormat::Bgra8Unorm);
+        let mut renderer = Renderer::new(&ctx, TextureFormat::Bgra8Unorm).unwrap();
         // 256 对齐宽度的图集:set_atlas 走完整纹理创建+直传路径
         let mut atlas = GlyphAtlas::new(256, 256);
         let bmp = GlyphBitmap::from_coverage(8, 12, vec![255; (8 * 12) as usize]);
@@ -927,7 +1139,10 @@ mod tests {
         assert_eq!(renderer.atlas_uploads, 1);
         // 重复调用同一图集:无条件路径也必须正常(门控职责在 app 层)
         renderer.set_atlas(&atlas);
-        assert_eq!(renderer.atlas_uploads, 2);
+        assert_eq!(
+            renderer.atlas_uploads, 1,
+            "same identity and revision needs no upload"
+        );
         // 撞车回归锁(1.0.10 二段修复):两份内容不同、revision 计数相同
         // 的图集——旧的内门按数值相等早退,第二份静默漏传=切标签乱码
         // 的机制本体。现在必须两次都真实上传。
@@ -941,7 +1156,10 @@ mod tests {
         );
         renderer.set_atlas(&other);
         renderer.set_atlas(&atlas);
-        assert_eq!(renderer.atlas_uploads, 4, "数值撞车不得跳过上传");
+        assert_eq!(
+            renderer.atlas_uploads, 2,
+            "different identities upload once each"
+        );
         // C1 回归锁:普通插入(不触发 grow)version 不动但 revision 递增,
         // 调用方据此触发 set_atlas——本函数无条件消费,永不漏传
         let plain = GlyphBitmap::from_coverage(6, 9, vec![200; (6 * 9) as usize]);
@@ -950,7 +1168,7 @@ mod tests {
         renderer.set_atlas(&atlas);
         // 直接读私有字段:诊断值随最近一次上传更新
         assert_eq!(renderer.atlas_revision, atlas.revision());
-        assert_eq!(renderer.atlas_uploads, 5);
+        assert_eq!(renderer.atlas_uploads, 3);
         // 高 250 的字形在剩余空间放不下 → 页追加(高度 +256,条目原位);
         // set_atlas 走"重建纹理+重传"路径(页追加式,version 恒 0)
         let big = GlyphBitmap::from_coverage(8, 250, vec![128; (8 * 250) as usize]);

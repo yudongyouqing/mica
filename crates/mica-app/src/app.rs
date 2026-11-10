@@ -495,11 +495,6 @@ struct WindowGpu {
     renderer: Renderer,
     wgpu_surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    /// GPU 纹理当前装载的图集归属(pane id, revision)——窗口级唯一
-    /// 纹理配窗口级所有权(1.0.10 修切标签乱码:此前 revision 按标签记,
-    /// 切回旧标签时其自身 revision 未变便跳过重传,GPU 里还是别的标签
-    /// 的字形,稳定乱码)。
-    atlas_owner: Option<(u64, u64)>,
 }
 
 pub(crate) use pty_bridge::{PtyBacklog, WriteQueue};
@@ -1431,13 +1426,12 @@ unsafe fn init_window_gpu(hwnd: HWND) -> WindowGpu {
         std::sync::Arc::new(|e: wgpu::Error| eprintln!("[wgpu] uncaptured error: {e}"));
     ctx.device.on_uncaptured_error(err_handler);
     // T4:Globals 不再携带 cell/shader v2 纯矩形化,Renderer::new 退掉 cell 参
-    let renderer = Renderer::new(&ctx, config.format);
+    let renderer = Renderer::new(&ctx, config.format).expect("initial GPU atlas quota");
     WindowGpu {
         ctx,
         renderer,
         wgpu_surface,
         config,
-        atlas_owner: None,
     }
 }
 
@@ -2227,7 +2221,25 @@ fn draw_frame() {
                 let _ = t.session.resize(want_cols, want_rows);
                 t.force_full = true;
             }
-            // 图集 grow 重排检查:布局变了,行实例缓存的 UV 全作废
+            // Reclaim only before building any grid/strip/overlay instances.
+            let max_dimension = GPU.with(|g| {
+                g.borrow()
+                    .as_ref()
+                    .map_or(8192, |gpu| gpu.renderer.max_atlas_dimension())
+            });
+            let fingerprint = if t.router.needs_resource_recovery() {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                mica_render::frame::resource_fingerprint(&t.term).hash(&mut hash);
+                titles.hash(&mut hash);
+                SEARCH_QUERY.with(|q| q.borrow().hash(&mut hash));
+                hash.finish()
+            } else {
+                0
+            };
+            t.router.prepare_frame(fingerprint, max_dimension);
+            // A generation change invalidates row UVs. Strip and overlay are
+            // rebuilt below; sibling routers synchronise on their next route.
             let ver = t.router.atlas_version();
             if ver != t.last_atlas_ver {
                 t.last_atlas_ver = ver;
@@ -2683,12 +2695,7 @@ fn draw_frame() {
                 else {
                     return; // 批构建后 pane 已关:整批丢弃
                 };
-                let revision = p.terminal.router.atlas_revision();
-                if gpu.atlas_owner != Some((*pane_id, revision)) {
-                    let atlas = p.terminal.router.atlas();
-                    gpu.renderer.set_atlas(&atlas);
-                    gpu.atlas_owner = Some((*pane_id, revision));
-                }
+                gpu.renderer.set_atlas(&p.terminal.router.atlas());
                 gpu.renderer.draw_batch(insts, Some(*scissor));
             });
         }
@@ -2704,12 +2711,7 @@ fn draw_frame() {
                 else {
                     return;
                 };
-                let revision = p.terminal.router.atlas_revision();
-                if gpu.atlas_owner != Some((*strip_pane, revision)) {
-                    let atlas = p.terminal.router.atlas();
-                    gpu.renderer.set_atlas(&atlas);
-                    gpu.atlas_owner = Some((*strip_pane, revision));
-                }
+                gpu.renderer.set_atlas(&p.terminal.router.atlas());
                 gpu.renderer.draw_batch(strip_insts, None);
             });
         }
