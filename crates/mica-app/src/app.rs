@@ -2035,6 +2035,15 @@ unsafe fn start_tab_with_shell(
 pub(crate) fn tab_seed() -> (Vec<String>, f32) {
     TAB_SEED.with(|s| s.borrow().clone())
 }
+
+/// 测试面:无窗口路径种字体/调色板 TLS——quickterm 回归测试直接调
+/// quickterm::init,其读 TAB_SEED/CURRENT_PALETTE,而 TLS 默认是空
+/// families(会让 DwriteRouter 失败 → init Err)。
+#[cfg(test)]
+pub(crate) fn seed_tls_for_tests(settings: &mica_core::config::settings::Settings) {
+    TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+    CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
+}
 pub(crate) fn current_palette() -> Palette {
     CURRENT_PALETTE.with(|p| *p.borrow())
 }
