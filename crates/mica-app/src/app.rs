@@ -2029,6 +2029,15 @@ unsafe fn start_tab_with_shell(
 pub(crate) fn tab_seed() -> (Vec<String>, f32) {
     TAB_SEED.with(|s| s.borrow().clone())
 }
+
+/// 测试面:无窗口路径种字体/调色板 TLS——quickterm 回归测试直接调
+/// quickterm::init,其读 TAB_SEED/CURRENT_PALETTE,而 TLS 默认是空
+/// families(会让 DwriteRouter 失败 → init Err)。
+#[cfg(test)]
+pub(crate) fn seed_tls_for_tests(settings: &mica_core::config::settings::Settings) {
+    TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+    CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
+}
 pub(crate) fn current_palette() -> Palette {
     CURRENT_PALETTE.with(|p| *p.borrow())
 }
@@ -5011,13 +5020,15 @@ fn search_close() {
 }
 
 /// #57 重扫:查询变更后全 buffer(历史+视口)大小写不敏感匹配。
-/// 命中表 = (buffer 行, 列, 宽);buffer 行坐标与 jump_prompt 同构
-/// (Line 负 = 历史)。扫完跳首个命中
+/// 命中表 = (buffer 行, 列, 宽)——列/宽均按**屏幕列**计(row_fold 的
+/// span:宽字符 2 列,高亮矩形直接乘 cell_width);旧实现把小写化串的
+/// 字节偏移当列、needle 字符数当宽,CJK/emoji/变长折叠(İ)三重错位。
+/// buffer 行坐标与 jump_prompt 同构(Line 负 = 历史)。扫完跳首个命中
 fn search_rescan() {
     let query = SEARCH_QUERY.with(|q| q.borrow().clone());
     let mut matches: Vec<(i32, usize, usize)> = Vec::new();
     if !query.is_empty() {
-        let needle = query.to_lowercase();
+        let needle = mica_render::frame::fold_search(&query);
         TABS.with(|tabs| {
             let guard = tabs.borrow();
             if let Some(t) = guard
@@ -5026,12 +5037,9 @@ fn search_rescan() {
             {
                 let (hist, rows, grid) = t.term.grid_dims();
                 for l in -(hist as i32)..rows as i32 {
-                    let (text, _) = mica_render::frame::row_string(grid, l);
-                    let hay = text.to_lowercase();
-                    let mut from = 0;
-                    while let Some(at) = hay[from..].find(&needle) {
-                        matches.push((l, from + at, needle.chars().count()));
-                        from += at + needle.len().max(1);
+                    let (hay, spans) = mica_render::frame::row_fold(grid, l);
+                    for (col, len) in mica_render::frame::find_row_matches(&hay, &spans, &needle) {
+                        matches.push((l, col, len));
                     }
                 }
             }

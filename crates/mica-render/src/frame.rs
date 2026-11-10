@@ -515,6 +515,76 @@ pub fn row_string(grid: &Grid<Cell>, line: i32) -> (String, Vec<usize>) {
     (text, cell_of)
 }
 
+/// #57 搜索的行索引:逐字符小写化,每字符携带 (起始列, 占列数) span。
+/// 取代旧"整串 to_lowercase + 字节偏移":整串折叠会变长变位(İ→i̇
+/// 两字符),之后字节偏移既对不上原行也不等于列号;宽字符占 2 列而
+/// UTF-8 是 3/4 字节——"字节偏移当列、字符数当宽"在 CJK/emoji 上
+/// 双双错位。WIDE_CHAR_SPACER 续格不产出字符(字符属首格,续格只是
+/// 占位)。折叠展开的多字符共享源格 span,列号永不失真。
+pub fn row_fold(grid: &Grid<Cell>, line: i32) -> (Vec<char>, Vec<(usize, usize)>) {
+    let cols = grid.columns();
+    let mut hay = Vec::with_capacity(cols);
+    let mut spans = Vec::with_capacity(cols);
+    for c in 0..cols {
+        let cell = &grid[Line(line)][Column(c)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        let w = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        // DCH/ICH can leave an orphan spacer. Derive positions from the grid,
+        // rather than assuming every skipped spacer has a preceding wide cell.
+        for lc in fold_search_char(cell.c) {
+            hay.push(lc);
+            spans.push((c, w));
+        }
+    }
+    (hay, spans)
+}
+
+/// Shared case-insensitive search folding for grid characters and queries.
+/// Normalize final sigma as well, so Σ/σ/ς match independently of word position.
+/// Unlike str::to_lowercase, this does not apply a different contextual mapping
+/// to a multi-character query than to characters extracted from terminal cells.
+pub fn fold_search(text: &str) -> Vec<char> {
+    text.chars().flat_map(fold_search_char).collect()
+}
+
+fn fold_search_char(c: char) -> impl Iterator<Item = char> {
+    c.to_lowercase().map(|lc| if lc == 'ς' { 'σ' } else { lc })
+}
+
+/// 在 row_fold 产物上找全部命中(非重叠推进):返回 (起始列, 占列宽)。
+/// needle 需调用方先经 fold_search。宽度按列计:命中跨宽字符时含其双列
+/// (高亮矩形直接乘 cell_width,见 app 侧消费)。
+pub fn find_row_matches(
+    hay: &[char],
+    spans: &[(usize, usize)],
+    needle: &[char],
+) -> Vec<(usize, usize)> {
+    let mut hits = Vec::new();
+    if needle.is_empty() || hay.len() < needle.len() || spans.len() != hay.len() {
+        return hits;
+    }
+    let mut i = 0;
+    'scan: while i + needle.len() <= hay.len() {
+        for (k, nc) in needle.iter().enumerate() {
+            if hay[i + k] != *nc {
+                i += 1;
+                continue 'scan;
+            }
+        }
+        let (c0, _) = spans[i];
+        let (cl, wl) = spans[i + needle.len() - 1];
+        hits.push((c0, cl + wl - c0));
+        i += needle.len();
+    }
+    hits
+}
+
 /// tab strip 的 UI 实例(T7,spec §3 同管线),**双行形制**(2026-10-12
 /// 用户裁定):第一行 = 窗口标题(活跃标签名,居中)+ 右端 caption 三键
 /// (— □ ×);第二行 = 均分标签占满 + 右端 "+" 开新标签;再下才是终端
@@ -1466,6 +1536,95 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CellInstance, size_uv), 16);
         assert_eq!(std::mem::offset_of!(CellInstance, fg), 32);
         assert_eq!(std::mem::offset_of!(CellInstance, bg), 48);
+    }
+
+    #[test]
+    fn row_fold_uses_real_columns_after_deleting_half_a_wide_cell() {
+        use mica_core::surface::{ScreenSize, Surface};
+        let mut s = Surface::new(ScreenSize::new(10, 2));
+        // DCH operates on cells and can leave a spacer without its wide lead.
+        s.feed("你a\r\x1b[P".as_bytes());
+        let (_, _, grid) = s.grid_dims();
+        assert!(
+            grid[Line(0)][Column(0)]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+        );
+        assert_eq!(grid[Line(0)][Column(1)].c, 'a');
+        let (hay, spans) = row_fold(grid, 0);
+        assert_eq!(find_row_matches(&hay, &spans, &['a']), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn row_fold_matches_all_greek_sigma_forms() {
+        use mica_core::surface::{ScreenSize, Surface};
+        for text in ["ΟΣ", "οσ", "ος"] {
+            let mut s = Surface::new(ScreenSize::new(10, 2));
+            s.feed(text.as_bytes());
+            let (_, _, grid) = s.grid_dims();
+            let (hay, spans) = row_fold(grid, 0);
+            for query in ["ΟΣ", "οσ", "ος"] {
+                let needle = fold_search(query);
+                assert_eq!(
+                    find_row_matches(&hay, &spans, &needle),
+                    vec![(0, 2)],
+                    "text={text:?}, query={query:?}"
+                );
+            }
+        }
+    }
+
+    /// #57 搜索列映射:真 parser 喂出的 WIDE_CHAR/SPACER 标志下,
+    /// 命中的列号/列宽必须按屏幕列计(旧实现字节偏移当列、字符数当宽,
+    /// CJK/emoji 双错位)。喂真实 VT 序列,不手搓 cell。
+    #[test]
+    fn row_fold_columns_cjk_emoji_ascii() {
+        use mica_core::surface::{ScreenSize, Surface};
+        let mut s = Surface::new(ScreenSize::new(20, 2));
+        s.feed("AB你c🙂\r\n".as_bytes());
+        let (_, _, grid) = s.grid_dims();
+        let (hay, spans) = row_fold(grid, 0);
+        // 续格不产出字符:AB你c🙂 = 5 字符,你/🙂 各占 2 列;行尾空白格
+        // 照常入列(与旧 row_string 一致——查询含空格也应命中)
+        assert_eq!(&hay[..5], &['a', 'b', '你', 'c', '🙂']);
+        assert_eq!(hay.len(), 18, "5 字符占 7 列 + 13 空白列 = 18 字符");
+        assert_eq!(&spans[..5], &[(0, 1), (1, 1), (2, 2), (4, 1), (5, 2)]);
+        assert_eq!(
+            &spans[5..],
+            &(7..20).map(|c| (c, 1)).collect::<Vec<_>>()[..],
+            "🙂 后空白格逐列 7..20"
+        );
+        let n = fold_search;
+        // ASCII:与旧实现的字节偏移语义一致(回归保护)
+        assert_eq!(find_row_matches(&hay, &spans, &n("ab")), vec![(0, 2)]);
+        // 宽字符命中:你 = 2 列
+        assert_eq!(find_row_matches(&hay, &spans, &n("你")), vec![(2, 2)]);
+        // 跨宽字符:你c = 3 列(旧实现报列 6/宽 2)
+        assert_eq!(find_row_matches(&hay, &spans, &n("你c")), vec![(2, 3)]);
+        // emoji 后继字符:列 4(旧实现字节偏移把 c 推到 3 之后)
+        assert_eq!(find_row_matches(&hay, &spans, &n("c")), vec![(4, 1)]);
+        assert_eq!(find_row_matches(&hay, &spans, &n("🙂")), vec![(5, 2)]);
+        // 大小写不敏感
+        assert_eq!(find_row_matches(&hay, &spans, &n("AB")), vec![(0, 2)]);
+        // 无命中
+        assert!(find_row_matches(&hay, &spans, &n("z")).is_empty());
+    }
+
+    /// #57 变长折叠:İ(U+0130)逐字小写化出 2 字符且共享源格 span——
+    /// 其后 ASCII 的列号不受影响(旧整串 to_lowercase 后字节偏移全错)。
+    #[test]
+    fn row_fold_expanding_case_keeps_columns() {
+        use mica_core::surface::{ScreenSize, Surface};
+        let mut s = Surface::new(ScreenSize::new(10, 2));
+        s.feed("İAB\r\n".as_bytes());
+        let (_, _, grid) = s.grid_dims();
+        let (hay, spans) = row_fold(grid, 0);
+        assert_eq!(&hay[..4], &['i', '\u{307}', 'a', 'b'], "İ 折叠成 i+U+0307");
+        assert_eq!(hay.len(), 11, "折叠 4 字符占 3 列 + 7 空白列");
+        assert_eq!(&spans[..4], &[(0, 1), (0, 1), (1, 1), (2, 1)]);
+        let n = fold_search;
+        // 旧实现:hay="i̇AB"(a 在字节 3)→ 报列 3;正解列 1
+        assert_eq!(find_row_matches(&hay, &spans, &n("ab")), vec![(1, 2)]);
     }
 
     #[test]
