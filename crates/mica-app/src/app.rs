@@ -479,8 +479,8 @@ static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 static IPC_RX: std::sync::Mutex<Option<std::sync::mpsc::Receiver<ipc::IncomingRequest>>> =
     std::sync::Mutex::new(None);
 
-/// 配置 watcher 的进程级持有(复核 4):watcher 只在主窗 deferred_init
-/// 建立,但**不随主窗销毁**——主窗先关、副窗仍在时热重载必须继续工作。
+/// 配置 watcher 的进程级持有:在首帧之后、主窗进入消息循环前建立,
+/// **不随主窗销毁**——主窗先关、副窗仍在时热重载必须继续工作。
 /// 进程退出时随进程回收(watcher Drop 停后端,线程随进程结束)。
 static CONFIG_WATCHER: Mutex<Option<ReloadHandle>> = Mutex::new(None);
 
@@ -846,10 +846,27 @@ pub fn run() {
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
 
+        // #109:watcher 是进程级服务,必须在消息循环能够关闭主窗前建立。
+        // 保留首帧优先,但不能留给随主窗 timer 7 一起消失的延迟初始化。
+        if let Some(reload) = spawn_config_watcher(Arc::clone(&hwnd_slot)) {
+            *CONFIG_WATCHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(reload);
+        }
+
         // #59 非关键初始化推迟:首帧已上屏,余下(COM/进程枚举/wsl.exe/
-        // 第二个 GPU surface/文件 watcher)经一拍定时器在主线程补做——
+        // 第二个 GPU surface)经一拍定时器在主线程补做——
         // TLS 安全(全主线程),用户感知 = 首帧即此前的全部等待
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 7, 100, None);
+        // Debug-only controlled startup timing for the early-main-close regression.
+        // Release builds always retain the normal 100ms deferred initialization.
+        let deferred_ms = if cfg!(debug_assertions) {
+            std::env::var("MICA_TEST_DEFER_INIT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|ms| (100..=60_000).contains(ms))
+                .unwrap_or(100)
+        } else {
+            100
+        };
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 7, deferred_ms, None);
         START_T0.with(|c| c.set(Some(t0)));
         message_loop(None, hwnd_slot);
     }
@@ -1097,7 +1114,7 @@ fn warn_box(text: &str) {
 /// 交给去抖线程。None = 未监听(文件缺失或 watch 失败,热重载降级关闭)。
 /// 哨兵由 run() 统一建立后传入——与转发线程共用"窗口存活"这一个事实。
 /// #59 非关键初始化(首帧后一拍,主线程):孤儿清理 / jumplist COM /
-/// profile 扫描 / Quick Terminal / 配置 watcher。全在主线程执行——
+/// profile 扫描 / Quick Terminal。全在主线程执行——
 /// 这些件吃 TLS(GPU/SHARED_HWND),后台线程会撞双实例 TLS。
 /// DEFER_DONE 只在主窗线程置位(timer 挂主窗 hwnd),副窗天然不进
 unsafe fn deferred_init(hwnd: HWND) {
@@ -1127,21 +1144,13 @@ unsafe fn deferred_init(hwnd: HWND) {
     jumplist::install(&exe, &profiles);
     // M3b:Quick Terminal(独立 GPU surface,重)
     let _ = quickterm::init(hwnd);
-    // T5:配置 watcher(晚于首帧启动 = 首 100ms 内改配置不触发,可接受)
-    if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone())
-        && let Some(reload) = spawn_config_watcher(slot)
-    {
-        // 进程级持有(复核 4):主窗销毁不带走 watcher;重复初始化由
-        // DEFER_DONE 守卫(本函数只跑一次)
-        *CONFIG_WATCHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(reload);
-    }
     if std::env::var_os("MICA_DEBUG_TIMING").is_some() {
         let total = START_T0
             .with(std::cell::Cell::get)
             .map(|t0| t0.elapsed().as_millis())
             .unwrap_or_default();
         eprintln!(
-            "[timing] 延迟段 {}ms(孤儿/COM/profile/QT/watcher),累计 {}ms",
+            "[timing] 延迟段 {}ms(孤儿/COM/profile/QT),累计 {}ms",
             t.elapsed().as_millis(),
             total
         );

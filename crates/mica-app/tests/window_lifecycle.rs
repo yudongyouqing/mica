@@ -76,6 +76,10 @@ fn launch_isolated() -> ChildGuard {
 /// 预置(空但存在的)config 文件启动:热重载 watcher 只在文件存在时
 /// 建立(spawn_config_watcher 的契约)。
 fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
+    launch_config(true)
+}
+
+fn launch_config(wait_deferred: bool) -> (ChildGuard, std::path::PathBuf) {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -92,7 +96,8 @@ fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
         .unwrap_or_else(|e| e.into_inner()) = user.clone();
     let log_path = iso.join("stderr.log");
     eprintln!("Window lifecycle diagnostics: {}", log_path.display());
-    let child = Command::new(env!("CARGO_BIN_EXE_mica"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mica"));
+    command
         .arg("--multi")
         .env("APPDATA", &iso)
         .env("LOCALAPPDATA", &iso)
@@ -100,10 +105,15 @@ fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
         .env("MICA_CRASH_NOPROMPT", "1")
         .env("MICA_DEBUG_TIMING", "1")
         .stdout(Stdio::null())
-        .stderr(std::fs::File::create(&log_path).unwrap())
-        .spawn()
-        .expect("launch mica");
+        .stderr(std::fs::File::create(&log_path).unwrap());
+    if !wait_deferred {
+        command.env("MICA_TEST_DEFER_INIT_MS", "60000");
+    }
+    let child = command.spawn().expect("launch mica");
     let mut app = ChildGuard(child);
+    if !wait_deferred {
+        return (app, cfg);
+    }
     // IPC ready / visible HWND 都早于 timer 7 的延迟初始化。先等待真实
     // 初始化完成日志,再测试配置变更;否则可能在 watcher 注册之前写入,
     // 或在 watcher 建立者完成初始化前关闭它。延长 reload 超时救不回丢失事件。
@@ -122,6 +132,58 @@ fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
         std::thread::sleep(Duration::from_millis(100));
     }
     (app, cfg)
+}
+
+/// #109:主窗 timer 7 还未执行时关闭,副窗的配置监听不能永久缺席。
+/// 控制定时器期限而不是赌随机 sleep;实际文件事件、广播、reload、
+/// 窗口销毁与 IPC 继续走生产路径。测试钩子仅存在于 debug 构建。
+#[test]
+#[cfg(debug_assertions)]
+fn config_watcher_survives_close_before_deferred_init() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, cfg) = launch_config(false);
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    let other = ws.iter().find(|h| **h != first[0]).copied().unwrap();
+    let log_path = cfg.parent().unwrap().parent().unwrap().join("stderr.log");
+    assert!(
+        !std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("[timing] 延迟段 "),
+        "用例必须在 timer 7 初始化前关闭主窗"
+    );
+    // SAFETY: 所有窗口都来自本测试启动的隔离进程。
+    unsafe { PostMessageW(Some(first[0]), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { IsWindow(Some(first[0])) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !unsafe { IsWindow(Some(first[0])) }.as_bool(),
+        "主窗必须已销毁"
+    );
+    assert!(app.0.try_wait().unwrap().is_none(), "副窗仍在,进程必须存活");
+    std::fs::write(&cfg, b"title = ReloadBeforeDeferredInit").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(other) != "ReloadBeforeDeferredInit" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        window_title(other),
+        "ReloadBeforeDeferredInit",
+        "早关闭后配置 watcher 仍须工作"
+    );
+    assert!(cli(&["send", "--literal", "x"]), "早关闭后 IPC 仍须工作");
+    assert!(
+        !std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("[timing] 延迟段 ")
+    );
+    // SAFETY: 本测试隔离副窗。
+    unsafe { PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
+    assert!(wait_exit(&mut app.0, Duration::from_secs(5)));
 }
 
 /// 读窗口标题(热重载 title 即时应用的观测面)。
