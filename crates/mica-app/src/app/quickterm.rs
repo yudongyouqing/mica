@@ -21,10 +21,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_NOREPEAT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_OEM_3,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, LoadCursorW,
-    RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR,
-    WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_POPUP, WS_VISIBLE,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, IsWindowVisible,
+    LoadCursorW, RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP,
+    WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, w};
 
@@ -47,6 +47,12 @@ thread_local! {
     static QT: RefCell<Option<QtState>> = const { RefCell::new(None) };
     /// QT 的 hwnd(主线程持;热键处理用)
     static QT_HWND: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// QT 合帧定时器(id 8)已武装(与主窗 DRAW_ARMED 同语义:只武装
+    /// 一次,续批不顺延)
+    static QT_DRAW_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// QT owns its frame clock: activity in the main window must not postpone it.
+    static QT_LAST_FRAME: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// 创建 Quick Terminal(主窗 run() 尾调用;失败仅记日志——QT 是增强件)。
@@ -293,6 +299,8 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
 /// (GPU 对象)**——坏驱动栈上 wgpu teardown 陷内核(1.0.2 实证),这是
 /// 与主窗同款的最后绕行。
 pub fn forget_state() {
+    QT_DRAW_PENDING.with(|p| p.set(false));
+    QT_LAST_FRAME.with(|f| f.set(None));
     if let Some(st) = QT.with(|q| q.borrow_mut().take()) {
         let QtState {
             terminal,
@@ -483,6 +491,13 @@ pub unsafe fn toggle() {
                 | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
         );
         let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        // 隐藏期不绘(damage 留存):显示即刻补一帧,不等新输出
+        QT.with(|q| {
+            let mut guard = q.borrow_mut();
+            let Some(st) = guard.as_mut() else { return };
+            st.terminal.force_full = true;
+            qt_draw(st);
+        });
     }
 }
 
@@ -505,6 +520,19 @@ unsafe extern "system" fn qt_wndproc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_TIMER => {
+            // id 8:合帧到期(id 6 注释见下;隐藏竞态下只撤武装不绘)
+            if wparam.0 == 8 {
+                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 8).ok();
+                QT_DRAW_PENDING.with(|p| p.set(false));
+                if IsWindowVisible(hwnd).as_bool() {
+                    QT.with(|q| {
+                        if let Some(st) = q.borrow_mut().as_mut() {
+                            qt_draw(st);
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
             // id 6(#37):会话退出轮询——主窗 poll_exits 轮 TABS,QT 在此
             // 自轮;命中记码 + 横幅重绘 + 停表(重开时 toggle 再起)
             if wparam.0 == 7 {
@@ -531,7 +559,9 @@ unsafe extern "system" fn qt_wndproc(
                     };
                     if exited_now {
                         hit = true;
-                        qt_draw(st);
+                        if IsWindowVisible(hwnd).as_bool() {
+                            qt_draw(st);
+                        }
                     }
                 });
                 if hit {
@@ -568,7 +598,31 @@ unsafe extern "system" fn qt_wndproc(
                         &HSTRING::from(format!("QT: {t}")),
                     );
                 }
-                qt_draw(st);
+                // 隐藏不绘(数据/应答照常——shell 不等画面;damage 留存,
+                // 显示时 force_full 兜底):旧版隐藏期照绘,失焦收起后
+                // 后台 shell 的输出仍持续上屏。复用主窗调度契约:
+                // 固定首次截止时间,WM_TIMER 被连续 WM_APP 饿死时距
+                // QT 上帧 >=16ms 直接绘制,不依赖主窗的节拍时钟。
+                if IsWindowVisible(hwnd).as_bool() {
+                    let since = QT_LAST_FRAME.with(|f| f.get().map(|t| t.elapsed()));
+                    match super::frame_sched(QT_DRAW_PENDING.with(std::cell::Cell::get), since) {
+                        super::FrameSched::DrawNow => {
+                            QT_DRAW_PENDING.with(|p| p.set(false));
+                            windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 8).ok();
+                            qt_draw(st);
+                        }
+                        super::FrameSched::Arm => {
+                            QT_DRAW_PENDING.with(|p| p.set(true));
+                            let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                                Some(hwnd),
+                                8,
+                                super::COALESCE_FRAME_MS,
+                                None,
+                            );
+                        }
+                        super::FrameSched::Pending => {}
+                    }
+                }
             });
             LRESULT(0)
         }
@@ -670,6 +724,9 @@ unsafe fn unregister_hotkey() -> windows::core::Result<()> {
 }
 
 fn qt_draw(st: &mut QtState) {
+    QT_LAST_FRAME.with(|f| f.set(Some(std::time::Instant::now())));
+    #[cfg(test)]
+    tests::DRAW_COUNT.with(|n| n.set(n.get() + 1));
     let t = &mut st.terminal;
     let damage = if std::mem::take(&mut t.force_full) {
         let _ = t.term.take_damage();
@@ -752,8 +809,146 @@ mod tests {
     use super::*;
     use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CLOSE};
 
+    // Visible test-owned QTs otherwise steal focus from each other, causing
+    // production WM_ACTIVATE to hide a window while its test is feeding it.
+    static QT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    thread_local! {
+        pub(super) static DRAW_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn hidden_session_exit_does_not_draw() {
+        let _lock = QT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::app::seed_tls_for_tests(&mica_core::config::settings::Settings::default());
+        unsafe { init(HWND(std::ptr::null_mut())) }.expect("quickterm init");
+        let hwnd = HWND(QT_HWND.with(|c| c.get()) as *mut std::ffi::c_void);
+        assert!(!unsafe { IsWindowVisible(hwnd).as_bool() });
+        let initial_draws = DRAW_COUNT.with(std::cell::Cell::get);
+        QT.with(|q| {
+            q.borrow_mut()
+                .as_mut()
+                .unwrap()
+                .terminal
+                .session
+                .kill_child()
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let exited = loop {
+            let exited = QT.with(|q| {
+                q.borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .terminal
+                    .session
+                    .try_wait()
+                    .unwrap()
+                    .is_some()
+            });
+            if exited || std::time::Instant::now() >= deadline {
+                break exited;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        unsafe { SendMessageW(hwnd, WM_TIMER, Some(WPARAM(6)), Some(LPARAM(0))) };
+        let state_exited = QT.with(|q| q.borrow().as_ref().unwrap().terminal.exited.is_some());
+        let draws = DRAW_COUNT.with(std::cell::Cell::get);
+        unsafe { SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))) };
+        forget_state();
+        assert!(
+            exited,
+            "test child must exit before polling its real timer path"
+        );
+        assert!(state_exited, "hidden session exit must still be recorded");
+        assert_eq!(draws, initial_draws, "hidden exit polling must not render");
+    }
+
+    #[test]
+    fn hidden_output_preserves_damage_and_show_draws_latest_grid() {
+        let _lock = QT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::app::seed_tls_for_tests(&mica_core::config::settings::Settings::default());
+        unsafe { init(HWND(std::ptr::null_mut())) }.expect("quickterm init");
+        let hwnd = HWND(QT_HWND.with(|c| c.get()) as *mut std::ffi::c_void);
+        unsafe { toggle() };
+        let before = QT.with(|q| q.borrow().as_ref().unwrap().terminal.row_insts[1].clone());
+        let initial_draws = DRAW_COUNT.with(std::cell::Cell::get);
+        // Exercise the production focus-loss hide path.
+        unsafe { SendMessageW(hwnd, WM_ACTIVATE, Some(WPARAM(0)), Some(LPARAM(0))) };
+        assert!(!unsafe { IsWindowVisible(hwnd).as_bool() });
+        let backlog = backlog_for_test().expect("QT state");
+        backlog
+            .push(0, b"\x1b[2;1HX\x1b[1;1H")
+            .expect("hidden output");
+        unsafe { SendMessageW(hwnd, WM_APP, Some(WPARAM(0xFF00)), Some(LPARAM(0))) };
+        // An already-queued timer may still arrive after hiding.
+        unsafe { SendMessageW(hwnd, WM_TIMER, Some(WPARAM(8)), Some(LPARAM(0))) };
+        let hidden_draws = DRAW_COUNT.with(std::cell::Cell::get);
+        let damage = QT.with(|q| q.borrow_mut().as_mut().unwrap().terminal.term.take_damage());
+        let hidden_cache = QT.with(|q| q.borrow().as_ref().unwrap().terminal.row_insts[1].clone());
+        unsafe { toggle() };
+        let shown_draws = DRAW_COUNT.with(std::cell::Cell::get);
+        let shown_cache = QT.with(|q| q.borrow().as_ref().unwrap().terminal.row_insts[1].clone());
+        // Verify visible WM_TIMER id 8 is connected to the real renderer too.
+        unsafe { SendMessageW(hwnd, WM_TIMER, Some(WPARAM(8)), Some(LPARAM(0))) };
+        let timer_draws = DRAW_COUNT.with(std::cell::Cell::get);
+        let timer_pending = QT_DRAW_PENDING.with(std::cell::Cell::get);
+        unsafe { SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))) };
+        forget_state();
+        assert_eq!(
+            hidden_draws, initial_draws,
+            "hidden output/timer must not draw"
+        );
+        assert_eq!(
+            hidden_cache, before,
+            "hidden output must not rebuild GPU instances"
+        );
+        assert!(
+            matches!(damage, Damage::Full)
+                || matches!(damage, Damage::Lines(ref rows) if rows.contains(&1)),
+            "hidden row damage must survive until showing"
+        );
+        assert_eq!(
+            shown_draws,
+            initial_draws + 1,
+            "show must draw without new output"
+        );
+        assert_ne!(
+            shown_cache, before,
+            "show must include hidden-period output"
+        );
+        assert_eq!(timer_draws, shown_draws + 1);
+        assert!(!timer_pending, "WM_TIMER must clear the frame arm state");
+    }
+
+    #[test]
+    fn continuous_output_draws_without_dispatching_wm_timer() {
+        let _lock = QT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::app::seed_tls_for_tests(&mica_core::config::settings::Settings::default());
+        unsafe { init(HWND(std::ptr::null_mut())) }.expect("quickterm init");
+        let hwnd = HWND(QT_HWND.with(|c| c.get()) as *mut std::ffi::c_void);
+        // This is the test-owned window; no main app or shared IPC instance.
+        unsafe { toggle() };
+        let initial_draws = DRAW_COUNT.with(std::cell::Cell::get);
+        let backlog = backlog_for_test().expect("QT state");
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(35) {
+            backlog.push(0, b"x").expect("inject output");
+            // Deliberately never pump queued WM_TIMER messages. This models
+            // a backlog self-wake chain that keeps posted WM_APP work ready.
+            unsafe { SendMessageW(hwnd, WM_APP, Some(WPARAM(0xFF00)), Some(LPARAM(0))) };
+        }
+        let draws = DRAW_COUNT.with(std::cell::Cell::get);
+        unsafe { SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))) };
+        forget_state();
+        assert!(
+            draws > initial_draws,
+            "continuous output must bypass a starved timer"
+        );
+    }
+
     #[test]
     fn reply_writeback_survives_held_qt_borrow() {
+        let _lock = QT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::app::seed_tls_for_tests(&mica_core::config::settings::Settings::default());
         // SAFETY: 本线程创建并拥有 QT 窗口;hwnd_main 仅用于显示器查询
         // (null → 默认显示器)。测试尾走 WM_CLOSE → DestroyWindow 收尾
