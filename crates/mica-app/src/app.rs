@@ -432,6 +432,12 @@ thread_local! {
     /// 2026 同步持帧(D29):h 起置 true,l 或 150ms 超时放帧。
     /// 持帧只跳 draw(数据照 drain+feed,不丢)
     static SYNC_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 合帧定时器(id 4)已武装:续批不再顺延(见 frame_sched)
+    static DRAW_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 上次绘帧时刻:持续输出下距上帧超 16ms 即直绘兜底(WM_TIMER 低
+    /// 优先级,渲染消息自唤醒链灌满队列时可能永远排不上)
+    static LAST_FRAME: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
     /// 光标闪烁相位(true = 亮);开关由配置驱动(settings.cursor_blink)
     static BLINK_PHASE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     static CURSOR_BLINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -479,8 +485,8 @@ static GPU_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 static IPC_RX: std::sync::Mutex<Option<std::sync::mpsc::Receiver<ipc::IncomingRequest>>> =
     std::sync::Mutex::new(None);
 
-/// 配置 watcher 的进程级持有(复核 4):watcher 只在主窗 deferred_init
-/// 建立,但**不随主窗销毁**——主窗先关、副窗仍在时热重载必须继续工作。
+/// 配置 watcher 的进程级持有:在首帧之后、主窗进入消息循环前建立,
+/// **不随主窗销毁**——主窗先关、副窗仍在时热重载必须继续工作。
 /// 进程退出时随进程回收(watcher Drop 停后端,线程随进程结束)。
 static CONFIG_WATCHER: Mutex<Option<ReloadHandle>> = Mutex::new(None);
 
@@ -856,10 +862,27 @@ pub fn run() {
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
 
+        // #109:watcher 是进程级服务,必须在消息循环能够关闭主窗前建立。
+        // 保留首帧优先,但不能留给随主窗 timer 7 一起消失的延迟初始化。
+        if let Some(reload) = spawn_config_watcher(Arc::clone(&hwnd_slot)) {
+            *CONFIG_WATCHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(reload);
+        }
+
         // #59 非关键初始化推迟:首帧已上屏,余下(COM/进程枚举/wsl.exe/
-        // 第二个 GPU surface/文件 watcher)经一拍定时器在主线程补做——
+        // 第二个 GPU surface)经一拍定时器在主线程补做——
         // TLS 安全(全主线程),用户感知 = 首帧即此前的全部等待
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 7, 100, None);
+        // Debug-only controlled startup timing for the early-main-close regression.
+        // Release builds always retain the normal 100ms deferred initialization.
+        let deferred_ms = if cfg!(debug_assertions) {
+            std::env::var("MICA_TEST_DEFER_INIT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|ms| (100..=60_000).contains(ms))
+                .unwrap_or(100)
+        } else {
+            100
+        };
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 7, deferred_ms, None);
         START_T0.with(|c| c.set(Some(t0)));
         message_loop(None, hwnd_slot);
     }
@@ -1121,7 +1144,7 @@ fn warn_box(text: &str) {
 /// 交给去抖线程。None = 未监听(文件缺失或 watch 失败,热重载降级关闭)。
 /// 哨兵由 run() 统一建立后传入——与转发线程共用"窗口存活"这一个事实。
 /// #59 非关键初始化(首帧后一拍,主线程):孤儿清理 / jumplist COM /
-/// profile 扫描 / Quick Terminal / 配置 watcher。全在主线程执行——
+/// profile 扫描 / Quick Terminal。全在主线程执行——
 /// 这些件吃 TLS(GPU/SHARED_HWND),后台线程会撞双实例 TLS。
 /// DEFER_DONE 只在主窗线程置位(timer 挂主窗 hwnd),副窗天然不进
 unsafe fn deferred_init(hwnd: HWND) {
@@ -1151,21 +1174,13 @@ unsafe fn deferred_init(hwnd: HWND) {
     jumplist::install(&exe, &profiles);
     // M3b:Quick Terminal(独立 GPU surface,重)
     let _ = quickterm::init(hwnd);
-    // T5:配置 watcher(晚于首帧启动 = 首 100ms 内改配置不触发,可接受)
-    if let Some(slot) = SHARED_HWND.with(|s| s.borrow().clone())
-        && let Some(reload) = spawn_config_watcher(slot)
-    {
-        // 进程级持有(复核 4):主窗销毁不带走 watcher;重复初始化由
-        // DEFER_DONE 守卫(本函数只跑一次)
-        *CONFIG_WATCHER.lock().unwrap_or_else(|e| e.into_inner()) = Some(reload);
-    }
     if std::env::var_os("MICA_DEBUG_TIMING").is_some() {
         let total = START_T0
             .with(std::cell::Cell::get)
             .map(|t0| t0.elapsed().as_millis())
             .unwrap_or_default();
         eprintln!(
-            "[timing] 延迟段 {}ms(孤儿/COM/profile/QT/watcher),累计 {}ms",
+            "[timing] 延迟段 {}ms(孤儿/COM/profile/QT),累计 {}ms",
             t.elapsed().as_millis(),
             total
         );
@@ -2180,7 +2195,38 @@ struct PaneBatch {
     insts: Vec<mica_render::frame::CellInstance>,
 }
 
+/// 合帧窗:数据到 → 5ms 内的同批输出并成一帧(打字回显无感,突发
+/// 重绘整数量级合并;2026-10-07 定档)
+const COALESCE_FRAME_MS: u32 = 5;
+/// 最大绘帧间隔:距上帧超此值即直绘,不让合帧窗在持续输出下变成
+/// 无限推迟(WM_TIMER 低优先级,消息队列不空不投递)
+const MAX_FRAME_WAIT: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// 合帧调度决策(纯函数,表测见 sched_tests):输出到达时三选一。
+/// 旧版每批 KillTimer+SetTimer **重置**计时——持续输出快于 5ms/批
+/// 时绘制被无限顺延;改为"只武装一次",截止时间 = 首批到达 + 5ms,
+/// 延迟有界;距上帧超 MAX_FRAME_WAIT 则绕过定时器直绘(饥饿兜底)。
+#[derive(PartialEq, Eq, Debug)]
+enum FrameSched {
+    /// 立即绘制(调用方撤定时器 + 清武装位)
+    DrawNow,
+    /// 武装 5ms 合帧定时器(仅未武装时)
+    Arm,
+    /// 已武装,本批并入待绘帧
+    Pending,
+}
+
+fn frame_sched(armed: bool, since_last_frame: Option<std::time::Duration>) -> FrameSched {
+    match since_last_frame {
+        Some(d) if d >= MAX_FRAME_WAIT => FrameSched::DrawNow,
+        _ if armed => FrameSched::Pending,
+        _ => FrameSched::Arm,
+    }
+}
+
 fn draw_frame() {
+    // 帧节拍锚点:合帧兜底与 PerfDebug 都以"上次绘帧"为基准
+    LAST_FRAME.with(|f| f.set(Some(std::time::Instant::now())));
     // device lost 重建(M5b/T2):下一帧发现丢失即整套重造(实例、适配
     // 器、surface、renderer),全部 tab 图集修订重置强制重传 + force_full。
     if GPU_LOST.swap(false, std::sync::atomic::Ordering::SeqCst) {
@@ -3816,12 +3862,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             });
             // 合帧去抖(2026-10-07):应用重绘是几十次独立小写入,逐块
             // 立绘 = 肉眼可见的"一块一块长出来"(用户实测 Claude Code)。
-            // 数据到 → 重置 5ms 定时器,窗口期内的新块同帧合并——5ms 对
-            // 打字回显无感,对突发重绘是整数量级的合并。2026 的持帧路径
-            // ConPTY 场景不可达(边界清单),这是其通用替代
+            // 数据到 → 5ms 定时器,窗口期内的新块同帧合并——5ms 对打字
+            // 回显无感,对突发重绘是整数量级的合并。2026 的持帧路径
+            // ConPTY 场景不可达(边界清单),这是其通用替代。
+            // 2026-11-10:改"只武装一次"——旧版每批重置定时器,持续输出
+            // 快于 5ms/批时绘制被无限顺延;距上帧超 16ms 直绘兜底
+            // (WM_TIMER 低优先级,自唤醒链灌满队列时排不上)
             if drew {
-                windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 4).ok();
-                let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 4, 5, None);
+                let since = LAST_FRAME.with(|f| f.get().map(|t| t.elapsed()));
+                match frame_sched(DRAW_ARMED.with(std::cell::Cell::get), since) {
+                    FrameSched::DrawNow => {
+                        DRAW_ARMED.with(|a| a.set(false));
+                        windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 4).ok();
+                        draw_frame();
+                    }
+                    FrameSched::Arm => {
+                        DRAW_ARMED.with(|a| a.set(true));
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(
+                            Some(hwnd),
+                            4,
+                            COALESCE_FRAME_MS,
+                            None,
+                        );
+                    }
+                    FrameSched::Pending => {}
+                }
             }
             LRESULT(0)
         }
@@ -3854,6 +3919,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     draw_frame();
                 }
                 4 => {
+                    DRAW_ARMED.with(|a| a.set(false));
                     windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 4).ok();
                     draw_frame();
                 }
@@ -5454,7 +5520,7 @@ fn current_mods() -> Mods {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_path_token, normalize_path_token, pretty_title};
+    use super::{FrameSched, detect_path_token, frame_sched, normalize_path_token, pretty_title};
 
     /// 标题呈现:exe 路径 basename 去扩展(Ghostty direct-command argv[0]
     /// 的 Windows 适配);普通 OSC 标题原样(nvim / user@host:cwd)
@@ -5523,5 +5589,33 @@ mod tests {
         );
         assert_eq!(normalize_path_token("a/b"), None, "单斜杠无扩展名不吃");
         assert_eq!(normalize_path_token("::"), None);
+    }
+
+    /// 合帧决策表:只武装一次(续批不顺延,旧版每批重置可无限推迟
+    /// 绘制)+ 距上帧超 16ms 直绘兜底(WM_TIMER 低优先级饥饿)
+    #[test]
+    fn frame_sched_arm_once_and_deadline() {
+        use std::time::Duration;
+        // 首批:武装 5ms 合帧窗(从未绘帧亦武装)
+        assert_eq!(frame_sched(false, None), FrameSched::Arm);
+        assert_eq!(
+            frame_sched(false, Some(Duration::from_millis(1))),
+            FrameSched::Arm
+        );
+        // 已武装 + 新批:并帧,不顺延截止时间
+        assert_eq!(
+            frame_sched(true, Some(Duration::from_millis(1))),
+            FrameSched::Pending
+        );
+        assert_eq!(frame_sched(true, None), FrameSched::Pending);
+        // 距上帧 ≥16ms:绕过定时器直绘(武装与否)
+        assert_eq!(
+            frame_sched(true, Some(Duration::from_millis(16))),
+            FrameSched::DrawNow
+        );
+        assert_eq!(
+            frame_sched(false, Some(Duration::from_millis(50))),
+            FrameSched::DrawNow
+        );
     }
 }

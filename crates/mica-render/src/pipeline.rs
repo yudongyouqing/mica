@@ -839,23 +839,7 @@ impl Renderer {
             self.rebind_after_bg();
             return Ok(());
         };
-        let img = image::open(p).map_err(|e| format!("背景图打开失败 {}: {e}", p.display()))?;
-        let (iw, ih) = (img.width(), img.height());
-        let scale = if iw.max(ih) > 4096 {
-            4096.0 / iw.max(ih) as f32
-        } else {
-            1.0
-        };
-        let rgba = if scale < 1.0 {
-            image::imageops::resize(
-                &img,
-                (iw as f32 * scale) as u32,
-                (ih as f32 * scale) as u32,
-                image::imageops::FilterType::Lanczos3,
-            )
-        } else {
-            img.to_rgba8()
-        };
+        let rgba = crate::background::load(p)?;
         let (w, h) = (rgba.width(), rgba.height());
         let size = wgpu::Extent3d {
             width: w,

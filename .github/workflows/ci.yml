@@ -50,7 +50,7 @@ jobs:
           name: windows-gui-test-diagnostics
           path: |
             ${{ runner.temp }}/mica-ipc-*/stderr.log
-            ${{ runner.temp }}/mica-winlife-*/stderr.log
+            ${{ runner.temp }}/mica-winlife-*/**/*.log
           if-no-files-found: ignore
           retention-days: 7
 
