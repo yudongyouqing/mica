@@ -76,7 +76,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - 启动清理孤儿 ConPTY 宿主(M5c):强杀终端必留 OpenConsole 孤儿,管道断裂后 busy-loop——2026-10-03 冒烟事故实证 13 个孤儿各烧满 1 核;启动时按"父进程已死"清杀(真开着的 WT 父进程活着不受影响),与 minidump 崩溃恢复成对
 - UIA 撤线(1.0.8):深度查询(Narrator/FindAll)稳定触发 native crash(panic/SEH 均接不住,无 dmp)——自定义 provider 走系统 host provider 替代,Narrator 仍可读窗口标题;uia.rs 模块与 COM 闭环测试保留,崩溃根因修复后恢复分派
 - kitty graphics:ConPTY 剥离 APC(M4c 字节级实证,与 2026/OSC 52 同类)——Windows 主路径不可达,不实现;金丝雀测试 `conpty_strips_apc_today_canary` 变红 = 边界移动,重估(预研文档含 M5 立项建议)
-- OSC 133(**边界随 OS build 走,2026-10-12 CI 实证修正**):≥26300(客户端实测)**完整透传**——jump/exit 状态点即刻可达;26100(CI Server 2025 实测)仍剥离。金丝雀按 `cmd /c ver` build 号分档断言,任一档翻向=边界移动。OSC 7 透传(新标签目录继承的数据源)
+- OSC 133(2026-11-10 修正):本机26300和当前CI Server2025 build26100(镜像windows-2025-vs2026/20261103.298.1,run42820078822)均实测完整透传。旧“26100及以下剥离”依据被PSReadLine输入回显早退假通过掩盖,不再按该阈值外推。CI用MICA_CONPTY_OSC133_EXPECT=passthrough严格锁当前能力,客户端26300+保留透传回归,其他未知旧版本只探测报告。OSC7透传仍用于新标签目录继承。
 - 标签溢出滚动:滚轮+左右箭头+活跃自动跟随齐备(1.1,#39)
 - 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段)
 - 标签 tear-off(1.1 软版,#35):拖出标签行即撕开独立窗,同 shell/cwd/标题重开——**进程不迁移**(COM/线程本地 !Send 架构),活进程迁移留后续增强

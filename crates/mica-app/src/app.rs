@@ -1140,14 +1140,10 @@ unsafe fn deferred_init(hwnd: HWND) {
     }
     // M3a:AUMID + jump list(profile 任务直达;COM 实例化是慢路径)
     jumplist::set_appuser_model_id();
-    let profiles: Vec<(String, String)> = mica_core::profile::scan_all()
-        .into_iter()
-        .map(|p| (p.name, p.command))
-        .collect();
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    jumplist::install(&exe, &profiles);
+    jumplist::install_cached_profiles(&exe);
     // M3b:Quick Terminal(独立 GPU surface,重)
     let _ = quickterm::init(hwnd);
     if std::env::var_os("MICA_DEBUG_TIMING").is_some() {
@@ -1958,7 +1954,7 @@ unsafe fn start_tab(hwnd: HWND) {
     start_tab_with_profile(hwnd, None, None);
 }
 
-/// 带 profile 的建标签(M3a):IPC new-tab / CLI 注入。名字在 scan_all
+/// 带 profile 的建标签(M3a):IPC new-tab / CLI 注入。名字在 cached_profiles
 /// 里查(大小写不敏感);查不到回落默认并记日志。font_size(T9)覆盖
 /// 启动字号(pt),None 跟随全局 seed——每标签字号的 IPC 通路。
 unsafe fn start_tab_with_profile(
@@ -1966,7 +1962,7 @@ unsafe fn start_tab_with_profile(
     profile: Option<&str>,
     font_size: Option<f32>,
 ) -> bool {
-    let profiles = mica_core::profile::scan_all();
+    let profiles = mica_core::profile::cached_profiles();
     let picked = profile.and_then(|name| {
         let p = profiles
             .iter()
@@ -4119,7 +4115,7 @@ unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> Option<IpcResponse>
                 return Some(IpcResponse::error(req.id, IpcError::BadFontSize));
             }
             if let Some(profile) = req.profile.as_deref() {
-                let known = mica_core::profile::scan_all()
+                let known = mica_core::profile::cached_profiles()
                     .iter()
                     .any(|p| p.name.eq_ignore_ascii_case(profile));
                 if !known {

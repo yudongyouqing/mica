@@ -5,6 +5,7 @@
 
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize,
 };
 use windows::Win32::UI::Shell::Common::{IObjectArray, IObjectCollection};
 use windows::Win32::UI::Shell::{ICustomDestinationList, IShellLinkW};
@@ -46,6 +47,46 @@ pub fn set_appuser_model_id() {
     }
 }
 
+/// Keep Shell COM and WSL discovery off the UI thread. One worker installs
+/// the initial snapshot, then applies successful cache refreshes. Notifications
+/// have one coalescing slot, so a slow Shell extension cannot grow a queue.
+pub fn install_cached_profiles(exe_path: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let exe_path = exe_path.to_string();
+    if let Err(error) = std::thread::Builder::new()
+        .name("jumplist-profiles".into())
+        .spawn(move || {
+            let updates = mica_core::profile::subscribe_profile_updates();
+            loop {
+                let profiles: Vec<_> = mica_core::profile::cached_profiles()
+                    .into_iter()
+                    .map(|p| (p.name, p.command))
+                    .collect();
+                install(&exe_path, &profiles);
+                if updates.recv().is_err() {
+                    break;
+                }
+            }
+        })
+    {
+        STARTED.store(false, Ordering::Release);
+        eprintln!("jumplist: profile worker 启动失败 {error}");
+    }
+}
+
+struct ComApartment;
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        // SAFETY: constructed only after successful CoInitializeEx on this thread.
+        unsafe { CoUninitialize() };
+    }
+}
+
 /// 注册任务栏 jump list:每 profile 一项(参数 = `new-tab <name>`)。
 pub fn install(exe_path: &str, profiles: &[(String, String)]) {
     // SAFETY: 全块 COM;结构非 Copy 按引用借
@@ -54,6 +95,7 @@ pub fn install(exe_path: &str, profiles: &[(String, String)]) {
             eprintln!("jumplist: CoInitializeEx 失败,跳过");
             return;
         }
+        let _apartment = ComApartment;
         let Ok(list) = CoCreateInstance::<_, ICustomDestinationList>(
             &CLSID_DESTINATION_LIST,
             None,
@@ -103,9 +145,26 @@ unsafe fn make_link(exe_path: &str, profile: &str) -> Option<IShellLinkW> {
         CoCreateInstance(&CLSID_SHELL_LINK_INPROC, None, CLSCTX_INPROC_SERVER).ok()?;
     let path: windows::core::HSTRING = exe_path.into();
     link.SetPath(PCWSTR(path.as_ptr())).ok()?;
-    let args: windows::core::HSTRING = format!("new-tab {profile}").into();
+    let args: windows::core::HSTRING = task_arguments(profile).into();
     link.SetArguments(PCWSTR(args.as_ptr())).ok()?;
     let desc: windows::core::HSTRING = format!("Open a {profile} tab").into();
     link.SetDescription(PCWSTR(desc.as_ptr())).ok()?;
     Some(link)
+}
+
+fn task_arguments(profile: &str) -> String {
+    format!("new-tab {}", mica_core::pty::quote_windows_arg(profile))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn jump_list_keeps_spaced_profile_as_one_argument() {
+        let args = super::task_arguments("Ubuntu With Space");
+        let parsed = mica_core::pty::command_from_str(&args);
+        assert_eq!(
+            parsed.get_argv(),
+            &["new-tab", "Ubuntu With Space"].map(std::ffi::OsString::from)
+        );
+    }
 }
