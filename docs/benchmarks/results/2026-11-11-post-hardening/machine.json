@@ -1,0 +1,13 @@
+{
+  "windows_full_version": "Microsoft Windows [版本 10.0.26300.9711]",
+  "cpu_name": "12th Gen Intel(R) Core(TM) i7-12650H",
+  "build_command": "cargo build --release -j2 --target-dir C:/Users/yudongyouqing/.codex/worktrees/render-budget-target",
+  "gpu_backend_from_mica_log": "DX12",
+  "gpu_from_mica_log": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "gpu_driver_from_mica_log": "32.0.16.1656",
+  "dpi_scale_from_mica_log": 1.5,
+  "window_px_from_mica_log": [
+    1462,
+    1006
+  ]
+}
