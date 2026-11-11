@@ -22,13 +22,15 @@
 | S2 | 5 标签 | S1 + 4×`mica new-tab` | 60s |
 | S3 | 10 标签 | S1 + 9×`mica new-tab` | 60s |
 | S4 | 持续输出 | `mica send` 向活跃标签注入 `while($true){Get-Date -Format o}` 循环 | 60s,结束后 Ctrl+C |
-| S5 | 开关标签循环 | 交替 `new-tab` / 关闭(Ctrl+W;当前仅 SendKeys 可自动化,best-effort) | N 轮 |
+| S5 | 开关标签循环 | `new-tab` / 关闭(默认 Ctrl+Shift+W；隔离驱动以 Delete 绑定 close_tab，向自有 HWND 投消息并核验 registry/进程身份) | N 轮 |
 | S6 | 4 分屏 | 分屏键位 ×3(需输入自动化,随 T03 落地) | 60s |
 | S7 | 隐藏 QT | QT 开→隐藏→持续输出(随 T03/T09 落地) | 60s |
 | S8 | 长时 soak | 30min 混合负载→8h(T20 执行) | 全程 |
 
 **自动化约束(如实记录,不得装作测过):** 关标签/分屏/QT 无 IPC 或 CLI
-入口,目前只能 SendKeys;S5 数据带"best-effort"标记,S6/S7 未测。
+入口。旧 S5 数据仍保留 SendKeys / best-effort 标记；2026-11-11 新驱动
+不使用全局输入，已完成 5 轮探针和 200 轮验证，逐轮断言会话和 child/host
+回收，见 `results/2026-11-11-post-hardening/summary.md`。S6/S7 资源曲线仍未测。
 
 ## 环境记录(每次结果目录必须附)
 
