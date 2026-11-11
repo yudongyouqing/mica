@@ -97,15 +97,23 @@ impl BytePermit {
         self.bytes
     }
     pub fn grow(&mut self, bytes: usize) -> bool {
-        if self
-            .budget
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
-                used.checked_add(bytes).filter(|&n| n <= self.budget.limit)
-            })
-            .is_err()
-        {
-            return false;
+        // Keep the reservation compatible with both the local toolchain and
+        // newer stable Rust, where fetch_update was renamed. No allowance or
+        // version-specific API is needed for this ordinary CAS loop.
+        let mut used = self.budget.used.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = used.checked_add(bytes).filter(|&n| n <= self.budget.limit) else {
+                return false;
+            };
+            match self.budget.used.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => used = observed,
+            }
         }
         self.bytes += bytes;
         true
@@ -137,12 +145,14 @@ pub fn gpu_atlas_budget() -> Arc<ByteBudget> {
         .get_or_init(|| ByteBudget::new(PROCESS_ATLAS_BYTES))
         .clone()
 }
+#[cfg(windows)]
 pub(crate) fn shaping_budget() -> Arc<ByteBudget> {
     static BUDGET: OnceLock<Arc<ByteBudget>> = OnceLock::new();
     BUDGET
         .get_or_init(|| ByteBudget::new(16 * 1024 * 1024))
         .clone()
 }
+#[cfg(windows)]
 pub(crate) fn character_budget() -> Arc<ByteBudget> {
     static BUDGET: OnceLock<Arc<ByteBudget>> = OnceLock::new();
     BUDGET

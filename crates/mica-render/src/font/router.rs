@@ -44,6 +44,7 @@ pub trait GlyphRouter {
 
 /// Byte-accounted LRU. Oversized values are used by the caller but never retained.
 /// Capacity is charged conservatively by callers, including key/value allocations.
+#[cfg(any(windows, test))]
 pub(crate) struct BoundedCache<K, V> {
     entries: std::collections::HashMap<K, (V, u64, usize)>,
     tick: u64,
@@ -52,6 +53,7 @@ pub(crate) struct BoundedCache<K, V> {
     permit: super::atlas::BytePermit,
 }
 
+#[cfg(any(windows, test))]
 impl<K: Eq + std::hash::Hash, V> BoundedCache<K, V> {
     pub(crate) fn new(
         limit: usize,
