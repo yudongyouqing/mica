@@ -1,0 +1,36 @@
+{
+  "exe": "C:\\Users\\yudongyouqing\\.codex\\worktrees\\render-budget-target\\release\\mica.exe",
+  "exe_sha256": "6c57b860fb31428fbdd6bf20fb79f0fd6a5f8afcadcc07b8319d4368399da050",
+  "source_head": "19c9afd",
+  "python": "3.13.3 (tags/v3.13.3:6280bb5, Apr  8 2025, 14:47:33) [MSC v.1943 64 bit (AMD64)]",
+  "psutil": "7.2.2",
+  "os": "Windows-11-10.0.26300-SP0",
+  "windows_version": [
+    "11",
+    "10.0.26300",
+    "SP0",
+    "Multiprocessor Free"
+  ],
+  "logical_cpus": 16,
+  "physical_ram": 16898719744,
+  "config": "title = Mica isolated resource measurement\ncursor-blink = false\nstrip-animation-duration = 0\nstrip-focus-animation-duration = 0\nkeybind = delete = close_tab\nkeybind = win+delete = close_tab\nkeybind = shift+delete = close_tab\nkeybind = shift+win+delete = close_tab\nkeybind = alt+delete = close_tab\nkeybind = alt+win+delete = close_tab\nkeybind = alt+shift+delete = close_tab\nkeybind = alt+shift+win+delete = close_tab\nkeybind = ctrl+delete = close_tab\nkeybind = ctrl+win+delete = close_tab\nkeybind = ctrl+shift+delete = close_tab\nkeybind = ctrl+shift+win+delete = close_tab\nkeybind = ctrl+alt+delete = close_tab\nkeybind = ctrl+alt+win+delete = close_tab\nkeybind = ctrl+alt+shift+delete = close_tab\nkeybind = ctrl+alt+shift+win+delete = close_tab\n",
+  "isolated_username": "mica_curve_16960_1794360288578139800",
+  "rounds": 5,
+  "startup_idle_s": 15,
+  "final_idle_s": 30,
+  "render_wait_s": 0.3,
+  "after_close_wait_s": 0.1,
+  "registry_timeout_s": 10,
+  "cli_timeout_s": 8,
+  "visibility": "normal visible window; no focus/input injection",
+  "stop_limits": {
+    "private_or_ws_mib": 1536,
+    "private_growth_mib": 512,
+    "handles_growth": 500,
+    "threads_growth": 64,
+    "registry_sessions": 3,
+    "minimum_available_ram_mib": 2048
+  },
+  "pid": 5376,
+  "process_create_time": 1794360288.8540323
+}

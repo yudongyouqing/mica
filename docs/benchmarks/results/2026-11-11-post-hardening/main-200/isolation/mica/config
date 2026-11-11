@@ -1,0 +1,20 @@
+title = Mica isolated resource measurement
+cursor-blink = false
+strip-animation-duration = 0
+strip-focus-animation-duration = 0
+keybind = delete = close_tab
+keybind = win+delete = close_tab
+keybind = shift+delete = close_tab
+keybind = shift+win+delete = close_tab
+keybind = alt+delete = close_tab
+keybind = alt+win+delete = close_tab
+keybind = alt+shift+delete = close_tab
+keybind = alt+shift+win+delete = close_tab
+keybind = ctrl+delete = close_tab
+keybind = ctrl+win+delete = close_tab
+keybind = ctrl+shift+delete = close_tab
+keybind = ctrl+shift+win+delete = close_tab
+keybind = ctrl+alt+delete = close_tab
+keybind = ctrl+alt+win+delete = close_tab
+keybind = ctrl+alt+shift+delete = close_tab
+keybind = ctrl+alt+shift+win+delete = close_tab

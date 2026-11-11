@@ -18,11 +18,11 @@
 
 文件：core/profile.rs、core/pty.rs、app.rs 的 profile 调用点与 lib.rs CLI。
 
-- [ ] 红灯：真实带空格程序路径、空参数、引号与反斜杠参数；受控挂起/超量输出的枚举。
-- [ ] WSL 扫描有真正 3s deadline、输出上限和子进程收尾，不留下无限 reader 线程。
-- [ ] GUI 使用立即可用的内置项与缓存快照，后台刷新单飞、有冷却；CLI 可同步有界列举。
-- [ ] Windows 引号解析与 PowerShell -Command 余串兼容；WSL 名中的空格完整保留。
-- [ ] 精确单测、真实启动测试、workspace fmt/Clippy/test、规格与质量审查、CI 后合并。
+- [x] 红灯：真实带空格程序路径、空参数、引号与反斜杠参数；受控挂起/超量输出的枚举。
+- [x] WSL 扫描有 3s 执行/采集 deadline、64KiB 输出上限和子进程收尾，不留下无限 reader 线程；OS 回收开销不作硬实时保证。
+- [x] GUI 使用立即可用的内置项与缓存快照，后台刷新单飞、有冷却；CLI 可同步有界列举。
+- [x] Windows 引号解析与 PowerShell -Command 余串兼容；WSL 名中的空格完整保留。
+- [x] 精确单测、真实启动测试、workspace fmt/Clippy/test、规格与质量审查、CI 后合并（#114 / 1bc7652）。
 
 ## #109：配置 watcher 的启动所有权
 
@@ -32,20 +32,20 @@
 - [x] 红灯：打开副窗、关闭主窗，确认延迟段尚未运行，再写配置；旧版无法改标题，修后副窗标题改变且 IPC 可用。
 - [x] 首帧后、进入主窗消息循环前建立进程级 watcher，成功/失败仍按原降级规则；从 timer 7 移除该职责。
 - [x] watcher 仍只创建一次、主窗关闭不释放它；原已初始化存活/广播测试与新早关闭测试同时通过。
-- [ ] 检查首帧顺序与窗口计数不回退，完整门禁与 CI 后合并。
+- [x] 检查首帧顺序与窗口计数不回退，完整门禁与 CI 后合并（#111 / 85b37ea）。
 
 ## #106：渲染预算与复用
 
 文件：render/font/{atlas,dwrite,router}.rs、pipeline.rs，及帧缓存失效与 app 绘制接线。
 
-- [ ] 先采可重放的字形增长、唯一 shaping 行和多 pane 切换负载，报告实际字节、纹理创建/上传计数。
-- [ ] 单 atlas、shaping、CPU 全进程与 GPU 缓存均有预算和 Drop 归还；用真实 identity 区分同值 revision。
-- [ ] 超限回收只在帧边界换 generation；router/row/overlay 全部失效，构建途中不移动有效 UV。
-- [ ] 单帧确实不可容纳时显示替代字形并限频诊断；预算释放后恢复，不静默空白，不每帧回收风暴。
-- [ ] 纹理按 identity 保留、尺寸不变时复用并增量上传；缓存本身有上限。
-- [ ] 保留并扩展多 pane 像素、identity/revision 撞值、预算满/释放、DPI 重建与 UV 一致性回归。
-- [ ] 完整门禁、对照数据、审查与 CI 后合并。
+- [x] 先采可重放的字形增长、唯一 shaping 行和多 pane 切换负载，报告实际字节、纹理创建/上传计数。
+- [x] 单 atlas、shaping、CPU 全进程与 GPU 缓存均有预算和 Drop 归还；用真实 identity 区分同值 revision。
+- [x] 超限回收只在帧边界换 generation；router/row/overlay 全部失效，构建途中不移动有效 UV。
+- [x] 单帧确实不可容纳时显示替代字形并限频诊断；预算释放后恢复，不静默空白，不每帧回收风暴。
+- [x] 纹理按 identity 保留、尺寸不变时复用并增量上传；缓存本身有上限。
+- [x] 保留并扩展多 pane 像素、identity/revision 撞值、预算满/释放、DPI 重建与 UV 一致性回归。
+- [x] 最终本地门禁 337 通过 / 5 忽略、格式/Clippy/审查通过；200 轮真实标签曲线已保存。远端 CI 和合并以关联 PR 状态为准，全部 required checks 通过才可合入 dev。
 
 ## 后续 P2
 
-先做背景图解码前预算与真实负载验收。app.rs 只随职责改动拆分；版本文档在发版前对齐。8h soak 和完整常驻内存归因不能用短时单测替代；未执行就明确保留未测状态。
+背景图解码前预算已在 #113 / da54485 合入；真实标签生命周期已做 5 轮探针及 200 轮曲线，见 `docs/benchmarks/results/2026-11-11-post-hardening/summary.md`。app.rs 只随职责改动调整；版本文档在发版前对齐。8h soak、输入到屏幕 p95、S6/S7 资源曲线和完整常驻内存归因仍未执行，不能用本次短时样本替代。
