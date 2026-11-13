@@ -86,6 +86,9 @@ theme = Dracula
 font-family = JetBrains Mono
 font-size = 13
 
+# 默认 shell(已安装 PowerShell 7 时)
+command = pwsh.exe -NoLogo
+
 # 标签栏外观全量可配(strip-* 键集)
 strip-font-size = 9.5
 strip-bar-wash = 0.18          # 条底提亮(失焦自动洗白一档)
@@ -95,6 +98,20 @@ strip-animation-duration = 120 # ms,0 = 关动画
 
 颜色/字体/几何/动画共 17 个 `strip-*` 键,详见
 `crates/mica-core/src/config/settings.rs` 文档注释。
+
+`command` 用于之后新建的窗口、标签、分屏和 Quick Terminal。显式选择
+`--profile` 时使用该 profile；空 `command =` 恢复 Windows PowerShell 默认值。
+保存后已有 shell 会继续运行，Quick Terminal 要完全退出 Mica 后重开才会换 shell。
+若桌面启动的 PATH 与命令行不同，使用带引号的绝对路径，例如：
+
+```ini
+command = "C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo
+```
+
+这沿用 [Ghostty 的 `command` 配置键](https://ghostty.org/docs/config/reference#command)
+及“用于新终端”的范围；Windows 命令按 CRT 引号规则直接执行，不展开 `~`、
+环境变量、管道或 `shell:`/`direct:` 前缀。PowerShell 初始化脚本放在其 `$PROFILE`
+中，需加载 Oh My Posh 时请保留 profile 加载，不加 `-NoProfile`。
 
 ## 状态 / Status
 

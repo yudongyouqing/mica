@@ -33,6 +33,7 @@ use crate::app::Terminal;
 /// QT 独立状态(单 pane)。
 struct QtState {
     terminal: Terminal,
+    wake_hwnd: crate::app::SharedHwnd,
     renderer: Renderer,
     wgpu_surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -176,7 +177,8 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         metrics.line_height.round() as u16,
     );
     term.set_palette(&palette);
-    // QT shell 恒 PowerShell(下拉终端语义;profile 化 M4)
+    // New quick terminals follow the same configured command as normal tabs.
+    let shell_command = crate::app::launch_command(None);
     if !crate::app::lifecycle::spawn_capacity_ok() {
         // 故障态门:拒绝新会话(有界泄漏);QT 是增强件,禁用即可
         eprintln!("quickterm: 会话回收通道故障态,QT 本轮禁用");
@@ -187,7 +189,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     })?;
     let probe = crate::app::orphan::before_spawn();
     let (session, reader) = mica_core::pty::PtySession::spawn(
-        mica_core::pty::command_from_str("powershell.exe -NoLogo"),
+        mica_core::pty::command_from_str(&shell_command),
         cols,
         rows,
     )
@@ -197,12 +199,12 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         crate::app::orphan::track_session_since(&probe, pid); // 入注册表(T02,同主窗)
     }
     // T08:QT 输出积压/写队列(WPARAM 0xFF00 寻址 QT 窗口)
+    let wake_hwnd = Arc::new(Mutex::new(Some(hwnd_qt.0 as isize)));
     let pty_buf = crate::app::pty_bridge::PtyBacklog::new(
         0xFF00,
         crate::app::pty_bridge::PANE_BUDGET_BYTES,
         Arc::new(crate::app::pty_bridge::WindowWake {
-            slot: crate::app::shared_hwnd_for_quickterm()
-                .unwrap_or_else(|| Arc::new(Mutex::new(None))),
+            slot: Arc::clone(&wake_hwnd),
             msg: WM_APP,
         }),
     );
@@ -240,7 +242,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         rows,
         row_insts: Vec::new(),
         force_full: true,
-        shell: "powershell.exe -NoLogo".into(),
+        shell: shell_command,
         exited: None,
         strip_router: None,
         last_atlas_ver: 0,
@@ -248,6 +250,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     QT.with(|q| {
         *q.borrow_mut() = Some(QtState {
             terminal,
+            wake_hwnd,
             renderer,
             wgpu_surface,
             config,
@@ -302,11 +305,13 @@ pub fn forget_state() {
     if let Some(st) = QT.with(|q| q.borrow_mut().take()) {
         let QtState {
             terminal,
+            wake_hwnd,
             renderer,
             wgpu_surface,
             config,
             pending_surrogate: _,
         } = st;
+        *wake_hwnd.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let mut renderer = renderer;
         renderer.release_atlas_resources();
         std::mem::forget(renderer);

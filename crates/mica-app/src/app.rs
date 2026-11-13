@@ -341,6 +341,8 @@ thread_local! {
     /// 新建标签所需的字体/度量种子(load_settings 快照):热重载后建的
     /// 标签跟随当前设置,而不是启动时的
     static TAB_SEED: RefCell<(Vec<String>, f32)> = const { RefCell::new((Vec::new(), 12.0)) };
+    /// Default launch command for future terminals; existing sessions keep theirs.
+    static SESSION_COMMAND: RefCell<Option<String>> = const { RefCell::new(None) };
     /// 当前生效调色板(建新标签用;热重载时更新)
     static CURRENT_PALETTE: RefCell<Palette> = const { RefCell::new(Palette::DEFAULT) };
     /// 锁定标题(Ghostty `title` 同义,2026-10-07):Some = 窗口/标签恒显
@@ -809,6 +811,7 @@ pub fn run() {
         WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         TAB_SEED
             .with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+        SESSION_COMMAND.with(|s| *s.borrow_mut() = settings.command.clone());
         STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
         CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
         let gpu = match init_window_gpu(hwnd) {
@@ -1037,6 +1040,7 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
             TAB_SEED.with(|s| {
                 *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt)
             });
+            SESSION_COMMAND.with(|s| *s.borrow_mut() = settings.command.clone());
             STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
             CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
             let gpu = match init_window_gpu(hwnd) {
@@ -1384,6 +1388,7 @@ unsafe fn reload_config(hwnd: HWND) {
         apply_window_alpha(hwnd, false);
     }
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+    SESSION_COMMAND.with(|s| *s.borrow_mut() = settings.command.clone());
     BG_IMG_PATH.with(|b| *b.borrow_mut() = settings.background_image.clone());
     GPU.with(|g| {
         if let Some(gpu) = g.borrow_mut().as_mut() {
@@ -1835,7 +1840,7 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
         let Some(target) = tab.active_pane_id() else {
             return;
         };
-        let (pane, reader) = match create_pane(hwnd, "powershell.exe -NoLogo") {
+        let (pane, reader) = match create_pane(hwnd, &launch_command(None)) {
             Ok(pair) => pair,
             Err(e) => {
                 // P1(1.0.9 大审查):内存紧张时 spawn 失败不能闪退整个 app
@@ -2004,10 +2009,7 @@ unsafe fn start_tab_with_profile(
         }
         p
     });
-    let shell = picked
-        .as_ref()
-        .map(|p| p.command.clone())
-        .unwrap_or_else(|| "powershell.exe -NoLogo".to_string());
+    let shell = launch_command(picked.as_ref());
     let title = picked
         .as_ref()
         .map(|p| p.name.clone())
@@ -2078,19 +2080,27 @@ pub(crate) fn tab_seed() -> (Vec<String>, f32) {
     TAB_SEED.with(|s| s.borrow().clone())
 }
 
+/// Explicit profiles override the configured default; never rewrite a saved
+/// terminal command when restarting or tearing off an existing session.
+pub(crate) fn launch_command(profile: Option<&mica_core::profile::Profile>) -> String {
+    profile.map(|p| p.command.clone()).unwrap_or_else(|| {
+        SESSION_COMMAND
+            .with(|s| s.borrow().clone())
+            .unwrap_or_else(|| "powershell.exe -NoLogo".into())
+    })
+}
+
 /// 测试面:无窗口路径种字体/调色板 TLS——quickterm 回归测试直接调
 /// quickterm::init,其读 TAB_SEED/CURRENT_PALETTE,而 TLS 默认是空
 /// families(会让 DwriteRouter 失败 → init Err)。
 #[cfg(test)]
 pub(crate) fn seed_tls_for_tests(settings: &mica_core::config::settings::Settings) {
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+    SESSION_COMMAND.with(|s| *s.borrow_mut() = settings.command.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
 }
 pub(crate) fn current_palette() -> Palette {
     CURRENT_PALETTE.with(|p| *p.borrow())
-}
-pub(crate) fn shared_hwnd_for_quickterm() -> Option<SharedHwnd> {
-    SHARED_HWND.with(|s| s.borrow().clone())
 }
 /// QT 转发线程:与主 forwarder 同款,但 WM_APP(非 WM_APP_RENDER)投给
 /// QT 窗口(独立消息域;WPARAM=0xFF00 哨兵)。
@@ -3266,7 +3276,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 t.panes
                                     .first()
                                     .map(|p| p.terminal.shell.clone())
-                                    .unwrap_or_else(|| "powershell.exe -NoLogo".into()),
+                                    .unwrap_or_else(|| launch_command(None)),
                                 t.panes
                                     .first()
                                     .and_then(|p| p.terminal.term.cwd().map(str::to_string)),
@@ -5525,6 +5535,20 @@ fn current_mods() -> Mods {
 #[cfg(test)]
 mod tests {
     use super::{FrameSched, detect_path_token, frame_sched, normalize_path_token, pretty_title};
+
+    #[test]
+    fn explicit_profile_overrides_configured_command_and_reset_restores_default() {
+        let previous = super::SESSION_COMMAND.with(|s| s.replace(Some("pwsh.exe -NoLogo".into())));
+        assert_eq!(super::launch_command(None), "pwsh.exe -NoLogo");
+        let profile = mica_core::profile::Profile {
+            name: "Command Prompt".into(),
+            command: "cmd.exe".into(),
+        };
+        assert_eq!(super::launch_command(Some(&profile)), "cmd.exe");
+        super::SESSION_COMMAND.with(|s| s.replace(None));
+        assert_eq!(super::launch_command(None), "powershell.exe -NoLogo");
+        super::SESSION_COMMAND.with(|s| s.replace(previous));
+    }
 
     /// 标题呈现:exe 路径 basename 去扩展(Ghostty direct-command argv[0]
     /// 的 Windows 适配);普通 OSC 标题原样(nvim / user@host:cwd)

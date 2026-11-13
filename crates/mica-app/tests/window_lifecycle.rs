@@ -83,6 +83,10 @@ fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
 }
 
 fn launch_config(wait_deferred: bool) -> (ChildGuard, std::path::PathBuf) {
+    launch_config_source(wait_deferred, "")
+}
+
+fn launch_config_source(wait_deferred: bool, source: &str) -> (ChildGuard, std::path::PathBuf) {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -91,7 +95,7 @@ fn launch_config(wait_deferred: bool) -> (ChildGuard, std::path::PathBuf) {
     let dir = iso.join("mica");
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("config");
-    std::fs::write(&cfg, b"").unwrap(); // 空文件 = 全默认且 watcher 启用
+    std::fs::write(&cfg, source).unwrap();
     let user = format!("micawincfg{unique}");
     *TEST_USER
         .get_or_init(|| Mutex::new(String::new()))
@@ -135,6 +139,87 @@ fn launch_config(wait_deferred: bool) -> (ChildGuard, std::path::PathBuf) {
         std::thread::sleep(Duration::from_millis(100));
     }
     (app, cfg)
+}
+
+#[test]
+fn configured_command_reaches_tabs_splits_windows_and_quick_terminal() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let markers = std::env::temp_dir().join(format!("mica shell markers {unique}"));
+    std::fs::create_dir_all(&markers).unwrap();
+    let script = format!(
+        "[IO.File]::WriteAllText(('{}' + '/' + $PID), 'configured'); Start-Sleep -Seconds 120",
+        markers
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .replace('\'', "''"),
+    );
+    let source = format!(
+        "command = powershell.exe -NoLogo -NoProfile -Command \"{script}\"\nkeybind = insert=split_right\n"
+    );
+    mica_core::config::settings::resolve(&source).expect("valid test configuration");
+    let (app, cfg) = launch_config_source(true, &source);
+    let wait_markers = |want| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let count = std::fs::read_dir(&markers).unwrap().count();
+            if count >= want {
+                assert_eq!(count, want);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {want} configured shells, found {count}; diagnostics: {}",
+                cfg.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    // The main tab and hidden quick terminal must both use the configured shell.
+    wait_markers(2);
+    assert!(wait_ready(Duration::from_secs(20)));
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    // SAFETY: post only to the window owned by this test's isolated process.
+    unsafe {
+        PostMessageW(
+            Some(first[0]),
+            windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            WPARAM(0x2d),
+            LPARAM(0),
+        )
+        .unwrap();
+    }
+    wait_markers(3);
+    assert!(cli(&["new-tab"]));
+    wait_markers(4);
+    assert!(cli(&["new-window"]));
+    wait_markers(5);
+
+    // A reload changes future sessions without restarting any of the five
+    // existing shells. The title confirms the production watcher applied it.
+    let updated = source.replace("'configured'", "'reloaded'");
+    std::fs::write(&cfg, format!("{updated}title = CommandReloaded\n")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(first[0]) != "CommandReloaded" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(window_title(first[0]), "CommandReloaded");
+    assert!(cli(&["new-tab"]));
+    wait_markers(6);
+    let reloaded = std::fs::read_dir(&markers)
+        .unwrap()
+        .filter(|entry| {
+            std::fs::read_to_string(entry.as_ref().unwrap().path()).unwrap() == "reloaded"
+        })
+        .count();
+    assert_eq!(
+        reloaded, 1,
+        "only the new shell should use the updated command"
+    );
 }
 
 /// #109:主窗 timer 7 还未执行时关闭,副窗的配置监听不能永久缺席。

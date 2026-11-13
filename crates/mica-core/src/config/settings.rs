@@ -95,6 +95,9 @@ pub enum MouseRightClick {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
+    /// 默认终端启动命令(Ghostty `command`):None 使用平台默认;
+    /// 显式 profile 优先。仅影响之后新建的终端,不重启已有会话。
+    pub command: Option<String>,
     /// 回退链按序;重复 `font-family` 追加(D9 链语义)
     pub font_families: Vec<String>,
     pub font_size_pt: f32,
@@ -141,6 +144,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            command: None,
             font_families: DEFAULT_FAMILIES.iter().map(|s| s.to_string()).collect(),
             font_size_pt: DEFAULT_FONT_SIZE_PT,
             title: None,
@@ -241,6 +245,7 @@ fn apply_pairs(
     let mut family_declared = false;
     for (key, value) in pairs {
         match key.as_str() {
+            "command" => settings.command = (!value.is_empty()).then_some(value),
             "font-family" => {
                 if !value.is_empty() {
                     if !family_declared {
@@ -428,6 +433,29 @@ fn apply_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_setting_selects_a_shell_and_empty_value_resets_it() {
+        let source = r#"command = "C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo"#;
+        let configured = resolve(source).unwrap();
+        assert_ne!(
+            configured,
+            Settings::default(),
+            "command must not be ignored"
+        );
+        assert_eq!(
+            configured.command.as_deref(),
+            source.strip_prefix("command = ")
+        );
+        assert_eq!(
+            crate::pty::command_from_str(configured.command.as_deref().unwrap()).get_argv(),
+            &[r"C:\Program Files\PowerShell\7\pwsh.exe", "-NoLogo"].map(std::ffi::OsString::from),
+        );
+        assert_eq!(
+            resolve(&format!("{source}\ncommand =")).unwrap(),
+            Settings::default()
+        );
+    }
 
     /// strip-* 全量可配(2026-10-12):键解析/范围/auto 语义/gtk-wide-tabs 同义
     #[test]
