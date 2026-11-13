@@ -729,6 +729,35 @@ mod tests {
     }
 
     #[test]
+    fn dectcem_changes_visibility_without_changing_shape_or_position_queries() {
+        let mut s = Surface::new(ScreenSize::new(12, 5));
+        assert!(
+            s.cursor_visible(),
+            "normal terminal starts with a visible cursor"
+        );
+        s.feed(b"\x1b[6 q\x1b[?25l\x1b[4;7H\x1b[6n");
+        assert!(!s.cursor_visible());
+        assert_eq!(
+            s.cursor_shape(),
+            CursorShape::Beam,
+            "visibility does not rewrite shape"
+        );
+        assert_eq!(
+            s.take_pty_writes(),
+            vec!["\x1b[4;7R"],
+            "hidden cursor still has a logical position"
+        );
+        s.feed(b"\x1b[?25h\x1b[6n");
+        assert!(s.cursor_visible());
+        assert_eq!(s.cursor_shape(), CursorShape::Beam);
+        assert_eq!(
+            s.take_pty_writes(),
+            vec!["\x1b[4;7R"],
+            "show must not move the cursor"
+        );
+    }
+
+    #[test]
     fn poisoned_proxy_state_is_recovered_not_fatal() {
         let proxy = EventProxy::default();
         // 人为毒化:持锁 panic(静默 panic hook,保持测试输出干净)

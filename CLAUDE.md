@@ -39,6 +39,8 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 
 ## 硬约束
 
+- **先对齐行业基线**:有明确 VT/DEC 协议规定时按协议实现；以 Windows Console/Terminal、xterm.js、Alacritty 等成熟实现的公开行为交叉验证。先补正确性与兼容性，再考虑扩展。实现前记录规范条目、参考版本/commit 和差异回归；没有统一规定的行为须明确适用边界，不把单个实现习惯称作通用标准。当前光标显隐对照见 `docs/superpowers/reviews/2026-11-13-cursor-visibility-conformance.md`。
+
 - **许可证**:MIT OR Apache-2.0;**禁止引入 GPL 依赖**(商业资产自持,加依赖前查 license)。
 - **配置语法**:兼容 Ghostty 的 `key = value` 语法是硬需求(spec D6)——主题生态靠它免费迁移。
 - **wgpu surface 格式必须非 sRGB**:shader 颜色路径无 gamma 转换,`Renderer::new` 有 assert 兜底(选格式是壳层的责任)。
