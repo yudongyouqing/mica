@@ -457,6 +457,12 @@ impl Surface {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// DECTCEM (DEC private mode 25). A TUI may move the cursor to repaint
+    /// while keeping it hidden; this takes precedence over shape/blink settings.
+    pub fn cursor_visible(&self) -> bool {
+        self.term.mode().contains(TermMode::SHOW_CURSOR)
+    }
+
     /// 当前光标样式(DECSCUSR;未设走上游默认块状)。
     pub fn cursor_style(&self) -> CursorStyle {
         self.term.cursor_style()
