@@ -25,6 +25,59 @@ pub fn handle_cli() -> i32 {
     app::crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("+show-config") => {
+            let flags = &args[1..];
+            if flags == ["--path"] {
+                println!("{}", mica_core::config::user_config_path().display());
+            } else if flags.iter().any(|s| s == "--default")
+                && flags.iter().all(|s| s == "--default" || s == "--docs")
+            {
+                print!("{}", mica_core::config::defaults::SOURCE);
+            } else {
+                eprintln!("用法: mica +show-config --default [--docs] | --path");
+                return 2;
+            }
+            0
+        }
+        Some("+validate-config") => {
+            if args.len() != 1 {
+                eprintln!("用法: mica +validate-config");
+                return 2;
+            }
+            let path = mica_core::config::user_config_path();
+            let source = match std::fs::read_to_string(&path) {
+                Ok(source) => source,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    eprintln!("无法读取 {}: {e}", path.display());
+                    return 1;
+                }
+            };
+            match mica_core::config::settings::resolve(&source) {
+                Ok(_) => {
+                    println!(
+                        "配置有效: {}{}",
+                        path.display(),
+                        if path.exists() {
+                            ""
+                        } else {
+                            " (文件缺失,使用默认配置)"
+                        }
+                    );
+                    0
+                }
+                Err(errors) => {
+                    eprintln!("配置无效: {}", path.display());
+                    for error in errors.parse {
+                        eprintln!("  第 {} 行: {}", error.line, error.reason);
+                    }
+                    for error in errors.values {
+                        eprintln!("  {error}");
+                    }
+                    1
+                }
+            }
+        }
         // 隐藏自检:集成测试 spawn 断言 dmp 落盘(crash.rs 测试用)
         Some("--panic-test") => {
             panic!("--panic-test 自检");

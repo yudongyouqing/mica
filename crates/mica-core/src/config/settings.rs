@@ -10,28 +10,7 @@ use crate::config::parse::{self, ParseError};
 use crate::config::theme;
 use crate::keymap::{self, KeyRemap, Keymap};
 
-/// 默认字体回退链(D9)。定义在此(core)——render 侧 re-export,
-/// 与格子度量一样保持单一来源。
-pub const DEFAULT_FAMILIES: &[&str] = &[
-    // JetBrains Mono 打头(Ghostty 官方观感;未安装时 DWrite 回退链自然
-    // 落到 Cascadia);Sarasa 装 CJK 等宽首选,再 Cascadia/YaHei/Emoji
-    "JetBrains Mono",
-    "Sarasa Mono SC",
-    "Cascadia Mono",
-    "Microsoft YaHei",
-    // Nerd Font(oh-my-posh/starship 等提示符引擎的图标/Powerline 三角
-    // 形 E0B0 族、F000 图标区;ASCII 仍由链头 JBMono 承担,此处只兜
-    // 缺字。两个族名都挂:NF 是 v3 短名(本机实测 GDI/DWrite 都叫这个),
-    // Nerd Font 是 v2 长名——未装的机器静默跳过
-    "JetBrainsMono NF",
-    "JetBrainsMono Nerd Font",
-    "Segoe UI Emoji",
-    // 图标字形(caption 按钮的 Segoe Fluent Icons PUA 区;终端文本
-    // 命中 E700-E8FF 时得到图标也是正确语义,Nerd Font 同族行为)
-    "Segoe Fluent Icons",
-];
-
-pub const DEFAULT_FONT_SIZE_PT: f32 = 12.0;
+pub use crate::config::defaults::{DEFAULT_FAMILIES, DEFAULT_FONT_SIZE_PT};
 
 /// 标签栏(双行条)外观全量可配(2026-10-12)。默认值 = 源码对标定档
 /// 的观感;颜色键写 `auto`(或不写)= 从调色板推导。
@@ -64,24 +43,7 @@ pub struct StripCfg {
 
 impl Default for StripCfg {
     fn default() -> Self {
-        Self {
-            font_family: None,
-            font_size_pt: 9.5,
-            title_h: 32.0,
-            tab_h: 36.0,
-            tab_min_w: 88.0,
-            tab_corner_r: 8.0,
-            wide_tabs: true,
-            hide_single: true,
-            bar: None,
-            bar_wash: 0.18,
-            bar_wash_unfocused: 0.30,
-            active_tab: None,
-            text: None,
-            dim: None,
-            anim_ms: 120.0,
-            focus_ms: 150.0,
-        }
+        Settings::default().strip
     }
 }
 
@@ -98,6 +60,14 @@ pub struct Settings {
     /// 默认终端启动命令(Ghostty `command`):None 使用平台默认;
     /// 显式 profile 优先。仅影响之后新建的终端,不重启已有会话。
     pub command: Option<String>,
+    /// Initial grid size in cells, used when creating a window.
+    pub window_width: u16,
+    pub window_height: u16,
+    /// Symmetric content padding in logical pixels (scaled with DPI).
+    pub window_padding_x: f32,
+    pub window_padding_y: f32,
+    /// Quick Terminal height as a percentage of monitor height (creation only).
+    pub quick_terminal_height: u8,
     /// 回退链按序;重复 `font-family` 追加(D9 链语义)
     pub font_families: Vec<String>,
     pub font_size_pt: f32,
@@ -143,27 +113,71 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self {
+        static RESOLVED: std::sync::OnceLock<Settings> = std::sync::OnceLock::new();
+        RESOLVED
+            .get_or_init(|| resolve("").expect("valid built-in configuration"))
+            .clone()
+    }
+}
+
+// Neutral construction state, not a second table of product defaults. Every
+// user-facing value is populated from the default configuration before use.
+fn default_state() -> &'static (Settings, [bool; 3]) {
+    static DEFAULTS: std::sync::OnceLock<(Settings, [bool; 3])> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let mut settings = Settings {
             command: None,
-            font_families: DEFAULT_FAMILIES.iter().map(|s| s.to_string()).collect(),
-            font_size_pt: DEFAULT_FONT_SIZE_PT,
-            title: None,
-            mouse_hide_while_typing: true,
+            font_families: Vec::new(),
+            font_size_pt: 0.0,
+            palette: Palette::DEFAULT,
+            theme_name: None,
+            keymap: Keymap::default(),
+            key_remap: Vec::new(),
+            cursor_blink: false,
+            quick_terminal_key: None,
+            quick_terminal_height: 0,
+            window_width: 0,
+            window_height: 0,
+            window_padding_x: 0.0,
+            window_padding_y: 0.0,
+            mouse_hide_while_typing: false,
             minimum_contrast: 0.0,
             window_position: None,
             background_image: None,
-            background_opacity: 1.0,
+            background_opacity: 0.0,
             mouse_right_click: MouseRightClick::None,
-            copy_on_select: true,
-            palette: Palette::DEFAULT,
-            theme_name: None,
-            keymap: Keymap::wt_default(),
-            key_remap: Vec::new(),
-            cursor_blink: false,
-            quick_terminal_key: Some("win+oem_3".into()),
-            strip: StripCfg::default(),
-        }
-    }
+            copy_on_select: false,
+            title: None,
+            strip: StripCfg {
+                font_family: None,
+                font_size_pt: 0.0,
+                title_h: 0.0,
+                tab_h: 0.0,
+                tab_min_w: 0.0,
+                tab_corner_r: 0.0,
+                wide_tabs: false,
+                hide_single: false,
+                bar: None,
+                bar_wash: 0.0,
+                bar_wash_unfocused: 0.0,
+                active_tab: None,
+                text: None,
+                dim: None,
+                anim_ms: 0.0,
+                focus_ms: 0.0,
+            },
+        };
+        let (pairs, parse) = parse::parse(crate::config::defaults::SOURCE);
+        let mut errors = ConfigError {
+            parse,
+            values: Vec::new(),
+        };
+        let mut explicit = [false; 3];
+        apply_pairs(&mut settings, pairs, &mut errors, &mut explicit);
+        assert!(errors.is_empty(), "invalid built-in defaults: {errors:?}");
+        finish_palette(&mut settings, &explicit);
+        (settings, explicit)
+    })
 }
 
 /// resolve 的全部失败:解析行错误 + 值语义错误(坏 hex/字号/主题名)。
@@ -182,21 +196,23 @@ impl ConfigError {
 
 /// 合成用户 config(可空串 = 全默认)。任何错误 → Err(调用方保旧)。
 pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
+    let user_source = user_source.strip_prefix('\u{feff}').unwrap_or(user_source);
     let mut err = ConfigError::default();
     let (user_pairs, parse_errors) = parse::parse(user_source);
     err.parse = parse_errors;
 
-    let mut settings = Settings::default();
+    let mut settings = default_state().0.clone();
     // 选区/光标是否被任何层显式设置(theme 或用户);[0]=selection-fg
     // [1]=selection-bg [2]=cursor——缺省派生(见尾部)不覆盖显式值
-    let mut explicit = [false; 3];
+    let mut explicit = default_state().1;
 
     // theme 片段在用户片段之前应用:用户键可以覆盖主题同名键
     let theme_name = user_pairs
         .iter()
         .rev()
         .find(|(k, _)| k == "theme")
-        .map(|(_, v)| v.clone());
+        .map(|(_, v)| (!v.is_empty()).then(|| v.clone()))
+        .unwrap_or_else(|| settings.theme_name.clone());
     if let Some(name) = theme_name {
         match theme::find_theme(&name) {
             Ok(source) => {
@@ -209,6 +225,16 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
     }
     apply_pairs(&mut settings, user_pairs, &mut err, &mut explicit);
 
+    finish_palette(&mut settings, &explicit);
+
+    if err.is_empty() {
+        Ok(settings)
+    } else {
+        Err(err)
+    }
+}
+
+fn finish_palette(settings: &mut Settings, explicit: &[bool; 3]) {
     // Ghostty 缺省语义(上游 renderer/generic.zig 实证):selection/cursor
     // 未显式配置时**动态互换/跟前景**——选区底 = 前景、选区字 = 背景、
     // 光标 = 前景。不是常量:用户只改 foreground 时选区光标随之走
@@ -223,12 +249,6 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
     }
     // #90 minimum-contrast 是渲染参数非调色板项:合成尾写入
     settings.palette.minimum_contrast = settings.minimum_contrast;
-
-    if err.is_empty() {
-        Ok(settings)
-    } else {
-        Err(err)
-    }
 }
 
 /// 键集分派:font-family 追加、font-size 限幅、色键(含 selection-*)走
@@ -245,6 +265,84 @@ fn apply_pairs(
     let mut family_declared = false;
     for (key, value) in pairs {
         match key.as_str() {
+            "window-padding-x" | "window-padding-y" => match value.parse::<f32>() {
+                Ok(n) if n.is_finite() && (0.0..=400.0).contains(&n) => {
+                    if key == "window-padding-x" {
+                        settings.window_padding_x = n;
+                    } else {
+                        settings.window_padding_y = n;
+                    }
+                }
+                _ => err
+                    .values
+                    .push(format!("{key} must be a finite number in 0..400")),
+            },
+            "window-width" | "window-height" => match value.parse::<u16>() {
+                Ok(n) if (1..=1000).contains(&n) => {
+                    if key == "window-width" {
+                        settings.window_width = n;
+                    } else {
+                        settings.window_height = n;
+                    }
+                }
+                _ => err
+                    .values
+                    .push(format!("{key} must be an integer in 1..1000")),
+            },
+            "quick-terminal-height" => match value.parse::<u8>() {
+                Ok(n) if (1..=100).contains(&n) => settings.quick_terminal_height = n,
+                _ => err
+                    .values
+                    .push("quick-terminal-height must be a percentage in 1..100".into()),
+            },
+            "window-position" => {
+                settings.window_position = None;
+                if !value.is_empty() {
+                    match value
+                        .split_once(',')
+                        .and_then(|(x, y)| Some((x.trim().parse().ok()?, y.trim().parse().ok()?)))
+                    {
+                        Some(position) => settings.window_position = Some(position),
+                        None => err.values.push(
+                            "window-position must be x,y integer coordinates or empty".into(),
+                        ),
+                    }
+                }
+            }
+            "background-image" => settings.background_image = (!value.is_empty()).then_some(value),
+            "background-opacity" | "minimum-contrast" => {
+                let lower = if key == "background-opacity" {
+                    0.05
+                } else {
+                    0.0
+                };
+                match value.parse::<f32>() {
+                    Ok(n) if n.is_finite() && (lower..=1.0).contains(&n) => {
+                        if key == "background-opacity" {
+                            settings.background_opacity = n;
+                        } else {
+                            settings.minimum_contrast = n;
+                        }
+                    }
+                    _ => err
+                        .values
+                        .push(format!("{key} must be a finite number in {lower}..1")),
+                }
+            }
+            "mouse-right-click" => match value.to_ascii_lowercase().as_str() {
+                "none" => settings.mouse_right_click = MouseRightClick::None,
+                "paste" => settings.mouse_right_click = MouseRightClick::Paste,
+                _ => err
+                    .values
+                    .push("mouse-right-click must be none or paste".into()),
+            },
+            "copy-on-select" => match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => settings.copy_on_select = true,
+                "false" | "0" | "no" => settings.copy_on_select = false,
+                _ => err
+                    .values
+                    .push("copy-on-select must be true or false".into()),
+            },
             "command" => settings.command = (!value.is_empty()).then_some(value),
             "font-family" => {
                 if !value.is_empty() {
@@ -261,7 +359,7 @@ fn apply_pairs(
                     .values
                     .push(format!("font-size 应为 4-72 的数字,得 `{value}`")),
             },
-            "theme" => settings.theme_name = Some(value),
+            "theme" => settings.theme_name = (!value.is_empty()).then_some(value),
             // 空值 = 解除锁定(Ghostty:置空回落默认/shell 标题)
             "title" => settings.title = Some(value).filter(|v| !v.is_empty()),
             "quick-terminal-key" => {
@@ -289,6 +387,7 @@ fn apply_pairs(
                     .values
                     .push(format!("cursor-blink 应为 true/false,得 `{value}`")),
             },
+            "key-remap" if value.is_empty() => settings.key_remap.clear(),
             "key-remap" => match KeyRemap::parse_pair(&value) {
                 Some(r) => settings.key_remap.push(r),
                 None => err.values.push(format!(
@@ -312,6 +411,16 @@ fn apply_pairs(
                         "keybind 值应为 `<触发器> = <动作>` 或 clear,得 `{value}`"
                     ));
                 }
+            }
+            "cursor-color" | "selection-foreground" | "selection-background"
+                if value.is_empty() || value.eq_ignore_ascii_case("auto") =>
+            {
+                let slot = match key.as_str() {
+                    "selection-foreground" => 0,
+                    "selection-background" => 1,
+                    _ => 2,
+                };
+                explicit[slot] = false;
             }
             "palette" | "foreground" | "background" | "cursor-color" => {
                 if let Err(reason) = settings.palette.apply_pair(&key, &value) {
@@ -433,6 +542,98 @@ fn apply_pairs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_user_options_are_not_silently_ignored() {
+        let s = resolve("background-image = C:\\wallpapers\\image.png\nbackground-opacity = 0.65\nminimum-contrast = 0.3\nwindow-position = -120,45\nmouse-right-click = paste\ncopy-on-select = false\n").unwrap();
+        assert_eq!(
+            s.background_image.as_deref(),
+            Some(r"C:\wallpapers\image.png")
+        );
+        assert_eq!(s.background_opacity, 0.65);
+        assert_eq!(s.minimum_contrast, 0.3);
+        assert_eq!(s.palette.minimum_contrast, 0.3);
+        assert_eq!(s.window_position, Some((-120, 45)));
+        assert_eq!(s.mouse_right_click, MouseRightClick::Paste);
+        assert!(!s.copy_on_select);
+    }
+
+    #[test]
+    fn external_defaults_preserve_existing_behavior() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config/defaults");
+        assert!(
+            path.is_file(),
+            "all product defaults must have an external source"
+        );
+        let source = std::fs::read_to_string(path).unwrap();
+        assert_eq!(resolve(&source).unwrap(), Settings::default());
+        assert_eq!(Settings::default().font_size_pt, 12.0);
+        assert_eq!(Settings::default().palette, Palette::DEFAULT);
+        assert_eq!(Settings::default().strip.font_size_pt, 9.5);
+        assert_eq!(Settings::default().keymap, Keymap::wt_default());
+        assert_eq!(Settings::default().window_width, 100);
+        assert_eq!(Settings::default().window_height, 30);
+        assert_eq!(Settings::default().quick_terminal_height, 40);
+        // The old Rust table contained later duplicate arrow bindings. Lookup
+        // used the first occurrence, so migration must preserve prompt jumps.
+        let trigger = crate::keymap::parse_trigger("ctrl+shift+up").unwrap();
+        assert_eq!(
+            Settings::default().keymap.lookup(trigger.mods, trigger.key),
+            Some(crate::keymap::Action::JumpPrevPrompt)
+        );
+        let trigger = crate::keymap::parse_trigger("ctrl+shift+down").unwrap();
+        assert_eq!(
+            Settings::default().keymap.lookup(trigger.mods, trigger.key),
+            Some(crate::keymap::Action::JumpNextPrompt)
+        );
+        assert_eq!(
+            Settings::default().strip,
+            StripCfg {
+                font_family: None,
+                font_size_pt: 9.5,
+                title_h: 32.0,
+                tab_h: 36.0,
+                tab_min_w: 88.0,
+                tab_corner_r: 8.0,
+                wide_tabs: true,
+                hide_single: true,
+                bar: None,
+                bar_wash: 0.18,
+                bar_wash_unfocused: 0.30,
+                active_tab: None,
+                text: None,
+                dim: None,
+                anim_ms: 120.0,
+                focus_ms: 150.0,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_user_options_are_reported_and_optional_values_reset() {
+        for line in [
+            "window-width = 0",
+            "window-height = 1001",
+            "window-width = -1",
+            "quick-terminal-height = 101",
+            "quick-terminal-height = 0",
+            "background-opacity = 0",
+            "background-opacity = NaN",
+            "minimum-contrast = inf",
+            "minimum-contrast = -1",
+            "minimum-contrast = 2",
+            "window-position = one,2",
+            "mouse-right-click = bad",
+            "copy-on-select = bad",
+        ] {
+            let error = resolve(line).expect_err(line);
+            assert_eq!(error.values.len(), 1, "{line}: {error:?}");
+        }
+        let source = "\u{feff}theme = Dracula\ncommand = pwsh.exe\nwindow-position = -5,8\nbackground-image = C:\\image.png\nkey-remap = ctrl=super\ncursor-color = #123456\nselection-foreground = #123456\nselection-background = #123456\n\
+            theme =\ncommand =\nwindow-position =\nbackground-image =\nkey-remap =\ncursor-color = auto\nselection-foreground = auto\nselection-background = auto\n";
+        let s = resolve(source).unwrap();
+        assert_eq!(s, Settings::default());
+    }
 
     #[test]
     fn command_setting_selects_a_shell_and_empty_value_resets_it() {

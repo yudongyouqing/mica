@@ -79,7 +79,9 @@ coding agent 不会炸。连不上实例时报错退出,绝不误启新窗。
 
 ## 配置
 
-`%APPDATA%\mica\config`,**Ghostty 语法**,保存即热重载:
+用户配置位于 `%APPDATA%\mica\config`，采用 **Ghostty 的 `key = value` 语法**。
+全部默认值和 34 条默认快捷键集中在
+[`crates/mica-core/config/defaults`](crates/mica-core/config/defaults)，用户文件只需写覆盖项：
 
 ```ini
 theme = Dracula
@@ -91,13 +93,34 @@ command = pwsh.exe -NoLogo
 
 # 标签栏外观全量可配(strip-* 键集)
 strip-font-size = 9.5
-strip-bar-wash = 0.18          # 条底提亮(失焦自动洗白一档)
+strip-bar-wash = 0.18
 strip-tab-height = 36
-strip-animation-duration = 120 # ms,0 = 关动画
+strip-animation-duration = 120
 ```
 
-颜色/字体/几何/动画共 17 个 `strip-*` 键,详见
-`crates/mica-core/src/config/settings.rs` 文档注释。
+注释必须独占一行，值后不能追加注释。查看完整选项、配置位置和校验结果：
+
+```powershell
+mica +show-config --default
+mica +show-config --path
+mica +validate-config
+```
+
+默认值从同一份文件生成内置兜底，无配置文件也能启动；加载顺序为默认值、主题、用户覆盖。
+不要把全部默认颜色直接粘成用户覆盖项，否则会盖住选中的主题；参考完整选项时可先注释掉。
+`+validate-config` 校验语法和值范围，失败返回非零；未知键保持兼容性容忍，
+不会校验 shell 程序、字体和图片文件是否已经安装或存在。
+
+| 配置 | 生效范围 |
+| --- | --- |
+| 普通窗口字体、调色板、背景、鼠标行为、快捷键、标题栏、光标闪烁 | 保存后热重载 |
+| `command` | 新标签、分屏、新窗口；已有会话保持原 shell |
+| `window-width` / `window-height` / `window-position` | 新建窗口；宽高单位为终端列、行 |
+| `window-padding-x` / `window-padding-y` | 逻辑像素、随 DPI 缩放，保存后热重载 |
+| `quick-terminal-key` | 热键可重绑或设 `none` 禁用 |
+| Quick Terminal 的 shell、字体、配色、`quick-terminal-height` | 完全退出 Mica 后重启 |
+
+首次创建配置文件后需重启以开启监听；坏配置热重载会保留当前设置。
 
 `command` 用于之后新建的窗口、标签、分屏和 Quick Terminal。显式选择
 `--profile` 时使用该 profile；空 `command =` 恢复 Windows PowerShell 默认值。
