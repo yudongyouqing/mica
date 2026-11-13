@@ -174,6 +174,7 @@ pub fn build_instances(
     display_offset: usize,
     cursor: Option<CursorShape>,
 ) -> Vec<CellInstance> {
+    let cursor = cursor.filter(|_| surface.cursor_visible());
     let grid = surface.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
@@ -1115,6 +1116,7 @@ pub fn build_rows(
     damage: &Damage,
     rows: &mut Vec<RowInst>,
 ) {
+    let cursor = cursor.filter(|_| surface.cursor_visible());
     let grid = surface.grid();
     let screen_lines = grid.screen_lines();
     if rows.len() != screen_lines {

@@ -457,6 +457,12 @@ impl Surface {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// DECTCEM (DEC private mode 25). A TUI may move the cursor to repaint
+    /// while keeping it hidden; this takes precedence over shape/blink settings.
+    pub fn cursor_visible(&self) -> bool {
+        self.term.mode().contains(TermMode::SHOW_CURSOR)
+    }
+
     /// 当前光标样式(DECSCUSR;未设走上游默认块状)。
     pub fn cursor_style(&self) -> CursorStyle {
         self.term.cursor_style()
@@ -720,6 +726,35 @@ mod tests {
         assert!(s.app_cursor_mode());
         s.feed(b"\x1b[?1l");
         assert!(!s.app_cursor_mode());
+    }
+
+    #[test]
+    fn dectcem_changes_visibility_without_changing_shape_or_position_queries() {
+        let mut s = Surface::new(ScreenSize::new(12, 5));
+        assert!(
+            s.cursor_visible(),
+            "normal terminal starts with a visible cursor"
+        );
+        s.feed(b"\x1b[6 q\x1b[?25l\x1b[4;7H\x1b[6n");
+        assert!(!s.cursor_visible());
+        assert_eq!(
+            s.cursor_shape(),
+            CursorShape::Beam,
+            "visibility does not rewrite shape"
+        );
+        assert_eq!(
+            s.take_pty_writes(),
+            vec!["\x1b[4;7R"],
+            "hidden cursor still has a logical position"
+        );
+        s.feed(b"\x1b[?25h\x1b[6n");
+        assert!(s.cursor_visible());
+        assert_eq!(s.cursor_shape(), CursorShape::Beam);
+        assert_eq!(
+            s.take_pty_writes(),
+            vec!["\x1b[4;7R"],
+            "show must not move the cursor"
+        );
     }
 
     #[test]
