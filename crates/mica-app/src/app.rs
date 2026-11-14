@@ -2318,10 +2318,11 @@ fn draw_frame() {
                 }
             }
             let fams: Vec<&str> = fams.iter().map(String::as_str).collect();
-            t.strip_router = DwriteRouter::new_with_atlas(
+            t.strip_router = DwriteRouter::new_ui(
                 scaled_pt(cfg.font_size_pt),
                 &fams,
-                t.router.shared_atlas(),
+                cfg.font_weight,
+                Some(t.router.shared_atlas()),
             )
             .ok();
         }

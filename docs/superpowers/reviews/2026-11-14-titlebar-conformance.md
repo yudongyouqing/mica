@@ -67,3 +67,22 @@ Reproduce without opening a window:
 ```powershell
 cargo run -p mica-render --example titlebar_preview -- output.png
 ```
+
+## Typography follow-up
+
+User feedback found the initial 9.5pt regular title too small/light. The Ghostty
+macOS source uses the system titlebar font via
+`NSFont.titleBarFont(ofSize: NSFont.systemFontSize)`; it does not establish a
+single cross-platform size or a universal numeric weight.
+Reference checked: https://github.com/ghostty-org/ghostty/blob/main/macos/Sources/Features/Terminal/Window%20Styles/TerminalWindow.swift
+
+Mica's Windows UI default is now 11pt / weight 600 (semibold), with the new
+`strip-font-weight` setting (100..900). Native terminal constructors retain
+weight 400; only the strip UI constructor selects another weight. Advances and
+glyphs use the same resolved face. Native tests verify actual DirectWrite face
+weights and unchanged terminal settings. The canonical default source now has
+50 keys. Workspace follow-up: 368 passed, five ignored; all-target clippy passes.
+
+The `--comparison` preview mode renders old 9.5pt/400 and new 11pt/600 labels
+at the same DPI and viewport, sharing the actual GPU atlas. It was inspected
+without changing foreground applications.

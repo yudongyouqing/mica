@@ -23,6 +23,7 @@ pub use crate::config::defaults::{DEFAULT_FAMILIES, DEFAULT_FONT_SIZE_PT};
 /// `strip-animation-duration`/`-focus`(ms,0=关)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StripCfg {
+    pub font_weight: u16,
     pub title_centered: bool,
     pub title_highlight: bool,
     pub title_highlight_color: Option<Rgb>,
@@ -157,6 +158,7 @@ fn default_state() -> &'static (Settings, [bool; 3]) {
             copy_on_select: false,
             title: None,
             strip: StripCfg {
+                font_weight: 0,
                 title_centered: false,
                 title_highlight: false,
                 title_highlight_color: None,
@@ -278,6 +280,13 @@ fn apply_pairs(
     let mut family_declared = false;
     for (key, value) in pairs {
         match key.as_str() {
+            "strip-font-weight" => match value.parse::<u16>() {
+                Ok(weight) if (100..=900).contains(&weight) => settings.strip.font_weight = weight,
+                _ => err.values.push(
+                    "strip-font-weight must be 100..900 (400 regular, 600 semibold, 700 bold)"
+                        .into(),
+                ),
+            },
             "window-size-pixels" => {
                 settings.window_size_pixels = None;
                 if !value.is_empty() {
@@ -645,6 +654,17 @@ mod tests {
     }
 
     #[test]
+    fn strip_font_weight_is_validated_and_kept_separate_from_terminal_font() {
+        let settings = resolve("strip-font-weight = 600\nstrip-font-size = 11").unwrap();
+        assert_eq!(settings.strip.font_weight, 600);
+        assert_eq!(settings.strip.font_size_pt, 11.0);
+        assert_eq!(settings.font_size_pt, 12.0);
+        for value in ["0", "99", "901", "bold", "-1"] {
+            assert!(resolve(&format!("strip-font-weight = {value}")).is_err());
+        }
+    }
+
+    #[test]
     fn declared_user_options_are_not_silently_ignored() {
         let s = resolve("background-image = C:\\wallpapers\\image.png\nbackground-opacity = 0.65\nminimum-contrast = 0.3\nwindow-position = -120,45\nmouse-right-click = paste\ncopy-on-select = false\n").unwrap();
         assert_eq!(
@@ -670,7 +690,7 @@ mod tests {
         assert_eq!(resolve(&source).unwrap(), Settings::default());
         assert_eq!(Settings::default().font_size_pt, 12.0);
         assert_eq!(Settings::default().palette, Palette::DEFAULT);
-        assert_eq!(Settings::default().strip.font_size_pt, 9.5);
+        assert_eq!(Settings::default().strip.font_size_pt, 11.0);
         assert_eq!(Settings::default().keymap, Keymap::wt_default());
         assert_eq!(Settings::default().window_width, 100);
         assert_eq!(Settings::default().window_height, 30);
@@ -690,13 +710,14 @@ mod tests {
         assert_eq!(
             Settings::default().strip,
             StripCfg {
+                font_weight: 600,
                 title_centered: true,
                 title_highlight: true,
                 title_highlight_color: None,
                 title_highlight_opacity: 0.16,
                 title_highlight_radius: 5.0,
                 font_family: Some("Segoe UI".into()),
-                font_size_pt: 9.5,
+                font_size_pt: 11.0,
                 title_h: 32.0,
                 tab_h: 36.0,
                 tab_min_w: 88.0,

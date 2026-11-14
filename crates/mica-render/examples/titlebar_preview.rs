@@ -20,18 +20,25 @@ fn main() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     let scale = 1.5;
     let sm = StripMetrics::from_scale_cfg(scale, &settings.strip);
-    let mut router = DwriteRouter::new(
+    let families = [
+        "Segoe UI",
+        "Microsoft YaHei UI",
+        "Segoe UI Emoji",
+        "Segoe Fluent Icons",
+    ];
+    let router = DwriteRouter::new_ui(
         settings.strip.font_size_pt * scale,
-        &[
-            "Segoe UI",
-            "Microsoft YaHei UI",
-            "Segoe UI Emoji",
-            "Segoe Fluent Icons",
-        ],
+        &families,
+        settings.strip.font_weight,
+        None,
     )?;
-    let font = router.metrics();
-    let (width, height) = (2032u32, 600u32);
-    let rows = [
+    let comparison = std::env::args().any(|arg| arg == "--comparison");
+    let (width, height) = if comparison {
+        (1000u32, 160u32)
+    } else {
+        (2032u32, 600u32)
+    };
+    let mut rows = vec![
         (vec![("Mica — yudongyouqing".into(), true)], 1.0),
         (
             vec![
@@ -50,11 +57,22 @@ fn main() -> anyhow::Result<()> {
         ),
         (vec![("Mica — yudongyouqing".into(), true)], 0.0),
     ];
+    if comparison {
+        rows = vec![(vec![("Mica — yudongyouqing".into(), true)], 1.0); 2];
+    }
     let mut quads = Vec::new();
     for (index, (titles, focus)) in rows.into_iter().enumerate() {
+        let (size, weight) = if comparison && index == 0 {
+            (9.5, 400)
+        } else {
+            (settings.strip.font_size_pt, settings.strip.font_weight)
+        };
+        let mut row_router =
+            DwriteRouter::new_ui(size * scale, &families, weight, Some(router.shared_atlas()))?;
+        let font = row_router.metrics();
         let mut row = strip_quads(
             &titles,
-            &mut router,
+            &mut row_router,
             &font,
             &settings.palette,
             &sm,
@@ -65,7 +83,7 @@ fn main() -> anyhow::Result<()> {
             },
         );
         for quad in &mut row {
-            quad.pos_uv[1] += index as f32 * 150.0;
+            quad.pos_uv[1] += index as f32 * if comparison { 80.0 } else { 150.0 };
         }
         quads.extend(row);
     }

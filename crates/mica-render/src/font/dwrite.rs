@@ -114,7 +114,12 @@ impl DwriteRouter {
         families: &[&str],
         atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
     ) -> anyhow::Result<Self> {
-        let mut r = Self::new_internal(font_size_pt, families, Some(atlas))?;
+        let mut r = Self::new_internal(
+            font_size_pt,
+            families,
+            Some(atlas),
+            DWRITE_FONT_WEIGHT_NORMAL,
+        )?;
         // 版本哨兵对齐共享图集当前值(其上已有终端字形——不能误清)
         r.last_atlas_version = r.atlas.borrow().version();
         Ok(r)
@@ -126,12 +131,33 @@ impl DwriteRouter {
     }
 
     pub fn new(font_size_pt: f32, families: &[&str]) -> anyhow::Result<Self> {
-        Self::new_internal(font_size_pt, families, None)
+        Self::new_internal(font_size_pt, families, None, DWRITE_FONT_WEIGHT_NORMAL)
+    }
+    /// Select a real UI font weight; terminal constructors retain regular faces.
+    pub fn new_ui(
+        font_size_pt: f32,
+        families: &[&str],
+        weight: u16,
+        atlas: Option<std::rc::Rc<std::cell::RefCell<GlyphAtlas>>>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (100..=900).contains(&weight),
+            "UI font weight must be 100..900"
+        );
+        let mut router = Self::new_internal(
+            font_size_pt,
+            families,
+            atlas,
+            DWRITE_FONT_WEIGHT(i32::from(weight)),
+        )?;
+        router.last_atlas_version = router.atlas.borrow().version();
+        Ok(router)
     }
     fn new_internal(
         font_size_pt: f32,
         families: &[&str],
         atlas: Option<std::rc::Rc<std::cell::RefCell<GlyphAtlas>>>,
+        normal_weight: DWRITE_FONT_WEIGHT,
     ) -> anyhow::Result<Self> {
         // SAFETY: 工厂创建,T 由 turbofish 指定
         let factory = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
@@ -157,9 +183,9 @@ impl DwriteRouter {
             let pick = |weight: DWRITE_FONT_WEIGHT, style: DWRITE_FONT_STYLE| unsafe {
                 family.GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, style)
             };
-            let plain = pick(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL)?;
+            let plain = pick(normal_weight, DWRITE_FONT_STYLE_NORMAL)?;
             let bold = pick(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL)?;
-            let italic = pick(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_ITALIC)?;
+            let italic = pick(normal_weight, DWRITE_FONT_STYLE_ITALIC)?;
             let bold_italic = pick(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_ITALIC)?;
             // SAFETY: IDWriteFont::CreateFontFace 无额外前提
             let face = unsafe { plain.CreateFontFace()? };
@@ -932,6 +958,19 @@ fn shape_run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_semibold_selects_real_font_face_without_bolding_terminal_font() {
+        let normal = super::DwriteRouter::new(11.0, &["Segoe UI"]).unwrap();
+        let ui = super::DwriteRouter::new_ui(11.0, &["Segoe UI"], 600, None).unwrap();
+        // SAFETY: resolved DirectWrite font objects are valid COM references.
+        unsafe {
+            assert_eq!(
+                normal.families[0].plain.GetWeight(),
+                super::DWRITE_FONT_WEIGHT_NORMAL
+            );
+            assert_eq!(ui.families[0].plain.GetWeight().0, 600);
+        }
+    }
     #[test]
     fn ui_font_uses_natural_advances_without_changing_terminal_cell_metrics() {
         let mut router = super::DwriteRouter::new(9.5, &["Segoe UI"]).unwrap();

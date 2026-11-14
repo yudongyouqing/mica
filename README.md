@@ -92,7 +92,8 @@ font-size = 13
 command = pwsh.exe -NoLogo
 
 # 标签栏外观全量可配(strip-* 键集)
-strip-font-size = 9.5
+strip-font-size = 11
+strip-font-weight = 600
 strip-bar-wash = 0.18
 strip-tab-height = 36
 strip-animation-duration = 120
@@ -119,6 +120,7 @@ mica +validate-config
 | `window-size-pixels = 宽,高` | 新窗口的精确物理像素外框；优先于列/行配置，置空恢复列/行 |
 | `window-padding-x` / `window-padding-y` | 逻辑像素、随 DPI 缩放，保存后热重载 |
 | `window-title-font-family` / `strip-font-family` | 同一项 UI 字体配置，默认 Segoe UI，独立于终端字体；热重载 |
+| `strip-font-size` / `strip-font-weight` | 标题栏字号和字重，默认 11pt / 600 半粗体；400 常规、700 粗体，范围 100–900 |
 | `strip-title-align` | `center`（整窗居中）或 `left`，长标题省略并避开按钮 |
 | `strip-title-highlight` / `-color` / `-opacity` / `-radius` | 标题圆角底的开关、颜色、强度与半径，支持热重载 |
 | `quick-terminal-key` | 热键可重绑或设 `none` 禁用 |
