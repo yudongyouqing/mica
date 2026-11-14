@@ -18,7 +18,8 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_NOREPEAT, MOD_WIN, RegisterHotKey, UnregisterHotKey, VK_OEM_3,
+    HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
+    UnregisterHotKey,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, IsWindowVisible,
@@ -33,6 +34,7 @@ use crate::app::Terminal;
 /// QT 独立状态(单 pane)。
 struct QtState {
     terminal: Terminal,
+    wake_hwnd: crate::app::SharedHwnd,
     renderer: Renderer,
     wgpu_surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -80,7 +82,9 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     let mon = MonitorFromWindow(hwnd_main, MONITOR_DEFAULTTONEAREST);
     let _ = GetMonitorInfoW(mon, &mut mi);
     let w_px = mi.rcMonitor.right - mi.rcMonitor.left;
-    let h_px = (mi.rcMonitor.bottom - mi.rcMonitor.top) * 40 / 100;
+    let h_px = (mi.rcMonitor.bottom - mi.rcMonitor.top)
+        * i32::from(crate::app::quick_terminal_height())
+        / 100;
 
     let hwnd: HSTRING = "mica_quickterm_class".into();
     let hwnd_qt = CreateWindowExW(
@@ -115,10 +119,6 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 
     // 热键:Win+`(可配;失败记日志,QT 仍可用 IPC 激活留 M3c)
     // id=1 与主窗不冲突(RegisterHotKey 按线程+id 域)
-    let hotkey_ok = RegisterHotKey(Some(hwnd_qt), 1, MOD_WIN | MOD_NOREPEAT, VK_OEM_3.0 as u32);
-    if hotkey_ok.is_err() {
-        eprintln!("quickterm: Win+` 注册失败(被占用?)——QT 需重配 quick-terminal-key");
-    }
 
     // QT 终端状态:复用 TAB_SEED/CURRENT_PALETTE 建字体与 pty
     let (families, size_pt) = crate::app::tab_seed();
@@ -176,7 +176,8 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         metrics.line_height.round() as u16,
     );
     term.set_palette(&palette);
-    // QT shell 恒 PowerShell(下拉终端语义;profile 化 M4)
+    // New quick terminals follow the same configured command as normal tabs.
+    let shell_command = crate::app::launch_command(None);
     if !crate::app::lifecycle::spawn_capacity_ok() {
         // 故障态门:拒绝新会话(有界泄漏);QT 是增强件,禁用即可
         eprintln!("quickterm: 会话回收通道故障态,QT 本轮禁用");
@@ -187,7 +188,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     })?;
     let probe = crate::app::orphan::before_spawn();
     let (session, reader) = mica_core::pty::PtySession::spawn(
-        mica_core::pty::command_from_str("powershell.exe -NoLogo"),
+        mica_core::pty::command_from_str(&shell_command),
         cols,
         rows,
     )
@@ -197,12 +198,12 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         crate::app::orphan::track_session_since(&probe, pid); // 入注册表(T02,同主窗)
     }
     // T08:QT 输出积压/写队列(WPARAM 0xFF00 寻址 QT 窗口)
+    let wake_hwnd = Arc::new(Mutex::new(Some(hwnd_qt.0 as isize)));
     let pty_buf = crate::app::pty_bridge::PtyBacklog::new(
         0xFF00,
         crate::app::pty_bridge::PANE_BUDGET_BYTES,
         Arc::new(crate::app::pty_bridge::WindowWake {
-            slot: crate::app::shared_hwnd_for_quickterm()
-                .unwrap_or_else(|| Arc::new(Mutex::new(None))),
+            slot: Arc::clone(&wake_hwnd),
             msg: WM_APP,
         }),
     );
@@ -240,7 +241,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         rows,
         row_insts: Vec::new(),
         force_full: true,
-        shell: "powershell.exe -NoLogo".into(),
+        shell: shell_command,
         exited: None,
         strip_router: None,
         last_atlas_ver: 0,
@@ -248,6 +249,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     QT.with(|q| {
         *q.borrow_mut() = Some(QtState {
             terminal,
+            wake_hwnd,
             renderer,
             wgpu_surface,
             config,
@@ -260,6 +262,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     // #37:会话退出轮询(1s;命中即停表)——QT 无 strip,主窗的
     // poll_exits 轮不到它
     let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd_qt), 6, 1000, None);
+    apply_hotkey(crate::app::quick_terminal_key().as_deref());
     let _ = class_name; // 注册已用 w! 字面量
     Ok(())
 }
@@ -302,11 +305,13 @@ pub fn forget_state() {
     if let Some(st) = QT.with(|q| q.borrow_mut().take()) {
         let QtState {
             terminal,
+            wake_hwnd,
             renderer,
             wgpu_surface,
             config,
             pending_surrogate: _,
         } = st;
+        *wake_hwnd.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let mut renderer = renderer;
         renderer.release_atlas_resources();
         std::mem::forget(renderer);
@@ -713,6 +718,62 @@ unsafe extern "system" fn qt_wndproc(
     }
 }
 
+fn hotkey_binding(value: &str) -> Option<(HOT_KEY_MODIFIERS, u32)> {
+    use mica_core::{input::Key, keymap::TriggerKey};
+    let trigger = mica_core::keymap::parse_trigger(value)?;
+    let vk = match trigger.key {
+        TriggerKey::Letter(c) => c as u32,
+        TriggerKey::Digit(d) => u32::from(b'0' + d),
+        TriggerKey::Insert => 0x2d,
+        TriggerKey::Key(key) => match key {
+            Key::Enter => 0x0d,
+            Key::Backspace => 0x08,
+            Key::Tab => 0x09,
+            Key::Escape => 0x1b,
+            Key::Up => 0x26,
+            Key::Down => 0x28,
+            Key::Left => 0x25,
+            Key::Right => 0x27,
+            Key::Home => 0x24,
+            Key::End => 0x23,
+            Key::Delete => 0x2e,
+            Key::PageUp => 0x21,
+            Key::PageDown => 0x22,
+            Key::Grave => 0xc0,
+        },
+    };
+    let mut mods = MOD_NOREPEAT;
+    if trigger.mods.ctrl {
+        mods |= MOD_CONTROL;
+    }
+    if trigger.mods.shift {
+        mods |= MOD_SHIFT;
+    }
+    if trigger.mods.alt {
+        mods |= MOD_ALT;
+    }
+    if trigger.mods.win {
+        mods |= MOD_WIN;
+    }
+    Some((mods, vk))
+}
+
+/// The owning UI thread may rebind or disable the hotkey without restarting QT.
+pub(super) unsafe fn apply_hotkey(value: Option<&str>) {
+    let raw = QT_HWND.with(std::cell::Cell::get);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    let _ = UnregisterHotKey(Some(hwnd), 1);
+    if let Some(value) = value
+        && let Some((mods, vk)) = hotkey_binding(value)
+        && let Err(error) = RegisterHotKey(Some(hwnd), 1, mods, vk)
+    {
+        eprintln!("quickterm: 无法注册 quick-terminal-key `{value}`: {error}");
+    }
+}
+
 unsafe fn unregister_hotkey() -> windows::core::Result<()> {
     let raw = QT_HWND.with(|c| c.take());
     if raw == 0 {
@@ -815,11 +876,96 @@ mod tests {
     //! 点在转发线程下游,自 WM_APP 消费起仍是全真生产路径。
 
     use super::*;
+
+    #[test]
+    fn configured_hotkey_maps_modifiers_and_key_to_win32() {
+        assert_eq!(
+            super::hotkey_binding("win+oem_3"),
+            Some((super::MOD_WIN | super::MOD_NOREPEAT, 0xc0))
+        );
+        assert_eq!(
+            super::hotkey_binding("ctrl+alt+shift+9"),
+            Some((
+                super::MOD_CONTROL | super::MOD_ALT | super::MOD_SHIFT | super::MOD_NOREPEAT,
+                u32::from(b'9')
+            ))
+        );
+        assert_eq!(
+            super::hotkey_binding("ctrl+insert"),
+            Some((super::MOD_CONTROL | super::MOD_NOREPEAT, 0x2d))
+        );
+        assert_eq!(super::hotkey_binding("none"), None);
+    }
+
     use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_CLOSE};
 
     // Visible test-owned QTs otherwise steal focus from each other, causing
     // production WM_ACTIVATE to hide a window while its test is feeding it.
     static QT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn configured_height_and_hotkey_rebinding_reach_native_window() {
+        let _lock = QT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let settings = mica_core::config::settings::Settings {
+            quick_terminal_height: 23,
+            quick_terminal_key: None,
+            ..Default::default()
+        };
+        crate::app::seed_tls_for_tests(&settings);
+        unsafe { init(HWND(std::ptr::null_mut())) }.expect("quickterm init");
+        let hwnd = HWND(QT_HWND.with(std::cell::Cell::get) as *mut std::ffi::c_void);
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        let mut monitor = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: the HWND belongs to this thread's isolated test QT.
+        let (height_ok, unbound, bound, rebound_old, rebound_new, disabled) = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect).unwrap();
+            let _ = GetMonitorInfoW(
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            );
+            let height_ok = rect.bottom - rect.top
+                == (monitor.rcMonitor.bottom - monitor.rcMonitor.top) * 23 / 100;
+            let (mods, key) = hotkey_binding("ctrl+alt+shift+9").unwrap();
+            let (_, next) = hotkey_binding("ctrl+alt+shift+8").unwrap();
+            let probe = |vk| {
+                let acquired = RegisterHotKey(None, 9876, mods, vk).is_ok();
+                if acquired {
+                    let _ = UnregisterHotKey(None, 9876);
+                }
+                acquired
+            };
+            let unbound = probe(key);
+            apply_hotkey(Some("ctrl+alt+shift+9"));
+            let bound = !probe(key);
+            apply_hotkey(Some("ctrl+alt+shift+8"));
+            let rebound_old = probe(key);
+            let rebound_new = !probe(next);
+            apply_hotkey(None);
+            let disabled = probe(next);
+            (
+                height_ok,
+                unbound,
+                bound,
+                rebound_old,
+                rebound_new,
+                disabled,
+            )
+        };
+        unsafe { SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))) };
+        forget_state();
+        assert!(
+            height_ok,
+            "configured QT height must reach native window geometry"
+        );
+        assert!(unbound, "test hotkey must initially be available");
+        assert!(
+            bound && rebound_old && rebound_new && disabled,
+            "hotkey apply/rebind/disable must affect native registration"
+        );
+    }
 
     thread_local! {
         pub(super) static DRAW_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

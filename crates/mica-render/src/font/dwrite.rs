@@ -65,6 +65,8 @@ pub struct DwriteRouter {
     /// Generation sentinel; both caches are invalid after frame-boundary reset.
     last_atlas_version: u64,
     cache: BoundedCache<(char, u8), GlyphInfo>,
+    /// Font-only UI advances; bounded and charged to the shared character budget.
+    advance_cache: BoundedCache<char, f32>,
     /// 连字 shaping(M2b/T4):启动探测(主字体对 =>/>= 系列产合成字形)
     /// 不通过则整条 route_run 走 None,行为与 M2a 完全一致
     ligatures: bool,
@@ -112,7 +114,12 @@ impl DwriteRouter {
         families: &[&str],
         atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
     ) -> anyhow::Result<Self> {
-        let mut r = Self::new_internal(font_size_pt, families, Some(atlas))?;
+        let mut r = Self::new_internal(
+            font_size_pt,
+            families,
+            Some(atlas),
+            DWRITE_FONT_WEIGHT_NORMAL,
+        )?;
         // 版本哨兵对齐共享图集当前值(其上已有终端字形——不能误清)
         r.last_atlas_version = r.atlas.borrow().version();
         Ok(r)
@@ -124,12 +131,33 @@ impl DwriteRouter {
     }
 
     pub fn new(font_size_pt: f32, families: &[&str]) -> anyhow::Result<Self> {
-        Self::new_internal(font_size_pt, families, None)
+        Self::new_internal(font_size_pt, families, None, DWRITE_FONT_WEIGHT_NORMAL)
+    }
+    /// Select a real UI font weight; terminal constructors retain regular faces.
+    pub fn new_ui(
+        font_size_pt: f32,
+        families: &[&str],
+        weight: u16,
+        atlas: Option<std::rc::Rc<std::cell::RefCell<GlyphAtlas>>>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (100..=900).contains(&weight),
+            "UI font weight must be 100..900"
+        );
+        let mut router = Self::new_internal(
+            font_size_pt,
+            families,
+            atlas,
+            DWRITE_FONT_WEIGHT(i32::from(weight)),
+        )?;
+        router.last_atlas_version = router.atlas.borrow().version();
+        Ok(router)
     }
     fn new_internal(
         font_size_pt: f32,
         families: &[&str],
         atlas: Option<std::rc::Rc<std::cell::RefCell<GlyphAtlas>>>,
+        normal_weight: DWRITE_FONT_WEIGHT,
     ) -> anyhow::Result<Self> {
         // SAFETY: 工厂创建,T 由 turbofish 指定
         let factory = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
@@ -155,9 +183,9 @@ impl DwriteRouter {
             let pick = |weight: DWRITE_FONT_WEIGHT, style: DWRITE_FONT_STYLE| unsafe {
                 family.GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, style)
             };
-            let plain = pick(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL)?;
+            let plain = pick(normal_weight, DWRITE_FONT_STYLE_NORMAL)?;
             let bold = pick(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL)?;
-            let italic = pick(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_ITALIC)?;
+            let italic = pick(normal_weight, DWRITE_FONT_STYLE_ITALIC)?;
             let bold_italic = pick(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_ITALIC)?;
             // SAFETY: IDWriteFont::CreateFontFace 无额外前提
             let face = unsafe { plain.CreateFontFace()? };
@@ -218,6 +246,7 @@ impl DwriteRouter {
             },
             last_atlas_version: 0,
             cache: BoundedCache::new(1024 * 1024, 8192, super::atlas::character_budget()),
+            advance_cache: BoundedCache::new(16 * 1024, 256, super::atlas::character_budget()),
             run_cache: BoundedCache::new(2 * 1024 * 1024, 1024, super::atlas::shaping_budget()),
         })
     }
@@ -630,6 +659,25 @@ impl DwriteRouter {
 }
 
 impl GlyphRouter for DwriteRouter {
+    fn ui_advance(&mut self, ch: char) -> Option<f32> {
+        if let Some(advance) = self.advance_cache.get(&ch).copied() {
+            return Some(advance);
+        }
+        let family = self.family_for(ch)?;
+        let (face, glyph) = face_with_glyph(&family.plain, ch)?;
+        let mut font_metrics = DWRITE_FONT_METRICS::default();
+        let mut glyph_metrics = DWRITE_GLYPH_METRICS::default();
+        // SAFETY: face/glyph are resolved together and outputs live for the call.
+        unsafe {
+            family.plain.GetMetrics(&mut font_metrics);
+            face.GetDesignGlyphMetrics(&glyph, 1, &mut glyph_metrics, false)
+                .ok()?;
+        }
+        let advance = glyph_metrics.advanceWidth as f32 * self.em_size_dip
+            / f32::from(font_metrics.designUnitsPerEm.max(1));
+        self.advance_cache.insert(ch, advance, 64);
+        Some(advance)
+    }
     /// 整段 shaping(连字,D16):cluster 布局逐格返回——单字符 cluster
     /// 给 None(渲染侧走 route 缓存,零额外成本),连字 cluster 给合成
     /// GlyphInfo(光栅化单 glyph 位图,宽 = cluster 总 advance)。
@@ -910,6 +958,34 @@ fn shape_run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_semibold_selects_real_font_face_without_bolding_terminal_font() {
+        let normal = super::DwriteRouter::new(11.0, &["Segoe UI"]).unwrap();
+        let ui = super::DwriteRouter::new_ui(11.0, &["Segoe UI"], 600, None).unwrap();
+        // SAFETY: resolved DirectWrite font objects are valid COM references.
+        unsafe {
+            assert_eq!(
+                normal.families[0].plain.GetWeight(),
+                super::DWRITE_FONT_WEIGHT_NORMAL
+            );
+            assert_eq!(ui.families[0].plain.GetWeight().0, 600);
+        }
+    }
+    #[test]
+    fn ui_font_uses_natural_advances_without_changing_terminal_cell_metrics() {
+        let mut router = super::DwriteRouter::new(9.5, &["Segoe UI"]).unwrap();
+        let cell = router.metrics().cell_width;
+        let wide = super::GlyphRouter::ui_advance(&mut router, 'W').unwrap();
+        let narrow = super::GlyphRouter::ui_advance(&mut router, 'i').unwrap();
+        let space = super::GlyphRouter::ui_advance(&mut router, ' ').unwrap();
+        assert!(wide > narrow * 1.5 && space > 0.0);
+        assert_eq!(
+            super::GlyphRouter::ui_advance(&mut router, 'i'),
+            Some(narrow)
+        );
+        assert_eq!(router.metrics().cell_width, cell);
+        assert_eq!(router.advance_cache.len(), 3);
+    }
     #[test]
     fn unique_long_runs_obey_byte_budget_and_oversized_input_falls_back_to_characters() {
         let mut r = super::DwriteRouter::new(12.0, &["Consolas"]).unwrap();

@@ -291,6 +291,11 @@ pub const TAB_CLOSE_W_BASE: f32 = 24.0;
 /// scale = 窗口 DPI/96(M5b 的 DPI_SCALE);cfg = 用户配置。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StripMetrics {
+    pub title_centered: bool,
+    pub title_highlight: bool,
+    pub title_highlight_color: Option<[u8; 3]>,
+    pub title_highlight_opacity: f32,
+    pub title_highlight_radius: f32,
     /// 条总高(两行;客户区顶部,终端区下移此值)
     pub h: f32,
     /// 第一行高:窗口标题 + caption 三键
@@ -342,6 +347,11 @@ impl StripMetrics {
         let s = scale.max(1.0);
         let c = |v: Option<Rgb>| v.map(|r| [r.r, r.g, r.b]);
         Self {
+            title_centered: cfg.title_centered,
+            title_highlight: cfg.title_highlight,
+            title_highlight_color: c(cfg.title_highlight_color),
+            title_highlight_opacity: cfg.title_highlight_opacity,
+            title_highlight_radius: cfg.title_highlight_radius * s,
             title_h: cfg.title_h * s,
             tab_h: cfg.tab_h * s,
             h: (cfg.title_h + cfg.tab_h) * s,
@@ -497,23 +507,29 @@ pub enum CaptionBtn {
 }
 
 /// 整行文本提取(#58 可点击路径 / 未来搜索共用):字符拼串 + 字符→格
-/// 下标映射(WIDE_CHAR 占 2 格)。line 为 buffer 行(i32,负 = 历史)。
+/// 边界映射(每字符起始列,末项为行尾列)。续格不产字符,组合符共用列。
+/// line 为 buffer 行(i32,负 = 历史)。
 pub fn row_string(grid: &Grid<Cell>, line: i32) -> (String, Vec<usize>) {
     let cols = grid.columns();
     let mut text = String::with_capacity(cols);
-    let mut cell_of = Vec::with_capacity(cols);
+    let mut cell_of = Vec::with_capacity(cols + 1);
     for c in 0..cols {
         let cell = &grid[Line(line)][Column(c)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
         text.push(cell.c);
-        let w = if cell.flags.contains(Flags::WIDE_CHAR) {
-            2
-        } else {
-            1
-        };
-        for _ in 0..w {
-            cell_of.push(c);
+        cell_of.push(c);
+        if let Some(extra) = cell.zerowidth() {
+            for ch in extra {
+                text.push(*ch);
+                cell_of.push(c);
+            }
         }
     }
+    // Character boundaries, including the end of the row. The next boundary
+    // gives the full terminal width of a wide character, including its spacer.
+    cell_of.push(cols);
     (text, cell_of)
 }
 
@@ -657,9 +673,8 @@ pub fn strip_quads(
     let eff_h = if single { sm.title_h } else { sm.h };
     // 全条底(两行同色;发丝线退役——活跃块要与内容区无缝相接)
     let strip_w = caption_x
-        .map(|cx| cx + 3.0 * sm.caption_w)
-        .unwrap_or(total_w)
-        .max(total_w);
+        .map(|cx| (cx + 3.0 * sm.caption_w).max(0.0))
+        .unwrap_or(total_w);
     out.push(CellInstance {
         pos_uv: [0.0, 0.0, 0.0, 0.0],
         size_uv: [strip_w, eff_h, 0.0, 0.0],
@@ -669,35 +684,84 @@ pub fn strip_quads(
 
     // ---- 第一行:窗口标题(活跃标签名,居中;caption 左界内,超宽省略号)
     let title_y = (sm.title_h - metrics.line_height).max(0.0) / 2.0;
-    let title_avail = caption_x.unwrap_or(strip_w) - 8.0 * k;
+    let left = 8.0 * k;
+    let right = (caption_x.unwrap_or(strip_w) - 8.0 * k).max(left);
+    let center = (strip_w * 0.5).clamp(left, right);
+    let pad_x = if sm.title_highlight { 8.0 * k } else { 0.0 };
+    let title_avail = (if sm.title_centered {
+        2.0 * (center - left).min(right - center)
+    } else {
+        right - left
+    } - 2.0 * pad_x)
+        .max(0.0);
     let title = titles
         .iter()
         .find(|(_, active)| *active)
         .map(|(t, _)| t.as_str())
         .unwrap_or_default();
     let ell = router.route('\u{2026}', GlyphStyle::PLAIN);
-    let routed: Vec<crate::font::router::GlyphInfo> = title
+    let ell_advance = router.ui_advance('\u{2026}').unwrap_or_else(|| adv(&ell));
+    let routed: Vec<_> = title
         .chars()
-        .map(|ch| router.route(ch, GlyphStyle::PLAIN))
+        .take(4096)
+        .map(|ch| {
+            let glyph = router.route(ch, GlyphStyle::PLAIN);
+            let advance = router
+                .ui_advance(ch)
+                .filter(|a| a.is_finite() && *a >= 0.0)
+                .unwrap_or_else(|| adv(&glyph));
+            (glyph, advance)
+        })
         .collect();
+    let total_width: f32 = routed.iter().map(|(_, advance)| advance).sum();
     let mut text_w = 0.0;
-    let mut n_take = routed.len();
-    let mut with_ell = false;
-    for (i, g) in routed.iter().enumerate() {
-        // 省略号宽度恒预留:正好装满的标题也换省略号收口,留呼吸
-        if text_w + adv(g) + adv(&ell) > title_avail {
-            n_take = i;
-            with_ell = n_take > 0;
+    let mut n_take = 0;
+    let with_ell = total_width > title_avail && ell_advance <= title_avail;
+    for (_, advance) in &routed {
+        if text_w + advance + if with_ell { ell_advance } else { 0.0 } > title_avail {
             break;
         }
-        text_w += adv(g);
+        text_w += advance;
+        n_take += 1;
     }
     if with_ell {
-        text_w += adv(&ell);
+        text_w += ell_advance;
     }
-    let mut tx = ((title_avail - text_w) / 2.0).max(0.0);
+    let text_x = if sm.title_centered {
+        center - text_w * 0.5
+    } else {
+        left + pad_x
+    };
+    let title_face = if sm.title_highlight && text_w > 0.0 {
+        let accent = sm.title_highlight_color.unwrap_or([
+            palette.colors[4].r,
+            palette.colors[4].g,
+            palette.colors[4].b,
+        ]);
+        mix(
+            bar,
+            accent,
+            sm.title_highlight_opacity * (0.4 + 0.6 * focus),
+        )
+    } else {
+        bar
+    };
+    if sm.title_highlight && text_w > 0.0 {
+        let h = (metrics.line_height + 6.0 * k).min((sm.title_h - 6.0 * k).max(0.0));
+        let r = sm.title_highlight_radius.min(h * 0.5);
+        out.push(rounded(
+            text_x - pad_x,
+            (sm.title_h - h) * 0.5,
+            text_w + 2.0 * pad_x,
+            h,
+            title_face,
+            bar,
+            (r, r),
+        ));
+    }
+    let mut tx = text_x;
     let title_ink = mix(ink2, white, focus);
-    for g in routed.iter().take(n_take) {
+    for (g, advance) in routed.iter().take(n_take) {
         if g.size_px[0] > 0.0 {
             out.push(CellInstance {
                 pos_uv: [
@@ -708,10 +772,10 @@ pub fn strip_quads(
                 ],
                 size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
                 fg: bg_of(title_ink),
-                bg: bg_of(bar),
+                bg: bg_of(title_face),
             });
         }
-        tx += adv(g);
+        tx += advance;
     }
     if with_ell && ell.size_px[0] > 0.0 {
         out.push(CellInstance {
@@ -723,7 +787,7 @@ pub fn strip_quads(
             ],
             size_uv: [ell.size_px[0], ell.size_px[1], ell.uv[2], ell.uv[3]],
             fg: bg_of(title_ink),
-            bg: bg_of(bar),
+            bg: bg_of(title_face),
         });
     }
 
@@ -845,7 +909,8 @@ pub fn strip_quads(
             let mut tx = x0 + sm.tab_pad;
             for ch in title.chars() {
                 let g = router.route(ch, GlyphStyle::PLAIN);
-                if tx + adv(&g) + adv(&ell) > close_x - 6.0 * k {
+                let advance = router.ui_advance(ch).unwrap_or_else(|| adv(&g));
+                if tx + advance + ell_advance > close_x - 6.0 * k {
                     if ell.size_px[0] > 0.0 {
                         out.push(CellInstance {
                             pos_uv: [
@@ -874,7 +939,7 @@ pub fn strip_quads(
                         bg: bg_of(backdrop),
                     });
                 }
-                tx += adv(&g);
+                tx += advance;
             }
             // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
             // 悬停浮现(主色);胶囊内双向真居中(不带 offset,见 caption 注),
@@ -1541,6 +1606,144 @@ mod tests {
         }
     }
 
+    #[test]
+    fn window_title_is_centered_in_full_viewport_not_caption_free_left_area() {
+        let mut router = FakeRouter {
+            atlas_w: 256.0,
+            atlas_h: 256.0,
+            glyph_w: 8.0,
+            glyph_h: 12.0,
+            wide: |_| false,
+        };
+        let metrics = StripMetrics::default();
+        let width = 600.0;
+        let caption = width - 3.0 * metrics.caption_w;
+        let quads = strip_quads(
+            &[("Mica".into(), true)],
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &metrics,
+            StripExtras {
+                caption_x: Some(caption),
+                focus: 1.0,
+                ..Default::default()
+            },
+        );
+        let title: Vec<_> = quads
+            .iter()
+            .filter(|q| {
+                q.size_uv[2] > 0.0 && q.pos_uv[1] < metrics.title_h && q.pos_uv[0] < caption
+            })
+            .collect();
+        assert_eq!(title.len(), 4);
+        let left = title
+            .iter()
+            .map(|q| q.pos_uv[0])
+            .fold(f32::INFINITY, f32::min);
+        let right = title
+            .iter()
+            .map(|q| q.pos_uv[0] + q.size_uv[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            ((left + right) / 2.0 - width / 2.0).abs() <= 1.1,
+            "title bounds {left}..{right}, viewport {width}"
+        );
+        let many: Vec<_> = (0..20).map(|i| ("Mica".into(), i == 0)).collect();
+        let quads = strip_quads(
+            &many,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &metrics,
+            StripExtras {
+                caption_x: Some(caption),
+                focus: 1.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            quads[0].size_uv[0], width,
+            "overflow tabs must not expand the header"
+        );
+    }
+
+    #[test]
+    fn title_layout_handles_long_cjk_empty_narrow_and_scaled_windows() {
+        for scale in [1.0, 1.5, 2.0] {
+            let sm = StripMetrics::from_scale(scale);
+            let font = FontMetrics {
+                cell_width: 8.0 * scale,
+                line_height: 16.0 * scale,
+                ascent: 13.0 * scale,
+                descent: 3.0 * scale,
+            };
+            for logical_width in [160.0, 240.0, 600.0] {
+                let width = logical_width * scale;
+                let caption = width - 3.0 * sm.caption_w;
+                for title in [
+                    String::new(),
+                    "Mica".into(),
+                    "项目目录/很长的窗口标题".repeat(40),
+                ] {
+                    let mut router = FakeRouter {
+                        atlas_w: 256.0,
+                        atlas_h: 256.0,
+                        glyph_w: 8.0 * scale,
+                        glyph_h: 12.0 * scale,
+                        wide: |_| false,
+                    };
+                    let quads = strip_quads(
+                        &[(title.clone(), true)],
+                        &mut router,
+                        &font,
+                        &Palette::DEFAULT,
+                        &sm,
+                        StripExtras {
+                            caption_x: Some(caption),
+                            focus: 1.0,
+                            ..Default::default()
+                        },
+                    );
+                    assert_eq!(quads[0].size_uv[0], width);
+                    let glyphs: Vec<_> = quads
+                        .iter()
+                        .filter(|q| q.size_uv[2] > 0.0 && q.pos_uv[1] < sm.title_h)
+                        .collect();
+                    assert!(glyphs.len() >= 3);
+                    for glyph in &glyphs[..glyphs.len() - 3] {
+                        assert!(
+                            glyph.pos_uv[0] >= 0.0 && glyph.pos_uv[0] + glyph.size_uv[0] < caption,
+                            "title must not cover caption buttons"
+                        );
+                    }
+                    if title.is_empty() {
+                        assert_eq!(glyphs.len(), 3);
+                    }
+                    let mut no_highlight = sm;
+                    no_highlight.title_highlight = false;
+                    let plain = strip_quads(
+                        &[(title, true)],
+                        &mut router,
+                        &font,
+                        &Palette::DEFAULT,
+                        &no_highlight,
+                        StripExtras {
+                            caption_x: Some(caption),
+                            focus: 1.0,
+                            ..Default::default()
+                        },
+                    );
+                    assert!(
+                        !plain.iter().any(|q| q.size_uv[2] == 0.0
+                            && q.bg[3] > 0.0
+                            && q.pos_uv[1] < sm.title_h)
+                    );
+                }
+            }
+        }
+    }
+
     /// #90 对比度强制:低对比被推达标、已达标直通、0 关闭、方向正确
     #[test]
     fn contrast_enforcement() {
@@ -1572,6 +1775,18 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CellInstance, size_uv), 16);
         assert_eq!(std::mem::offset_of!(CellInstance, fg), 32);
         assert_eq!(std::mem::offset_of!(CellInstance, bg), 48);
+    }
+
+    #[test]
+    fn row_string_maps_unicode_characters_once_and_keeps_end_boundary() {
+        let mut surface =
+            mica_core::surface::Surface::new(mica_core::surface::ScreenSize::new(28, 2));
+        surface.feed("你😀 C:/src/文件.rs".as_bytes());
+        let (text, columns) = row_string(surface.grid(), 0);
+        assert!(text.starts_with("你😀 C:/src/文件.rs"), "{text:?}");
+        assert_eq!(columns.len(), text.chars().count() + 1);
+        assert_eq!(&columns[..5], &[0, 2, 4, 5, 6]);
+        assert_eq!(columns.last(), Some(&28));
     }
 
     #[test]
@@ -1815,8 +2030,9 @@ mod tests {
             "单标签:条高 = 标题行"
         );
         assert!(
-            !out.iter().any(|q| q.bg[3] > 0.0 && q.size_uv[1] > 1.0),
-            "无标签块/胶囊"
+            !out.iter()
+                .any(|q| q.bg[3] > 0.0 && q.size_uv[1] > 1.0 && q.pos_uv[1] >= sm.title_h),
+            "隐藏的第二行没有标签块；第一行允许标题高亮"
         );
         assert!(
             out.iter()

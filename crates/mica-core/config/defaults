@@ -1,0 +1,137 @@
+# Mica defaults. This is the authoritative source for product settings.
+# Syntax: key = value. Comments must occupy a whole line.
+# Export: mica +show-config --default
+# Personal overrides: %APPDATA%\mica\config (theme is applied before overrides).
+# Empty command uses Windows PowerShell; select PS7 with pwsh.exe -NoLogo.
+# Quote executable paths containing spaces. No environment/shell expansion.
+command =
+
+# Fonts: repeated entries form the ordered fallback chain. Size is in points.
+font-family = JetBrains Mono
+font-family = Sarasa Mono SC
+font-family = Cascadia Mono
+font-family = Microsoft YaHei
+font-family = JetBrainsMono NF
+font-family = JetBrainsMono Nerd Font
+font-family = Segoe UI Emoji
+font-family = Segoe Fluent Icons
+font-size = 12
+
+# Colors: empty theme means built-in colors; auto follows foreground/background.
+theme =
+foreground = #ffffff
+background = #282c34
+cursor-color = auto
+selection-foreground = auto
+selection-background = auto
+palette = 0=#1d1f21
+palette = 1=#cc6666
+palette = 2=#b5bd68
+palette = 3=#f0c674
+palette = 4=#81a2be
+palette = 5=#b294bb
+palette = 6=#8abeb7
+palette = 7=#c5c8c6
+palette = 8=#666666
+palette = 9=#d54e53
+palette = 10=#b9ca4a
+palette = 11=#e7c547
+palette = 12=#7aa6da
+palette = 13=#c397d8
+palette = 14=#70c0b1
+palette = 15=#eaeaea
+minimum-contrast = 0
+
+# Window: width/height are cells (1..1000); applied when creating a window.
+# Position is x,y screen coordinates; empty uses the monitor under the pointer.
+window-width = 100
+window-height = 30
+# Optional exact outer dimensions in physical pixels: width,height. Overrides cells.
+# Empty keeps cell-based sizing; affects new windows only.
+window-size-pixels =
+# Symmetric content padding in logical pixels (0..400), scaled with DPI.
+window-padding-x = 2
+window-padding-y = 2
+window-position =
+title =
+background-image =
+# Opacity range: 0.05..1. Changes reload; 1 is fully opaque.
+background-opacity = 1
+
+# Input behavior (reloadable). right-click: none or paste.
+cursor-blink = false
+mouse-hide-while-typing = true
+mouse-right-click = none
+copy-on-select = true
+key-remap =
+
+# Quick Terminal: key accepts modifiers, or none to disable.
+# Height is percent of monitor height (1..100), applied on creation/restart.
+quick-terminal-key = win+oem_3
+quick-terminal-height = 40
+
+# Tab/title strip: geometry in logical pixels; animations in milliseconds.
+# UI fonts are separate from terminal grid fonts; strip-font-family is an alias.
+window-title-font-family = Segoe UI
+strip-font-size = 11
+# DirectWrite weights: 400 regular, 600 semibold, 700 bold.
+strip-font-weight = 600
+strip-title-align = center
+strip-title-highlight = true
+strip-title-highlight-color = auto
+strip-title-highlight-opacity = 0.16
+strip-title-highlight-radius = 5
+strip-title-height = 32
+strip-tab-height = 36
+strip-tab-min-width = 88
+strip-tab-corner-radius = 8
+strip-wide-tabs = true
+strip-hide-single-tab = true
+strip-bar-color = auto
+strip-active-tab-color = auto
+strip-text-color = auto
+strip-dim-color = auto
+strip-bar-wash = 0.18
+strip-bar-wash-unfocused = 0.30
+strip-animation-duration = 120
+strip-focus-animation-duration = 150
+
+# Default bindings. Individual entries override the same trigger.
+# keybind = clear removes all bindings accumulated so far.
+# Ctrl+C/Ctrl+V also retain the terminal's context-sensitive copy/paste behavior.
+keybind = clear
+keybind = ctrl+shift+t = new_tab
+keybind = ctrl+t = new_tab
+keybind = ctrl+shift+n = new_window
+keybind = ctrl+shift+w = close_pane
+keybind = ctrl+tab = next_tab
+keybind = ctrl+shift+tab = prev_tab
+keybind = ctrl+shift+1 = goto_tab_1
+keybind = ctrl+shift+2 = goto_tab_2
+keybind = ctrl+shift+3 = goto_tab_3
+keybind = ctrl+shift+4 = goto_tab_4
+keybind = ctrl+shift+5 = goto_tab_5
+keybind = ctrl+shift+6 = goto_tab_6
+keybind = ctrl+shift+7 = goto_tab_7
+keybind = ctrl+shift+8 = goto_tab_8
+keybind = ctrl+shift+9 = goto_tab_9
+keybind = ctrl+shift+c = copy
+keybind = ctrl+shift+v = paste
+keybind = ctrl+insert = copy
+keybind = shift+insert = paste
+keybind = ctrl+alt+left = focus_left
+keybind = ctrl+alt+right = focus_right
+keybind = ctrl+alt+up = focus_up
+keybind = ctrl+alt+down = focus_down
+keybind = shift+pageup = scroll_page_up
+keybind = ctrl+shift+r = restart_pane
+keybind = ctrl+shift+s = write_scrollback
+keybind = ctrl+shift+z = reopen_tab
+keybind = ctrl+shift+o = toggle_background_opacity
+keybind = ctrl+shift+f = search_scrollback
+keybind = ctrl+shift+up = jump_prev_prompt
+keybind = ctrl+shift+down = jump_next_prompt
+keybind = shift+pagedown = scroll_page_down
+keybind = ctrl+shift+home = scroll_top
+keybind = ctrl+shift+end = scroll_bottom
+# Unbound actions available for custom bindings: scroll_line_up, scroll_line_down.

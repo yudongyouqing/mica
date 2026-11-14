@@ -79,22 +79,80 @@ coding agent 不会炸。连不上实例时报错退出,绝不误启新窗。
 
 ## 配置
 
-`%APPDATA%\mica\config`,**Ghostty 语法**,保存即热重载:
+用户配置位于 `%APPDATA%\mica\config`，采用 **Ghostty 的 `key = value` 语法**。
+全部默认值和 34 条默认快捷键集中在
+[`crates/mica-core/config/defaults`](crates/mica-core/config/defaults)，用户文件只需写覆盖项：
 
 ```ini
 theme = Dracula
 font-family = JetBrains Mono
 font-size = 13
 
+# 默认 shell(已安装 PowerShell 7 时)
+command = pwsh.exe -NoLogo
+
 # 标签栏外观全量可配(strip-* 键集)
-strip-font-size = 9.5
-strip-bar-wash = 0.18          # 条底提亮(失焦自动洗白一档)
+strip-font-size = 11
+strip-font-weight = 600
+strip-bar-wash = 0.18
 strip-tab-height = 36
-strip-animation-duration = 120 # ms,0 = 关动画
+strip-animation-duration = 120
 ```
 
-颜色/字体/几何/动画共 17 个 `strip-*` 键,详见
-`crates/mica-core/src/config/settings.rs` 文档注释。
+注释必须独占一行，值后不能追加注释。查看完整选项、配置位置和校验结果：
+
+```powershell
+mica +show-config --default
+mica +show-config --path
+mica +validate-config
+```
+
+默认值从同一份文件生成内置兜底，无配置文件也能启动；加载顺序为默认值、主题、用户覆盖。
+不要把全部默认颜色直接粘成用户覆盖项，否则会盖住选中的主题；参考完整选项时可先注释掉。
+`+validate-config` 校验语法和值范围，失败返回非零；未知键保持兼容性容忍，
+不会校验 shell 程序、字体和图片文件是否已经安装或存在。
+
+| 配置 | 生效范围 |
+| --- | --- |
+| 普通窗口字体、调色板、背景、鼠标行为、快捷键、标题栏、光标闪烁 | 保存后热重载 |
+| `command` | 新标签、分屏、新窗口；已有会话保持原 shell |
+| `window-width` / `window-height` / `window-position` | 新建窗口；宽高单位为终端列、行 |
+| `window-size-pixels = 宽,高` | 新窗口的精确物理像素外框；优先于列/行配置，置空恢复列/行 |
+| `window-padding-x` / `window-padding-y` | 逻辑像素、随 DPI 缩放，保存后热重载 |
+| `window-title-font-family` / `strip-font-family` | 同一项 UI 字体配置，默认 Segoe UI，独立于终端字体；热重载 |
+| `strip-font-size` / `strip-font-weight` | 标题栏字号和字重，默认 11pt / 600 半粗体；400 常规、700 粗体，范围 100–900 |
+| `strip-title-align` | `center`（整窗居中）或 `left`，长标题省略并避开按钮 |
+| `strip-title-highlight` / `-color` / `-opacity` / `-radius` | 标题圆角底的开关、颜色、强度与半径，支持热重载 |
+| `quick-terminal-key` | 热键可重绑或设 `none` 禁用 |
+| Quick Terminal 的 shell、字体、配色、`quick-terminal-height` | 完全退出 Mica 后重启 |
+
+首次创建配置文件后需重启以开启监听；坏配置热重载会保留当前设置。
+
+例如按现有窗口的物理像素大小启动，并设置居中标题：
+
+```ini
+window-size-pixels = 2032,1041
+window-title-font-family = Segoe UI
+strip-title-align = center
+strip-title-highlight = true
+```
+
+像素尺寸是 Mica 的扩展，不随 DPI 换算；未设置时仍采用列/行配置。
+标题底色默认从主题强调色推导，`strip-title-highlight-color = auto` 恢复自动配色。
+
+`command` 用于之后新建的窗口、标签、分屏和 Quick Terminal。显式选择
+`--profile` 时使用该 profile；空 `command =` 恢复 Windows PowerShell 默认值。
+保存后已有 shell 会继续运行，Quick Terminal 要完全退出 Mica 后重开才会换 shell。
+若桌面启动的 PATH 与命令行不同，使用带引号的绝对路径，例如：
+
+```ini
+command = "C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo
+```
+
+这沿用 [Ghostty 的 `command` 配置键](https://ghostty.org/docs/config/reference#command)
+及“用于新终端”的范围；Windows 命令按 CRT 引号规则直接执行，不展开 `~`、
+环境变量、管道或 `shell:`/`direct:` 前缀。PowerShell 初始化脚本放在其 `$PROFILE`
+中，需加载 Oh My Posh 时请保留 profile 加载，不加 `-NoProfile`。
 
 ## 状态 / Status
 

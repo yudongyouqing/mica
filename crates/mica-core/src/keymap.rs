@@ -143,155 +143,7 @@ pub struct Keymap {
 impl Keymap {
     /// WT 兼容默认表(D15):目标用户是 WT 迁移者,肌肉记忆零成本。
     pub fn wt_default() -> Self {
-        let m = |ctrl: bool, shift: bool, alt: bool| Mods {
-            shift,
-            alt,
-            ctrl,
-            win: false,
-        };
-        let mut binds = Vec::new();
-        let mut push = |mods: Mods, key: TriggerKey, action: Action| {
-            binds.push((Trigger::new(mods, key), action))
-        };
-        // 标签
-        push(
-            m(true, true, false),
-            TriggerKey::Letter('T'),
-            Action::NewTab,
-        );
-        // Ctrl+T 同绑(浏览器直觉,2026-10-12 用户实报"新建标签没用了"
-        // ——WT 系默认只有 Ctrl+Shift+T,裸 Ctrl+T 透传 shell 无反馈)
-        push(
-            m(true, false, false),
-            TriggerKey::Letter('T'),
-            Action::NewTab,
-        );
-        push(
-            m(true, true, false),
-            TriggerKey::Letter('N'),
-            Action::NewWindow,
-        );
-        // WT 语义:Ctrl+Shift+W 关焦点 pane,最后一个 pane 时升级关标签
-        push(
-            m(true, true, false),
-            TriggerKey::Letter('W'),
-            Action::ClosePane,
-        );
-        push(
-            m(true, false, false),
-            TriggerKey::Key(Key::Tab),
-            Action::NextTab,
-        );
-        push(
-            m(true, true, false),
-            TriggerKey::Key(Key::Tab),
-            Action::PrevTab,
-        );
-        for d in 1..=9u8 {
-            push(
-                m(true, true, false),
-                TriggerKey::Digit(d),
-                Action::GotoTab(d),
-            );
-        }
-        // 复制粘贴(WT 的 Ctrl+Shift+C/V;裸 Ctrl+C/V 的智能语义在壳层,不进表)
-        push(m(true, true, false), TriggerKey::Letter('C'), Action::Copy);
-        push(m(true, true, false), TriggerKey::Letter('V'), Action::Paste);
-        push(m(true, false, false), TriggerKey::Insert, Action::Copy);
-        push(m(false, true, false), TriggerKey::Insert, Action::Paste);
-        // 分屏:Alt+方向 焦点跳邻(几何最近邻)
-        push(
-            m(true, false, true),
-            TriggerKey::Key(Key::Left),
-            Action::FocusNeighbor(Key::Left),
-        );
-        push(
-            m(true, false, true),
-            TriggerKey::Key(Key::Right),
-            Action::FocusNeighbor(Key::Right),
-        );
-        push(
-            m(true, false, true),
-            TriggerKey::Key(Key::Up),
-            Action::FocusNeighbor(Key::Up),
-        );
-        push(
-            m(true, false, true),
-            TriggerKey::Key(Key::Down),
-            Action::FocusNeighbor(Key::Down),
-        );
-        // 滚动:正方向 = 历史
-        push(
-            m(false, true, false),
-            TriggerKey::Key(Key::PageUp),
-            Action::ScrollPage(1),
-        );
-        // OSC 133 prompt 间跳转(D37,WezTerm 同款肌肉记忆)
-        push(
-            m(true, true, false),
-            TriggerKey::Letter('R'),
-            Action::RestartPane,
-        );
-        // #81:回看导出(与搜索同族:搜到→导出深挖)
-        push(
-            m(true, true, false),
-            TriggerKey::Letter('S'),
-            Action::WriteScrollback,
-        );
-        // #88:重开最近关闭的标签(浏览器 Ctrl+Shift+Z 肌肉记忆)
-        push(
-            m(true, true, false),
-            TriggerKey::Letter('Z'),
-            Action::ReopenTab,
-        );
-        // #78:透明度切换(默认 Ctrl+Shift+O)
-        push(
-            m(true, true, false),
-            TriggerKey::Letter('O'),
-            Action::ToggleBackgroundOpacity,
-        );
-        // #57:回看搜索(浏览器查找直觉同款键位)
-        push(
-            m(true, true, false),
-            TriggerKey::Letter('F'),
-            Action::SearchScrollback,
-        );
-        push(
-            m(true, true, false),
-            TriggerKey::Key(Key::Up),
-            Action::JumpPrevPrompt,
-        );
-        push(
-            m(true, true, false),
-            TriggerKey::Key(Key::Down),
-            Action::JumpNextPrompt,
-        );
-        push(
-            m(false, true, false),
-            TriggerKey::Key(Key::PageDown),
-            Action::ScrollPage(-1),
-        );
-        push(
-            m(true, true, false),
-            TriggerKey::Key(Key::Home),
-            Action::ScrollTop,
-        );
-        push(
-            m(true, true, false),
-            TriggerKey::Key(Key::End),
-            Action::ScrollBottom,
-        );
-        push(
-            m(true, true, false),
-            TriggerKey::Key(Key::Up),
-            Action::ScrollLine(1),
-        );
-        push(
-            m(true, true, false),
-            TriggerKey::Key(Key::Down),
-            Action::ScrollLine(-1),
-        );
-        Self { binds }
+        crate::config::settings::Settings::default().keymap
     }
 
     /// 清空(配置 `keybind = clear` 后只保留用户条目)。
@@ -382,6 +234,8 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "paste" => Some(Action::Paste),
         "scroll_top" => Some(Action::ScrollTop),
         "scroll_bottom" => Some(Action::ScrollBottom),
+        "jump_prev_prompt" => Some(Action::JumpPrevPrompt),
+        "jump_next_prompt" => Some(Action::JumpNextPrompt),
         "scroll_line_up" => Some(Action::ScrollLine(1)),
         "scroll_line_down" => Some(Action::ScrollLine(-1)),
         "scroll_page_up" => Some(Action::ScrollPage(1)),
@@ -411,6 +265,54 @@ pub fn parse_action(s: &str) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_binding_table_preserves_every_legacy_default() {
+        let keymap = Keymap::wt_default();
+        let expected = [
+            ("ctrl+shift+t", Action::NewTab),
+            ("ctrl+t", Action::NewTab),
+            ("ctrl+shift+n", Action::NewWindow),
+            ("ctrl+shift+w", Action::ClosePane),
+            ("ctrl+tab", Action::NextTab),
+            ("ctrl+shift+tab", Action::PrevTab),
+            ("ctrl+shift+c", Action::Copy),
+            ("ctrl+shift+v", Action::Paste),
+            ("ctrl+insert", Action::Copy),
+            ("shift+insert", Action::Paste),
+            ("ctrl+alt+left", Action::FocusNeighbor(Key::Left)),
+            ("ctrl+alt+right", Action::FocusNeighbor(Key::Right)),
+            ("ctrl+alt+up", Action::FocusNeighbor(Key::Up)),
+            ("ctrl+alt+down", Action::FocusNeighbor(Key::Down)),
+            ("shift+pageup", Action::ScrollPage(1)),
+            ("ctrl+shift+r", Action::RestartPane),
+            ("ctrl+shift+s", Action::WriteScrollback),
+            ("ctrl+shift+z", Action::ReopenTab),
+            ("ctrl+shift+o", Action::ToggleBackgroundOpacity),
+            ("ctrl+shift+f", Action::SearchScrollback),
+            ("ctrl+shift+up", Action::JumpPrevPrompt),
+            ("ctrl+shift+down", Action::JumpNextPrompt),
+            ("shift+pagedown", Action::ScrollPage(-1)),
+            ("ctrl+shift+home", Action::ScrollTop),
+            ("ctrl+shift+end", Action::ScrollBottom),
+        ];
+        assert_eq!(keymap.binds.len(), expected.len() + 9);
+        for (source, action) in expected {
+            let trigger = parse_trigger(source).unwrap();
+            assert_eq!(
+                keymap.lookup(trigger.mods, trigger.key),
+                Some(action),
+                "{source}"
+            );
+        }
+        for index in 1..=9 {
+            let trigger = parse_trigger(&format!("ctrl+shift+{index}")).unwrap();
+            assert_eq!(
+                keymap.lookup(trigger.mods, trigger.key),
+                Some(Action::GotoTab(index))
+            );
+        }
+    }
 
     /// #79 重映射语义:交换语义(源↔目标),无源修饰时目标清位
     #[test]

@@ -12,15 +12,11 @@
 
 use std::cell::RefCell;
 use std::num::NonZeroIsize;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use notify::{Event, RecursiveMode, Watcher};
-
 use mica_core::config::palette::Palette;
-use mica_core::config::settings::{self, ConfigError, DEFAULT_FAMILIES, MouseRightClick, Settings};
+use mica_core::config::settings::{DEFAULT_FAMILIES, MouseRightClick, Settings};
 use mica_core::input::{self, Key, Mods};
 use mica_core::ipc::{IpcError, IpcRequest, IpcResponse};
 use mica_core::keymap::{Action, Keymap, TriggerKey};
@@ -47,9 +43,9 @@ use windows::Win32::UI::WindowsAndMessaging::HICON;
 /// ShellExecuteW show cmd(打开链接用)
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-    DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG,
-    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowTextW,
+    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+    DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect, LoadCursorW, MSG, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowTextW,
     TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
     WM_ERASEBKGND, WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
@@ -64,8 +60,37 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
-const COLS: u16 = 100;
-const ROWS: u16 = 30;
+// WM_NCCALCSIZE makes the entire window the client area. Account for our
+// own strip exactly once; round up so a fractional cell never loses a column.
+fn initial_window_rect(settings: &Settings, metrics: &FontMetrics) -> RECT {
+    if let Some((width, height)) = settings.window_size_pixels {
+        return RECT {
+            right: i32::from(width),
+            bottom: i32::from(height),
+            ..Default::default()
+        };
+    }
+    let strip = mica_render::frame::StripMetrics::from_scale_cfg(
+        DPI_SCALE.with(std::cell::Cell::get),
+        &settings.strip,
+    );
+    let strip_h = if strip.hide_single {
+        strip.title_h
+    } else {
+        strip.h
+    };
+    let scale = DPI_SCALE.with(std::cell::Cell::get);
+    RECT {
+        right: (f32::from(settings.window_width) * metrics.cell_width
+            + 2.0 * settings.window_padding_x * scale)
+            .ceil() as i32,
+        bottom: (f32::from(settings.window_height) * metrics.line_height
+            + 2.0 * settings.window_padding_y * scale)
+            .ceil() as i32
+            + strip_h.ceil() as i32,
+        ..Default::default()
+    }
+}
 
 /// strip/顶栏运行时几何(DPI 缩放 + 用户配置单源,渲染与 hit-test 同取):
 /// 150% 屏上物理常量曾致条高/× 与字体错位(2026-10-06 用户实测);
@@ -221,9 +246,60 @@ pub(crate) fn scaled_pt(base_pt: f32) -> f32 {
     (base_pt * DPI_SCALE.with(std::cell::Cell::get)).clamp(6.0, 72.0)
 }
 
-/// 内容区内边距(Ghostty window-padding-x/y 默认 2px 逻辑值,随 DPI 缩放)
-fn pad() -> f32 {
-    2.0 * DPI_SCALE.with(std::cell::Cell::get)
+/// All layout, input hit testing and grid sizing share the configured padding.
+fn terminal_area(width: f32, height: f32, strip: f32) -> mica_core::layout::Rect {
+    let scale = DPI_SCALE.with(std::cell::Cell::get);
+    let (x, y) = CONTENT_PADDING.with(|p| *p.borrow());
+    let (x, y) = (x * scale, y * scale);
+    mica_core::layout::Rect::new(
+        x,
+        strip + y,
+        (width - 2.0 * x).max(1.0),
+        (height - strip - 2.0 * y).max(1.0),
+    )
+}
+
+fn grid_size(area: mica_core::layout::Rect, metrics: &FontMetrics) -> (u16, u16) {
+    (
+        ((area.w / metrics.cell_width).max(1.0)) as u16,
+        ((area.h / metrics.line_height).max(1.0)) as u16,
+    )
+}
+
+fn resize_terminal(terminal: &mut Terminal, area: mica_core::layout::Rect) -> bool {
+    let (cols, rows) = grid_size(area, &terminal.metrics);
+    if (cols, rows) == (terminal.cols, terminal.rows) {
+        return false;
+    }
+    terminal.cols = cols;
+    terminal.rows = rows;
+    terminal
+        .term
+        .resize(ScreenSize::new(cols as usize, rows as usize));
+    terminal.term.set_cell_metrics(
+        terminal.metrics.cell_width.round() as u16,
+        terminal.metrics.line_height.round() as u16,
+    );
+    let _ = terminal.session.resize(cols, rows);
+    terminal.force_full = true;
+    true
+}
+
+/// Resize every tab using its own layout, including inactive split panes.
+fn resize_all_grids(width: f32, height: f32) -> bool {
+    let area = terminal_area(width, height, strip_h());
+    TABS.with(|tabs| {
+        let mut changed = false;
+        for tab in tabs.borrow_mut().iter_mut() {
+            let rects = tab.layout.rects(area);
+            for pane in &mut tab.panes {
+                if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == pane.id) {
+                    changed |= resize_terminal(&mut pane.terminal, *rect);
+                }
+            }
+        }
+        changed
+    })
 }
 
 /// resize 拖拽边宽(逻辑 6px 随 DPI)
@@ -312,12 +388,8 @@ const WM_APP_IPC: u32 = 0x8000 + 3;
 /// Send,投递侧再包回 HWND。
 type SharedHwnd = Arc<Mutex<Option<isize>>>;
 
-/// 热重载组件打包:退出时按 哨兵置 None(共用,见 SharedHwnd)→ drop watcher
-/// → join 线程 拆除(序在 message_loop 的退出分支,先于既有 teardown)。
-struct ReloadHandle {
-    watcher: notify::RecommendedWatcher,
-    thread: std::thread::JoinHandle<()>,
-}
+mod config;
+use config::{ReloadHandle, load_settings, reload_config, spawn_config_watcher};
 
 mod clipboard;
 pub(crate) mod crash;
@@ -330,6 +402,33 @@ pub(crate) mod quickterm;
 pub mod uia;
 pub mod window_registry; // pub:tests 直入(真窗口生命周期回归,T04)
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PathHover {
+    pane_id: u64,
+    line: i32,
+    column: usize,
+    cells: usize,
+}
+
+fn path_hover_rect(
+    hover: PathHover,
+    pane_id: u64,
+    rect: mica_core::layout::Rect,
+    metrics: &FontMetrics,
+    offset: usize,
+    rows: u16,
+) -> Option<mica_core::layout::Rect> {
+    let view = hover.line + offset as i32;
+    (hover.pane_id == pane_id && (0..i32::from(rows)).contains(&view)).then(|| {
+        mica_core::layout::Rect::new(
+            rect.x + hover.column as f32 * metrics.cell_width,
+            rect.y + view as f32 * metrics.line_height,
+            hover.cells as f32 * metrics.cell_width,
+            metrics.line_height,
+        )
+    })
+}
+
 thread_local! {
     static GPU: RefCell<Option<WindowGpu>> = const { RefCell::new(None) };
     static TABS: RefCell<Vec<TabState>> = const { RefCell::new(Vec::new()) };
@@ -341,6 +440,11 @@ thread_local! {
     /// 新建标签所需的字体/度量种子(load_settings 快照):热重载后建的
     /// 标签跟随当前设置,而不是启动时的
     static TAB_SEED: RefCell<(Vec<String>, f32)> = const { RefCell::new((Vec::new(), 12.0)) };
+    /// Default launch command for future terminals; existing sessions keep theirs.
+    static QUICK_TERMINAL_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
+    static QUICK_TERMINAL_HEIGHT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static CONTENT_PADDING: RefCell<(f32, f32)> = const { RefCell::new((0.0, 0.0)) };
+    static SESSION_COMMAND: RefCell<Option<String>> = const { RefCell::new(None) };
     /// 当前生效调色板(建新标签用;热重载时更新)
     static CURRENT_PALETTE: RefCell<Palette> = const { RefCell::new(Palette::DEFAULT) };
     /// 锁定标题(Ghostty `title` 同义,2026-10-07):Some = 窗口/标签恒显
@@ -455,7 +559,7 @@ thread_local! {
         const { RefCell::new(None) };
     /// #58 悬停路径 span(buffer 行,列,格宽):即时下划线的数据源;
     /// None = 光标不在路径上(WM_MOUSEMOVE 每次刷新,替代 300ms 气泡)
-    static HOVER_PATH: RefCell<Option<(i32, usize, usize)>> =
+    static HOVER_PATH: RefCell<Option<PathHover>> =
         const { RefCell::new(None) };
     /// #58 悬停反色动画相位(0 = 2px 下划线,1 = 整块):进入/换路径时
     /// 归零,timer 5 推进(120ms ease-out)——"从下划线滑成整块"
@@ -772,13 +876,7 @@ pub fn run() {
                 settings.font_size_pt,
                 DPI_SCALE.with(std::cell::Cell::get)
             );
-            let mut rect = RECT {
-                left: 0,
-                top: 0,
-                right: (f32::from(COLS) * metrics.cell_width).round() as i32,
-                bottom: (f32::from(ROWS) * metrics.line_height).round() as i32,
-            };
-            AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false).expect("AdjustWindowRect");
+            let rect = initial_window_rect(&settings, &metrics);
             let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                 hwnd,
                 None,
@@ -809,6 +907,11 @@ pub fn run() {
         WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         TAB_SEED
             .with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+        SESSION_COMMAND.with(|s| *s.borrow_mut() = settings.command.clone());
+        CONTENT_PADDING
+            .with(|p| *p.borrow_mut() = (settings.window_padding_x, settings.window_padding_y));
+        QUICK_TERMINAL_HEIGHT.with(|h| h.set(settings.quick_terminal_height));
+        QUICK_TERMINAL_KEY.with(|k| *k.borrow_mut() = settings.quick_terminal_key.clone());
         STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
         CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
         let gpu = match init_window_gpu(hwnd) {
@@ -1007,13 +1110,7 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                     }
                 };
                 let metrics = router.metrics();
-                let mut rect = RECT {
-                    left: 0,
-                    top: 0,
-                    right: (f32::from(COLS) * metrics.cell_width).round() as i32,
-                    bottom: (f32::from(ROWS) * metrics.line_height).round() as i32,
-                };
-                AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false).expect("AdjustWindowRect");
+                let rect = initial_window_rect(&settings, &metrics);
                 let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                     hwnd,
                     None,
@@ -1037,6 +1134,11 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
             TAB_SEED.with(|s| {
                 *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt)
             });
+            SESSION_COMMAND.with(|s| *s.borrow_mut() = settings.command.clone());
+            CONTENT_PADDING
+                .with(|p| *p.borrow_mut() = (settings.window_padding_x, settings.window_padding_y));
+            QUICK_TERMINAL_HEIGHT.with(|h| h.set(settings.quick_terminal_height));
+            QUICK_TERMINAL_KEY.with(|k| *k.borrow_mut() = settings.quick_terminal_key.clone());
             STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
             CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
             let gpu = match init_window_gpu(hwnd) {
@@ -1077,72 +1179,6 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
         .expect("spawn window thread");
 }
 
-/// 配置文件路径:`%APPDATA%\mica\config`;APPDATA 未设(理论上不存在,
-/// 保留兜底)落当前目录 `.mica\config`。
-fn config_path() -> PathBuf {
-    match std::env::var("APPDATA") {
-        Ok(dir) if !dir.is_empty() => Path::new(&dir).join("mica").join("config"),
-        _ => PathBuf::from(".mica").join("config"),
-    }
-}
-
-/// 读配置并合成 Settings。错误哲学(T2 同款):终端绝不因配置拒绝启动——
-/// 文件缺失 = 全默认静默;读失败或 resolve 失败 = MessageBox 警告后回落默认。
-fn load_settings() -> Settings {
-    let path = config_path();
-    let source = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
-        Err(e) => {
-            warn_box(&format!(
-                "无法读取配置文件 {}:\n{e}\n\n继续使用默认设置。",
-                path.display()
-            ));
-            return Settings::default();
-        }
-    };
-    // PowerShell 5 `Out-File` 等工具写 UTF-8 会带 BOM:不剥则首键(常是
-    // theme/font-family)被静默吞掉,配置"半生效"且无任何提示
-    let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
-    match settings::resolve(source) {
-        Ok(s) => s,
-        Err(err) => {
-            warn_box(&format_config_error(&path, &err, "已回退默认设置"));
-            Settings::default()
-        }
-    }
-}
-
-/// 错误弹窗文案:解析行错误带行号在前,值语义错误随后(与 ConfigError 同序)。
-/// 结尾措辞按调用点参数化:启动路径回退默认,热重载路径保留当前设置。
-fn format_config_error(path: &Path, err: &ConfigError, outcome: &str) -> String {
-    let mut msg = format!("配置文件 {} 有误,{outcome}:", path.display());
-    for e in &err.parse {
-        msg.push_str(&format!("\n  第 {} 行: {}", e.line, e.reason));
-    }
-    for v in &err.values {
-        msg.push_str(&format!("\n  {v}"));
-    }
-    msg
-}
-
-/// 警告框:不挂窗口(启动期 hwnd 尚未创建),自带消息泵,OK 后继续初始化。
-fn warn_box(text: &str) {
-    unsafe {
-        let _ = MessageBoxW(
-            None,
-            &HSTRING::from(text),
-            w!("Mica"),
-            MB_OK | MB_ICONWARNING,
-        );
-    }
-}
-
-/// 配置热重载 watcher(最佳努力,绝不致命——T4 错误哲学同款):
-/// notify 推荐后端(Windows = ReadDirectoryChangesW;对文件路径它实际监视
-/// 父目录并按路径过滤,原子替换/重建不失联)监听 config 文件,事件经 mpsc
-/// 交给去抖线程。None = 未监听(文件缺失或 watch 失败,热重载降级关闭)。
-/// 哨兵由 run() 统一建立后传入——与转发线程共用"窗口存活"这一个事实。
 /// #59 非关键初始化(首帧后一拍,主线程):孤儿清理 / jumplist COM /
 /// profile 扫描 / Quick Terminal。全在主线程执行——
 /// 这些件吃 TLS(GPU/SHARED_HWND),后台线程会撞双实例 TLS。
@@ -1183,43 +1219,16 @@ unsafe fn deferred_init(hwnd: HWND) {
     }
 }
 
-fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle> {
-    let path = config_path();
-    if !path.exists() {
-        eprintln!("config watcher: {} 不存在,热重载未启用", path.display());
-        return None;
-    }
-    // notify 的 EventHandler 直接支持 std mpsc Sender<Result<Event>>;
-    // watcher 持有发送端,Drop 时后端停止、通道断开,线程随之退出
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    // 创建/监听/起线程三步都按"绝不致命"降级:失败只记日志、热重载关闭,
-    // 绝不 expect 崩终端
-    let mut watcher = match notify::recommended_watcher(tx) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("config watcher: 创建失败:{e};热重载未启用");
-            return None;
-        }
-    };
-    if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-        eprintln!(
-            "config watcher: 无法监听 {}: {e};热重载未启用",
-            path.display()
+/// 警告框:不挂窗口(启动期 hwnd 尚未创建),自带消息泵,OK 后继续初始化。
+fn warn_box(text: &str) {
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            w!("Mica"),
+            MB_OK | MB_ICONWARNING,
         );
-        return None;
     }
-    let thread_slot = Arc::clone(&hwnd_slot);
-    let thread = match std::thread::Builder::new()
-        .name("config-watcher".into())
-        .spawn(move || debounce_loop(path, rx, thread_slot))
-    {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("config watcher: 线程创建失败:{e};热重载未启用");
-            return None; // watcher 随之 Drop,后端停止
-        }
-    };
-    Some(ReloadHandle { watcher, thread })
 }
 
 /// pty → 渲染转发线程(T7,app 所有;pty.rs 零 GUI 纪律:core 不碰 win32)。
@@ -1253,165 +1262,6 @@ fn spawn_render_forwarder(
             }
         })
         .expect("spawn pty forwarder")
-}
-
-/// 去抖线程:notify 后端已按被监视文件过滤事件,收到的必是 config 的动静。
-/// 编辑器原子保存 = Delete+Create+Write 连发,不去抖会触发多轮重载并撞上
-/// 瞬时缺失窗——故收首个事件后持续吞事件,直到 300ms 静默窗走完才投递一次;
-/// 路径在静默结束时仍不存在(原子替换途中)则跳过本轮。通道断开(watcher
-/// 已 Drop)即退出。
-fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<notify::Result<Event>>, hwnd_slot: SharedHwnd) {
-    const QUIET: Duration = Duration::from_millis(300);
-    loop {
-        if rx.recv().is_err() {
-            return; // watcher 已停,通道断开
-        }
-        loop {
-            match rx.recv_timeout(QUIET) {
-                Ok(_) => {} // 风暴未息,续等
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-        }
-        if !path.exists() {
-            continue;
-        }
-        // 复核 4:广播到**全部**存活窗口(单投会让多窗配置漂移);
-        // 无存活窗口(进程退出中)静默丢弃本轮
-        let _ = window_registry::post_to_all_alive(WM_APP_CONFIG, WPARAM(0), LPARAM(0));
-        let _ = &hwnd_slot;
-    }
-}
-
-/// 热重载主路径(WM_APP_CONFIG,主线程):重读+合成;失败弹窗保旧、现状态
-/// 不动;成功则重建 DwriteRouter(旧 router Drop 释放图集,新字形随绘制自然
-/// 重光栅化,无需显式清缓存)、按**不变的窗口像素尺寸**重算网格、resize 终端
-/// 与会话、换 palette 与清屏色,最后全量重绘。
-unsafe fn reload_config(hwnd: HWND) {
-    let path = config_path();
-    let Ok(source) = std::fs::read_to_string(&path) else {
-        // 去抖后仍读不到:文件被删而非瞬时缺失,提示后保旧
-        warn_box(&format!(
-            "无法读取配置文件 {}:\n热重载跳过,继续使用当前设置。",
-            path.display()
-        ));
-        return;
-    };
-    // 与启动路径同一 BOM 剥离:热重载不该比首读更挑剔编码
-    let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
-    let settings = match settings::resolve(source) {
-        Ok(s) => s,
-        Err(err) => {
-            warn_box(&format_config_error(&path, &err, "已保留当前设置"));
-            return; // 保旧
-        }
-    };
-    let families: Vec<&str> = settings.font_families.iter().map(String::as_str).collect();
-    let Ok(router) = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families) else {
-        warn_box("重建字体链失败,继续使用当前设置。");
-        return; // 保旧
-    };
-    eprintln!("font families in use: {:?}", router.families_in_use()); // 冒烟期观察回退链
-    let metrics = router.metrics();
-
-    // 客户区像素尺寸不变(不碰窗口尺寸),终端区按新度量重算(减 strip)
-    let mut rect = RECT::default();
-    GetClientRect(hwnd, &mut rect).expect("GetClientRect");
-    let width = rect.right.max(1) as u32;
-    let term_h = (rect.bottom.max(1) as u32)
-        .saturating_sub(strip_h() as u32)
-        .max(1);
-
-    let mut reloaded = false;
-    TABS.with(|tabs| {
-        // 全部标签全部 pane 一起换(T7):palette/字体是全局语义
-        for tab in tabs.borrow_mut().iter_mut() {
-            for pane in tab.panes.iter_mut() {
-                let t = &mut pane.terminal;
-                let Ok(router) = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families)
-                else {
-                    return;
-                };
-                let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
-                let rows = ((term_h as f32 / metrics.line_height).max(1.0)) as u16;
-                t.router = router;
-                // strip 字体/几何随配置(STRIP_CFG 已在上方更新):惰性建
-                // 置空强制下一帧按新配置重建
-                t.strip_router = None;
-                t.metrics = metrics;
-                t.cols = cols;
-                t.rows = rows;
-                t.term.resize(ScreenSize::new(cols as usize, rows as usize));
-                // 应答值取整与布局换算 f32 的分工同 init(I3)
-                t.term.set_cell_metrics(
-                    metrics.cell_width.round() as u16,
-                    metrics.line_height.round() as u16,
-                );
-                let _ = t.session.resize(cols, rows);
-                // 几何/字形全换:行缓存结构性失配,显式全量(Task 8)
-                t.force_full = true;
-                t.term.set_palette(&settings.palette);
-                t.palette = settings.palette;
-            }
-        }
-        reloaded = true;
-    });
-    // 窗口级同步:清屏色、键位表、建标签种子(T7:新标签跟随当前设置)
-    GPU.with(|g| {
-        if let Some(gpu) = g.borrow_mut().as_mut() {
-            gpu.renderer.set_clear_color(&settings.palette);
-        }
-    });
-    KEYMAP.with(|k| *k.borrow_mut() = settings.keymap.clone());
-    TITLE_LOCK.with(|t| *t.borrow_mut() = settings.title.clone());
-    MOUSE_HIDE_ON_TYPE.with(|m| m.set(settings.mouse_hide_while_typing));
-    COPY_ON_SELECT.with(|c| c.set(settings.copy_on_select));
-    RIGHT_CLICK_PASTE.with(|r| r.set(settings.mouse_right_click == MouseRightClick::Paste));
-    KEY_REMAP.with(|k| *k.borrow_mut() = settings.key_remap.clone());
-    let dim = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
-        217
-    } else {
-        (settings.background_opacity.clamp(0.05, 1.0) * 255.0) as u8
-    };
-    WINDOW_ALPHA_DIM.with(|a| a.set(dim));
-    // 热重载改透明度:立即生效
-    if (settings.background_opacity - 1.0).abs() >= f32::EPSILON {
-        WINDOW_TRANSLUCENT.with(|t| t.set(true));
-        apply_window_alpha(hwnd, true);
-    } else if WINDOW_TRANSLUCENT.with(std::cell::Cell::get) {
-        // 改回 1.0:若处于透明档(配置进的,非 toggle),回不透明
-        WINDOW_TRANSLUCENT.with(|t| t.set(false));
-        apply_window_alpha(hwnd, false);
-    }
-    TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
-    BG_IMG_PATH.with(|b| *b.borrow_mut() = settings.background_image.clone());
-    GPU.with(|g| {
-        if let Some(gpu) = g.borrow_mut().as_mut() {
-            let path = settings
-                .background_image
-                .as_deref()
-                .map(std::path::Path::new);
-            let alpha = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
-                0.9
-            } else {
-                settings.background_opacity
-            };
-            if let Err(e) = gpu.renderer.set_background_image(path, alpha) {
-                eprintln!("[bg] {e}");
-            }
-        }
-    });
-    STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
-    CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
-    // title 锁定值即时应用(此前要等下一次 shell 标题事件才生效)——
-    // 这也是"热重载确实执行"的外部观测面(测试读窗口文本)
-    if let Some(t) = TITLE_LOCK.with(|t| t.borrow().clone()) {
-        let _ = SetWindowTextW(hwnd, &HSTRING::from(t));
-    }
-    // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
-    if reloaded {
-        draw_frame();
-    }
 }
 
 /// 初始化终端状态,返回 (pty 读端, 共享输出缓冲):读端连同缓冲交给转发
@@ -1616,10 +1466,6 @@ unsafe fn reload_dpi(hwnd: HWND, dpi: u32) {
     let metrics = head.metrics();
     let mut rect = RECT::default();
     GetClientRect(hwnd, &mut rect).expect("GetClientRect");
-    let width = rect.right.max(1) as u32;
-    let term_h = (rect.bottom.max(1) as u32)
-        .saturating_sub(strip_h() as u32)
-        .max(1);
     eprintln!("[dpi] {dpi} (x{scale:.2}) → pt {base_pt}→{size_pt}");
     TABS.with(|tabs| {
         for tab in tabs.borrow_mut().iter_mut() {
@@ -1628,13 +1474,8 @@ unsafe fn reload_dpi(hwnd: HWND, dpi: u32) {
                 let Ok(router) = DwriteRouter::new(size_pt, &families) else {
                     return;
                 };
-                let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
-                let rows = ((term_h as f32 / metrics.line_height).max(1.0)) as u16;
                 t.router = router;
                 t.metrics = metrics;
-                t.cols = cols;
-                t.rows = rows;
-                t.term.resize(ScreenSize::new(cols as usize, rows as usize));
                 t.term.set_cell_metrics(
                     metrics.cell_width.round() as u16,
                     metrics.line_height.round() as u16,
@@ -1643,6 +1484,7 @@ unsafe fn reload_dpi(hwnd: HWND, dpi: u32) {
             }
         }
     });
+    resize_all_grids(rect.right.max(1) as f32, rect.bottom.max(1) as f32);
 }
 
 /// IME 组合窗/候选窗定位(M5b/T5):跟随焦点 pane 的终端光标格。
@@ -1706,15 +1548,12 @@ fn position_ime(hwnd: HWND) {
 fn active_pane_rects() -> Vec<(u64, mica_core::layout::Rect)> {
     let (aw, ah) = GPU
         .with(|g| {
-            g.borrow().as_ref().map(|gpu| {
-                (
-                    gpu.config.width as f32,
-                    gpu.config.height as f32 - strip_h(),
-                )
-            })
+            g.borrow()
+                .as_ref()
+                .map(|gpu| (gpu.config.width as f32, gpu.config.height as f32))
         })
         .unwrap_or((1.0, 1.0));
-    let area = mica_core::layout::Rect::new(0.0, strip_h(), aw.max(1.0), ah.max(1.0));
+    let area = terminal_area(aw, ah, strip_h());
     TABS.with(|tabs| {
         tabs.borrow()
             .get(ACTIVE.get())
@@ -1726,7 +1565,6 @@ fn active_pane_rects() -> Vec<(u64, mica_core::layout::Rect)> {
 /// 焦点 pane 在布局树里的最近邻(方向几何:候选中心与当前中心的方向向量
 /// 点积最大且分量同向)——Alt+方向跳焦点(spec §6)。
 fn focus_neighbor(dir: input::Key) {
-    use mica_core::layout::Rect;
     // 条高先取(动态,含 TABS 借用)——with 内 guard 常驻,再借会 panic
     let sh = strip_h();
     TABS.with(|tabs| {
@@ -1742,10 +1580,10 @@ fn focus_neighbor(dir: input::Key) {
             .with(|g| {
                 g.borrow()
                     .as_ref()
-                    .map(|gpu| (gpu.config.width as f32, gpu.config.height as f32 - sh))
+                    .map(|gpu| (gpu.config.width as f32, gpu.config.height as f32))
             })
             .unwrap_or((1.0, 1.0));
-        let area = Rect::new(0.0, sh, aw.max(1.0), ah.max(1.0));
+        let area = terminal_area(aw, ah, sh);
         let rects = tab.layout.rects(area);
         let Some((_, cur)) = rects.iter().find(|(id, _)| *id == cur_id) else {
             return;
@@ -1835,7 +1673,7 @@ unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
         let Some(target) = tab.active_pane_id() else {
             return;
         };
-        let (pane, reader) = match create_pane(hwnd, "powershell.exe -NoLogo") {
+        let (pane, reader) = match create_pane(hwnd, &launch_command(None)) {
             Ok(pair) => pair,
             Err(e) => {
                 // P1(1.0.9 大审查):内存紧张时 spawn 失败不能闪退整个 app
@@ -1888,13 +1726,12 @@ unsafe fn create_pane_with_size(
 
     let mut rect = RECT::default();
     GetClientRect(hwnd, &mut rect).expect("GetClientRect");
-    let width = rect.right.max(1) as u32;
-    let height = (rect.bottom.max(1) as u32)
-        .saturating_sub(strip_h() as u32)
-        .max(1);
-
-    let cols = ((width as f32 / metrics.cell_width).max(1.0)) as u16;
-    let rows = ((height as f32 / metrics.line_height).max(1.0)) as u16;
+    let area = terminal_area(
+        rect.right.max(1) as f32,
+        rect.bottom.max(1) as f32,
+        strip_h(),
+    );
+    let (cols, rows) = grid_size(area, &metrics);
     let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
     // 查询应答(DSR/OSC 尺寸)用格子度量;应答值取整不截断(I3:真度量如
     // 8.53px 时 as u16 会答 8,应答与像素网格漂移;布局换算保持 f32)
@@ -2004,10 +1841,7 @@ unsafe fn start_tab_with_profile(
         }
         p
     });
-    let shell = picked
-        .as_ref()
-        .map(|p| p.command.clone())
-        .unwrap_or_else(|| "powershell.exe -NoLogo".to_string());
+    let shell = launch_command(picked.as_ref());
     let title = picked
         .as_ref()
         .map(|p| p.name.clone())
@@ -2074,8 +1908,26 @@ unsafe fn start_tab_with_shell(
 /// 渲染唤醒(WM_APP_RENDER)、输入、尺寸、热重载全在 wndproc 侧处理。
 ///
 /// Quick Terminal 接线辅助(pub(crate) 供 quickterm 模块)
+pub(crate) fn quick_terminal_key() -> Option<String> {
+    QUICK_TERMINAL_KEY.with(|k| k.borrow().clone())
+}
+
+pub(crate) fn quick_terminal_height() -> u8 {
+    QUICK_TERMINAL_HEIGHT.with(std::cell::Cell::get)
+}
+
 pub(crate) fn tab_seed() -> (Vec<String>, f32) {
     TAB_SEED.with(|s| s.borrow().clone())
+}
+
+/// Explicit profiles override the configured default; never rewrite a saved
+/// terminal command when restarting or tearing off an existing session.
+pub(crate) fn launch_command(profile: Option<&mica_core::profile::Profile>) -> String {
+    profile.map(|p| p.command.clone()).unwrap_or_else(|| {
+        SESSION_COMMAND
+            .with(|s| s.borrow().clone())
+            .unwrap_or_else(|| "powershell.exe -NoLogo".into())
+    })
 }
 
 /// 测试面:无窗口路径种字体/调色板 TLS——quickterm 回归测试直接调
@@ -2084,13 +1936,15 @@ pub(crate) fn tab_seed() -> (Vec<String>, f32) {
 #[cfg(test)]
 pub(crate) fn seed_tls_for_tests(settings: &mica_core::config::settings::Settings) {
     TAB_SEED.with(|s| *s.borrow_mut() = (settings.font_families.clone(), settings.font_size_pt));
+    SESSION_COMMAND.with(|s| *s.borrow_mut() = settings.command.clone());
+    CONTENT_PADDING
+        .with(|p| *p.borrow_mut() = (settings.window_padding_x, settings.window_padding_y));
+    QUICK_TERMINAL_HEIGHT.with(|h| h.set(settings.quick_terminal_height));
+    QUICK_TERMINAL_KEY.with(|k| *k.borrow_mut() = settings.quick_terminal_key.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
 }
 pub(crate) fn current_palette() -> Palette {
     CURRENT_PALETTE.with(|p| *p.borrow())
-}
-pub(crate) fn shared_hwnd_for_quickterm() -> Option<SharedHwnd> {
-    SHARED_HWND.with(|s| s.borrow().clone())
 }
 /// QT 转发线程:与主 forwarder 同款,但 WM_APP(非 WM_APP_RENDER)投给
 /// QT 窗口(独立消息域;WPARAM=0xFF00 哨兵)。
@@ -2182,6 +2036,24 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
         "[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight}/故障态 {degraded};pty 预留 {}B)",
         pty_bridge::reserved_bytes()
     );
+}
+
+// Scissors use attachment coordinates. Restore the fixed header offset when
+// converting content height to the full client viewport extent.
+fn pane_scissor(
+    rect: mica_core::layout::Rect,
+    content_size: (f32, f32),
+    content_top: f32,
+) -> (u32, u32, u32, u32) {
+    let sx = rect.x.max(0.0).round() as u32;
+    let sy = rect.y.max(0.0).round() as u32;
+    let sw = ((rect.x + rect.w).round() as u32)
+        .min(content_size.0 as u32)
+        .saturating_sub(sx);
+    let sh_r = ((rect.y + rect.h).round() as u32)
+        .min((content_size.1 + content_top) as u32)
+        .saturating_sub(sy);
+    (sx, sy, sw, sh_r)
 }
 
 /// T05 一次绘制批:pane id + scissor 矩形(px)+ 实例(该 pane 的图集批)
@@ -2277,12 +2149,7 @@ fn draw_frame() {
             .unwrap_or(0.0)
             - sh;
         use mica_core::layout::Rect;
-        let area = Rect::new(
-            pad(),
-            sh,
-            (area_w - 2.0 * pad()).max(1.0),
-            (area_h - pad()).max(1.0),
-        );
+        let area = terminal_area(area_w, area_h + sh, sh);
         let rects: Vec<(u64, Rect)> = active.layout.rects(area);
         let focused_pane_id = active.active_pane_id().unwrap_or(0);
 
@@ -2303,16 +2170,7 @@ fn draw_frame() {
             }
             // 布局变了 → 网格按 pane 矩形重算(只在几何不匹配时;rects 每
             // 帧重算,网格重排由 resize/分屏动作显式触发,这里只兜底)
-            let want_cols = ((rect.w / t.metrics.cell_width).max(1.0)) as u16;
-            let want_rows = ((rect.h / t.metrics.line_height).max(1.0)) as u16;
-            if want_cols != t.cols || want_rows != t.rows {
-                t.cols = want_cols;
-                t.rows = want_rows;
-                t.term
-                    .resize(ScreenSize::new(want_cols as usize, want_rows as usize));
-                let _ = t.session.resize(want_cols, want_rows);
-                t.force_full = true;
-            }
+            resize_terminal(t, rect);
             // Reclaim only before building any grid/strip/overlay instances.
             let max_dimension = GPU.with(|g| {
                 g.borrow()
@@ -2377,16 +2235,47 @@ fn draw_frame() {
                 inst.pos_uv[1] += rect.y;
                 insts.push(inst);
             }
+            if let Some(hover) = HOVER_PATH.with(|h| *h.borrow())
+                && let Some(hl) = path_hover_rect(
+                    hover,
+                    pane.id,
+                    rect,
+                    &t.metrics,
+                    t.term.display_offset(),
+                    t.rows,
+                )
+            {
+                let phase = HOVER_ANIM.with(std::cell::Cell::get);
+                let hh = 2.0 + (hl.h - 2.0) * (1.0 - (1.0 - phase).powi(3));
+                let y = hl.y + hl.h - hh;
+                let c = t.palette.colors[12];
+                let color = [
+                    c.r as f32 / 255.0,
+                    c.g as f32 / 255.0,
+                    c.b as f32 / 255.0,
+                    0.0,
+                ];
+                for inst in &mut insts {
+                    // Quantised cell positions can differ by a few ulps at
+                    // shared edges. A mere touching edge must not tint a neighbour.
+                    if (inst.pos_uv[0] + inst.size_uv[0]).min(hl.x + hl.w)
+                        - inst.pos_uv[0].max(hl.x)
+                        > 0.01
+                        && (inst.pos_uv[1] + inst.size_uv[1]).min(y + hh) - inst.pos_uv[1].max(y)
+                            > 0.01
+                    {
+                        inst.fg = if inst.size_uv[2] > 0.0 {
+                            [0.05, 0.05, 0.05, 0.0]
+                        } else {
+                            color
+                        };
+                        inst.bg = color;
+                    }
+                }
+            }
             // scissor = pane 矩形(像素,钳到视口):宽字/光标越界不再
             // 污染邻 pane;draw_batch 内还会对帧视口再钳一次
-            let sx = rect.x.max(0.0).round() as u32;
-            let sy = rect.y.max(0.0).round() as u32;
-            let sw = ((rect.x + rect.w).round() as u32)
-                .min(area_w as u32)
-                .saturating_sub(sx);
-            let sh_r = ((rect.y + rect.h).round() as u32)
-                .min(area_h as u32)
-                .saturating_sub(sy);
+            let (sx, sy, sw, sh_r) = pane_scissor(rect, (area_w, area_h), sh);
             pane_batches.push(PaneBatch {
                 pane_id: pane.id,
                 scissor: (sx, sy, sw, sh_r),
@@ -2418,16 +2307,22 @@ fn draw_frame() {
                 Some(f) => vec![f.clone()],
                 None => TAB_SEED.with(|s| s.borrow().clone()).0,
             };
-            for fb in ["Segoe UI Emoji", "Segoe Fluent Icons"] {
+            for fb in [
+                "Segoe UI",
+                "Microsoft YaHei UI",
+                "Segoe UI Emoji",
+                "Segoe Fluent Icons",
+            ] {
                 if !fams.iter().any(|f| f.eq_ignore_ascii_case(fb)) {
                     fams.push(fb.to_string());
                 }
             }
             let fams: Vec<&str> = fams.iter().map(String::as_str).collect();
-            t.strip_router = DwriteRouter::new_with_atlas(
+            t.strip_router = DwriteRouter::new_ui(
                 scaled_pt(cfg.font_size_pt),
                 &fams,
-                t.router.shared_atlas(),
+                cfg.font_weight,
+                Some(t.router.shared_atlas()),
             )
             .ok();
         }
@@ -2712,57 +2607,6 @@ fn draw_frame() {
                 }
             }
         }
-        // #58 悬停路径高亮(二版,用户点名"浅色转深色更清晰"):选中反色
-        // 式——浅蓝底 + 深色字,与搜索当前命中(黄底黑字)同款形制。
-        // 做法与搜索 hit_rects 相同:矩形相交的实例直接改色
-        if let Some((line, col, cells)) = HOVER_PATH.with(|h| *h.borrow()) {
-            let offset = t.term.display_offset() as i32;
-            let view = line + offset;
-            if (0..t.rows as i32).contains(&view)
-                && let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
-            {
-                let hx = pr.x + col as f32 * t.metrics.cell_width;
-                let hy_full = pr.y + view as f32 * t.metrics.line_height;
-                let hw = cells as f32 * t.metrics.cell_width;
-                let lh = t.metrics.line_height;
-                // 动画:相位 0 → 2px 底线,相位 1 → 整行;ease-out cubic
-                let a = HOVER_ANIM.with(std::cell::Cell::get);
-                let ease = 1.0 - (1.0 - a).powi(3);
-                let hh = 2.0 + (lh - 2.0) * ease;
-                let hy = hy_full + lh - hh; // 自底向上长
-                let bc = t.palette.colors[12];
-                let hl = [
-                    bc.r as f32 / 255.0,
-                    bc.g as f32 / 255.0,
-                    bc.b as f32 / 255.0,
-                    0.0,
-                ];
-                let ink_dark = [0.05, 0.05, 0.05, 0.0];
-                // T05:高亮后期处理遍历各 pane 批次实例(原 all_instances)
-                for batch in pane_batches.iter_mut() {
-                    let batch_insts = &mut batch.insts;
-                    for inst in batch_insts.iter_mut() {
-                        let (ix, iy, iw, ih) = (
-                            inst.pos_uv[0],
-                            inst.pos_uv[1],
-                            inst.size_uv[0],
-                            inst.size_uv[1],
-                        );
-                        if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
-                            if inst.size_uv[2] > 0.0 {
-                                // 字形 quad:墨色改近黑(浅蓝底可读)
-                                inst.fg = ink_dark;
-                                inst.bg = hl;
-                            } else {
-                                // 背景 quad:整块换高亮色
-                                inst.fg = hl;
-                                inst.bg = hl;
-                            }
-                        }
-                    }
-                }
-            }
-        }
         // #57 搜索 overlay 最后拼 = 最上层(盖在终端内容之上)
         strip.extend(search_overlay);
         // strip/overlay 与焦点 pane 同源图集(strip_router 共享终端图集,
@@ -2783,7 +2627,7 @@ fn draw_frame() {
         }
         for batch in &pane_batches {
             let (pane_id, scissor, insts) = (&batch.pane_id, &batch.scissor, &batch.insts);
-            if insts.is_empty() {
+            if insts.is_empty() || scissor.2 == 0 || scissor.3 == 0 {
                 continue;
             }
             TABS.with(|tabs| {
@@ -2974,9 +2818,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return LRESULT(0);
                 }
             }
-            if (mods.ctrl && !mods.alt && !mods.shift && vk == 'V' as u32)
-                || (mods.shift && !mods.ctrl && vk == VK_INSERT.0 as u32)
-            {
+            if contextual_paste(mods, vk) {
                 // 吞伴生 WM_CHAR(0x16):不置位则 SYN 泄给 pty,PSReadLine
                 // 把它当第二次 Ctrl+V 粘贴 → 文本双份(用户实报;与当年
                 // Ctrl+Shift+T 送 ^T 同类,keymap 分支修过硬编码漏了)
@@ -3225,8 +3067,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(t) = tab.pane_by_id(*pid).map(|p| &mut p.terminal) {
                         let offset = t.term.display_offset();
                         let (point, side) = px_to_buffer_point(
-                            px - r.x as i32,
-                            py - r.y as i32,
+                            px as f32 - r.x,
+                            py as f32 - r.y,
                             &t.metrics,
                             offset,
                         );
@@ -3266,7 +3108,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 t.panes
                                     .first()
                                     .map(|p| p.terminal.shell.clone())
-                                    .unwrap_or_else(|| "powershell.exe -NoLogo".into()),
+                                    .unwrap_or_else(|| launch_command(None)),
                                 t.panes
                                     .first()
                                     .and_then(|p| p.terminal.term.cwd().map(str::to_string)),
@@ -3353,20 +3195,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 });
                 // #58 路径悬停 span 实时算(单行扫描,轻):即时下划线;
                 // 路径上抑制气泡(旧 300ms 气泡循环 = 用户实报鼠标区闪烁)
-                let path_span = hover_path_span(hx, hy);
-                let path_changed = HOVER_PATH.with(|h| {
-                    let old = *h.borrow();
-                    if old != path_span {
-                        *h.borrow_mut() = path_span;
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if path_changed && path_span.is_some() {
-                    HOVER_ANIM.with(|a| a.set(0.0)); // 进入/换路径:下划线起步
-                    ensure_anim_timer();
-                }
+                let path_changed = update_hover_path(hx, hy);
                 if strip_changed || path_changed {
                     draw_frame();
                 }
@@ -3393,7 +3222,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 {
                     let offset = t.term.display_offset();
                     let (point, side) =
-                        px_to_buffer_point(px - r.x as i32, py - r.y as i32, &t.metrics, offset);
+                        px_to_buffer_point(px as f32 - r.x, py as f32 - r.y, &t.metrics, offset);
                     t.term.selection_update(point, side);
                     t.force_full = true;
                 }
@@ -3406,6 +3235,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             HOVER_ARMED.with(|a| a.set(false));
             arm_hover(hwnd);
             let (px, py) = mouse_xy(lparam);
+            let path_changed = update_hover_path(px, py);
             // #58:路径上用即时下划线(WM_MOUSEMOVE 算的 HOVER_PATH),
             // 气泡退役——300ms 循环 + 锚点跟随是鼠标区闪烁的来源
             let url = if HOVER_PATH.with(|h| h.borrow().is_some()) {
@@ -3436,7 +3266,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     false
                 }
             });
-            if changed || hover_changed {
+            if changed || hover_changed || path_changed {
                 draw_frame();
             }
             LRESULT(0)
@@ -3599,24 +3429,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     SelectionType::Semantic
                 }
             };
-            TABS.with(|tabs| {
-                if let Some(t) = tabs
-                    .borrow_mut()
-                    .get_mut(ACTIVE.get())
-                    .and_then(|tab| tab.active_pane())
-                {
-                    let offset = t.term.display_offset();
-                    let (point, side) = px_to_buffer_point(px, py, &t.metrics, offset);
-                    t.term.selection_begin(ty, point, side);
-                    t.force_full = true;
-                }
-            });
+            let rects = active_pane_rects();
+            if let Some((pane_id, rect)) = rects.into_iter().find(|(_, r)| {
+                px as f32 >= r.x
+                    && (px as f32) < r.x + r.w
+                    && py as f32 >= r.y
+                    && (py as f32) < r.y + r.h
+            }) {
+                TABS.with(|tabs| {
+                    let mut tabs = tabs.borrow_mut();
+                    if let Some(tab) = tabs.get_mut(ACTIVE.get())
+                        && let Some(index) = tab.panes.iter().position(|p| p.id == pane_id)
+                    {
+                        tab.focused = index;
+                        let t = &mut tab.panes[index].terminal;
+                        let (point, side) = px_to_buffer_point(
+                            px as f32 - rect.x,
+                            py as f32 - rect.y,
+                            &t.metrics,
+                            t.term.display_offset(),
+                        );
+                        t.term.selection_begin(ty, point, side);
+                        t.force_full = true;
+                    }
+                });
+            }
             MOUSE_DOWN.with(|m| m.set(true));
             let _ = SetCapture(hwnd);
             draw_frame();
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
+            HOVER_PATH.with(|h| h.borrow_mut().take());
+            HOVER_URL.with(|h| h.borrow_mut().take());
             // 高位有符号 delta,120/格;WT 惯例 3 行/格(=delta/40)。
             // delta 正 = 滚轮向上 = 看历史(上游 Scroll::Delta 正值增 offset)
             let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
@@ -3726,37 +3571,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if std::env::var_os("MICA_DEBUG_DPI").is_some() {
                 eprintln!("[dpi] WM_SIZE {width}x{height} wparam={}", wparam.0);
             }
-            if width == 0 || height == 0 {
+            if wparam.0 == windows::Win32::UI::WindowsAndMessaging::SIZE_MINIMIZED as usize
+                || width == 0
+                || height == 0
+            {
                 return LRESULT(0); // 最小化
             }
             let mut resized = false;
-            // surface 是整窗的(含 strip);终端网格按客户区减 strip 高
-            let term_h = height.saturating_sub(strip_h() as u32).max(1);
-            TABS.with(|tabs| {
-                // 全部标签一起重排(T7):后台标签的 pty/网格也必须跟新几何,
-                // 切换时才不重排跳变
-                let mut guard = tabs.borrow_mut();
-                for tab in guard.iter_mut() {
-                    for t in tab.panes.iter_mut().map(|p| &mut p.terminal) {
-                        let cols = ((width as f32 / t.metrics.cell_width).max(1.0)) as u16;
-                        let rows = ((term_h as f32 / t.metrics.line_height).max(1.0)) as u16;
-                        if cols == t.cols && rows == t.rows {
-                            continue;
-                        }
-                        t.cols = cols;
-                        t.rows = rows;
-                        t.term.resize(ScreenSize::new(cols as usize, rows as usize));
-                        t.term.set_cell_metrics(
-                            t.metrics.cell_width.round() as u16,
-                            t.metrics.line_height.round() as u16,
-                        );
-                        let _ = t.session.resize(cols, rows);
-                        // 行缓存与视口几何脱节:显式全量(Task 8)
-                        t.force_full = true;
-                        resized = true;
-                    }
-                }
-            });
+            resized |= resize_all_grids(width as f32, height as f32);
             GPU.with(|g| {
                 if let Some(gpu) = g.borrow_mut().as_mut()
                     && (gpu.config.width != width || gpu.config.height != height)
@@ -5023,23 +4845,21 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
 /// 客户区像素 → buffer 坐标点(视口行 + display_offset)与半格侧别。
 /// 拖出上/左边缘夹到 0(捕获期间 WM_MOUSEMOVE 仍投递,坐标可为负)。
 fn px_to_buffer_point(
-    px: i32,
-    py: i32,
+    px: f32,
+    py: f32,
     metrics: &FontMetrics,
     display_offset: usize,
 ) -> (Point, Side) {
-    let col_f = (px.max(0) as f32 / metrics.cell_width).max(0.0);
+    let col_f = (px.max(0.0) / metrics.cell_width).max(0.0);
     let col = col_f as usize;
     let side = if (col_f - col as f32) < 0.5 {
         Side::Left
     } else {
         Side::Right
     };
-    // y 是全客户区坐标:终端内容从 STRIP_H 起(窗口级布局,T7)
-    let py = py - strip_h() as i32;
-    let view_line = (py.max(0) as f32 / metrics.line_height).max(0.0) as usize;
+    let view_line = (py.max(0.0) / metrics.line_height).floor() as i32;
     (
-        Point::new(Line(view_line as i32 + display_offset as i32), Column(col)),
+        Point::new(Line(view_line - display_offset as i32), Column(col)),
         side,
     )
 }
@@ -5298,32 +5118,57 @@ fn search_key(vk: u32) -> bool {
 /// 通过模式判定的 token 的 (col, cells)——可点击路径常显下划线
 fn all_path_spans(text: &str, cell_of: &[usize]) -> Vec<(usize, usize)> {
     let bytes: Vec<char> = text.chars().collect();
-    let is_word = |c: char| {
+    let is_word = |i: usize| {
+        let c = bytes[i];
         c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+            // Combining characters belong to the preceding grid cell. Keep
+            // their exact spelling instead of splitting a Unicode filename.
+            || (i > 0 && cell_of.get(i).zip(cell_of.get(i-1)).is_some_and(|(a,b)| a == b))
     };
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if !is_word(bytes[i]) {
+        if !is_word(i) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < bytes.len() && is_word(bytes[i]) {
+        while i < bytes.len() && is_word(i) {
             i += 1;
         }
         let token: String = bytes[start..i].iter().collect();
         if normalize_path_token(&token).is_some() {
             let c0 = *cell_of.get(start).unwrap_or(&start);
-            let c1 = *cell_of.get(i.saturating_sub(1)).unwrap_or(&start);
-            out.push((c0, c1.saturating_sub(c0) + 1));
+            let end = cell_of
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| cell_of.get(i.saturating_sub(1)).copied().unwrap_or(c0) + 1);
+            out.push((c0, end.saturating_sub(c0)));
         }
     }
     out
 }
 
-fn hover_path_span(px: i32, py: i32) -> Option<(i32, usize, usize)> {
-    let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
+fn update_hover_path(px: i32, py: i32) -> bool {
+    let span = hover_path_span(px, py);
+    let changed = HOVER_PATH.with(|h| {
+        let mut old = h.borrow_mut();
+        if *old == span {
+            false
+        } else {
+            *old = span;
+            true
+        }
+    });
+    if changed && span.is_some() {
+        HOVER_ANIM.with(|a| a.set(0.0));
+        ensure_anim_timer();
+    }
+    changed
+}
+
+fn hover_path_span(px: i32, py: i32) -> Option<PathHover> {
+    let (pane_id, r) = active_pane_rects().into_iter().find(|(_, r)| {
         (px as f32) >= r.x
             && (px as f32) < r.x + r.w
             && (py as f32) >= r.y
@@ -5331,46 +5176,44 @@ fn hover_path_span(px: i32, py: i32) -> Option<(i32, usize, usize)> {
     })?;
     TABS.with(|tabs| {
         let guard = tabs.borrow();
-        let t = guard.get(ACTIVE.get())?.active_pane_ref()?;
-        let line =
-            ((py as f32 - r.y) / t.metrics.line_height) as i32 + t.term.display_offset() as i32;
-        let col = ((px as f32 - r.x) / t.metrics.cell_width) as usize;
-        let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), line);
-        detect_path_token(&text, &cell_of, col)?;
-        let (_, c0, cells) = span_of_token(&text, &cell_of, col)?;
-        Some((line, c0, cells))
+        let t = &guard
+            .get(ACTIVE.get())?
+            .panes
+            .iter()
+            .find(|p| p.id == pane_id)?
+            .terminal;
+        let (point, _) = px_to_buffer_point(
+            px as f32 - r.x,
+            py as f32 - r.y,
+            &t.metrics,
+            t.term.display_offset(),
+        );
+        if point.column.0 >= t.cols as usize
+            || point.line.0 + t.term.display_offset() as i32 >= t.rows as i32
+        {
+            return None;
+        }
+        let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), point.line.0);
+        let (column, cells) = span_of_token(&text, &cell_of, point.column.0)?;
+        Some(PathHover {
+            pane_id,
+            line: point.line.0,
+            column,
+            cells,
+        })
     })
 }
 
 /// 命中 token 的 (col_start, cell 宽):重扫一遍行找覆盖 cursor_col 的
 /// token 边界(detect 判定已过,这里只取几何)
-fn span_of_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<(i32, usize, usize)> {
-    let bytes: Vec<char> = text.chars().collect();
-    let is_word = |c: char| {
-        c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
-    };
-    let mut i = 0;
-    while i < bytes.len() {
-        if !is_word(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && is_word(bytes[i]) {
-            i += 1;
-        }
-        let covered: std::collections::HashSet<usize> = cell_of[start..i].iter().copied().collect();
-        if covered.contains(&cursor_col) {
-            let c0 = *cell_of.get(start).unwrap_or(&cursor_col);
-            let c1 = *cell_of.get(i.saturating_sub(1)).unwrap_or(&cursor_col);
-            return Some((c0 as i32, 0, c1.saturating_sub(c0) + 1));
-        }
-    }
-    None
+fn span_of_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<(usize, usize)> {
+    all_path_spans(text, cell_of)
+        .into_iter()
+        .find(|(start, width)| (*start..*start + *width).contains(&cursor_col))
 }
 
 fn link_at(px: i32, py: i32) -> Option<String> {
-    let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
+    let (pane_id, r) = active_pane_rects().into_iter().find(|(_, r)| {
         (px as f32) >= r.x
             && (px as f32) < r.x + r.w
             && (py as f32) >= r.y
@@ -5378,10 +5221,24 @@ fn link_at(px: i32, py: i32) -> Option<String> {
     })?;
     TABS.with(|tabs| {
         let guard = tabs.borrow();
-        let t = guard.get(ACTIVE.get())?.active_pane_ref()?;
-        let line =
-            ((py as f32 - r.y) / t.metrics.line_height) as i32 + t.term.display_offset() as i32;
-        let col = ((px as f32 - r.x) / t.metrics.cell_width) as usize;
+        let t = &guard
+            .get(ACTIVE.get())?
+            .panes
+            .iter()
+            .find(|p| p.id == pane_id)?
+            .terminal;
+        let (point, _) = px_to_buffer_point(
+            px as f32 - r.x,
+            py as f32 - r.y,
+            &t.metrics,
+            t.term.display_offset(),
+        );
+        if point.column.0 >= t.cols as usize
+            || point.line.0 + t.term.display_offset() as i32 >= t.rows as i32
+        {
+            return None;
+        }
+        let (line, col) = (point.line.0, point.column.0);
         if let Some(l) = t.term.grid()[Line(line)][Column(col)].hyperlink() {
             return Some(l.uri().to_string());
         }
@@ -5419,25 +5276,32 @@ fn path_at_in_row(
 /// 定位剥离(:line[:col])→ 光标覆盖判定
 fn detect_path_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<String> {
     let bytes: Vec<char> = text.chars().collect();
-    let is_word = |c: char| {
+    let is_word = |i: usize| {
+        let c = bytes[i];
         c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+            // Combining characters belong to the preceding grid cell. Keep
+            // their exact spelling instead of splitting a Unicode filename.
+            || (i > 0 && cell_of.get(i).zip(cell_of.get(i-1)).is_some_and(|(a,b)| a == b))
     };
     let mut i = 0;
     while i < bytes.len() {
-        if !is_word(bytes[i]) {
+        if !is_word(i) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < bytes.len() && is_word(bytes[i]) {
+        while i < bytes.len() && is_word(i) {
             i += 1;
         }
         let token: String = bytes[start..i].iter().collect();
         if let Some(path) = normalize_path_token(&token) {
             // 光标落在 token 覆盖区(宽字符 token 的 cell 映射收缩)
-            let covered: std::collections::HashSet<usize> =
-                cell_of[start..i].iter().copied().collect();
-            if covered.contains(&cursor_col) {
+            let first = cell_of[start];
+            let end = cell_of
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| cell_of[i - 1] + 1);
+            if (first..end).contains(&cursor_col) {
                 return Some(path);
             }
         }
@@ -5448,6 +5312,9 @@ fn detect_path_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option
 /// token → 文件系统路径:剥离尾部 :line[:col],按模式判定是否路径。
 /// None = 不是路径(误报防线)
 fn normalize_path_token(token: &str) -> Option<String> {
+    if token.contains("://") {
+        return None;
+    }
     // 剥离 :N[:N] 定位后缀(仅当剩余部分像路径)
     let mut path = token;
     let mut num = 0;
@@ -5510,6 +5377,11 @@ fn remap_mods(mods: Mods) -> Mods {
     KEY_REMAP.with(|r| r.borrow().iter().fold(mods, |m, rm| rm.apply(m)))
 }
 
+// All other paste shortcuts belong to the configurable keymap.
+fn contextual_paste(mods: Mods, vk: u32) -> bool {
+    mods.ctrl && !mods.alt && !mods.shift && !mods.win && vk == 'V' as u32
+}
+
 fn current_mods() -> Mods {
     unsafe {
         let down = |vk: VIRTUAL_KEY| GetKeyState(vk.0 as i32) < 0;
@@ -5525,6 +5397,151 @@ fn current_mods() -> Mods {
 #[cfg(test)]
 mod tests {
     use super::{FrameSched, detect_path_token, frame_sched, normalize_path_token, pretty_title};
+
+    #[test]
+    fn exact_pixel_window_size_overrides_cell_dimensions() {
+        let settings = mica_core::config::settings::resolve(
+            "window-size-pixels = 2032,1041\nwindow-width = 10\nwindow-height = 4",
+        )
+        .unwrap();
+        let metrics = mica_render::font::metrics::FontMetrics {
+            cell_width: 10.0,
+            line_height: 20.0,
+            ascent: 15.0,
+            descent: 5.0,
+        };
+        let rect = super::initial_window_rect(&settings, &metrics);
+        assert_eq!((rect.right, rect.bottom), (2032, 1041));
+    }
+
+    #[test]
+    fn footer_scissor_includes_last_terminal_row_below_header() {
+        let rect = mica_core::layout::Rect::new(3.0, 51.0, 794.0, 746.0);
+        let (x, y, w, h) = super::pane_scissor(rect, (800.0, 752.0), 48.0);
+        assert_eq!((x, y, w, h), (3, 51, 794, 746));
+        assert_eq!(
+            y + h,
+            797,
+            "last row must not be clipped by a second header subtraction"
+        );
+    }
+
+    #[test]
+    fn hovered_path_span_keeps_nonzero_start_column() {
+        let text = "open C:/src/main.rs:12 now";
+        let columns: Vec<usize> = (0..text.chars().count()).collect();
+        let (start, cells) = super::span_of_token(text, &columns, 10).unwrap();
+        assert_eq!((start, cells), (5, 17));
+    }
+
+    #[test]
+    fn pane_local_pointer_does_not_subtract_header_and_history_is_negative() {
+        let metrics = mica_render::font::metrics::FontMetrics {
+            cell_width: 10.0,
+            line_height: 20.0,
+            ascent: 15.0,
+            descent: 5.0,
+        };
+        let (point, _) = super::px_to_buffer_point(25.0, 25.0, &metrics, 5);
+        assert_eq!(point.column.0, 2);
+        assert_eq!(point.line.0, -4);
+    }
+
+    #[test]
+    fn path_span_and_hit_testing_follow_wide_cells_and_scrolled_pane() {
+        let mut surface =
+            mica_core::surface::Surface::new(mica_core::surface::ScreenSize::new(32, 3));
+        surface.feed("你好 C:/文件/main.rs".as_bytes());
+        let (text, columns) = mica_render::frame::row_string(surface.grid(), 0);
+        let (start, cells) = super::span_of_token(&text, &columns, 9).unwrap();
+        assert_eq!(start, 5);
+        assert_eq!(cells, 15);
+        // Both columns of the final wide filename character are part of the path.
+        assert_eq!(
+            super::detect_path_token(&text, &columns, 11).as_deref(),
+            Some("C:\\文件\\main.rs")
+        );
+        let metrics = mica_render::font::metrics::FontMetrics {
+            cell_width: 10.0,
+            line_height: 20.0,
+            ascent: 15.0,
+            descent: 5.0,
+        };
+        let pane = mica_core::layout::Rect::new(200.5, 90.5, 320.0, 60.0);
+        let hover = super::PathHover {
+            pane_id: 42,
+            line: -2,
+            column: start,
+            cells,
+        };
+        let rect = super::path_hover_rect(hover, 42, pane, &metrics, 3, 3).unwrap();
+        assert_eq!(
+            (rect.x, rect.y, rect.w, rect.h),
+            (250.5, 110.5, 150.0, 20.0)
+        );
+        assert!(super::path_hover_rect(hover, 99, pane, &metrics, 3, 3).is_none());
+        let (point, _) =
+            super::px_to_buffer_point(rect.x - pane.x + 1.0, rect.y - pane.y + 1.0, &metrics, 3);
+        assert_eq!((point.line.0, point.column.0), (-2, start));
+        assert_eq!(
+            super::normalize_path_token("https://example.test/a.rs"),
+            None
+        );
+    }
+
+    #[test]
+    fn path_spans_do_not_include_wrap_placeholder_and_keep_combining_marks() {
+        let mut surface =
+            mica_core::surface::Surface::new(mica_core::surface::ScreenSize::new(10, 2));
+        surface.feed("C:/foobar中".as_bytes());
+        let (text, columns) = mica_render::frame::row_string(surface.grid(), 0);
+        assert_eq!(super::all_path_spans(&text, &columns), vec![(0, 9)]);
+        assert!(super::detect_path_token(&text, &columns, 9).is_none());
+        let mut surface =
+            mica_core::surface::Surface::new(mica_core::surface::ScreenSize::new(24, 2));
+        surface.feed("C:/cafe\u{0301}.rs".as_bytes());
+        let (text, columns) = mica_render::frame::row_string(surface.grid(), 0);
+        assert_eq!(
+            super::detect_path_token(&text, &columns, 6).as_deref(),
+            Some("C:\\cafe\u{0301}.rs")
+        );
+        assert_eq!(super::span_of_token(&text, &columns, 6), Some((0, 10)));
+    }
+
+    #[test]
+    fn clearing_keymap_does_not_leave_a_shift_insert_paste_fallback() {
+        let mods = mica_core::input::Mods {
+            shift: true,
+            ..Default::default()
+        };
+        let settings = mica_core::config::settings::resolve("keybind = clear").unwrap();
+        assert_eq!(
+            settings
+                .keymap
+                .lookup(mods, mica_core::keymap::TriggerKey::Insert),
+            None
+        );
+        assert!(!super::contextual_paste(mods, 0x2d));
+        let ctrl = mica_core::input::Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert!(super::contextual_paste(ctrl, 'V' as u32));
+    }
+
+    #[test]
+    fn explicit_profile_overrides_configured_command_and_reset_restores_default() {
+        let previous = super::SESSION_COMMAND.with(|s| s.replace(Some("pwsh.exe -NoLogo".into())));
+        assert_eq!(super::launch_command(None), "pwsh.exe -NoLogo");
+        let profile = mica_core::profile::Profile {
+            name: "Command Prompt".into(),
+            command: "cmd.exe".into(),
+        };
+        assert_eq!(super::launch_command(Some(&profile)), "cmd.exe");
+        super::SESSION_COMMAND.with(|s| s.replace(None));
+        assert_eq!(super::launch_command(None), "powershell.exe -NoLogo");
+        super::SESSION_COMMAND.with(|s| s.replace(previous));
+    }
 
     /// 标题呈现:exe 路径 basename 去扩展(Ghostty direct-command argv[0]
     /// 的 Windows 适配);普通 OSC 标题原样(nvim / user@host:cwd)
