@@ -395,6 +395,33 @@ pub(crate) mod quickterm;
 pub mod uia;
 pub mod window_registry; // pub:tests 直入(真窗口生命周期回归,T04)
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PathHover {
+    pane_id: u64,
+    line: i32,
+    column: usize,
+    cells: usize,
+}
+
+fn path_hover_rect(
+    hover: PathHover,
+    pane_id: u64,
+    rect: mica_core::layout::Rect,
+    metrics: &FontMetrics,
+    offset: usize,
+    rows: u16,
+) -> Option<mica_core::layout::Rect> {
+    let view = hover.line + offset as i32;
+    (hover.pane_id == pane_id && (0..i32::from(rows)).contains(&view)).then(|| {
+        mica_core::layout::Rect::new(
+            rect.x + hover.column as f32 * metrics.cell_width,
+            rect.y + view as f32 * metrics.line_height,
+            hover.cells as f32 * metrics.cell_width,
+            metrics.line_height,
+        )
+    })
+}
+
 thread_local! {
     static GPU: RefCell<Option<WindowGpu>> = const { RefCell::new(None) };
     static TABS: RefCell<Vec<TabState>> = const { RefCell::new(Vec::new()) };
@@ -525,7 +552,7 @@ thread_local! {
         const { RefCell::new(None) };
     /// #58 悬停路径 span(buffer 行,列,格宽):即时下划线的数据源;
     /// None = 光标不在路径上(WM_MOUSEMOVE 每次刷新,替代 300ms 气泡)
-    static HOVER_PATH: RefCell<Option<(i32, usize, usize)>> =
+    static HOVER_PATH: RefCell<Option<PathHover>> =
         const { RefCell::new(None) };
     /// #58 悬停反色动画相位(0 = 2px 下划线,1 = 整块):进入/换路径时
     /// 归零,timer 5 推进(120ms ease-out)——"从下划线滑成整块"
@@ -2004,6 +2031,24 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
     );
 }
 
+// Scissors use attachment coordinates. Restore the fixed header offset when
+// converting content height to the full client viewport extent.
+fn pane_scissor(
+    rect: mica_core::layout::Rect,
+    content_size: (f32, f32),
+    content_top: f32,
+) -> (u32, u32, u32, u32) {
+    let sx = rect.x.max(0.0).round() as u32;
+    let sy = rect.y.max(0.0).round() as u32;
+    let sw = ((rect.x + rect.w).round() as u32)
+        .min(content_size.0 as u32)
+        .saturating_sub(sx);
+    let sh_r = ((rect.y + rect.h).round() as u32)
+        .min((content_size.1 + content_top) as u32)
+        .saturating_sub(sy);
+    (sx, sy, sw, sh_r)
+}
+
 /// T05 一次绘制批:pane id + scissor 矩形(px)+ 实例(该 pane 的图集批)
 struct PaneBatch {
     pane_id: u64,
@@ -2183,16 +2228,47 @@ fn draw_frame() {
                 inst.pos_uv[1] += rect.y;
                 insts.push(inst);
             }
+            if let Some(hover) = HOVER_PATH.with(|h| *h.borrow())
+                && let Some(hl) = path_hover_rect(
+                    hover,
+                    pane.id,
+                    rect,
+                    &t.metrics,
+                    t.term.display_offset(),
+                    t.rows,
+                )
+            {
+                let phase = HOVER_ANIM.with(std::cell::Cell::get);
+                let hh = 2.0 + (hl.h - 2.0) * (1.0 - (1.0 - phase).powi(3));
+                let y = hl.y + hl.h - hh;
+                let c = t.palette.colors[12];
+                let color = [
+                    c.r as f32 / 255.0,
+                    c.g as f32 / 255.0,
+                    c.b as f32 / 255.0,
+                    0.0,
+                ];
+                for inst in &mut insts {
+                    // Quantised cell positions can differ by a few ulps at
+                    // shared edges. A mere touching edge must not tint a neighbour.
+                    if (inst.pos_uv[0] + inst.size_uv[0]).min(hl.x + hl.w)
+                        - inst.pos_uv[0].max(hl.x)
+                        > 0.01
+                        && (inst.pos_uv[1] + inst.size_uv[1]).min(y + hh) - inst.pos_uv[1].max(y)
+                            > 0.01
+                    {
+                        inst.fg = if inst.size_uv[2] > 0.0 {
+                            [0.05, 0.05, 0.05, 0.0]
+                        } else {
+                            color
+                        };
+                        inst.bg = color;
+                    }
+                }
+            }
             // scissor = pane 矩形(像素,钳到视口):宽字/光标越界不再
             // 污染邻 pane;draw_batch 内还会对帧视口再钳一次
-            let sx = rect.x.max(0.0).round() as u32;
-            let sy = rect.y.max(0.0).round() as u32;
-            let sw = ((rect.x + rect.w).round() as u32)
-                .min(area_w as u32)
-                .saturating_sub(sx);
-            let sh_r = ((rect.y + rect.h).round() as u32)
-                .min(area_h as u32)
-                .saturating_sub(sy);
+            let (sx, sy, sw, sh_r) = pane_scissor(rect, (area_w, area_h), sh);
             pane_batches.push(PaneBatch {
                 pane_id: pane.id,
                 scissor: (sx, sy, sw, sh_r),
@@ -2518,57 +2594,6 @@ fn draw_frame() {
                 }
             }
         }
-        // #58 悬停路径高亮(二版,用户点名"浅色转深色更清晰"):选中反色
-        // 式——浅蓝底 + 深色字,与搜索当前命中(黄底黑字)同款形制。
-        // 做法与搜索 hit_rects 相同:矩形相交的实例直接改色
-        if let Some((line, col, cells)) = HOVER_PATH.with(|h| *h.borrow()) {
-            let offset = t.term.display_offset() as i32;
-            let view = line + offset;
-            if (0..t.rows as i32).contains(&view)
-                && let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
-            {
-                let hx = pr.x + col as f32 * t.metrics.cell_width;
-                let hy_full = pr.y + view as f32 * t.metrics.line_height;
-                let hw = cells as f32 * t.metrics.cell_width;
-                let lh = t.metrics.line_height;
-                // 动画:相位 0 → 2px 底线,相位 1 → 整行;ease-out cubic
-                let a = HOVER_ANIM.with(std::cell::Cell::get);
-                let ease = 1.0 - (1.0 - a).powi(3);
-                let hh = 2.0 + (lh - 2.0) * ease;
-                let hy = hy_full + lh - hh; // 自底向上长
-                let bc = t.palette.colors[12];
-                let hl = [
-                    bc.r as f32 / 255.0,
-                    bc.g as f32 / 255.0,
-                    bc.b as f32 / 255.0,
-                    0.0,
-                ];
-                let ink_dark = [0.05, 0.05, 0.05, 0.0];
-                // T05:高亮后期处理遍历各 pane 批次实例(原 all_instances)
-                for batch in pane_batches.iter_mut() {
-                    let batch_insts = &mut batch.insts;
-                    for inst in batch_insts.iter_mut() {
-                        let (ix, iy, iw, ih) = (
-                            inst.pos_uv[0],
-                            inst.pos_uv[1],
-                            inst.size_uv[0],
-                            inst.size_uv[1],
-                        );
-                        if ix < hx + hw && ix + iw > hx && iy < hy + hh && iy + ih > hy {
-                            if inst.size_uv[2] > 0.0 {
-                                // 字形 quad:墨色改近黑(浅蓝底可读)
-                                inst.fg = ink_dark;
-                                inst.bg = hl;
-                            } else {
-                                // 背景 quad:整块换高亮色
-                                inst.fg = hl;
-                                inst.bg = hl;
-                            }
-                        }
-                    }
-                }
-            }
-        }
         // #57 搜索 overlay 最后拼 = 最上层(盖在终端内容之上)
         strip.extend(search_overlay);
         // strip/overlay 与焦点 pane 同源图集(strip_router 共享终端图集,
@@ -2589,7 +2614,7 @@ fn draw_frame() {
         }
         for batch in &pane_batches {
             let (pane_id, scissor, insts) = (&batch.pane_id, &batch.scissor, &batch.insts);
-            if insts.is_empty() {
+            if insts.is_empty() || scissor.2 == 0 || scissor.3 == 0 {
                 continue;
             }
             TABS.with(|tabs| {
@@ -3029,8 +3054,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(t) = tab.pane_by_id(*pid).map(|p| &mut p.terminal) {
                         let offset = t.term.display_offset();
                         let (point, side) = px_to_buffer_point(
-                            px - r.x as i32,
-                            py - r.y as i32,
+                            px as f32 - r.x,
+                            py as f32 - r.y,
                             &t.metrics,
                             offset,
                         );
@@ -3157,20 +3182,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 });
                 // #58 路径悬停 span 实时算(单行扫描,轻):即时下划线;
                 // 路径上抑制气泡(旧 300ms 气泡循环 = 用户实报鼠标区闪烁)
-                let path_span = hover_path_span(hx, hy);
-                let path_changed = HOVER_PATH.with(|h| {
-                    let old = *h.borrow();
-                    if old != path_span {
-                        *h.borrow_mut() = path_span;
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if path_changed && path_span.is_some() {
-                    HOVER_ANIM.with(|a| a.set(0.0)); // 进入/换路径:下划线起步
-                    ensure_anim_timer();
-                }
+                let path_changed = update_hover_path(hx, hy);
                 if strip_changed || path_changed {
                     draw_frame();
                 }
@@ -3197,7 +3209,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 {
                     let offset = t.term.display_offset();
                     let (point, side) =
-                        px_to_buffer_point(px - r.x as i32, py - r.y as i32, &t.metrics, offset);
+                        px_to_buffer_point(px as f32 - r.x, py as f32 - r.y, &t.metrics, offset);
                     t.term.selection_update(point, side);
                     t.force_full = true;
                 }
@@ -3210,6 +3222,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             HOVER_ARMED.with(|a| a.set(false));
             arm_hover(hwnd);
             let (px, py) = mouse_xy(lparam);
+            let path_changed = update_hover_path(px, py);
             // #58:路径上用即时下划线(WM_MOUSEMOVE 算的 HOVER_PATH),
             // 气泡退役——300ms 循环 + 锚点跟随是鼠标区闪烁的来源
             let url = if HOVER_PATH.with(|h| h.borrow().is_some()) {
@@ -3240,7 +3253,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     false
                 }
             });
-            if changed || hover_changed {
+            if changed || hover_changed || path_changed {
                 draw_frame();
             }
             LRESULT(0)
@@ -3403,24 +3416,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     SelectionType::Semantic
                 }
             };
-            TABS.with(|tabs| {
-                if let Some(t) = tabs
-                    .borrow_mut()
-                    .get_mut(ACTIVE.get())
-                    .and_then(|tab| tab.active_pane())
-                {
-                    let offset = t.term.display_offset();
-                    let (point, side) = px_to_buffer_point(px, py, &t.metrics, offset);
-                    t.term.selection_begin(ty, point, side);
-                    t.force_full = true;
-                }
-            });
+            let rects = active_pane_rects();
+            if let Some((pane_id, rect)) = rects.into_iter().find(|(_, r)| {
+                px as f32 >= r.x
+                    && (px as f32) < r.x + r.w
+                    && py as f32 >= r.y
+                    && (py as f32) < r.y + r.h
+            }) {
+                TABS.with(|tabs| {
+                    let mut tabs = tabs.borrow_mut();
+                    if let Some(tab) = tabs.get_mut(ACTIVE.get())
+                        && let Some(index) = tab.panes.iter().position(|p| p.id == pane_id)
+                    {
+                        tab.focused = index;
+                        let t = &mut tab.panes[index].terminal;
+                        let (point, side) = px_to_buffer_point(
+                            px as f32 - rect.x,
+                            py as f32 - rect.y,
+                            &t.metrics,
+                            t.term.display_offset(),
+                        );
+                        t.term.selection_begin(ty, point, side);
+                        t.force_full = true;
+                    }
+                });
+            }
             MOUSE_DOWN.with(|m| m.set(true));
             let _ = SetCapture(hwnd);
             draw_frame();
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
+            HOVER_PATH.with(|h| h.borrow_mut().take());
+            HOVER_URL.with(|h| h.borrow_mut().take());
             // 高位有符号 delta,120/格;WT 惯例 3 行/格(=delta/40)。
             // delta 正 = 滚轮向上 = 看历史(上游 Scroll::Delta 正值增 offset)
             let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
@@ -4801,23 +4829,21 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
 /// 客户区像素 → buffer 坐标点(视口行 + display_offset)与半格侧别。
 /// 拖出上/左边缘夹到 0(捕获期间 WM_MOUSEMOVE 仍投递,坐标可为负)。
 fn px_to_buffer_point(
-    px: i32,
-    py: i32,
+    px: f32,
+    py: f32,
     metrics: &FontMetrics,
     display_offset: usize,
 ) -> (Point, Side) {
-    let col_f = (px.max(0) as f32 / metrics.cell_width).max(0.0);
+    let col_f = (px.max(0.0) / metrics.cell_width).max(0.0);
     let col = col_f as usize;
     let side = if (col_f - col as f32) < 0.5 {
         Side::Left
     } else {
         Side::Right
     };
-    // y 是全客户区坐标:终端内容从 STRIP_H 起(窗口级布局,T7)
-    let py = py - strip_h() as i32;
-    let view_line = (py.max(0) as f32 / metrics.line_height).max(0.0) as usize;
+    let view_line = (py.max(0.0) / metrics.line_height).floor() as i32;
     (
-        Point::new(Line(view_line as i32 + display_offset as i32), Column(col)),
+        Point::new(Line(view_line - display_offset as i32), Column(col)),
         side,
     )
 }
@@ -5076,32 +5102,57 @@ fn search_key(vk: u32) -> bool {
 /// 通过模式判定的 token 的 (col, cells)——可点击路径常显下划线
 fn all_path_spans(text: &str, cell_of: &[usize]) -> Vec<(usize, usize)> {
     let bytes: Vec<char> = text.chars().collect();
-    let is_word = |c: char| {
+    let is_word = |i: usize| {
+        let c = bytes[i];
         c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+            // Combining characters belong to the preceding grid cell. Keep
+            // their exact spelling instead of splitting a Unicode filename.
+            || (i > 0 && cell_of.get(i).zip(cell_of.get(i-1)).is_some_and(|(a,b)| a == b))
     };
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if !is_word(bytes[i]) {
+        if !is_word(i) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < bytes.len() && is_word(bytes[i]) {
+        while i < bytes.len() && is_word(i) {
             i += 1;
         }
         let token: String = bytes[start..i].iter().collect();
         if normalize_path_token(&token).is_some() {
             let c0 = *cell_of.get(start).unwrap_or(&start);
-            let c1 = *cell_of.get(i.saturating_sub(1)).unwrap_or(&start);
-            out.push((c0, c1.saturating_sub(c0) + 1));
+            let end = cell_of
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| cell_of.get(i.saturating_sub(1)).copied().unwrap_or(c0) + 1);
+            out.push((c0, end.saturating_sub(c0)));
         }
     }
     out
 }
 
-fn hover_path_span(px: i32, py: i32) -> Option<(i32, usize, usize)> {
-    let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
+fn update_hover_path(px: i32, py: i32) -> bool {
+    let span = hover_path_span(px, py);
+    let changed = HOVER_PATH.with(|h| {
+        let mut old = h.borrow_mut();
+        if *old == span {
+            false
+        } else {
+            *old = span;
+            true
+        }
+    });
+    if changed && span.is_some() {
+        HOVER_ANIM.with(|a| a.set(0.0));
+        ensure_anim_timer();
+    }
+    changed
+}
+
+fn hover_path_span(px: i32, py: i32) -> Option<PathHover> {
+    let (pane_id, r) = active_pane_rects().into_iter().find(|(_, r)| {
         (px as f32) >= r.x
             && (px as f32) < r.x + r.w
             && (py as f32) >= r.y
@@ -5109,46 +5160,44 @@ fn hover_path_span(px: i32, py: i32) -> Option<(i32, usize, usize)> {
     })?;
     TABS.with(|tabs| {
         let guard = tabs.borrow();
-        let t = guard.get(ACTIVE.get())?.active_pane_ref()?;
-        let line =
-            ((py as f32 - r.y) / t.metrics.line_height) as i32 + t.term.display_offset() as i32;
-        let col = ((px as f32 - r.x) / t.metrics.cell_width) as usize;
-        let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), line);
-        detect_path_token(&text, &cell_of, col)?;
-        let (_, c0, cells) = span_of_token(&text, &cell_of, col)?;
-        Some((line, c0, cells))
+        let t = &guard
+            .get(ACTIVE.get())?
+            .panes
+            .iter()
+            .find(|p| p.id == pane_id)?
+            .terminal;
+        let (point, _) = px_to_buffer_point(
+            px as f32 - r.x,
+            py as f32 - r.y,
+            &t.metrics,
+            t.term.display_offset(),
+        );
+        if point.column.0 >= t.cols as usize
+            || point.line.0 + t.term.display_offset() as i32 >= t.rows as i32
+        {
+            return None;
+        }
+        let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), point.line.0);
+        let (column, cells) = span_of_token(&text, &cell_of, point.column.0)?;
+        Some(PathHover {
+            pane_id,
+            line: point.line.0,
+            column,
+            cells,
+        })
     })
 }
 
 /// 命中 token 的 (col_start, cell 宽):重扫一遍行找覆盖 cursor_col 的
 /// token 边界(detect 判定已过,这里只取几何)
-fn span_of_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<(i32, usize, usize)> {
-    let bytes: Vec<char> = text.chars().collect();
-    let is_word = |c: char| {
-        c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
-    };
-    let mut i = 0;
-    while i < bytes.len() {
-        if !is_word(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && is_word(bytes[i]) {
-            i += 1;
-        }
-        let covered: std::collections::HashSet<usize> = cell_of[start..i].iter().copied().collect();
-        if covered.contains(&cursor_col) {
-            let c0 = *cell_of.get(start).unwrap_or(&cursor_col);
-            let c1 = *cell_of.get(i.saturating_sub(1)).unwrap_or(&cursor_col);
-            return Some((c0 as i32, 0, c1.saturating_sub(c0) + 1));
-        }
-    }
-    None
+fn span_of_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<(usize, usize)> {
+    all_path_spans(text, cell_of)
+        .into_iter()
+        .find(|(start, width)| (*start..*start + *width).contains(&cursor_col))
 }
 
 fn link_at(px: i32, py: i32) -> Option<String> {
-    let (_, r) = active_pane_rects().into_iter().find(|(_, r)| {
+    let (pane_id, r) = active_pane_rects().into_iter().find(|(_, r)| {
         (px as f32) >= r.x
             && (px as f32) < r.x + r.w
             && (py as f32) >= r.y
@@ -5156,10 +5205,24 @@ fn link_at(px: i32, py: i32) -> Option<String> {
     })?;
     TABS.with(|tabs| {
         let guard = tabs.borrow();
-        let t = guard.get(ACTIVE.get())?.active_pane_ref()?;
-        let line =
-            ((py as f32 - r.y) / t.metrics.line_height) as i32 + t.term.display_offset() as i32;
-        let col = ((px as f32 - r.x) / t.metrics.cell_width) as usize;
+        let t = &guard
+            .get(ACTIVE.get())?
+            .panes
+            .iter()
+            .find(|p| p.id == pane_id)?
+            .terminal;
+        let (point, _) = px_to_buffer_point(
+            px as f32 - r.x,
+            py as f32 - r.y,
+            &t.metrics,
+            t.term.display_offset(),
+        );
+        if point.column.0 >= t.cols as usize
+            || point.line.0 + t.term.display_offset() as i32 >= t.rows as i32
+        {
+            return None;
+        }
+        let (line, col) = (point.line.0, point.column.0);
         if let Some(l) = t.term.grid()[Line(line)][Column(col)].hyperlink() {
             return Some(l.uri().to_string());
         }
@@ -5197,25 +5260,32 @@ fn path_at_in_row(
 /// 定位剥离(:line[:col])→ 光标覆盖判定
 fn detect_path_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option<String> {
     let bytes: Vec<char> = text.chars().collect();
-    let is_word = |c: char| {
+    let is_word = |i: usize| {
+        let c = bytes[i];
         c.is_alphanumeric() || matches!(c, '.' | '/' | '\\' | ':' | '_' | '-' | '+' | '@')
+            // Combining characters belong to the preceding grid cell. Keep
+            // their exact spelling instead of splitting a Unicode filename.
+            || (i > 0 && cell_of.get(i).zip(cell_of.get(i-1)).is_some_and(|(a,b)| a == b))
     };
     let mut i = 0;
     while i < bytes.len() {
-        if !is_word(bytes[i]) {
+        if !is_word(i) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < bytes.len() && is_word(bytes[i]) {
+        while i < bytes.len() && is_word(i) {
             i += 1;
         }
         let token: String = bytes[start..i].iter().collect();
         if let Some(path) = normalize_path_token(&token) {
             // 光标落在 token 覆盖区(宽字符 token 的 cell 映射收缩)
-            let covered: std::collections::HashSet<usize> =
-                cell_of[start..i].iter().copied().collect();
-            if covered.contains(&cursor_col) {
+            let first = cell_of[start];
+            let end = cell_of
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| cell_of[i - 1] + 1);
+            if (first..end).contains(&cursor_col) {
                 return Some(path);
             }
         }
@@ -5226,6 +5296,9 @@ fn detect_path_token(text: &str, cell_of: &[usize], cursor_col: usize) -> Option
 /// token → 文件系统路径:剥离尾部 :line[:col],按模式判定是否路径。
 /// None = 不是路径(误报防线)
 fn normalize_path_token(token: &str) -> Option<String> {
+    if token.contains("://") {
+        return None;
+    }
     // 剥离 :N[:N] 定位后缀(仅当剩余部分像路径)
     let mut path = token;
     let mut num = 0;
@@ -5308,6 +5381,100 @@ fn current_mods() -> Mods {
 #[cfg(test)]
 mod tests {
     use super::{FrameSched, detect_path_token, frame_sched, normalize_path_token, pretty_title};
+
+    #[test]
+    fn footer_scissor_includes_last_terminal_row_below_header() {
+        let rect = mica_core::layout::Rect::new(3.0, 51.0, 794.0, 746.0);
+        let (x, y, w, h) = super::pane_scissor(rect, (800.0, 752.0), 48.0);
+        assert_eq!((x, y, w, h), (3, 51, 794, 746));
+        assert_eq!(
+            y + h,
+            797,
+            "last row must not be clipped by a second header subtraction"
+        );
+    }
+
+    #[test]
+    fn hovered_path_span_keeps_nonzero_start_column() {
+        let text = "open C:/src/main.rs:12 now";
+        let columns: Vec<usize> = (0..text.chars().count()).collect();
+        let (start, cells) = super::span_of_token(text, &columns, 10).unwrap();
+        assert_eq!((start, cells), (5, 17));
+    }
+
+    #[test]
+    fn pane_local_pointer_does_not_subtract_header_and_history_is_negative() {
+        let metrics = mica_render::font::metrics::FontMetrics {
+            cell_width: 10.0,
+            line_height: 20.0,
+            ascent: 15.0,
+            descent: 5.0,
+        };
+        let (point, _) = super::px_to_buffer_point(25.0, 25.0, &metrics, 5);
+        assert_eq!(point.column.0, 2);
+        assert_eq!(point.line.0, -4);
+    }
+
+    #[test]
+    fn path_span_and_hit_testing_follow_wide_cells_and_scrolled_pane() {
+        let mut surface =
+            mica_core::surface::Surface::new(mica_core::surface::ScreenSize::new(32, 3));
+        surface.feed("你好 C:/文件/main.rs".as_bytes());
+        let (text, columns) = mica_render::frame::row_string(surface.grid(), 0);
+        let (start, cells) = super::span_of_token(&text, &columns, 9).unwrap();
+        assert_eq!(start, 5);
+        assert_eq!(cells, 15);
+        // Both columns of the final wide filename character are part of the path.
+        assert_eq!(
+            super::detect_path_token(&text, &columns, 11).as_deref(),
+            Some("C:\\文件\\main.rs")
+        );
+        let metrics = mica_render::font::metrics::FontMetrics {
+            cell_width: 10.0,
+            line_height: 20.0,
+            ascent: 15.0,
+            descent: 5.0,
+        };
+        let pane = mica_core::layout::Rect::new(200.5, 90.5, 320.0, 60.0);
+        let hover = super::PathHover {
+            pane_id: 42,
+            line: -2,
+            column: start,
+            cells,
+        };
+        let rect = super::path_hover_rect(hover, 42, pane, &metrics, 3, 3).unwrap();
+        assert_eq!(
+            (rect.x, rect.y, rect.w, rect.h),
+            (250.5, 110.5, 150.0, 20.0)
+        );
+        assert!(super::path_hover_rect(hover, 99, pane, &metrics, 3, 3).is_none());
+        let (point, _) =
+            super::px_to_buffer_point(rect.x - pane.x + 1.0, rect.y - pane.y + 1.0, &metrics, 3);
+        assert_eq!((point.line.0, point.column.0), (-2, start));
+        assert_eq!(
+            super::normalize_path_token("https://example.test/a.rs"),
+            None
+        );
+    }
+
+    #[test]
+    fn path_spans_do_not_include_wrap_placeholder_and_keep_combining_marks() {
+        let mut surface =
+            mica_core::surface::Surface::new(mica_core::surface::ScreenSize::new(10, 2));
+        surface.feed("C:/foobar中".as_bytes());
+        let (text, columns) = mica_render::frame::row_string(surface.grid(), 0);
+        assert_eq!(super::all_path_spans(&text, &columns), vec![(0, 9)]);
+        assert!(super::detect_path_token(&text, &columns, 9).is_none());
+        let mut surface =
+            mica_core::surface::Surface::new(mica_core::surface::ScreenSize::new(24, 2));
+        surface.feed("C:/cafe\u{0301}.rs".as_bytes());
+        let (text, columns) = mica_render::frame::row_string(surface.grid(), 0);
+        assert_eq!(
+            super::detect_path_token(&text, &columns, 6).as_deref(),
+            Some("C:\\cafe\u{0301}.rs")
+        );
+        assert_eq!(super::span_of_token(&text, &columns, 6), Some((0, 10)));
+    }
 
     #[test]
     fn clearing_keymap_does_not_leave_a_shift_insert_paste_fallback() {

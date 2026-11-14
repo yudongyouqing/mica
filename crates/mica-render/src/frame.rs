@@ -497,23 +497,29 @@ pub enum CaptionBtn {
 }
 
 /// 整行文本提取(#58 可点击路径 / 未来搜索共用):字符拼串 + 字符→格
-/// 下标映射(WIDE_CHAR 占 2 格)。line 为 buffer 行(i32,负 = 历史)。
+/// 边界映射(每字符起始列,末项为行尾列)。续格不产字符,组合符共用列。
+/// line 为 buffer 行(i32,负 = 历史)。
 pub fn row_string(grid: &Grid<Cell>, line: i32) -> (String, Vec<usize>) {
     let cols = grid.columns();
     let mut text = String::with_capacity(cols);
-    let mut cell_of = Vec::with_capacity(cols);
+    let mut cell_of = Vec::with_capacity(cols + 1);
     for c in 0..cols {
         let cell = &grid[Line(line)][Column(c)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
         text.push(cell.c);
-        let w = if cell.flags.contains(Flags::WIDE_CHAR) {
-            2
-        } else {
-            1
-        };
-        for _ in 0..w {
-            cell_of.push(c);
+        cell_of.push(c);
+        if let Some(extra) = cell.zerowidth() {
+            for ch in extra {
+                text.push(*ch);
+                cell_of.push(c);
+            }
         }
     }
+    // Character boundaries, including the end of the row. The next boundary
+    // gives the full terminal width of a wide character, including its spacer.
+    cell_of.push(cols);
     (text, cell_of)
 }
 
@@ -1572,6 +1578,18 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CellInstance, size_uv), 16);
         assert_eq!(std::mem::offset_of!(CellInstance, fg), 32);
         assert_eq!(std::mem::offset_of!(CellInstance, bg), 48);
+    }
+
+    #[test]
+    fn row_string_maps_unicode_characters_once_and_keeps_end_boundary() {
+        let mut surface =
+            mica_core::surface::Surface::new(mica_core::surface::ScreenSize::new(28, 2));
+        surface.feed("你😀 C:/src/文件.rs".as_bytes());
+        let (text, columns) = row_string(surface.grid(), 0);
+        assert!(text.starts_with("你😀 C:/src/文件.rs"), "{text:?}");
+        assert_eq!(columns.len(), text.chars().count() + 1);
+        assert_eq!(&columns[..5], &[0, 2, 4, 5, 6]);
+        assert_eq!(columns.last(), Some(&28));
     }
 
     #[test]
