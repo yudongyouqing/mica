@@ -165,6 +165,16 @@ pub(super) unsafe fn reload_config(hwnd: HWND) {
     // 客户区像素尺寸不变(不碰窗口尺寸),终端区按新度量重算(减 strip)
     let mut rect = RECT::default();
     GetClientRect(hwnd, &mut rect).expect("GetClientRect");
+    // A minimized HWND reports the icon client size. Keep the last real
+    // viewport so appearance reload cannot collapse live PTYs to a tiny grid.
+    if windows::Win32::UI::WindowsAndMessaging::IsIconic(hwnd).as_bool() {
+        GPU.with(|g| {
+            if let Some(gpu) = g.borrow().as_ref() {
+                rect.right = gpu.config.width as i32;
+                rect.bottom = gpu.config.height as i32;
+            }
+        });
+    }
     let mut reloaded = false;
     TABS.with(|tabs| {
         // 全部标签全部 pane 一起换(T7):palette/字体是全局语义

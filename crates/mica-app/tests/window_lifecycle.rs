@@ -314,6 +314,55 @@ fn configured_command_reaches_tabs_splits_windows_and_quick_terminal() {
     assert_eq!(query_grid(1, "background-resized"), active);
     let split = query_grid(0, "split-resized");
     assert!(split.0 <= active.0 / 2 + 1 && split.1 == active.1);
+
+    // Appearance reload on a minimized HWND must keep background PTYs at the
+    // cached real viewport, not resize them to Windows' icon client rectangle.
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+            first[0],
+            windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE,
+        )
+        .ok();
+    }
+    std::fs::write(&cfg, format!("{updated}title = MinimizedReload\n")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(first[0]) != "MinimizedReload" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(window_title(first[0]), "MinimizedReload");
+    assert_eq!(query_grid(1, "background-minimized"), active);
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+            first[0],
+            windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+        )
+        .ok();
+    }
+}
+
+#[test]
+fn pixel_size_configuration_sets_exact_native_outer_dimensions() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (app, _) = launch_config_source(
+        true,
+        "window-size-pixels = 2032,1041\nquick-terminal-key = none\n",
+    );
+    let windows = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    let mut rect = RECT::default();
+    // Read physical pixels independently of the test runner's DPI awareness.
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+        };
+        let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let result = GetWindowRect(windows[0], &mut rect);
+        SetThreadDpiAwarenessContext(previous);
+        result.unwrap();
+    }
+    assert_eq!(
+        (rect.right - rect.left, rect.bottom - rect.top),
+        (2032, 1041)
+    );
 }
 
 /// #109:主窗 timer 7 还未执行时关闭,副窗的配置监听不能永久缺席。

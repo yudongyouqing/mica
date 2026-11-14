@@ -23,6 +23,11 @@ pub use crate::config::defaults::{DEFAULT_FAMILIES, DEFAULT_FONT_SIZE_PT};
 /// `strip-animation-duration`/`-focus`(ms,0=关)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StripCfg {
+    pub title_centered: bool,
+    pub title_highlight: bool,
+    pub title_highlight_color: Option<Rgb>,
+    pub title_highlight_opacity: f32,
+    pub title_highlight_radius: f32,
     pub font_family: Option<String>,
     pub font_size_pt: f32,
     pub title_h: f32,
@@ -63,6 +68,8 @@ pub struct Settings {
     /// Initial grid size in cells, used when creating a window.
     pub window_width: u16,
     pub window_height: u16,
+    /// Exact initial outer window dimensions in physical pixels, overriding cells.
+    pub window_size_pixels: Option<(u16, u16)>,
     /// Symmetric content padding in logical pixels (scaled with DPI).
     pub window_padding_x: f32,
     pub window_padding_y: f32,
@@ -138,6 +145,7 @@ fn default_state() -> &'static (Settings, [bool; 3]) {
             quick_terminal_height: 0,
             window_width: 0,
             window_height: 0,
+            window_size_pixels: None,
             window_padding_x: 0.0,
             window_padding_y: 0.0,
             mouse_hide_while_typing: false,
@@ -149,6 +157,11 @@ fn default_state() -> &'static (Settings, [bool; 3]) {
             copy_on_select: false,
             title: None,
             strip: StripCfg {
+                title_centered: false,
+                title_highlight: false,
+                title_highlight_color: None,
+                title_highlight_opacity: 0.0,
+                title_highlight_radius: 0.0,
                 font_family: None,
                 font_size_pt: 0.0,
                 title_h: 0.0,
@@ -265,6 +278,58 @@ fn apply_pairs(
     let mut family_declared = false;
     for (key, value) in pairs {
         match key.as_str() {
+            "window-size-pixels" => {
+                settings.window_size_pixels = None;
+                if !value.is_empty() {
+                    match value.split_once(',').and_then(|(w,h)| Some((w.trim().parse::<u16>().ok()?, h.trim().parse::<u16>().ok()?))) {
+                        Some((w,h)) if (320..=16384).contains(&w) && (200..=16384).contains(&h) => settings.window_size_pixels = Some((w,h)),
+                        _ => err.values.push("window-size-pixels must be width,height in 320..16384 by 200..16384, or empty".into()),
+                    }
+                }
+            }
+            "strip-title-align" => match value.as_str() {
+                "center" => settings.strip.title_centered = true,
+                "left" => settings.strip.title_centered = false,
+                _ => err
+                    .values
+                    .push("strip-title-align must be center or left".into()),
+            },
+            "strip-title-highlight" => match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => settings.strip.title_highlight = true,
+                "false" | "0" | "no" => settings.strip.title_highlight = false,
+                _ => err
+                    .values
+                    .push("strip-title-highlight must be true or false".into()),
+            },
+            "strip-title-highlight-color" => {
+                if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+                    settings.strip.title_highlight_color = None;
+                } else {
+                    match parse_hex(&value) {
+                        Ok(color) => settings.strip.title_highlight_color = Some(color),
+                        Err(reason) => err.values.push(format!("{key}: {reason}")),
+                    }
+                }
+            }
+            "strip-title-highlight-opacity" | "strip-title-highlight-radius" => {
+                let upper = if key == "strip-title-highlight-opacity" {
+                    1.0
+                } else {
+                    32.0
+                };
+                match value.parse::<f32>() {
+                    Ok(n) if n.is_finite() && (0.0..=upper).contains(&n) => {
+                        if key == "strip-title-highlight-opacity" {
+                            settings.strip.title_highlight_opacity = n;
+                        } else {
+                            settings.strip.title_highlight_radius = n;
+                        }
+                    }
+                    _ => err
+                        .values
+                        .push(format!("{key} must be a finite number in 0..{upper}")),
+                }
+            }
             "window-padding-x" | "window-padding-y" => match value.parse::<f32>() {
                 Ok(n) if n.is_finite() && (0.0..=400.0).contains(&n) => {
                     if key == "window-padding-x" {
@@ -448,7 +513,7 @@ fn apply_pairs(
                     settings.strip.wide_tabs = v;
                 }
             }
-            "strip-font-family" => {
+            "strip-font-family" | "window-title-font-family" => {
                 settings.strip.font_family =
                     (!value.trim().is_empty()).then(|| value.trim().to_string());
             }
@@ -544,6 +609,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn titlebar_and_exact_pixel_size_are_real_config_overrides() {
+        let source = "window-size-pixels = 2032,1041\nwindow-title-font-family = Segoe UI\nstrip-title-align = left\nstrip-title-highlight = false\nstrip-title-highlight-color = #123456\nstrip-title-highlight-opacity = 0.2\nstrip-title-highlight-radius = 6\n";
+        let settings = resolve(source).unwrap();
+        assert_eq!(settings.window_size_pixels, Some((2032, 1041)));
+        assert_eq!(settings.strip.font_family.as_deref(), Some("Segoe UI"));
+        assert!(!settings.strip.title_centered);
+        assert!(!settings.strip.title_highlight);
+        assert_eq!(
+            settings.strip.title_highlight_color,
+            Some(Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56
+            })
+        );
+        assert_eq!(settings.strip.title_highlight_opacity, 0.2);
+        assert_eq!(settings.strip.title_highlight_radius, 6.0);
+        assert_eq!(
+            resolve(&format!("{source}window-size-pixels =\n"))
+                .unwrap()
+                .window_size_pixels,
+            None
+        );
+        for bad in [
+            "window-size-pixels = 0,0",
+            "window-size-pixels = 2032",
+            "strip-title-align = middle",
+            "strip-title-highlight-opacity = NaN",
+            "strip-title-highlight-opacity = 2",
+            "strip-title-highlight-radius = -1",
+        ] {
+            assert!(resolve(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn declared_user_options_are_not_silently_ignored() {
         let s = resolve("background-image = C:\\wallpapers\\image.png\nbackground-opacity = 0.65\nminimum-contrast = 0.3\nwindow-position = -120,45\nmouse-right-click = paste\ncopy-on-select = false\n").unwrap();
         assert_eq!(
@@ -589,7 +690,12 @@ mod tests {
         assert_eq!(
             Settings::default().strip,
             StripCfg {
-                font_family: None,
+                title_centered: true,
+                title_highlight: true,
+                title_highlight_color: None,
+                title_highlight_opacity: 0.16,
+                title_highlight_radius: 5.0,
+                font_family: Some("Segoe UI".into()),
                 font_size_pt: 9.5,
                 title_h: 32.0,
                 tab_h: 36.0,

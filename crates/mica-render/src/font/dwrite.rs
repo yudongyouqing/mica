@@ -65,6 +65,8 @@ pub struct DwriteRouter {
     /// Generation sentinel; both caches are invalid after frame-boundary reset.
     last_atlas_version: u64,
     cache: BoundedCache<(char, u8), GlyphInfo>,
+    /// Font-only UI advances; bounded and charged to the shared character budget.
+    advance_cache: BoundedCache<char, f32>,
     /// 连字 shaping(M2b/T4):启动探测(主字体对 =>/>= 系列产合成字形)
     /// 不通过则整条 route_run 走 None,行为与 M2a 完全一致
     ligatures: bool,
@@ -218,6 +220,7 @@ impl DwriteRouter {
             },
             last_atlas_version: 0,
             cache: BoundedCache::new(1024 * 1024, 8192, super::atlas::character_budget()),
+            advance_cache: BoundedCache::new(16 * 1024, 256, super::atlas::character_budget()),
             run_cache: BoundedCache::new(2 * 1024 * 1024, 1024, super::atlas::shaping_budget()),
         })
     }
@@ -630,6 +633,25 @@ impl DwriteRouter {
 }
 
 impl GlyphRouter for DwriteRouter {
+    fn ui_advance(&mut self, ch: char) -> Option<f32> {
+        if let Some(advance) = self.advance_cache.get(&ch).copied() {
+            return Some(advance);
+        }
+        let family = self.family_for(ch)?;
+        let (face, glyph) = face_with_glyph(&family.plain, ch)?;
+        let mut font_metrics = DWRITE_FONT_METRICS::default();
+        let mut glyph_metrics = DWRITE_GLYPH_METRICS::default();
+        // SAFETY: face/glyph are resolved together and outputs live for the call.
+        unsafe {
+            family.plain.GetMetrics(&mut font_metrics);
+            face.GetDesignGlyphMetrics(&glyph, 1, &mut glyph_metrics, false)
+                .ok()?;
+        }
+        let advance = glyph_metrics.advanceWidth as f32 * self.em_size_dip
+            / f32::from(font_metrics.designUnitsPerEm.max(1));
+        self.advance_cache.insert(ch, advance, 64);
+        Some(advance)
+    }
     /// 整段 shaping(连字,D16):cluster 布局逐格返回——单字符 cluster
     /// 给 None(渲染侧走 route 缓存,零额外成本),连字 cluster 给合成
     /// GlyphInfo(光栅化单 glyph 位图,宽 = cluster 总 advance)。
@@ -910,6 +932,21 @@ fn shape_run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_font_uses_natural_advances_without_changing_terminal_cell_metrics() {
+        let mut router = super::DwriteRouter::new(9.5, &["Segoe UI"]).unwrap();
+        let cell = router.metrics().cell_width;
+        let wide = super::GlyphRouter::ui_advance(&mut router, 'W').unwrap();
+        let narrow = super::GlyphRouter::ui_advance(&mut router, 'i').unwrap();
+        let space = super::GlyphRouter::ui_advance(&mut router, ' ').unwrap();
+        assert!(wide > narrow * 1.5 && space > 0.0);
+        assert_eq!(
+            super::GlyphRouter::ui_advance(&mut router, 'i'),
+            Some(narrow)
+        );
+        assert_eq!(router.metrics().cell_width, cell);
+        assert_eq!(router.advance_cache.len(), 3);
+    }
     #[test]
     fn unique_long_runs_obey_byte_budget_and_oversized_input_falls_back_to_characters() {
         let mut r = super::DwriteRouter::new(12.0, &["Consolas"]).unwrap();

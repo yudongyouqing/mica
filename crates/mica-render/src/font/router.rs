@@ -24,6 +24,11 @@ pub struct ClusterLayout {
 }
 
 pub trait GlyphRouter {
+    /// Natural advance for proportional UI labels. Terminal grid layout never
+    /// uses this; routers without font metrics retain the legacy fallback.
+    fn ui_advance(&mut self, _ch: char) -> Option<f32> {
+        None
+    }
     /// 整段 shaping(M2b/T4 连字):同 style 的连续字符段一次性整形,
     /// 返回逐 cluster 布局(长度恒等于 chars;sum(len) == chars.len())。
     /// `len == 1 且 glyph == None` = 常规字符,调用方走逐字路由(缓存路径);

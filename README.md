@@ -116,11 +116,27 @@ mica +validate-config
 | 普通窗口字体、调色板、背景、鼠标行为、快捷键、标题栏、光标闪烁 | 保存后热重载 |
 | `command` | 新标签、分屏、新窗口；已有会话保持原 shell |
 | `window-width` / `window-height` / `window-position` | 新建窗口；宽高单位为终端列、行 |
+| `window-size-pixels = 宽,高` | 新窗口的精确物理像素外框；优先于列/行配置，置空恢复列/行 |
 | `window-padding-x` / `window-padding-y` | 逻辑像素、随 DPI 缩放，保存后热重载 |
+| `window-title-font-family` / `strip-font-family` | 同一项 UI 字体配置，默认 Segoe UI，独立于终端字体；热重载 |
+| `strip-title-align` | `center`（整窗居中）或 `left`，长标题省略并避开按钮 |
+| `strip-title-highlight` / `-color` / `-opacity` / `-radius` | 标题圆角底的开关、颜色、强度与半径，支持热重载 |
 | `quick-terminal-key` | 热键可重绑或设 `none` 禁用 |
 | Quick Terminal 的 shell、字体、配色、`quick-terminal-height` | 完全退出 Mica 后重启 |
 
 首次创建配置文件后需重启以开启监听；坏配置热重载会保留当前设置。
+
+例如按现有窗口的物理像素大小启动，并设置居中标题：
+
+```ini
+window-size-pixels = 2032,1041
+window-title-font-family = Segoe UI
+strip-title-align = center
+strip-title-highlight = true
+```
+
+像素尺寸是 Mica 的扩展，不随 DPI 换算；未设置时仍采用列/行配置。
+标题底色默认从主题强调色推导，`strip-title-highlight-color = auto` 恢复自动配色。
 
 `command` 用于之后新建的窗口、标签、分屏和 Quick Terminal。显式选择
 `--profile` 时使用该 profile；空 `command =` 恢复 Windows PowerShell 默认值。

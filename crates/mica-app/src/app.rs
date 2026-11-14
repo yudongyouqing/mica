@@ -63,6 +63,13 @@ use windows::core::{HSTRING, PCWSTR, w};
 // WM_NCCALCSIZE makes the entire window the client area. Account for our
 // own strip exactly once; round up so a fractional cell never loses a column.
 fn initial_window_rect(settings: &Settings, metrics: &FontMetrics) -> RECT {
+    if let Some((width, height)) = settings.window_size_pixels {
+        return RECT {
+            right: i32::from(width),
+            bottom: i32::from(height),
+            ..Default::default()
+        };
+    }
     let strip = mica_render::frame::StripMetrics::from_scale_cfg(
         DPI_SCALE.with(std::cell::Cell::get),
         &settings.strip,
@@ -2300,7 +2307,12 @@ fn draw_frame() {
                 Some(f) => vec![f.clone()],
                 None => TAB_SEED.with(|s| s.borrow().clone()).0,
             };
-            for fb in ["Segoe UI Emoji", "Segoe Fluent Icons"] {
+            for fb in [
+                "Segoe UI",
+                "Microsoft YaHei UI",
+                "Segoe UI Emoji",
+                "Segoe Fluent Icons",
+            ] {
                 if !fams.iter().any(|f| f.eq_ignore_ascii_case(fb)) {
                     fams.push(fb.to_string());
                 }
@@ -3558,7 +3570,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if std::env::var_os("MICA_DEBUG_DPI").is_some() {
                 eprintln!("[dpi] WM_SIZE {width}x{height} wparam={}", wparam.0);
             }
-            if width == 0 || height == 0 {
+            if wparam.0 == windows::Win32::UI::WindowsAndMessaging::SIZE_MINIMIZED as usize
+                || width == 0
+                || height == 0
+            {
                 return LRESULT(0); // 最小化
             }
             let mut resized = false;
@@ -5381,6 +5396,22 @@ fn current_mods() -> Mods {
 #[cfg(test)]
 mod tests {
     use super::{FrameSched, detect_path_token, frame_sched, normalize_path_token, pretty_title};
+
+    #[test]
+    fn exact_pixel_window_size_overrides_cell_dimensions() {
+        let settings = mica_core::config::settings::resolve(
+            "window-size-pixels = 2032,1041\nwindow-width = 10\nwindow-height = 4",
+        )
+        .unwrap();
+        let metrics = mica_render::font::metrics::FontMetrics {
+            cell_width: 10.0,
+            line_height: 20.0,
+            ascent: 15.0,
+            descent: 5.0,
+        };
+        let rect = super::initial_window_rect(&settings, &metrics);
+        assert_eq!((rect.right, rect.bottom), (2032, 1041));
+    }
 
     #[test]
     fn footer_scissor_includes_last_terminal_row_below_header() {
