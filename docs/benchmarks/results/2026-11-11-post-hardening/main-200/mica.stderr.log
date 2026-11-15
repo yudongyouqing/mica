@@ -1,0 +1,16 @@
+[dpi] 启动于 144 DPI 屏(初始即按 x1.50 缩放)
+font families in use: ["JetBrains Mono", "Cascadia Mono", "Microsoft YaHei", "JetBrainsMono NF", "JetBrainsMono Nerd Font", "Segoe UI Emoji", "Segoe Fluent Icons"]
+[dpi] 初始网格 cw=14.4 lh=31.68(pt=12 ×1.5)
+[dpi] 落位窗口 1462x1006
+adapter: NVIDIA GeForce RTX 4060 Laptop GPU (DiscreteGpu, 32.0.16.1656 , backend Dx12)
+[timing] run→首帧 917ms(含窗口/GPU/首标签)
+jumplist: DestinationList 实例化失败
+quickterm: Win+` 注册失败(被占用?)——QT 需重配 quick-terminal-key
+adapter: NVIDIA GeForce RTX 4060 Laptop GPU (DiscreteGpu, 32.0.16.1656 , backend Dx12)
+[timing] 延迟段 429ms(孤儿/COM/profile/QT),累计 1483ms
+jumplist: DestinationList 实例化失败
+jumplist: DestinationList 实例化失败
+[exit] step1: sentinel None
+[exit] step2: watcher 留存(进程级,副窗仍在时热重载继续)
+[exit] step5: reclaim terminals, leak only GPU
+[exit] step6: done (reaper 已回收 202/降级 forget 0/在途 0/故障态 false;pty 预留 0B)

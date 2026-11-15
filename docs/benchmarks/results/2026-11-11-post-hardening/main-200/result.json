@@ -1,0 +1,8 @@
+{
+  "success": true,
+  "completed_rounds": 200,
+  "requested_rounds": 200,
+  "failure": null,
+  "elapsed_s": 196.39679369999976,
+  "samples": 1246
+}

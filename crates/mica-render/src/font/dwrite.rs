@@ -8,7 +8,6 @@
 //! 字形 bounds 按基线相对解读,offset_px = ascent + bounds.top。
 //! 注意纹理类型必须匹配渲染模式——ALIASED_1x1 在 NATURAL 系下 bounds 恒空。
 
-use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 
 use windows::Win32::Graphics::DirectWrite::{
@@ -28,7 +27,7 @@ use windows_numerics::Vector2;
 use super::GlyphStyle;
 use super::atlas::{GlyphAtlas, GlyphBitmap, GlyphFormat};
 use super::metrics::FontMetrics;
-use super::router::{ClusterLayout, GlyphInfo, GlyphRouter};
+use super::router::{BoundedCache, ClusterLayout, GlyphInfo, GlyphRouter};
 
 /// 一个家族的四个样式面(plain/bold/italic/bold_italic;T7 起四态齐备)。
 struct FamilyFaces {
@@ -63,14 +62,16 @@ pub struct DwriteRouter {
     /// 图集**——单次 draw 只绑一张纹理的硬约束(2026-10-12 共享图集
     /// 重构;此前每路由私有一份,strip 换 UI 字体必然两张图集)
     atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
-    /// 图集版本哨兵:grow 会重排搬动全部条目,缓存里的 UV 是按当时尺寸归一的
+    /// Generation sentinel; both caches are invalid after frame-boundary reset.
     last_atlas_version: u64,
-    cache: HashMap<(char, u8), GlyphInfo>,
+    cache: BoundedCache<(char, u8), GlyphInfo>,
+    /// Font-only UI advances; bounded and charged to the shared character budget.
+    advance_cache: BoundedCache<char, f32>,
     /// 连字 shaping(M2b/T4):启动探测(主字体对 =>/>= 系列产合成字形)
     /// 不通过则整条 route_run 走 None,行为与 M2a 完全一致
     ligatures: bool,
     /// 连字缓存:key = (字符段, 样式位);命中免 shaping
-    run_cache: HashMap<(Vec<char>, u8), Vec<ClusterLayout>>,
+    run_cache: BoundedCache<(Vec<char>, u8), Vec<ClusterLayout>>,
 }
 
 /// 缓存键的样式位:bold=bit0,italic=bit1。
@@ -113,8 +114,12 @@ impl DwriteRouter {
         families: &[&str],
         atlas: std::rc::Rc<std::cell::RefCell<GlyphAtlas>>,
     ) -> anyhow::Result<Self> {
-        let mut r = Self::new(font_size_pt, families)?;
-        r.atlas = atlas;
+        let mut r = Self::new_internal(
+            font_size_pt,
+            families,
+            Some(atlas),
+            DWRITE_FONT_WEIGHT_NORMAL,
+        )?;
         // 版本哨兵对齐共享图集当前值(其上已有终端字形——不能误清)
         r.last_atlas_version = r.atlas.borrow().version();
         Ok(r)
@@ -126,6 +131,34 @@ impl DwriteRouter {
     }
 
     pub fn new(font_size_pt: f32, families: &[&str]) -> anyhow::Result<Self> {
+        Self::new_internal(font_size_pt, families, None, DWRITE_FONT_WEIGHT_NORMAL)
+    }
+    /// Select a real UI font weight; terminal constructors retain regular faces.
+    pub fn new_ui(
+        font_size_pt: f32,
+        families: &[&str],
+        weight: u16,
+        atlas: Option<std::rc::Rc<std::cell::RefCell<GlyphAtlas>>>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (100..=900).contains(&weight),
+            "UI font weight must be 100..900"
+        );
+        let mut router = Self::new_internal(
+            font_size_pt,
+            families,
+            atlas,
+            DWRITE_FONT_WEIGHT(i32::from(weight)),
+        )?;
+        router.last_atlas_version = router.atlas.borrow().version();
+        Ok(router)
+    }
+    fn new_internal(
+        font_size_pt: f32,
+        families: &[&str],
+        atlas: Option<std::rc::Rc<std::cell::RefCell<GlyphAtlas>>>,
+        normal_weight: DWRITE_FONT_WEIGHT,
+    ) -> anyhow::Result<Self> {
         // SAFETY: 工厂创建,T 由 turbofish 指定
         let factory = unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)? };
         let mut collection: Option<IDWriteFontCollection> = None;
@@ -150,9 +183,9 @@ impl DwriteRouter {
             let pick = |weight: DWRITE_FONT_WEIGHT, style: DWRITE_FONT_STYLE| unsafe {
                 family.GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, style)
             };
-            let plain = pick(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL)?;
+            let plain = pick(normal_weight, DWRITE_FONT_STYLE_NORMAL)?;
             let bold = pick(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL)?;
-            let italic = pick(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_ITALIC)?;
+            let italic = pick(normal_weight, DWRITE_FONT_STYLE_ITALIC)?;
             let bold_italic = pick(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_ITALIC)?;
             // SAFETY: IDWriteFont::CreateFontFace 无额外前提
             let face = unsafe { plain.CreateFontFace()? };
@@ -207,11 +240,53 @@ impl DwriteRouter {
             metrics,
             // 512 固定宽:覆盖 400pt 级极端字形且守卫不触发;行距对齐
             // 512*4=2048 % 256==0 ✓。页追加式下宽度永不再变(u 稳定)
-            atlas: std::rc::Rc::new(std::cell::RefCell::new(GlyphAtlas::new(512, 512))),
+            atlas: match atlas {
+                Some(atlas) => atlas,
+                None => std::rc::Rc::new(std::cell::RefCell::new(GlyphAtlas::try_new(512, 512)?)),
+            },
             last_atlas_version: 0,
-            cache: HashMap::new(),
-            run_cache: HashMap::new(),
+            cache: BoundedCache::new(1024 * 1024, 8192, super::atlas::character_budget()),
+            advance_cache: BoundedCache::new(16 * 1024, 256, super::atlas::character_budget()),
+            run_cache: BoundedCache::new(2 * 1024 * 1024, 1024, super::atlas::shaping_budget()),
         })
+    }
+
+    fn replacement(&mut self) -> GlyphInfo {
+        let rect = self.atlas.borrow_mut().insert(&GlyphBitmap {
+            width: u32::MAX,
+            height: u32::MAX,
+            pixels: Vec::new(),
+            format: GlyphFormat::Coverage,
+        });
+        GlyphInfo {
+            uv: [rect.u as f32, rect.v as f32, rect.w as f32, rect.h as f32],
+            size_px: [self.metrics.cell_width, self.metrics.line_height],
+            offset_px: [0.0, 0.0],
+            color: false,
+        }
+    }
+    fn raster_dimensions_ok(w: u32, h: u32) -> bool {
+        w < 512 && h < 8192 && w.checked_mul(h).is_some_and(|n| n <= 512 * 512)
+    }
+    fn sync_generation(&mut self) {
+        let version = self.atlas.borrow().version();
+        if version != self.last_atlas_version {
+            self.cache.clear();
+            self.run_cache.clear();
+            self.last_atlas_version = version;
+        }
+    }
+    /// Must precede building grid, strip and overlay for this atlas.
+    pub fn prepare_frame(&mut self, fingerprint: u64, max_dimension: u32) -> bool {
+        let changed = self
+            .atlas
+            .borrow_mut()
+            .prepare_frame(fingerprint, max_dimension);
+        self.sync_generation();
+        changed
+    }
+    pub fn needs_resource_recovery(&self) -> bool {
+        self.atlas.borrow().exhausted()
     }
 
     pub fn metrics(&self) -> FontMetrics {
@@ -228,10 +303,8 @@ impl DwriteRouter {
         self.atlas.borrow().revision()
     }
 
-    /// 仅 grow 重排递增——app 侧据此作废行级实例缓存(2026-10-08:
-    /// row_insts 的 UV 是按当时图集布局烘焙的,grow 重排后全表位移,
-    /// 未重建的行 = 画到别人的字形上 = "一块一块/乱码"。新实例测不出
-    /// ——要会话内字符量把图集撑大才触发,claude+omp+精灵必中)
+    /// Layout generation: app must fully rebuild row instances when it changes.
+    /// Append-only growth changes content revision, never existing pixel UVs.
     pub fn atlas_version(&self) -> u64 {
         self.atlas.borrow().version()
     }
@@ -329,6 +402,9 @@ impl DwriteRouter {
             return Some(blank_glyph()); // 空字形(如组合符单发)不占图集
         }
         let (w, h) = (w as u32, h as u32);
+        if !Self::raster_dimensions_ok(w, h) {
+            return Some(self.replacement());
+        }
         let mut raw = vec![0u8; w as usize * h as usize * 3]; // 3x1:RGB 亚像素
         // SAFETY: 缓冲恰好 bounds 大小 × 3 字节/像素
         unsafe {
@@ -403,6 +479,9 @@ impl DwriteRouter {
             );
             if w == 0 || h == 0 {
                 return blank_glyph();
+            }
+            if !Self::raster_dimensions_ok(w as u32, h as u32) {
+                return self.replacement();
             }
             let mut raw = vec![0u8; (w * h) as usize * 3];
             if analysis
@@ -498,6 +577,17 @@ impl DwriteRouter {
             if bw == 0 || bh == 0 {
                 continue; // 空层跳过
             }
+            let retained_coverage: usize = layers
+                .iter()
+                .map(|(_, coverage, _)| coverage.capacity())
+                .sum();
+            if retained_coverage.saturating_add((bw as usize).saturating_mul(bh as usize))
+                > 512 * 512
+                || layers.len() >= 64
+                || !Self::raster_dimensions_ok(bw as u32, bh as u32)
+            {
+                return Some(self.replacement());
+            }
             let mut raw = vec![0u8; (bw * bh) as usize * 3];
             unsafe {
                 analysis
@@ -520,6 +610,9 @@ impl DwriteRouter {
             u.bottom = u.bottom.max(b.bottom);
         }
         let (uw, uh) = ((u.right - u.left).max(1), (u.bottom - u.top).max(1));
+        if !Self::raster_dimensions_ok(uw as u32, uh as u32) {
+            return Some(self.replacement());
+        }
         let mut canvas = vec![0f32; (uw * uh) as usize * 4]; // 非预乘 RGBA f32
         for (b, coverage, rgba) in layers {
             let color = rgba.map(|c| c.clamp(0.0, 1.0));
@@ -566,11 +659,31 @@ impl DwriteRouter {
 }
 
 impl GlyphRouter for DwriteRouter {
+    fn ui_advance(&mut self, ch: char) -> Option<f32> {
+        if let Some(advance) = self.advance_cache.get(&ch).copied() {
+            return Some(advance);
+        }
+        let family = self.family_for(ch)?;
+        let (face, glyph) = face_with_glyph(&family.plain, ch)?;
+        let mut font_metrics = DWRITE_FONT_METRICS::default();
+        let mut glyph_metrics = DWRITE_GLYPH_METRICS::default();
+        // SAFETY: face/glyph are resolved together and outputs live for the call.
+        unsafe {
+            family.plain.GetMetrics(&mut font_metrics);
+            face.GetDesignGlyphMetrics(&glyph, 1, &mut glyph_metrics, false)
+                .ok()?;
+        }
+        let advance = glyph_metrics.advanceWidth as f32 * self.em_size_dip
+            / f32::from(font_metrics.designUnitsPerEm.max(1));
+        self.advance_cache.insert(ch, advance, 64);
+        Some(advance)
+    }
     /// 整段 shaping(连字,D16):cluster 布局逐格返回——单字符 cluster
     /// 给 None(渲染侧走 route 缓存,零额外成本),连字 cluster 给合成
     /// GlyphInfo(光栅化单 glyph 位图,宽 = cluster 总 advance)。
     fn route_run(&mut self, chars: &[char], style: GlyphStyle) -> Option<Vec<ClusterLayout>> {
-        if !self.ligatures || chars.len() < 2 {
+        self.sync_generation();
+        if !self.ligatures || chars.len() < 2 || chars.len() > 4096 {
             return None;
         }
         // 精灵覆盖的字符不得进 shaping:整形直出字体字形,绕过精灵的
@@ -648,18 +761,15 @@ impl GlyphRouter for DwriteRouter {
             }
             u = v;
         }
-        self.run_cache.insert(key, layouts.clone());
+        let bytes = key.0.capacity() * std::mem::size_of::<char>()
+            + layouts.capacity() * std::mem::size_of::<ClusterLayout>()
+            + 512;
+        self.run_cache.insert(key, layouts.clone(), bytes);
         Some(layouts)
     }
 
     fn route(&mut self, ch: char, style: GlyphStyle) -> GlyphInfo {
-        // 图集 grow 重排后全部条目换了位置,旧缓存的 UV 按当时尺寸归一已失效——
-        // 版本号一动即清缓存(本轮新插入本就按当前尺寸计算,不受影响)
-        let version = self.atlas.borrow().version();
-        if version != self.last_atlas_version {
-            self.cache.clear();
-            self.last_atlas_version = version;
-        }
+        self.sync_generation();
         let key = (ch, style_bits(style));
         if let Some(g) = self.cache.get(&key) {
             return *g;
@@ -667,6 +777,14 @@ impl GlyphRouter for DwriteRouter {
         // sprite face(2026-10-07):制表符/方块/几何/盲文/Powerline 程序化
         // 绘制——精确几何天然无缝,优先于字体(字体墨迹与格子差几像素,
         // 曾致 TUI 边框"一块一块")。不在精灵范围 → 字体路径
+        if crate::font::sprite::covers(ch as u32)
+            && !Self::raster_dimensions_ok(
+                self.metrics.cell_width.ceil() as u32,
+                self.metrics.line_height.ceil() as u32,
+            )
+        {
+            return self.replacement();
+        }
         if let Some((pw, ph, cov)) =
             crate::font::sprite::draw(ch as u32, self.metrics.cell_width, self.metrics.line_height)
         {
@@ -682,7 +800,7 @@ impl GlyphRouter for DwriteRouter {
             // 会每帧重画重插,图集无限膨胀+重排,revision 逐帧变把未脏行
             // 的缓存 UV 全部作废(乱码)乃至纹理爆掉(黑屏/崩)。
             // 2026-10-07 sprite 首版漏了这条,真机十分钟翻车
-            self.cache.insert(key, info);
+            self.cache.insert(key, info, 512);
             return info;
         }
         let mut info = self.rasterize(ch, style).unwrap_or_else(blank_glyph);
@@ -706,7 +824,7 @@ impl GlyphRouter for DwriteRouter {
             info.offset_px[1] += (info.size_px[1] - new_h) / 2.0;
             info.size_px = [cw, new_h];
         }
-        self.cache.insert(key, info);
+        self.cache.insert(key, info, 512);
         info
     }
 }
@@ -840,6 +958,159 @@ fn shape_run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_semibold_selects_real_font_face_without_bolding_terminal_font() {
+        let normal = super::DwriteRouter::new(11.0, &["Segoe UI"]).unwrap();
+        let ui = super::DwriteRouter::new_ui(11.0, &["Segoe UI"], 600, None).unwrap();
+        // SAFETY: resolved DirectWrite font objects are valid COM references.
+        unsafe {
+            assert_eq!(
+                normal.families[0].plain.GetWeight(),
+                super::DWRITE_FONT_WEIGHT_NORMAL
+            );
+            assert_eq!(ui.families[0].plain.GetWeight().0, 600);
+        }
+    }
+    #[test]
+    fn ui_font_uses_natural_advances_without_changing_terminal_cell_metrics() {
+        let mut router = super::DwriteRouter::new(9.5, &["Segoe UI"]).unwrap();
+        let cell = router.metrics().cell_width;
+        let wide = super::GlyphRouter::ui_advance(&mut router, 'W').unwrap();
+        let narrow = super::GlyphRouter::ui_advance(&mut router, 'i').unwrap();
+        let space = super::GlyphRouter::ui_advance(&mut router, ' ').unwrap();
+        assert!(wide > narrow * 1.5 && space > 0.0);
+        assert_eq!(
+            super::GlyphRouter::ui_advance(&mut router, 'i'),
+            Some(narrow)
+        );
+        assert_eq!(router.metrics().cell_width, cell);
+        assert_eq!(router.advance_cache.len(), 3);
+    }
+    #[test]
+    fn unique_long_runs_obey_byte_budget_and_oversized_input_falls_back_to_characters() {
+        let mut r = super::DwriteRouter::new(12.0, &["Consolas"]).unwrap();
+        r.ligatures = true;
+        for n in 0..64 {
+            let text: Vec<char> = format!("{:>3000} value_{n}", "a").chars().collect();
+            assert!(
+                super::GlyphRouter::route_run(&mut r, &text, super::GlyphStyle::PLAIN).is_some()
+            );
+        }
+        assert!(
+            r.run_cache.len() < 64,
+            "byte budget must evict below the entry ceiling"
+        );
+        let retained = r.run_cache.len();
+        assert!(
+            super::GlyphRouter::route_run(&mut r, &vec!['a'; 4097], super::GlyphStyle::PLAIN)
+                .is_none()
+        );
+        assert_eq!(r.run_cache.len(), retained);
+        assert!(super::GlyphRouter::route(&mut r, 'a', super::GlyphStyle::PLAIN).size_px[0] > 0.0);
+    }
+
+    #[test]
+    fn shared_grid_strip_generation_clears_character_and_shaping_caches() {
+        let budget = super::super::atlas::ByteBudget::new(512 * 512 * 4);
+        let atlas = std::rc::Rc::new(std::cell::RefCell::new(
+            super::GlyphAtlas::with_budget(512, 512, 512 * 512 * 4, budget).unwrap(),
+        ));
+        let mut grid =
+            super::DwriteRouter::new_with_atlas(12.0, &["Consolas"], atlas.clone()).unwrap();
+        let mut strip =
+            super::DwriteRouter::new_with_atlas(9.5, &["Consolas"], atlas.clone()).unwrap();
+        grid.ligatures = true;
+        super::GlyphRouter::route(&mut grid, 'A', super::GlyphStyle::PLAIN);
+        super::GlyphRouter::route(&mut strip, 'B', super::GlyphStyle::PLAIN);
+        super::GlyphRouter::route_run(&mut grid, &['a', 'b'], super::GlyphStyle::PLAIN);
+        assert!(grid.run_cache.len() > 0);
+        let identity = atlas.borrow().identity();
+        atlas
+            .borrow_mut()
+            .insert(&super::GlyphBitmap::from_coverage(
+                500,
+                500,
+                vec![255; 500 * 500],
+            ));
+        atlas
+            .borrow_mut()
+            .insert(&super::GlyphBitmap::from_coverage(
+                500,
+                500,
+                vec![255; 500 * 500],
+            ));
+        assert!(grid.prepare_frame(10, 8192));
+        assert_eq!(grid.cache.len(), 0);
+        assert_eq!(grid.run_cache.len(), 0);
+        super::GlyphRouter::route(&mut strip, 'C', super::GlyphStyle::PLAIN);
+        assert_eq!(
+            strip.cache.len(),
+            1,
+            "sibling router lazily discards its old generation"
+        );
+        assert_eq!(atlas.borrow().identity(), identity);
+        assert_eq!(atlas.borrow().version(), 1);
+        let fresh_dpi = super::DwriteRouter::new(18.0, &["Consolas"]).unwrap();
+        assert_ne!(
+            fresh_dpi.atlas().identity(),
+            identity,
+            "DPI rebuild cannot collide at equal revision"
+        );
+        assert_eq!(fresh_dpi.atlas().revision(), 0);
+    }
+
+    #[test]
+    fn shaping_unique_lines_have_bounded_cache() {
+        let mut r = super::DwriteRouter::new(12.0, &["Consolas"]).unwrap();
+        r.ligatures = true; // exercise cache even when installed font probe is negative
+        for n in 0..2048 {
+            let text: Vec<char> = format!("unique_{n:08} => value").chars().collect();
+            assert!(
+                super::GlyphRouter::route_run(&mut r, &text, super::GlyphStyle::PLAIN).is_some()
+            );
+        }
+        assert!(
+            r.run_cache.len() <= 1024,
+            "unique full-text keys must be evicted"
+        );
+    }
+
+    #[test]
+    #[ignore = "local reproducible resource probe"]
+    fn resource_baseline_probe() {
+        let start = std::time::Instant::now();
+        let mut routers = Vec::new();
+        for pane in 0..40 {
+            let mut r =
+                super::DwriteRouter::new(12.0, &["Consolas", "Microsoft YaHei", "Segoe UI Emoji"])
+                    .unwrap();
+            for code in 0x4e00..0x4e00 + 2000 {
+                let _ = super::GlyphRouter::route(
+                    &mut r,
+                    char::from_u32(code).unwrap(),
+                    super::GlyphStyle::PLAIN,
+                );
+            }
+            if pane == 0 {
+                eprintln!(
+                    "baseline pane: {} atlas bytes, {} character cache entries, shaping enabled={}",
+                    r.atlas().texture().len(),
+                    r.cache.len(),
+                    r.ligatures
+                );
+            }
+            routers.push(r);
+        }
+        eprintln!(
+            "baseline 40 panes / 2000 CJK: {} atlas bytes, elapsed {:?}",
+            routers
+                .iter()
+                .map(|r| r.atlas().texture().len())
+                .sum::<usize>(),
+            start.elapsed()
+        );
+    }
+
     use super::*;
     /// sprite 契约锁(2026-10-07 翻车复盘):同 字形路由必须缓存命中
     /// ——重复 route 的 revision 不得再变(否则图集逐帧膨胀+重排,未脏行

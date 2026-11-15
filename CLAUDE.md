@@ -19,7 +19,7 @@ cargo test -p mica-core pty                             # 模块过滤(注意 'p
 cargo run --bin mica                                    # 运行(仅 Windows 有真窗口;mac 打印 stub)
 ```
 
-- pty 测试起**真实子进程**(mac 上 sh/cmd,Windows 上 ConPTY),首个 ConPTY 测试冷启动可达 30s——是预算不是卡死。
+- pty 测试起**真实子进程**(mac 上 sh/cmd,Windows 上 ConPTY),首个 ConPTY 测试冷启动可达 30s——是预算不是卡死。测试的 APPDATA/USERNAME 隔离盖不住 `USERPROFILE\Documents` 下的 PowerShell profile——真实 profile(oh-my-posh)仍会加载,高负载下拖慢 pty 终结、放大退出死线抖动(#124);键位回归用测试二进制自身作 ConPTY 接收器可绕开此噪声。
 - **在 mac 上交叉 lint Windows 专属代码**(不用等 CI):`cargo clippy -p mica-app --target x86_64-pc-windows-msvc --all-targets`(check 不链接,无需 MSVC 工具链)。
 - ConPTY 测试的隐藏契约:cmd/powershell 启动即发 `ESC[6n`(光标查询)并**阻塞等回包**——测试必须替终端应答 `ESC[1;1R`(见 `pty.rs` 的 `read_until` 与 `tests/powershell.rs`)。
 - CI:GitHub Actions 双平台(Windows 全量,macOS 仅 core+render),位于 `.github/workflows/ci.yml`。
@@ -30,7 +30,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 **三 crate 边界是本项目最重要的纪律**(spec §3):
 
 - `mica-core`:终端核心,**零 GUI 依赖**(Cargo.toml 里不得出现任何窗口/渲染库)。`surface.rs` 包装 alacritty_terminal(`vte::ansi::Processor::advance` 喂 `Term`,`Term` 实现的是 `Handler` 不是 `Perform`);`EventProxy` 收集应答类事件(DSR/OSC 回写、标题、尺寸查询),由 `take_pty_writes`/`take_title` 排空——**必须排空并写回 pty,否则 shell 会卡在等应答**。`pty.rs` 是 portable-pty 封装(读线程→mpsc;Drop 杀子并 reap)。`input.rs` 纯函数 xterm 键位编码。
-- `mica-render`:只认 grid 不认窗口。纯逻辑层(`color`/`frame` + `font/` 模块:样式与宽度判定、度量数学、字形图集、路由 trait,全部可 TDD)+ wgpu 管线(`pipeline.rs`)+ `#[cfg(windows)]` 的 DirectWrite 光栅化(`font/dwrite.rs`)。`CellInstance` 是 **64 字节** `#[repr(C)]`(pos_uv/size_uv/fg/bg 四个 vec4f,offset 0/16/32/48),与 WGSL 四个 location 锁死,有 size_of 测试兜底。**两遍发射契约**:`build_instances` 先产全部整格背景 quad、再产全部字形 quad(blend:None 下保证宽字形不被后续格背景擦除);空白格单实例(uv 尺寸 0 → ink_mask 0)。`GlyphRouter` trait 是"字符+样式→图集几何"的接缝,dwrite 与测试 Fake 各为其实现;图集**双计数**:`revision`(每次 insert/grow 递增)门控 `Renderer::set_atlas` 重传,`version`(仅 grow 重排递增)只做 `DwriteRouter` 清缓存信号——两者不可合并。**draw 前必须 set_atlas**(panic 契约)。dwrite 纹理类型必须匹配渲染模式:NATURAL_SYMMETRIC 配 `CLEARTYPE_3x1` 取 R 通道做灰度墨,配 `ALIASED_1x1` 则 bounds 恒空(黑屏,有回归测试)。
+- `mica-render`:只认 grid 不认窗口。纯逻辑层(`color`/`frame` + `font/` 模块:样式与宽度判定、度量数学、字形图集、路由 trait,全部可 TDD)+ wgpu 管线(`pipeline.rs`)+ `#[cfg(windows)]` 的 DirectWrite 光栅化(`font/dwrite.rs`)。`CellInstance` 是 **64 字节** `#[repr(C)]`(pos_uv/size_uv/fg/bg 四个 vec4f,offset 0/16/32/48),与 WGSL 四个 location 锁死,有 size_of 测试兜底。**两遍发射契约**:`build_instances` 先产全部整格背景 quad、再产全部字形 quad(blend:None 下保证宽字形不被后续格背景擦除);空白格单实例(uv 尺寸 0 → ink_mask 0)。`GlyphRouter` trait 是"字符+样式→图集几何"的接缝,dwrite 与测试 Fake 各为其实现;图集**身份/双计数**:`identity` 区分真实 atlas(共享 grid/strip 同身份),`revision`(新增位图/grow 递增)门控按消费者的脏矩形上传,`version` 仅在帧边界资源回收时递增,清 router 字符/shaping 缓存并强制 row/overlay 重建；追加页与去重命中不移动既有纹素 UV。CPU 位图、去重索引、路由缓存与 GPU 缓存分别限额,不等于整个进程内存上限,见 `docs/superpowers/research/2026-11-10-render-resource-budgets.md`。**draw 前必须 set_atlas**(panic 契约)。dwrite 纹理类型必须匹配渲染模式:NATURAL_SYMMETRIC 配 `CLEARTYPE_3x1` 取 R 通道做灰度墨,配 `ALIASED_1x1` 则 bounds 恒空(黑屏,有回归测试)。
 - `mica-app`:Win32 壳,保持最薄——窗口/输入路由/系统集成,不含终端逻辑。持 `DwriteRouter`(T7 已接线),窗口尺寸/网格换算由真度量驱动;WM_CHAR 重组 UTF-16 代理对(emoji/扩展表意文字才进得来)。
 
 **数据流**(事件驱动,T7):WM_CHAR/WM_KEYDOWN → `input::encode`(Ctrl+字母走 WM_CHAR 原始字节,不经 encode)→ pty 写;pty 读线程 → app 转发线程 → `WM_APP_RENDER` → drain → `Surface::feed` → `take_damage()` → `build_rows`(行级脏区,两遍发射;光标格与 SGR7 反色格都是 fg/bg 互换;WIDE_CHAR 天然双宽、SPACER 空白)→ `repack` → `Renderer::draw`。config 变更走 notify 去抖 → `WM_APP_CONFIG` → 重合成 Settings → 重建 router/palette。
@@ -38,6 +38,8 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 **度量与调色板单一来源**:格子尺寸由 `font::metrics::FontMetrics`(DirectWrite 设计单位换算)产出,流入 app 网格换算、`Surface::set_cell_metrics`(查询应答)与 blank 实例尺寸;8/16 硬编码常量已退役。调色板收敛于 mica-core `config::palette::Palette`(M1-B/T3),渲染着色、清屏色与 OSC 应答同源;配置合成见 `config::settings`(默认 < 主题 < 用户三层)。
 
 ## 硬约束
+
+- **先对齐行业基线**:有明确 VT/DEC 协议规定时按协议实现；以 Windows Console/Terminal、xterm.js、Alacritty 等成熟实现的公开行为交叉验证。先补正确性与兼容性，再考虑扩展。实现前记录规范条目、参考版本/commit 和差异回归；没有统一规定的行为须明确适用边界，不把单个实现习惯称作通用标准。当前光标显隐对照见 `docs/superpowers/reviews/2026-11-13-cursor-visibility-conformance.md`。
 
 - **许可证**:MIT OR Apache-2.0;**禁止引入 GPL 依赖**(商业资产自持,加依赖前查 license)。
 - **配置语法**:兼容 Ghostty 的 `key = value` 语法是硬需求(spec D6)——主题生态靠它免费迁移。
@@ -62,27 +64,31 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/specs/2026-10-03-m5-1.0-design.md` — M5 1.0 设计(打磨/健壮/发布三切片,D32-D37;砍单 tear-off/defterm 二级/官网/连字引擎/签名;验收=winget 可装+崩溃有档+IME 跟随+1.0 tag)。
 - `docs/superpowers/plans/2026-10-03-m5c-release.md` — M5c 计划(发布五件;UiaRootObjectId=-25 判据三轮实证、perf 25% 门禁偏差注记)。
 - `docs/superpowers/plans/2026-10-03-m5b-robustness.md` — M5b 计划(健壮五件;wgpu lost 双钩子/DbgHelp/try_wait/Ime/winres-manifest API 全核实;冒烟抓到 restart 双借真 bug——T1 崩溃档案首秀定位)。
-- 里程碑:M0→M4(✅)→ M5 1.0(tag v1.0.0)→ 1.1(tag v1.1.0)→ **1.2 发布完成(2026-10-22,tag v1.2.0)**:send-text IPC(`mica send`,tmux send-keys 同义)、启动优化(非关键初始化移首帧后,实测 -424ms)、滚动回看搜索(Ctrl+Shift+F,五版定档反色高亮)、裸路径可点击(Ctrl+Click+常显下划线+悬停生长反色)、粘贴双份修复(硬编码分支控制字节泄漏)、copy-on-select 配置键、asciinema 回放基准、依赖更新(actions/serde/pollster)。→ 票箱:**空**(#36 winget 用户关账:项目完善前不做)。
+- 里程碑:M0→M4(✅)→ M5 1.0(tag v1.0.0)→ 1.1(tag v1.1.0)→ 1.2(tag v1.2.0,send-text/启动优化 -424ms/回看搜索/路径点击/粘贴双份修复)→ **1.3 发布完成(2026-10-23,tag v1.3.0)**:透明度(Ctrl+Shift+O 两档+`background-opacity`)、窗口背景图(`background-image`,空白格混合)、右键粘贴(`mouse-right-click=paste`)、回看导出(Ctrl+Shift+S)、key-remap 修饰键重映射、`window-position`、重开最近关闭标签(Ctrl+Shift+Z)、`minimum-contrast`、标签改名与着色(rename_tab+OSC 1337);仓库转 Public(Actions 免费不限量+CI 止血三连:并发取消/msi+perf 仅主干与 tag/纯文档免跑)→ **1.4(2026-11-15,tag v1.4.0,PR #119)**:设置集中外置与三层合成、PowerShell 7 默认 shell、`window-size-pixels` 精确外框(按显示器工作区约束,OS 不再代裁)、居中标题与弱中性底(11pt/600,用户评审定案)、字形采样全域 UV 修复(1px 白列 255→143 的发虚根除)、Tab 键族修复(Shift+Tab=CSI Z、Ctrl+Tab 快捷键可达,#123/#125)。→ 票箱:**空**(#36 winget 用户关账:项目完善前不做)。
 
 ## 当前边界(M3 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
 - 连字:Cascadia 系需 TextLayout 级引擎(analyzer+liga/calt 不触发),管线已备,probe 阴性自动回退——换引擎留 M3
 - OSC 52:管线单测全过,真机经 ConPTY 疑被拦截——tmux 环境复验后定案(M3 或关账)
+- 透明度(1.3):整窗 LWA_ALPHA 通道,文字同步半透明——per-pixel 背景透明(需 swapchain alpha+composition 模式)留后续增强
+- 背景图(1.3):blend:None 管线下只在空白格混图、有字形格保实色底——文字区透图需开 blend,留后续
+- 标签改名(1.3):入口为键绑定(默认无键,`keybind = …:rename_tab`),右键菜单基建未建(立项原设想,量级中等)
 - DECSET 2026:sidecar 检测→帧持有管线单测全绿,但 ConPTY 不透传 2026(2026-10-03 真机探针实证 feed 零命中;同路径 OSC 8 可透传,唯 2026 被消费——ConPTY 自带同步缓冲)——直连 pty 场景生效,ConPTY 场景由其自身机制兜底
 - sidecar 快筛(M4b/D29 备胎,已启用):候选前缀深跑 + carry/open_seq 跨块续命;基准测试 `sidecar_throughput_budget`(#ignored,release 跑)预算 5%
 - 启动清理孤儿 ConPTY 宿主(M5c):强杀终端必留 OpenConsole 孤儿,管道断裂后 busy-loop——2026-10-03 冒烟事故实证 13 个孤儿各烧满 1 核;启动时按"父进程已死"清杀(真开着的 WT 父进程活着不受影响),与 minidump 崩溃恢复成对
 - UIA 撤线(1.0.8):深度查询(Narrator/FindAll)稳定触发 native crash(panic/SEH 均接不住,无 dmp)——自定义 provider 走系统 host provider 替代,Narrator 仍可读窗口标题;uia.rs 模块与 COM 闭环测试保留,崩溃根因修复后恢复分派
 - kitty graphics:ConPTY 剥离 APC(M4c 字节级实证,与 2026/OSC 52 同类)——Windows 主路径不可达,不实现;金丝雀测试 `conpty_strips_apc_today_canary` 变红 = 边界移动,重估(预研文档含 M5 立项建议)
-- OSC 133(**边界随 OS build 走,2026-10-12 CI 实证修正**):≥26300(客户端实测)**完整透传**——jump/exit 状态点即刻可达;26100(CI Server 2025 实测)仍剥离。金丝雀按 `cmd /c ver` build 号分档断言,任一档翻向=边界移动。OSC 7 透传(新标签目录继承的数据源)
+- OSC 133(2026-11-10 修正):本机26300和当前CI Server2025 build26100(镜像windows-2025-vs2026/20261103.298.1,run42820078822)均实测完整透传。旧“26100及以下剥离”依据被PSReadLine输入回显早退假通过掩盖,不再按该阈值外推。CI用MICA_CONPTY_OSC133_EXPECT=passthrough严格锁当前能力,客户端26300+保留透传回归,其他未知旧版本只探测报告。OSC7透传仍用于新标签目录继承。
 - 标签溢出滚动:滚轮+左右箭头+活跃自动跟随齐备(1.1,#39)
 - 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段)
 - 标签 tear-off(1.1 软版,#35):拖出标签行即撕开独立窗,同 shell/cwd/标题重开——**进程不迁移**(COM/线程本地 !Send 架构),活进程迁移留后续增强
 - 输入管线控制字节纪律(1.2):**任何消费了 Ctrl+字母 键的分支都必须置 KEYMAP_ATE_CHAR**(keymap 分支 2026-10 修过,硬编码粘贴/复制分支 1.2 补齐——漏置 = 伴生控制字节泄漏 pty,PSReadLine 当二次快捷键,粘贴双份实证);新增硬编码键分支时照此
+- Tab 键族契约(1.4):Tab 全族走 WM_KEYDOWN 编码(普通=09、Shift=CSI Z,kitty 协商时 CSI-u),WM_CHAR 的伴随 09 必须吞(漏吞=双发);`vk_to_trigger` 与 `vkey_bytes` 的 VK 集合同步维护——缺 VK_TAB 曾令 Shift+Tab 丢修饰、Ctrl+Tab 快捷键整体不可达(#125);主窗与 QT 同契约
 - defterm 整体撤除(1.0.2):RRVA 一级注册实测是陷阱——装完即劫持默认终端且无 COM 实现接管,console 程序全弹 0xC0000142。真实现(ITerminalHandoff)完成前不再注册
 - Quick Terminal 键位运行期注册(M3b):开机自启/托盘 M5c 观察;QT 输入已对齐主窗契约(M5a 修双发)
 - IME(M5b 已实现跟随:组合/候选窗定光标格下缘)——**2026-10-04 用户手验通过**(中文输入正常、候选框跟随、不崩);旧 6/10 崩账定性为坏驱动栈时代伪影(1.0.8 后复测无恙)
 - OSC 4 全域正确(16-231 立方/232-255 灰阶,M5a 落);SGR 下划线族已渲染(M5a,此前从未画)
-- DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始定尺寸链路已实证正确(#38 关账,**混合 DPI 跨屏初始落位仍缩水,#41**);`mica --multi` 起隔离实例是 DPI/首窗类排查的标准工具
+- DPI:PMv2 已上线(M5b,manifest+WM_DPICHANGED,配置 pt 不污染可逆)——此前'写死 96'实为 DPI-unaware 被系统虚拟化(150% 屏一直发虚拉伸,现原生清晰);初始定尺寸链路已实证正确(#38/#41 均关账——"跨屏缩水"是 DPI-unaware 进程的虚拟化测量假象;光标屏锚定落地,#52);`mica --multi` 起隔离实例是 DPI/首窗类排查的标准工具
 
 ## 提交规范
 

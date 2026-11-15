@@ -1,0 +1,799 @@
+//! T04 窗口生命周期集成回归:真实 mica 子进程 + 真实窗口消息。
+//! 只操作**自己启动的实例**的窗口(按 PID 过滤),绝不触碰用户窗口;
+//! 单实例管道全局唯一 → 全部用例串行(GUARD)。
+
+#![cfg(windows)]
+
+#[path = "support/process.rs"]
+mod process;
+
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
+    IsWindowVisible, PostMessageW, SendMessageW, WM_CLOSE, WM_NCLBUTTONDOWN,
+};
+use windows::core::BOOL;
+
+/// 串行锁:单实例管道唯一,并行用例会互抢实例。
+static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+fn guard() -> &'static Mutex<()> {
+    GUARD.get_or_init(|| Mutex::new(()))
+}
+
+/// 关闭守卫:无论如何都树杀子进程(绝不留孤儿实例占管道)。
+struct ChildGuard(std::process::Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.0.try_wait().map(|s| s.is_none()).unwrap_or(false) {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &self.0.id().to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// 本用例的隔离身份(唯一管道名 + 状态目录,复核 6)。
+static TEST_USER: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn test_user() -> String {
+    TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn launch_isolated() -> ChildGuard {
+    // 配置隔离:空 APPDATA = 全默认;USERNAME 派生唯一管道;
+    // LOCALAPPDATA 隔离状态目录(pty 注册表)
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let iso = std::env::temp_dir().join(format!("mica-winlife-{unique}"));
+    std::fs::create_dir_all(&iso).unwrap();
+    let user = format!("micawin{unique}");
+    *TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = user.clone();
+    let child = Command::new(env!("CARGO_BIN_EXE_mica"))
+        .arg("--multi")
+        .env("APPDATA", &iso)
+        .env("LOCALAPPDATA", &iso)
+        .env("USERNAME", &user)
+        .env("MICA_CRASH_NOPROMPT", "1")
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(iso.join("stderr.log")).unwrap())
+        .spawn()
+        .expect("launch mica");
+    ChildGuard(child)
+}
+
+/// 预置(空但存在的)config 文件启动:热重载 watcher 只在文件存在时
+/// 建立(spawn_config_watcher 的契约)。
+fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
+    launch_config(true)
+}
+
+fn launch_config(wait_deferred: bool) -> (ChildGuard, std::path::PathBuf) {
+    launch_config_source(wait_deferred, "")
+}
+
+fn launch_config_source(wait_deferred: bool, source: &str) -> (ChildGuard, std::path::PathBuf) {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let iso = std::env::temp_dir().join(format!("mica-winlife-cfg-{unique}"));
+    let dir = iso.join("mica");
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("config");
+    std::fs::write(&cfg, source).unwrap();
+    let user = format!("micawincfg{unique}");
+    *TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = user.clone();
+    let log_path = iso.join("stderr.log");
+    eprintln!("Window lifecycle diagnostics: {}", log_path.display());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mica"));
+    command
+        .arg("--multi")
+        .env("APPDATA", &iso)
+        .env("LOCALAPPDATA", &iso)
+        .env("USERNAME", &user)
+        .env("MICA_CRASH_NOPROMPT", "1")
+        .env("MICA_DEBUG_TIMING", "1")
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log_path).unwrap());
+    if !wait_deferred {
+        command.env("MICA_TEST_DEFER_INIT_MS", "60000");
+    }
+    let child = command.spawn().expect("launch mica");
+    let mut app = ChildGuard(child);
+    if !wait_deferred {
+        return (app, cfg);
+    }
+    // IPC ready / visible HWND 都早于 timer 7 的延迟初始化。先等待真实
+    // 初始化完成日志,再测试配置变更;否则可能在 watcher 注册之前写入,
+    // 或在 watcher 建立者完成初始化前关闭它。延长 reload 超时救不回丢失事件。
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains("[timing] 延迟段 ") {
+            break;
+        }
+        let status = app.0.try_wait().unwrap();
+        assert!(
+            status.is_none() && Instant::now() < deadline,
+            "等待配置 watcher 初始化失败; status={status:?}; log={}; stderr:\n{log}",
+            log_path.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    (app, cfg)
+}
+
+#[test]
+fn configured_command_reaches_tabs_splits_windows_and_quick_terminal() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let markers = std::env::temp_dir().join(format!("mica shell markers {unique}"));
+    std::fs::create_dir_all(&markers).unwrap();
+    let script = format!(
+        "[IO.File]::WriteAllText(('{}' + '/' + $PID), ('configured' + ',' + $Host.UI.RawUI.WindowSize.Width + ',' + $Host.UI.RawUI.WindowSize.Height))",
+        markers
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .replace('\'', "''"),
+    );
+    let source = format!(
+        "command = powershell.exe -NoLogo -NoProfile -NoExit -Command \"{script}\"\nkeybind = insert=split_right\nwindow-width = 83\nwindow-height = 17\nwindow-padding-x = 36\nwindow-padding-y = 24\nstrip-title-height = 42\nstrip-hide-single-tab = false\nquick-terminal-height = 25\nquick-terminal-key = none\n"
+    );
+    mica_core::config::settings::resolve(&source).expect("valid test configuration");
+    let (app, cfg) = launch_config_source(true, &source);
+    let wait_markers = |want| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let count = std::fs::read_dir(&markers).unwrap().count();
+            if count >= want {
+                assert_eq!(count, want);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {want} configured shells, found {count}; diagnostics: {}",
+                cfg.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    // The main tab and hidden quick terminal must both use the configured shell.
+    wait_markers(2);
+    let grid_matches = || {
+        std::fs::read_dir(&markers)
+            .unwrap()
+            .filter(|entry| {
+                std::fs::read_to_string(entry.as_ref().unwrap().path()).unwrap()
+                    == "configured,83,17"
+            })
+            .count()
+    };
+    assert_eq!(
+        grid_matches(),
+        1,
+        "first shell must have the configured grid despite custom strip geometry"
+    );
+    assert!(wait_ready(Duration::from_secs(20)));
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    // SAFETY: post only to the window owned by this test's isolated process.
+    unsafe {
+        PostMessageW(
+            Some(first[0]),
+            windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            WPARAM(0x2d),
+            LPARAM(0),
+        )
+        .unwrap();
+    }
+    wait_markers(3);
+    assert!(cli(&["new-tab"]));
+    wait_markers(4);
+    assert!(cli(&["new-window"]));
+    wait_markers(5);
+    assert_eq!(
+        grid_matches(),
+        3,
+        "new tab and secondary window must retain the configured grid"
+    );
+    // Keep one target window for explicit --tab probes below.
+    let windows = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    let other = *windows.iter().find(|h| **h != first[0]).unwrap();
+    unsafe {
+        PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { IsWindow(Some(other)) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!unsafe { IsWindow(Some(other)) }.as_bool());
+
+    // A reload changes future sessions without restarting any of the five
+    // existing shells. The title confirms the production watcher applied it.
+    let updated = source
+        .replace("'configured'", "'reloaded'")
+        .replace("window-padding-x = 36", "window-padding-x = 48")
+        .replace("window-padding-y = 24", "window-padding-y = 36");
+    std::fs::write(&cfg, format!("{updated}title = CommandReloaded\n")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(first[0]) != "CommandReloaded" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(window_title(first[0]), "CommandReloaded");
+    assert!(cli(&["new-tab"]));
+    wait_markers(6);
+    let reloaded = std::fs::read_dir(&markers)
+        .unwrap()
+        .filter(|entry| {
+            std::fs::read_to_string(entry.as_ref().unwrap().path())
+                .unwrap()
+                .starts_with("reloaded,")
+        })
+        .count();
+    assert_eq!(
+        reloaded, 1,
+        "only the new shell should use the updated command"
+    );
+    let query_grid = |tab: usize, name: &str| -> (u16, u16) {
+        let path = cfg.parent().unwrap().join(name);
+        let command = format!(
+            "[IO.File]::WriteAllText('{}', ($Host.UI.RawUI.WindowSize.Width.ToString() + ',' + $Host.UI.RawUI.WindowSize.Height))\r",
+            path.display().to_string().replace('\'', "''")
+        );
+        assert!(cli(&[
+            "send",
+            &format!("--tab={tab}"),
+            "--literal",
+            &command
+        ]));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(source) = std::fs::read_to_string(&path)
+                && let Some((width, height)) = source.split_once(',')
+                && let (Ok(width), Ok(height)) = (width.parse(), height.parse())
+            {
+                break (width, height);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "query tab {tab} timed out: {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let active = query_grid(2, "active-reloaded");
+    assert_eq!(
+        query_grid(1, "background-reloaded"),
+        active,
+        "inactive tabs must receive updated padding without being activated"
+    );
+    let split = query_grid(0, "split-reloaded");
+    assert!(
+        split.0 <= active.0 / 2 + 1 && split.1 == active.1,
+        "inactive split pane must use its layout, got {split:?}, full grid {active:?}"
+    );
+    // Real native resize follows the same layout calculation for background tabs.
+    let mut rect = RECT::default();
+    unsafe {
+        GetWindowRect(first[0], &mut rect).unwrap();
+        windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            first[0],
+            None,
+            0,
+            0,
+            rect.right - rect.left + 60,
+            rect.bottom - rect.top + 40,
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    let active = query_grid(2, "active-resized");
+    assert_eq!(query_grid(1, "background-resized"), active);
+    let split = query_grid(0, "split-resized");
+    assert!(split.0 <= active.0 / 2 + 1 && split.1 == active.1);
+
+    // Appearance reload on a minimized HWND must keep background PTYs at the
+    // cached real viewport, not resize them to Windows' icon client rectangle.
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+            first[0],
+            windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE,
+        )
+        .ok();
+    }
+    std::fs::write(&cfg, format!("{updated}title = MinimizedReload\n")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(first[0]) != "MinimizedReload" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(window_title(first[0]), "MinimizedReload");
+    assert_eq!(query_grid(1, "background-minimized"), active);
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+            first[0],
+            windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+        )
+        .ok();
+    }
+}
+
+/// PMv2 线程上下文里读窗口外框与所在显示器工作区(物理像素),读毕恢复
+/// 原 DPI 上下文——测试进程本身未必 PMv2,不切会拿到虚拟化坐标。
+/// 返回 (窗口外框矩形, 工作区矩形)。
+fn outer_rect_and_work_area(hwnd: HWND) -> (RECT, RECT) {
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        };
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+        };
+        let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let mut rect = RECT::default();
+        let rect_result = GetWindowRect(hwnd, &mut rect);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mon_ok = GetMonitorInfoW(mon, &mut mi);
+        SetThreadDpiAwarenessContext(previous);
+        rect_result.unwrap();
+        assert!(mon_ok.as_bool(), "GetMonitorInfoW 失败");
+        (rect, mi.rcWork)
+    }
+}
+
+/// 契约 A:工作区内的请求得到**精确**外框(任何屏幕都必须逐像素成立;
+/// 640×480 前提是工作区 ≥ 700×540,CI runner 与桌面机均满足)。
+#[test]
+fn pixel_size_configuration_sets_exact_native_outer_dimensions() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (app, _) = launch_config_source(
+        true,
+        "window-size-pixels = 640,480\nquick-terminal-key = none\n",
+    );
+    let windows = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    let (rect, _) = outer_rect_and_work_area(windows[0]);
+    assert_eq!(
+        (rect.right - rect.left, rect.bottom - rect.top),
+        (640, 480),
+        "工作区内请求必须精确落位"
+    );
+}
+
+/// 契约 B:超屏请求按**窗口所在显示器实际工作区**约束,期望随环境计算
+/// (不写死某 runner 的 OS 兜底值 1044×788);大屏(本机 2560×1440)上
+/// 期望即 2032×1041,保留 Windows Terminal 参考尺寸精确回归。
+/// 主窗与 IPC 副窗都验证;自动落位在缩窗后整窗必须仍在工作区内。
+#[test]
+fn oversized_pixel_size_request_constrains_to_monitor_work_area() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (app, _) = launch_config_source(
+        true,
+        "window-size-pixels = 2032,1041\nquick-terminal-key = none\n",
+    );
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let _first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let both = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    for (i, hwnd) in both.iter().enumerate() {
+        let (rect, work) = outer_rect_and_work_area(*hwnd);
+        let expected = (
+            2032.min(work.right - work.left),
+            1041.min(work.bottom - work.top),
+        );
+        assert_eq!(
+            (rect.right - rect.left, rect.bottom - rect.top),
+            expected,
+            "窗口 {i}:请求 2032×1041 应约束到工作区 {:?}",
+            (work.right - work.left, work.bottom - work.top)
+        );
+        assert!(
+            rect.left >= work.left
+                && rect.top >= work.top
+                && rect.right <= work.right
+                && rect.bottom <= work.bottom,
+            "窗口 {i} 自动落位越出工作区: rect={rect:?} work={work:?}"
+        );
+    }
+}
+
+/// #109:主窗 timer 7 还未执行时关闭,副窗的配置监听不能永久缺席。
+/// 控制定时器期限而不是赌随机 sleep;实际文件事件、广播、reload、
+/// 窗口销毁与 IPC 继续走生产路径。测试钩子仅存在于 debug 构建。
+#[test]
+#[cfg(debug_assertions)]
+fn config_watcher_survives_close_before_deferred_init() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, cfg) = launch_config(false);
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    let other = ws.iter().find(|h| **h != first[0]).copied().unwrap();
+    let log_path = cfg.parent().unwrap().parent().unwrap().join("stderr.log");
+    assert!(
+        !std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("[timing] 延迟段 "),
+        "用例必须在 timer 7 初始化前关闭主窗"
+    );
+    // SAFETY: 所有窗口都来自本测试启动的隔离进程。
+    unsafe { PostMessageW(Some(first[0]), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { IsWindow(Some(first[0])) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !unsafe { IsWindow(Some(first[0])) }.as_bool(),
+        "主窗必须已销毁"
+    );
+    assert!(app.0.try_wait().unwrap().is_none(), "副窗仍在,进程必须存活");
+    std::fs::write(&cfg, b"title = ReloadBeforeDeferredInit").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(other) != "ReloadBeforeDeferredInit" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        window_title(other),
+        "ReloadBeforeDeferredInit",
+        "早关闭后配置 watcher 仍须工作"
+    );
+    assert!(cli(&["send", "--literal", "x"]), "早关闭后 IPC 仍须工作");
+    assert!(
+        !std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("[timing] 延迟段 ")
+    );
+    // SAFETY: 本测试隔离副窗。
+    unsafe { PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
+    assert!(wait_exit(&mut app.0, Duration::from_secs(5)));
+}
+
+/// 读窗口标题(热重载 title 即时应用的观测面)。
+fn window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
+    let mut buf = [0u16; 128];
+    // SAFETY: 缓冲与长度对应
+    let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// 复核 4:主窗先关后改配置——watcher 是进程级服务,热重载必须继续
+/// 工作(标题从默认变为配置值 = reload 真实执行的外部证据)。
+#[test]
+fn config_reload_survives_main_close() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, cfg) = launch_with_config();
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    let other = ws.iter().find(|h| **h != first[0]).copied().unwrap();
+    // 关主窗(watcher 的建立者)
+    // SAFETY: 本测试的子进程窗口
+    unsafe {
+        let _ = PostMessageW(Some(first[0]), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { IsWindow(Some(first[0])) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!unsafe { IsWindow(Some(first[0])) }.as_bool(), "主窗销毁");
+    assert!(app.0.try_wait().unwrap().is_none(), "副窗在,进程存活");
+
+    // 改配置 → 去抖 300ms → 广播 → 副窗 reload → title 即时应用
+    std::fs::write(&cfg, b"title = ReloadAfterMainClose").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(other) != "ReloadAfterMainClose" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        window_title(other),
+        "ReloadAfterMainClose",
+        "主窗关闭后热重载必须仍然工作"
+    );
+
+    // 收尾
+    // SAFETY: 本测试的子进程窗口
+    unsafe {
+        let _ = PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    assert!(wait_exit(&mut app.0, Duration::from_secs(5)));
+}
+
+/// 复核 4:多窗同时更新——广播到全部存活窗口,无漂移。
+#[test]
+fn both_windows_reload_from_broadcast() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, cfg) = launch_with_config();
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let _first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+
+    std::fs::write(&cfg, b"title = BothReloaded").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while ws.iter().any(|h| window_title(*h) != "BothReloaded") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    for h in &ws {
+        assert_eq!(window_title(*h), "BothReloaded", "广播必须覆盖全部窗口");
+    }
+
+    // SAFETY: 本测试的子进程窗口
+    unsafe {
+        for h in &ws {
+            let _ = PostMessageW(Some(*h), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    assert!(wait_exit(&mut app.0, Duration::from_secs(5)));
+}
+
+/// CLI 过 IPC 驱动实例(activate/new-tab/new-window)。
+/// 注意:除 send 外的 IPC 命令在管道不通时会**自启 GUI**(dispatch_ipc
+/// 兜底),就绪探测只能用 send——它失败时干净退出 1,绝不自启。
+fn cli(args: &[&str]) -> bool {
+    let log_dir = std::env::temp_dir().join(format!("mica-winlife-cli-{}", test_user()));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mica"));
+    command.args(args).env("USERNAME", test_user());
+    match process::run_with_deadline(&mut command, Duration::from_secs(8), &log_dir) {
+        Ok(output) => {
+            if !output.status.success() {
+                eprintln!(
+                    "CLI {args:?} failed: {}; logs: {}; stderr: {}",
+                    output.status,
+                    log_dir.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            output.status.success()
+        }
+        Err(error) => {
+            eprintln!("CLI {args:?}: {error}");
+            false
+        }
+    }
+}
+
+/// 等 IPC 管道就绪:send 受理(exit 0)即就绪;连不上 exit 1 不自启。
+fn wait_ready(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cli(&["send", "--literal", "x"]) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    false
+}
+
+/// EnumWindows 的收集上下文(回调与调用方共用)。
+struct EnumCtx {
+    pid: u32,
+    out: Vec<HWND>,
+}
+
+/// 枚举属于指定 PID 的可见 mica 主窗。
+fn windows_of(pid: u32) -> Vec<HWND> {
+    let mut ctx = EnumCtx {
+        pid,
+        out: Vec::new(),
+    };
+    let ctx_ptr = &mut ctx as *mut EnumCtx;
+    // SAFETY: 回调里只写调用方栈上的 ctx;EnumWindows 同步完成
+    unsafe {
+        let _ = EnumWindows(
+            Some(win32_enum_proc as unsafe extern "system" fn(HWND, LPARAM) -> BOOL),
+            LPARAM(ctx_ptr as isize),
+        );
+    }
+    ctx.out
+}
+
+/// EnumWindows 回调:收集属于目标 PID 的 mica 主窗。
+unsafe extern "system" fn win32_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY(Rust 2024 unsafe_op_in_unsafe_fn):lparam 指向调用方栈上的
+    // Ctx,EnumWindows 同步完成;Win32 调用按各自契约
+    unsafe {
+        let ctx = &mut *(lparam.0 as *mut EnumCtx);
+        let mut wpid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut wpid));
+        if wpid == ctx.pid && IsWindowVisible(hwnd).as_bool() {
+            let mut name = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut name);
+            let class = String::from_utf16_lossy(&name[..n.max(0) as usize]);
+            if class == "mica_app_class" {
+                ctx.out.push(hwnd);
+            }
+        }
+    }
+    BOOL(1)
+}
+
+fn wait_windows(pid: u32, want: usize, timeout: Duration) -> Vec<HWND> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ws = windows_of(pid);
+        if ws.len() >= want {
+            return ws;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{timeout:?} 内未见 {want} 个窗口"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn wait_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().map(|s| s.is_some()).unwrap_or(false) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 模拟 caption ×:向 HTCLOSE 区投 NCLBUTTONDOWN(应用据此走关闭路径)。
+/// 坐标取窗口右上角内侧(× 按钮区,NCHITTEST 的 HTCLOSE 带)。
+fn caption_close(hwnd: HWND) {
+    let mut rect = RECT::default();
+    // SAFETY: 只读窗口矩形
+    unsafe {
+        let _ = GetWindowRect(hwnd, &mut rect);
+        let x = (rect.right - 40).max(rect.left + 1);
+        let y = rect.top + 12;
+        let lp = LPARAM((((y as isize) & 0xFFFF) << 16) | ((x as isize) & 0xFFFF));
+        let _ = SendMessageW(
+            hwnd,
+            WM_NCLBUTTONDOWN,
+            Some(WPARAM(20 /* HTCLOSE */)),
+            Some(lp),
+        );
+    }
+}
+
+/// 关闭最后窗口:进程及时退出,无挂死(F05 修前:close_tab 只
+/// PostQuitMessage,计数不归零,run() 尾部永久 park)。
+#[test]
+fn last_window_close_exits_process() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let ws = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    // SAFETY: 目标是本测试启动的子进程窗口
+    unsafe {
+        let _ = PostMessageW(Some(ws[0]), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    assert!(
+        wait_exit(&mut app.0, Duration::from_secs(5)),
+        "关最后窗口后 5s 内进程必须退出"
+    );
+}
+
+/// 核心回归:双窗口下 caption × 关闭 A → A 的 HWND **真实销毁**
+/// (IsWindow=false),进程与窗口 B 存活。修前投伪 WM_DESTROY:A 计数
+/// 递减但 HWND 不销毁——僵尸窗口留在桌面直到进程退出。
+#[test]
+fn caption_close_destroys_window_keeps_process() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    let other = ws.iter().find(|h| **h != first[0]).copied().unwrap();
+
+    caption_close(first[0]);
+    // A 销毁 + 进程/B 存活
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { IsWindow(Some(first[0])) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !unsafe { IsWindow(Some(first[0])) }.as_bool(),
+        "caption × 必须真实销毁 HWND(修前是僵尸窗口)"
+    );
+    assert!(app.0.try_wait().unwrap().is_none(), "进程必须存活(还有 B)");
+    assert!(
+        unsafe { IsWindow(Some(other)) }.as_bool(),
+        "副窗 B 必须存活"
+    );
+
+    // 收尾:关 B → 进程退出
+    // SAFETY: 同上
+    unsafe {
+        let _ = PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    assert!(
+        wait_exit(&mut app.0, Duration::from_secs(5)),
+        "关 B 后应退出"
+    );
+}
+
+/// 主窗先关:进程存活,IPC 仍被服务(窗口表寻址副窗),副窗关闭才退出。
+#[test]
+fn ipc_survives_main_window_close() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    let other = ws.iter().find(|h| **h != first[0]).copied().unwrap();
+
+    // 关主窗(首个窗口;IPC/配置 watcher 由它建立)
+    // SAFETY: 本测试的子进程窗口
+    unsafe {
+        let _ = PostMessageW(Some(first[0]), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { IsWindow(Some(first[0])) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!unsafe { IsWindow(Some(first[0])) }.as_bool(), "主窗销毁");
+    assert!(app.0.try_wait().unwrap().is_none(), "副窗在,进程必须存活");
+
+    // IPC 仍被服务:管道活着、命令被受理(exit 0)——通知由窗口表
+    // 寻址到副窗(ACK 语义在 T06 落地,此处先锁"不拒连、不挂死")
+    assert!(cli(&["new-tab"]), "主窗关闭后 IPC 必须仍受理");
+    assert!(app.0.try_wait().unwrap().is_none(), "受理后进程仍存活");
+
+    // SAFETY: 同上
+    unsafe {
+        let _ = PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    assert!(
+        wait_exit(&mut app.0, Duration::from_secs(5)),
+        "最后窗口关闭应退出"
+    );
+}
+
+/// 快速连关双窗:无挂死、无残留窗口(进程在超时内退出)。
+#[test]
+fn rapid_close_both_windows_exits() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let _ = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let ws = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    // SAFETY: 本测试的子进程窗口
+    unsafe {
+        for h in &ws {
+            let _ = PostMessageW(Some(*h), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    assert!(
+        wait_exit(&mut app.0, Duration::from_secs(5)),
+        "快速连关后进程必须退出"
+    );
+}

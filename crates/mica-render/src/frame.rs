@@ -18,8 +18,30 @@ use crate::font::GlyphStyle;
 use crate::font::metrics::FontMetrics;
 use crate::font::router::GlyphRouter;
 
-/// One drawable quad. `pos_uv = [x_px, y_px, u, v]`(uv 为图集内左上,0..1),
-/// `size_uv = [w_px, h_px, uw, uvh]`(像素尺寸 + uv 尺寸,0..1)。
+/// Visible glyph/style working set, evaluated only under resource pressure.
+/// Scrollback outside the viewport cannot force resource-recovery rebuilds.
+pub fn resource_fingerprint(surface: &Surface, shared_ui: &impl std::hash::Hash) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let grid = surface.grid();
+    grid.columns().hash(&mut hash);
+    grid.screen_lines().hash(&mut hash);
+    for row in 0..grid.screen_lines() {
+        let line = Line(row as i32 - surface.display_offset() as i32);
+        for col in 0..grid.columns() {
+            let cell = &grid[line][Column(col)];
+            cell.c.hash(&mut hash);
+            (cell.flags & (Flags::BOLD | Flags::ITALIC | Flags::WIDE_CHAR))
+                .bits()
+                .hash(&mut hash);
+        }
+    }
+    shared_ui.hash(&mut hash);
+    hash.finish()
+}
+
+/// One drawable quad. `pos_uv = [x_px, y_px, u, v]` (u/v are atlas pixel coordinates),
+/// `size_uv = [w_px, h_px, uw, uvh]` (screen pixels + atlas pixel extent).
 /// 背景 quad 与空白格均用 `blank` 形态:uv 尺寸 0,shader 墨恒 0。
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -152,6 +174,7 @@ pub fn build_instances(
     display_offset: usize,
     cursor: Option<CursorShape>,
 ) -> Vec<CellInstance> {
+    let cursor = cursor.filter(|_| surface.cursor_visible());
     let grid = surface.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
@@ -268,6 +291,11 @@ pub const TAB_CLOSE_W_BASE: f32 = 24.0;
 /// scale = 窗口 DPI/96(M5b 的 DPI_SCALE);cfg = 用户配置。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StripMetrics {
+    pub title_centered: bool,
+    pub title_highlight: bool,
+    pub title_highlight_color: Option<[u8; 3]>,
+    pub title_highlight_opacity: f32,
+    pub title_highlight_radius: f32,
     /// 条总高(两行;客户区顶部,终端区下移此值)
     pub h: f32,
     /// 第一行高:窗口标题 + caption 三键
@@ -319,6 +347,11 @@ impl StripMetrics {
         let s = scale.max(1.0);
         let c = |v: Option<Rgb>| v.map(|r| [r.r, r.g, r.b]);
         Self {
+            title_centered: cfg.title_centered,
+            title_highlight: cfg.title_highlight,
+            title_highlight_color: c(cfg.title_highlight_color),
+            title_highlight_opacity: cfg.title_highlight_opacity,
+            title_highlight_radius: cfg.title_highlight_radius * s,
             title_h: cfg.title_h * s,
             tab_h: cfg.tab_h * s,
             h: (cfg.title_h + cfg.tab_h) * s,
@@ -427,8 +460,7 @@ pub struct StripExtras {
     pub hover: StripHover,
     /// 最大化态(2026-10-07):true 时最大化钮显还原图标(E923)
     pub zoomed: bool,
-    /// 窗口聚焦相位(2026-10-12):1.0 = 聚焦(条底 18% 提亮),0.0 = 失焦
-    /// (洗白至 30%)——**连续值**,app 侧动画驱动(WM_TIMER 渐进),
+    /// 窗口聚焦相位(2026-10-12):1.0 = 聚焦,0.0 = 失焦(颜色由配置合成)——**连续值**,app 侧动画驱动(WM_TIMER 渐进),
     /// 切换不跳变(上游 becomeMain/resignMain 语义的动画化)
     pub focus: f32,
     /// 活跃标签胶囊横移量(动画中):非零时活跃标签 x0 偏移此值,衰减到
@@ -474,31 +506,107 @@ pub enum CaptionBtn {
 }
 
 /// 整行文本提取(#58 可点击路径 / 未来搜索共用):字符拼串 + 字符→格
-/// 下标映射(WIDE_CHAR 占 2 格)。line 为 buffer 行(i32,负 = 历史)。
+/// 边界映射(每字符起始列,末项为行尾列)。续格不产字符,组合符共用列。
+/// line 为 buffer 行(i32,负 = 历史)。
 pub fn row_string(grid: &Grid<Cell>, line: i32) -> (String, Vec<usize>) {
     let cols = grid.columns();
     let mut text = String::with_capacity(cols);
-    let mut cell_of = Vec::with_capacity(cols);
+    let mut cell_of = Vec::with_capacity(cols + 1);
     for c in 0..cols {
         let cell = &grid[Line(line)][Column(c)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
         text.push(cell.c);
+        cell_of.push(c);
+        if let Some(extra) = cell.zerowidth() {
+            for ch in extra {
+                text.push(*ch);
+                cell_of.push(c);
+            }
+        }
+    }
+    // Character boundaries, including the end of the row. The next boundary
+    // gives the full terminal width of a wide character, including its spacer.
+    cell_of.push(cols);
+    (text, cell_of)
+}
+
+/// #57 搜索的行索引:逐字符小写化,每字符携带 (起始列, 占列数) span。
+/// 取代旧"整串 to_lowercase + 字节偏移":整串折叠会变长变位(İ→i̇
+/// 两字符),之后字节偏移既对不上原行也不等于列号;宽字符占 2 列而
+/// UTF-8 是 3/4 字节——"字节偏移当列、字符数当宽"在 CJK/emoji 上
+/// 双双错位。WIDE_CHAR_SPACER 续格不产出字符(字符属首格,续格只是
+/// 占位)。折叠展开的多字符共享源格 span,列号永不失真。
+pub fn row_fold(grid: &Grid<Cell>, line: i32) -> (Vec<char>, Vec<(usize, usize)>) {
+    let cols = grid.columns();
+    let mut hay = Vec::with_capacity(cols);
+    let mut spans = Vec::with_capacity(cols);
+    for c in 0..cols {
+        let cell = &grid[Line(line)][Column(c)];
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
         let w = if cell.flags.contains(Flags::WIDE_CHAR) {
             2
         } else {
             1
         };
-        for _ in 0..w {
-            cell_of.push(c);
+        // DCH/ICH can leave an orphan spacer. Derive positions from the grid,
+        // rather than assuming every skipped spacer has a preceding wide cell.
+        for lc in fold_search_char(cell.c) {
+            hay.push(lc);
+            spans.push((c, w));
         }
     }
-    (text, cell_of)
+    (hay, spans)
+}
+
+/// Shared case-insensitive search folding for grid characters and queries.
+/// Normalize final sigma as well, so Σ/σ/ς match independently of word position.
+/// Unlike str::to_lowercase, this does not apply a different contextual mapping
+/// to a multi-character query than to characters extracted from terminal cells.
+pub fn fold_search(text: &str) -> Vec<char> {
+    text.chars().flat_map(fold_search_char).collect()
+}
+
+fn fold_search_char(c: char) -> impl Iterator<Item = char> {
+    c.to_lowercase().map(|lc| if lc == 'ς' { 'σ' } else { lc })
+}
+
+/// 在 row_fold 产物上找全部命中(非重叠推进):返回 (起始列, 占列宽)。
+/// needle 需调用方先经 fold_search。宽度按列计:命中跨宽字符时含其双列
+/// (高亮矩形直接乘 cell_width,见 app 侧消费)。
+pub fn find_row_matches(
+    hay: &[char],
+    spans: &[(usize, usize)],
+    needle: &[char],
+) -> Vec<(usize, usize)> {
+    let mut hits = Vec::new();
+    if needle.is_empty() || hay.len() < needle.len() || spans.len() != hay.len() {
+        return hits;
+    }
+    let mut i = 0;
+    'scan: while i + needle.len() <= hay.len() {
+        for (k, nc) in needle.iter().enumerate() {
+            if hay[i + k] != *nc {
+                i += 1;
+                continue 'scan;
+            }
+        }
+        let (c0, _) = spans[i];
+        let (cl, wl) = spans[i + needle.len() - 1];
+        hits.push((c0, cl + wl - c0));
+        i += needle.len();
+    }
+    hits
 }
 
 /// tab strip 的 UI 实例(T7,spec §3 同管线),**双行形制**(2026-10-12
 /// 用户裁定):第一行 = 窗口标题(活跃标签名,居中)+ 右端 caption 三键
 /// (— □ ×);第二行 = 均分标签占满 + 右端 "+" 开新标签;再下才是终端
 /// 主体。单标签时第二行整行隐藏(上游 hasTabBar 同款)。
-/// 条底 = 常态浅灰(终端底提亮 18%;失焦再洗至 30%,上游 becomeMain/
+/// 条底采用配置中的聚焦/失焦提亮比例(上游 becomeMain/
 /// resignMain 同款),活跃标签块 = 终端底色原样、上圆下方与内容区无缝
 /// 相接。strip 文字走**小号等宽路由**(9.5pt 共享图集,app 侧注入;
 /// 字号 12pt 的终端路由出的大字形会挤出 × 关闭区,用户实报)。
@@ -537,7 +645,7 @@ pub fn strip_quads(
     };
     let bg3 = [palette.bg.r, palette.bg.g, palette.bg.b];
     // 条底 = 常态浅灰(上游实测:标签栏比终端底亮;Ventura 版 14% 提亮同族,
-    // 默认 18%),失焦再洗一档(默认 30%;Tahoe becomeMain/resignMain 同款)。
+    // 比例由外置配置给出,聚焦/失焦分别合成。
     // focus 是 0..1 的动画相位(app 侧 WM_TIMER 渐进),切换不再跳变——
     // 这是"丝滑"的一半;另一半是活跃块滑动(capsule_dx)。
     // 全部颜色/比例可配(strip-* 键):显式色直通,auto 才走提亮推导
@@ -545,9 +653,13 @@ pub fn strip_quads(
     let wash = sm.bar_wash + (sm.bar_wash_unfocused - sm.bar_wash) * (1.0 - focus);
     let bar = sm.bar_c.unwrap_or_else(|| mix(bg3, [255, 255, 255], wash));
     // 活跃标签面色:聚焦 = 终端底原样(与内容一体);失焦同样洗白一档
-    let active_face = sm
-        .active_c
-        .unwrap_or_else(|| mix(bg3, [255, 255, 255], 0.18 * (1.0 - focus)));
+    let active_face = sm.active_c.unwrap_or_else(|| {
+        mix(
+            bg3,
+            [255, 255, 255],
+            sm.bar_wash_unfocused * 0.5 * (1.0 - focus),
+        )
+    });
     let white = sm
         .text_c
         .unwrap_or([palette.fg.r, palette.fg.g, palette.fg.b]);
@@ -564,9 +676,8 @@ pub fn strip_quads(
     let eff_h = if single { sm.title_h } else { sm.h };
     // 全条底(两行同色;发丝线退役——活跃块要与内容区无缝相接)
     let strip_w = caption_x
-        .map(|cx| cx + 3.0 * sm.caption_w)
-        .unwrap_or(total_w)
-        .max(total_w);
+        .map(|cx| (cx + 3.0 * sm.caption_w).max(0.0))
+        .unwrap_or(total_w);
     out.push(CellInstance {
         pos_uv: [0.0, 0.0, 0.0, 0.0],
         size_uv: [strip_w, eff_h, 0.0, 0.0],
@@ -576,35 +687,80 @@ pub fn strip_quads(
 
     // ---- 第一行:窗口标题(活跃标签名,居中;caption 左界内,超宽省略号)
     let title_y = (sm.title_h - metrics.line_height).max(0.0) / 2.0;
-    let title_avail = caption_x.unwrap_or(strip_w) - 8.0 * k;
+    let left = 8.0 * k;
+    let right = (caption_x.unwrap_or(strip_w) - 8.0 * k).max(left);
+    let center = (strip_w * 0.5).clamp(left, right);
+    let pad_x = if sm.title_highlight { 8.0 * k } else { 0.0 };
+    let title_avail = (if sm.title_centered {
+        2.0 * (center - left).min(right - center)
+    } else {
+        right - left
+    } - 2.0 * pad_x)
+        .max(0.0);
     let title = titles
         .iter()
         .find(|(_, active)| *active)
         .map(|(t, _)| t.as_str())
         .unwrap_or_default();
     let ell = router.route('\u{2026}', GlyphStyle::PLAIN);
-    let routed: Vec<crate::font::router::GlyphInfo> = title
+    let ell_advance = router.ui_advance('\u{2026}').unwrap_or_else(|| adv(&ell));
+    let routed: Vec<_> = title
         .chars()
-        .map(|ch| router.route(ch, GlyphStyle::PLAIN))
+        .take(4096)
+        .map(|ch| {
+            let glyph = router.route(ch, GlyphStyle::PLAIN);
+            let advance = router
+                .ui_advance(ch)
+                .filter(|a| a.is_finite() && *a >= 0.0)
+                .unwrap_or_else(|| adv(&glyph));
+            (glyph, advance)
+        })
         .collect();
+    let total_width: f32 = routed.iter().map(|(_, advance)| advance).sum();
     let mut text_w = 0.0;
-    let mut n_take = routed.len();
-    let mut with_ell = false;
-    for (i, g) in routed.iter().enumerate() {
-        // 省略号宽度恒预留:正好装满的标题也换省略号收口,留呼吸
-        if text_w + adv(g) + adv(&ell) > title_avail {
-            n_take = i;
-            with_ell = n_take > 0;
+    let mut n_take = 0;
+    let with_ell = total_width > title_avail && ell_advance <= title_avail;
+    for (_, advance) in &routed {
+        if text_w + advance + if with_ell { ell_advance } else { 0.0 } > title_avail {
             break;
         }
-        text_w += adv(g);
+        text_w += advance;
+        n_take += 1;
     }
     if with_ell {
-        text_w += adv(&ell);
+        text_w += ell_advance;
     }
-    let mut tx = ((title_avail - text_w) / 2.0).max(0.0);
+    let text_x = if sm.title_centered {
+        center - text_w * 0.5
+    } else {
+        left + pad_x
+    };
+    let title_face = if sm.title_highlight && text_w > 0.0 {
+        let accent = sm.title_highlight_color.unwrap_or(white);
+        mix(
+            bar,
+            accent,
+            sm.title_highlight_opacity * (0.4 + 0.6 * focus),
+        )
+    } else {
+        bar
+    };
+    if sm.title_highlight && text_w > 0.0 {
+        let h = (metrics.line_height + 6.0 * k).min((sm.title_h - 6.0 * k).max(0.0));
+        let r = sm.title_highlight_radius.min(h * 0.5);
+        out.push(rounded(
+            text_x - pad_x,
+            (sm.title_h - h) * 0.5,
+            text_w + 2.0 * pad_x,
+            h,
+            title_face,
+            bar,
+            (r, r),
+        ));
+    }
+    let mut tx = text_x;
     let title_ink = mix(ink2, white, focus);
-    for g in routed.iter().take(n_take) {
+    for (g, advance) in routed.iter().take(n_take) {
         if g.size_px[0] > 0.0 {
             out.push(CellInstance {
                 pos_uv: [
@@ -615,10 +771,10 @@ pub fn strip_quads(
                 ],
                 size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
                 fg: bg_of(title_ink),
-                bg: bg_of(bar),
+                bg: bg_of(title_face),
             });
         }
-        tx += adv(g);
+        tx += advance;
     }
     if with_ell && ell.size_px[0] > 0.0 {
         out.push(CellInstance {
@@ -630,7 +786,7 @@ pub fn strip_quads(
             ],
             size_uv: [ell.size_px[0], ell.size_px[1], ell.uv[2], ell.uv[3]],
             fg: bg_of(title_ink),
-            bg: bg_of(bar),
+            bg: bg_of(title_face),
         });
     }
 
@@ -752,7 +908,8 @@ pub fn strip_quads(
             let mut tx = x0 + sm.tab_pad;
             for ch in title.chars() {
                 let g = router.route(ch, GlyphStyle::PLAIN);
-                if tx + adv(&g) + adv(&ell) > close_x - 6.0 * k {
+                let advance = router.ui_advance(ch).unwrap_or_else(|| adv(&g));
+                if tx + advance + ell_advance > close_x - 6.0 * k {
                     if ell.size_px[0] > 0.0 {
                         out.push(CellInstance {
                             pos_uv: [
@@ -781,7 +938,7 @@ pub fn strip_quads(
                         bg: bg_of(backdrop),
                     });
                 }
-                tx += adv(&g);
+                tx += advance;
             }
             // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
             // 悬停浮现(主色);胶囊内双向真居中(不带 offset,见 caption 注),
@@ -920,6 +1077,14 @@ pub fn strip_quads(
             ));
         }
     }
+    // Glyph images were rasterized at an integer baseline. Snap UI bitmap
+    // placement in physical pixels without rounding the proportional pen.
+    for quad in &mut out {
+        if quad.size_uv[2] > 0.0 {
+            quad.pos_uv[0] = quad.pos_uv[0].round();
+            quad.pos_uv[1] = quad.pos_uv[1].round();
+        }
+    }
     out
 }
 
@@ -1023,6 +1188,7 @@ pub fn build_rows(
     damage: &Damage,
     rows: &mut Vec<RowInst>,
 ) {
+    let cursor = cursor.filter(|_| surface.cursor_visible());
     let grid = surface.grid();
     let screen_lines = grid.screen_lines();
     if rows.len() != screen_lines {
@@ -1373,6 +1539,39 @@ pub fn repack(rows: &[RowInst]) -> Vec<CellInstance> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changed_shared_ui_recovers_a_full_atlas_with_unchanged_grid() {
+        use crate::font::atlas::{ByteBudget, GlyphAtlas, GlyphBitmap};
+        use mica_core::surface::{ScreenSize, Surface};
+        let surface = Surface::new(ScreenSize::new(2, 2));
+        let mut atlas =
+            GlyphAtlas::with_budget(64, 64, 64 * 64 * 4, ByteBudget::new(64 * 64 * 4)).unwrap();
+        let large = GlyphBitmap::from_coverage(40, 40, vec![255; 40 * 40]);
+        let other = GlyphBitmap::from_coverage(40, 40, vec![200; 40 * 40]);
+        let key = |hover: &str, rename: &str, exited: Option<u32>| {
+            super::resource_fingerprint(&surface, &(hover, rename, exited))
+        };
+        atlas.insert(&large);
+        atlas.insert(&other);
+        assert!(atlas.prepare_frame(key("old tooltip", "old rename", None), 8192));
+        atlas.insert(&large);
+        atlas.insert(&other);
+        assert!(!atlas.prepare_frame(key("old tooltip", "old rename", None), 8192));
+        assert!(atlas.prepare_frame(key("new tooltip", "old rename", None), 8192));
+        atlas.insert(&large);
+        atlas.insert(&other);
+        assert!(atlas.prepare_frame(key("new tooltip", "new rename", None), 8192));
+        assert_ne!(
+            key("", "", None),
+            key("", "", Some(0)),
+            "QT successful exit adds banner glyphs"
+        );
+        assert_ne!(
+            atlas.insert(&GlyphBitmap::from_coverage(10, 10, vec![255; 100])),
+            atlas.fallback_rect()
+        );
+    }
+
     use super::*;
     use crate::font::sprite::draw;
 
@@ -1414,6 +1613,176 @@ mod tests {
         }
     }
 
+    #[test]
+    fn window_title_is_centered_in_full_viewport_not_caption_free_left_area() {
+        let mut router = FakeRouter {
+            atlas_w: 256.0,
+            atlas_h: 256.0,
+            glyph_w: 8.0,
+            glyph_h: 12.0,
+            wide: |_| false,
+        };
+        let metrics = StripMetrics::default();
+        let width = 600.0;
+        let caption = width - 3.0 * metrics.caption_w;
+        let quads = strip_quads(
+            &[("Mica".into(), true)],
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &metrics,
+            StripExtras {
+                caption_x: Some(caption),
+                focus: 1.0,
+                ..Default::default()
+            },
+        );
+        let title: Vec<_> = quads
+            .iter()
+            .filter(|q| {
+                q.size_uv[2] > 0.0 && q.pos_uv[1] < metrics.title_h && q.pos_uv[0] < caption
+            })
+            .collect();
+        assert_eq!(title.len(), 4);
+        let left = title
+            .iter()
+            .map(|q| q.pos_uv[0])
+            .fold(f32::INFINITY, f32::min);
+        let right = title
+            .iter()
+            .map(|q| q.pos_uv[0] + q.size_uv[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            ((left + right) / 2.0 - width / 2.0).abs() <= 1.1,
+            "title bounds {left}..{right}, viewport {width}"
+        );
+        let many: Vec<_> = (0..20).map(|i| ("Mica".into(), i == 0)).collect();
+        let quads = strip_quads(
+            &many,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &metrics,
+            StripExtras {
+                caption_x: Some(caption),
+                focus: 1.0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            quads[0].size_uv[0], width,
+            "overflow tabs must not expand the header"
+        );
+    }
+
+    #[test]
+    fn ui_glyph_bitmaps_are_positioned_on_physical_pixel_boundaries() {
+        let mut router = FakeRouter {
+            atlas_w: 256.0,
+            atlas_h: 256.0,
+            glyph_w: 8.0,
+            glyph_h: 12.0,
+            wide: |_| false,
+        };
+        let sm = StripMetrics::default();
+        let quads = strip_quads(
+            &[("Mica".into(), true)],
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &sm,
+            StripExtras {
+                caption_x: Some(601.0 - 3.0 * sm.caption_w),
+                focus: 1.0,
+                ..Default::default()
+            },
+        );
+        for glyph in quads.iter().filter(|q| q.size_uv[2] > 0.0) {
+            assert_eq!(
+                glyph.pos_uv[0].fract(),
+                0.0,
+                "fractional bitmap x blurs the rasterized glyph"
+            );
+            assert_eq!(glyph.pos_uv[1].fract(), 0.0);
+        }
+    }
+
+    #[test]
+    fn title_layout_handles_long_cjk_empty_narrow_and_scaled_windows() {
+        for scale in [1.0, 1.5, 2.0] {
+            let sm = StripMetrics::from_scale(scale);
+            let font = FontMetrics {
+                cell_width: 8.0 * scale,
+                line_height: 16.0 * scale,
+                ascent: 13.0 * scale,
+                descent: 3.0 * scale,
+            };
+            for logical_width in [160.0, 240.0, 600.0] {
+                let width = logical_width * scale;
+                let caption = width - 3.0 * sm.caption_w;
+                for title in [
+                    String::new(),
+                    "Mica".into(),
+                    "项目目录/很长的窗口标题".repeat(40),
+                ] {
+                    let mut router = FakeRouter {
+                        atlas_w: 256.0,
+                        atlas_h: 256.0,
+                        glyph_w: 8.0 * scale,
+                        glyph_h: 12.0 * scale,
+                        wide: |_| false,
+                    };
+                    let quads = strip_quads(
+                        &[(title.clone(), true)],
+                        &mut router,
+                        &font,
+                        &Palette::DEFAULT,
+                        &sm,
+                        StripExtras {
+                            caption_x: Some(caption),
+                            focus: 1.0,
+                            ..Default::default()
+                        },
+                    );
+                    assert_eq!(quads[0].size_uv[0], width);
+                    let glyphs: Vec<_> = quads
+                        .iter()
+                        .filter(|q| q.size_uv[2] > 0.0 && q.pos_uv[1] < sm.title_h)
+                        .collect();
+                    assert!(glyphs.len() >= 3);
+                    for glyph in &glyphs[..glyphs.len() - 3] {
+                        assert!(
+                            glyph.pos_uv[0] >= 0.0 && glyph.pos_uv[0] + glyph.size_uv[0] < caption,
+                            "title must not cover caption buttons"
+                        );
+                    }
+                    if title.is_empty() {
+                        assert_eq!(glyphs.len(), 3);
+                    }
+                    let mut no_highlight = sm;
+                    no_highlight.title_highlight = false;
+                    let plain = strip_quads(
+                        &[(title, true)],
+                        &mut router,
+                        &font,
+                        &Palette::DEFAULT,
+                        &no_highlight,
+                        StripExtras {
+                            caption_x: Some(caption),
+                            focus: 1.0,
+                            ..Default::default()
+                        },
+                    );
+                    assert!(
+                        !plain.iter().any(|q| q.size_uv[2] == 0.0
+                            && q.bg[3] > 0.0
+                            && q.pos_uv[1] < sm.title_h)
+                    );
+                }
+            }
+        }
+    }
+
     /// #90 对比度强制:低对比被推达标、已达标直通、0 关闭、方向正确
     #[test]
     fn contrast_enforcement() {
@@ -1445,6 +1814,107 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CellInstance, size_uv), 16);
         assert_eq!(std::mem::offset_of!(CellInstance, fg), 32);
         assert_eq!(std::mem::offset_of!(CellInstance, bg), 48);
+    }
+
+    #[test]
+    fn row_string_maps_unicode_characters_once_and_keeps_end_boundary() {
+        let mut surface =
+            mica_core::surface::Surface::new(mica_core::surface::ScreenSize::new(28, 2));
+        surface.feed("你😀 C:/src/文件.rs".as_bytes());
+        let (text, columns) = row_string(surface.grid(), 0);
+        assert!(text.starts_with("你😀 C:/src/文件.rs"), "{text:?}");
+        assert_eq!(columns.len(), text.chars().count() + 1);
+        assert_eq!(&columns[..5], &[0, 2, 4, 5, 6]);
+        assert_eq!(columns.last(), Some(&28));
+    }
+
+    #[test]
+    fn row_fold_uses_real_columns_after_deleting_half_a_wide_cell() {
+        use mica_core::surface::{ScreenSize, Surface};
+        let mut s = Surface::new(ScreenSize::new(10, 2));
+        // DCH operates on cells and can leave a spacer without its wide lead.
+        s.feed("你a\r\x1b[P".as_bytes());
+        let (_, _, grid) = s.grid_dims();
+        assert!(
+            grid[Line(0)][Column(0)]
+                .flags
+                .contains(Flags::WIDE_CHAR_SPACER)
+        );
+        assert_eq!(grid[Line(0)][Column(1)].c, 'a');
+        let (hay, spans) = row_fold(grid, 0);
+        assert_eq!(find_row_matches(&hay, &spans, &['a']), vec![(1, 1)]);
+    }
+
+    #[test]
+    fn row_fold_matches_all_greek_sigma_forms() {
+        use mica_core::surface::{ScreenSize, Surface};
+        for text in ["ΟΣ", "οσ", "ος"] {
+            let mut s = Surface::new(ScreenSize::new(10, 2));
+            s.feed(text.as_bytes());
+            let (_, _, grid) = s.grid_dims();
+            let (hay, spans) = row_fold(grid, 0);
+            for query in ["ΟΣ", "οσ", "ος"] {
+                let needle = fold_search(query);
+                assert_eq!(
+                    find_row_matches(&hay, &spans, &needle),
+                    vec![(0, 2)],
+                    "text={text:?}, query={query:?}"
+                );
+            }
+        }
+    }
+
+    /// #57 搜索列映射:真 parser 喂出的 WIDE_CHAR/SPACER 标志下,
+    /// 命中的列号/列宽必须按屏幕列计(旧实现字节偏移当列、字符数当宽,
+    /// CJK/emoji 双错位)。喂真实 VT 序列,不手搓 cell。
+    #[test]
+    fn row_fold_columns_cjk_emoji_ascii() {
+        use mica_core::surface::{ScreenSize, Surface};
+        let mut s = Surface::new(ScreenSize::new(20, 2));
+        s.feed("AB你c🙂\r\n".as_bytes());
+        let (_, _, grid) = s.grid_dims();
+        let (hay, spans) = row_fold(grid, 0);
+        // 续格不产出字符:AB你c🙂 = 5 字符,你/🙂 各占 2 列;行尾空白格
+        // 照常入列(与旧 row_string 一致——查询含空格也应命中)
+        assert_eq!(&hay[..5], &['a', 'b', '你', 'c', '🙂']);
+        assert_eq!(hay.len(), 18, "5 字符占 7 列 + 13 空白列 = 18 字符");
+        assert_eq!(&spans[..5], &[(0, 1), (1, 1), (2, 2), (4, 1), (5, 2)]);
+        assert_eq!(
+            &spans[5..],
+            &(7..20).map(|c| (c, 1)).collect::<Vec<_>>()[..],
+            "🙂 后空白格逐列 7..20"
+        );
+        let n = fold_search;
+        // ASCII:与旧实现的字节偏移语义一致(回归保护)
+        assert_eq!(find_row_matches(&hay, &spans, &n("ab")), vec![(0, 2)]);
+        // 宽字符命中:你 = 2 列
+        assert_eq!(find_row_matches(&hay, &spans, &n("你")), vec![(2, 2)]);
+        // 跨宽字符:你c = 3 列(旧实现报列 6/宽 2)
+        assert_eq!(find_row_matches(&hay, &spans, &n("你c")), vec![(2, 3)]);
+        // emoji 后继字符:列 4(旧实现字节偏移把 c 推到 3 之后)
+        assert_eq!(find_row_matches(&hay, &spans, &n("c")), vec![(4, 1)]);
+        assert_eq!(find_row_matches(&hay, &spans, &n("🙂")), vec![(5, 2)]);
+        // 大小写不敏感
+        assert_eq!(find_row_matches(&hay, &spans, &n("AB")), vec![(0, 2)]);
+        // 无命中
+        assert!(find_row_matches(&hay, &spans, &n("z")).is_empty());
+    }
+
+    /// #57 变长折叠:İ(U+0130)逐字小写化出 2 字符且共享源格 span——
+    /// 其后 ASCII 的列号不受影响(旧整串 to_lowercase 后字节偏移全错)。
+    #[test]
+    fn row_fold_expanding_case_keeps_columns() {
+        use mica_core::surface::{ScreenSize, Surface};
+        let mut s = Surface::new(ScreenSize::new(10, 2));
+        s.feed("İAB\r\n".as_bytes());
+        let (_, _, grid) = s.grid_dims();
+        let (hay, spans) = row_fold(grid, 0);
+        assert_eq!(&hay[..4], &['i', '\u{307}', 'a', 'b'], "İ 折叠成 i+U+0307");
+        assert_eq!(hay.len(), 11, "折叠 4 字符占 3 列 + 7 空白列");
+        assert_eq!(&spans[..4], &[(0, 1), (0, 1), (1, 1), (2, 1)]);
+        let n = fold_search;
+        // 旧实现:hay="i̇AB"(a 在字节 3)→ 报列 3;正解列 1
+        assert_eq!(find_row_matches(&hay, &spans, &n("ab")), vec![(1, 2)]);
     }
 
     #[test]
@@ -1543,12 +2013,12 @@ mod tests {
                 && q.fg[3] == 0.0),
             "活动标签块(第二行整高,上圆下方,等宽 {want_w})"
         );
-        // 条底浅灰:聚焦态 = 终端底 18% 提亮
+        // 条底浅灰:聚焦态 = 终端底 8% 提亮
         let p = Palette::DEFAULT;
         let want_bar = [
-            p.bg.r + ((255 - p.bg.r) as f32 * 0.18 + 0.5) as u8,
-            p.bg.g + ((255 - p.bg.g) as f32 * 0.18 + 0.5) as u8,
-            p.bg.b + ((255 - p.bg.b) as f32 * 0.18 + 0.5) as u8,
+            p.bg.r + ((255 - p.bg.r) as f32 * 0.08 + 0.5) as u8,
+            p.bg.g + ((255 - p.bg.g) as f32 * 0.08 + 0.5) as u8,
+            p.bg.b + ((255 - p.bg.b) as f32 * 0.08 + 0.5) as u8,
         ];
         assert!(
             out.iter().any(
@@ -1557,7 +2027,7 @@ mod tests {
                     && q.bg[1] == want_bar[1] as f32 / 255.0
                     && q.bg[2] == want_bar[2] as f32 / 255.0
             ),
-            "条底 = 浅灰(18% 提亮)"
+            "条底 = 浅灰(8% 提亮)"
         );
         // 关闭钮字形(E8BB)在:active 恒显(第二行)
         assert!(
@@ -1599,8 +2069,9 @@ mod tests {
             "单标签:条高 = 标题行"
         );
         assert!(
-            !out.iter().any(|q| q.bg[3] > 0.0 && q.size_uv[1] > 1.0),
-            "无标签块/胶囊"
+            !out.iter()
+                .any(|q| q.bg[3] > 0.0 && q.size_uv[1] > 1.0 && q.pos_uv[1] >= sm.title_h),
+            "隐藏的第二行没有标签块；第一行允许标题高亮"
         );
         assert!(
             out.iter()
