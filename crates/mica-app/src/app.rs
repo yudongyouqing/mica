@@ -92,6 +92,86 @@ fn initial_window_rect(settings: &Settings, metrics: &FontMetrics) -> RECT {
     }
 }
 
+/// 纯尺寸规则:请求外框约束到**已成功读取的正尺寸工作区**。
+/// monitor 查询失败不进这里(fit 前值已由调用方保证为正),
+/// 也不表达位置——位置约束见 [`constrained_window_placement`]。
+fn fit_outer_size(request: (i32, i32), work: (i32, i32)) -> (i32, i32) {
+    (request.0.min(work.0).max(1), request.1.min(work.1).max(1))
+}
+
+/// 窗口所在显示器工作区(物理像素,窗口本身 PMv2):只认正尺寸矩形,
+/// 查询失败/退化矩形返回 None——由调用方保留请求原值,不把失败当 1×1 窗口
+fn window_work_area(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+    // SAFETY: 只读查询
+    unsafe {
+        let mon = windows::Win32::Graphics::Gdi::MonitorFromWindow(
+            hwnd,
+            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+        );
+        let mut mi = windows::Win32::Graphics::Gdi::MONITORINFO {
+            cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if windows::Win32::Graphics::Gdi::GetMonitorInfoW(mon, &mut mi) == false {
+            return None;
+        }
+        let w = mi.rcWork;
+        (w.right > w.left && w.bottom > w.top).then_some((w.left, w.top, w.right, w.bottom))
+    }
+}
+
+/// 落位约束:初始外框请求按所在显示器工作区收敛,`initial_window_rect`
+/// 仍只表达配置(不碰 Settings/用户文件)。
+/// - 尺寸:自己按工作区裁,而不是交给 OS 默认 max track——小屏 runner
+///   上后者把 2032×1041 压成屏幕+边距(1044×788 实证),行为不可述;
+/// - 位置:自动落位(光标屏 +60 偏移)在缩窗后可能越出工作区,起点一并
+///   收回;显式 window-position 信任用户坐标(多屏自由摆,负坐标合法)。
+///
+/// monitor 查询失败:eprintln 诊断并保留请求(尺寸不缩、位置取当前
+/// 矩形),既有 OS 兜底仍在——失败不是 1×1 窗口。
+fn constrained_window_placement(hwnd: HWND, request: RECT, auto_position: bool) -> RECT {
+    // SAFETY: 只读几何查询;SetWindowPos 由调用方执行
+    unsafe {
+        let mut current = RECT::default();
+        if GetWindowRect(hwnd, &mut current).is_err() {
+            eprintln!(
+                "[window] GetWindowRect 失败,保留请求外框 {}x{}(原点 0,0)",
+                request.right - request.left,
+                request.bottom - request.top
+            );
+            return request;
+        }
+        let mut placed = RECT {
+            left: current.left,
+            top: current.top,
+            right: current.left + request.right - request.left,
+            bottom: current.top + request.bottom - request.top,
+        };
+        let Some((wl, wt, wr, wb)) = window_work_area(hwnd) else {
+            eprintln!(
+                "[window] 工作区查询失败,保留请求外框 {}x{}(OS max track 兜底)",
+                placed.right - placed.left,
+                placed.bottom - placed.top
+            );
+            return placed;
+        };
+        let (w, h) = fit_outer_size(
+            (placed.right - placed.left, placed.bottom - placed.top),
+            (wr - wl, wb - wt),
+        );
+        placed.right = placed.left + w;
+        placed.bottom = placed.top + h;
+        if auto_position {
+            // 缩窗后起点收回工作区:上压右/下边界,下托左/上边界
+            placed.left = placed.left.min(wr - w).max(wl);
+            placed.top = placed.top.min(wb - h).max(wt);
+            placed.right = placed.left + w;
+            placed.bottom = placed.top + h;
+        }
+        placed
+    }
+}
+
 /// strip/顶栏运行时几何(DPI 缩放 + 用户配置单源,渲染与 hit-test 同取):
 /// 150% 屏上物理常量曾致条高/× 与字体错位(2026-10-06 用户实测);
 /// strip-* 配置键热重载时经 STRIP_CFG 生效(2026-10-12 全量可配)
@@ -877,15 +957,17 @@ pub fn run() {
                 DPI_SCALE.with(std::cell::Cell::get)
             );
             let rect = initial_window_rect(&settings, &metrics);
+            // Task 1(2026-11-15):请求外框按所在屏工作区收敛;显式
+            // window-position 信任用户坐标,自动落位在缩窗后收回工作区内
+            let rect = constrained_window_placement(hwnd, rect, settings.window_position.is_none());
             let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                 hwnd,
                 None,
-                0,
-                0,
+                rect.left,
+                rect.top,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
-                windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER
                     | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
             );
             eprintln!(
@@ -1111,15 +1193,16 @@ fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
                 };
                 let metrics = router.metrics();
                 let rect = initial_window_rect(&settings, &metrics);
+                // 副窗无 window-position,恒自动落位(同主窗约束)
+                let rect = constrained_window_placement(hwnd, rect, true);
                 let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
                     hwnd,
                     None,
-                    0,
-                    0,
+                    rect.left,
+                    rect.top,
                     rect.right - rect.left,
                     rect.bottom - rect.top,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
                 );
             }
             if CURSOR_BLINK.with(std::cell::Cell::get) {
@@ -5396,7 +5479,20 @@ fn current_mods() -> Mods {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameSched, detect_path_token, frame_sched, normalize_path_token, pretty_title};
+    use super::{
+        FrameSched, detect_path_token, fit_outer_size, frame_sched, normalize_path_token,
+        pretty_title,
+    };
+
+    #[test]
+    fn fit_outer_size_constrains_only_what_exceeds_work_area() {
+        // 大屏:请求原样通过(本机 2032×1041 精确回归的纯函数面)
+        assert_eq!(fit_outer_size((2032, 1041), (2560, 1440)), (2032, 1041));
+        // 小屏(1024×768 runner 实测 work):整体收到工作区
+        assert_eq!(fit_outer_size((2032, 1041), (1024, 728)), (1024, 728));
+        // 工作区内请求不受影响
+        assert_eq!(fit_outer_size((640, 480), (1024, 728)), (640, 480));
+    }
 
     #[test]
     fn exact_pixel_window_size_overrides_cell_dimensions() {

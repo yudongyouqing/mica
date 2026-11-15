@@ -117,7 +117,7 @@ mica +validate-config
 | 普通窗口字体、调色板、背景、鼠标行为、快捷键、标题栏、光标闪烁 | 保存后热重载 |
 | `command` | 新标签、分屏、新窗口；已有会话保持原 shell |
 | `window-width` / `window-height` / `window-position` | 新建窗口；宽高单位为终端列、行 |
-| `window-size-pixels = 宽,高` | 新窗口的精确物理像素外框；优先于列/行配置，置空恢复列/行 |
+| `window-size-pixels = 宽,高` | 新窗口的物理像素外框请求；落在显示器工作区内时精确生效，超出时按所在显示器工作区约束（不随 DPI 换算）；优先于列/行配置，置空恢复列/行 |
 | `window-padding-x` / `window-padding-y` | 逻辑像素、随 DPI 缩放，保存后热重载 |
 | `window-title-font-family` / `strip-font-family` | 同一项 UI 字体配置，默认 Segoe UI，独立于终端字体；热重载 |
 | `strip-font-size` / `strip-font-weight` | 标题栏字号和字重，默认 11pt / 600 半粗体；400 常规、700 粗体，范围 100–900 |
@@ -137,7 +137,9 @@ strip-title-align = center
 strip-title-highlight = true
 ```
 
-像素尺寸是 Mica 的扩展，不随 DPI 换算；未设置时仍采用列/行配置。
+像素尺寸是 Mica 的扩展，不随 DPI 换算；请求外框落在所选显示器工作区内时逐像素精确，
+超出时按该显示器工作区约束（小屏上窗口整体收纳进工作区，而不是交给系统裁掉）。
+未设置时仍采用列/行配置。
 标题底色默认从主题强调色推导，`strip-title-highlight-color = auto` 恢复自动配色。
 
 `command` 用于之后新建的窗口、标签、分屏和 Quick Terminal。显式选择

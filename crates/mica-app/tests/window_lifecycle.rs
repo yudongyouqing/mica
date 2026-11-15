@@ -340,29 +340,86 @@ fn configured_command_reaches_tabs_splits_windows_and_quick_terminal() {
     }
 }
 
+/// PMv2 线程上下文里读窗口外框与所在显示器工作区(物理像素),读毕恢复
+/// 原 DPI 上下文——测试进程本身未必 PMv2,不切会拿到虚拟化坐标。
+/// 返回 (窗口外框矩形, 工作区矩形)。
+fn outer_rect_and_work_area(hwnd: HWND) -> (RECT, RECT) {
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        };
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+        };
+        let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let mut rect = RECT::default();
+        let rect_result = GetWindowRect(hwnd, &mut rect);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mon_ok = GetMonitorInfoW(mon, &mut mi);
+        SetThreadDpiAwarenessContext(previous);
+        rect_result.unwrap();
+        assert!(mon_ok.as_bool(), "GetMonitorInfoW 失败");
+        (rect, mi.rcWork)
+    }
+}
+
+/// 契约 A:工作区内的请求得到**精确**外框(任何屏幕都必须逐像素成立;
+/// 640×480 前提是工作区 ≥ 700×540,CI runner 与桌面机均满足)。
 #[test]
 fn pixel_size_configuration_sets_exact_native_outer_dimensions() {
     let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
     let (app, _) = launch_config_source(
         true,
-        "window-size-pixels = 2032,1041\nquick-terminal-key = none\n",
+        "window-size-pixels = 640,480\nquick-terminal-key = none\n",
     );
     let windows = wait_windows(app.0.id(), 1, Duration::from_secs(10));
-    let mut rect = RECT::default();
-    // Read physical pixels independently of the test runner's DPI awareness.
-    unsafe {
-        use windows::Win32::UI::HiDpi::{
-            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
-        };
-        let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let result = GetWindowRect(windows[0], &mut rect);
-        SetThreadDpiAwarenessContext(previous);
-        result.unwrap();
-    }
+    let (rect, _) = outer_rect_and_work_area(windows[0]);
     assert_eq!(
         (rect.right - rect.left, rect.bottom - rect.top),
-        (2032, 1041)
+        (640, 480),
+        "工作区内请求必须精确落位"
     );
+}
+
+/// 契约 B:超屏请求按**窗口所在显示器实际工作区**约束,期望随环境计算
+/// (不写死某 runner 的 OS 兜底值 1044×788);大屏(本机 2560×1440)上
+/// 期望即 2032×1041,保留 Windows Terminal 参考尺寸精确回归。
+/// 主窗与 IPC 副窗都验证;自动落位在缩窗后整窗必须仍在工作区内。
+#[test]
+fn oversized_pixel_size_request_constrains_to_monitor_work_area() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (app, _) = launch_config_source(
+        true,
+        "window-size-pixels = 2032,1041\nquick-terminal-key = none\n",
+    );
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let _first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let both = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    for (i, hwnd) in both.iter().enumerate() {
+        let (rect, work) = outer_rect_and_work_area(*hwnd);
+        let expected = (
+            2032.min(work.right - work.left),
+            1041.min(work.bottom - work.top),
+        );
+        assert_eq!(
+            (rect.right - rect.left, rect.bottom - rect.top),
+            expected,
+            "窗口 {i}:请求 2032×1041 应约束到工作区 {:?}",
+            (work.right - work.left, work.bottom - work.top)
+        );
+        assert!(
+            rect.left >= work.left
+                && rect.top >= work.top
+                && rect.right <= work.right
+                && rect.bottom <= work.bottom,
+            "窗口 {i} 自动落位越出工作区: rect={rect:?} work={work:?}"
+        );
+    }
 }
 
 /// #109:主窗 timer 7 还未执行时关闭,副窗的配置监听不能永久缺席。
