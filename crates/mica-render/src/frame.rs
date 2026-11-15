@@ -1078,6 +1078,14 @@ pub fn strip_quads(
             ));
         }
     }
+    // Glyph images were rasterized at an integer baseline. Snap UI bitmap
+    // placement in physical pixels without rounding the proportional pen.
+    for quad in &mut out {
+        if quad.size_uv[2] > 0.0 {
+            quad.pos_uv[0] = quad.pos_uv[0].round();
+            quad.pos_uv[1] = quad.pos_uv[1].round();
+        }
+    }
     out
 }
 
@@ -1666,6 +1674,38 @@ mod tests {
             quads[0].size_uv[0], width,
             "overflow tabs must not expand the header"
         );
+    }
+
+    #[test]
+    fn ui_glyph_bitmaps_are_positioned_on_physical_pixel_boundaries() {
+        let mut router = FakeRouter {
+            atlas_w: 256.0,
+            atlas_h: 256.0,
+            glyph_w: 8.0,
+            glyph_h: 12.0,
+            wide: |_| false,
+        };
+        let sm = StripMetrics::default();
+        let quads = strip_quads(
+            &[("Mica".into(), true)],
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &sm,
+            StripExtras {
+                caption_x: Some(601.0 - 3.0 * sm.caption_w),
+                focus: 1.0,
+                ..Default::default()
+            },
+        );
+        for glyph in quads.iter().filter(|q| q.size_uv[2] > 0.0) {
+            assert_eq!(
+                glyph.pos_uv[0].fract(),
+                0.0,
+                "fractional bitmap x blurs the rasterized glyph"
+            );
+            assert_eq!(glyph.pos_uv[1].fract(), 0.0);
+        }
     }
 
     #[test]

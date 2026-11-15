@@ -35,6 +35,7 @@ struct VsOut {
     @location(3) ink_mask: f32,
     @location(4) local: vec2f,
     @location(5) geo: vec4f,
+    @location(6) @interpolate(flat) uv_bounds: vec4f,
 };
 
 @vertex
@@ -50,13 +51,13 @@ fn vs(
     let y = pos_uv.y + corner.y * size_uv.y;
     var out: VsOut;
     out.pos = vec4f(x / globals.viewport.x * 2.0 - 1.0, 1.0 - y / globals.viewport.y * 2.0, 0.0, 1.0);
-    // 半纹素内缩(2026-10-11 接缝修复):采样域从 [0, w] 收到 [0.5, w-0.5]
-    // ——边缘落在纹素中心,LINEAR 采样永不与图集零填充邻格混合。此前的
-    // 边界采样让每格最后一列像素混入 1/10 零墨 = 半亮接缝,块字符艺术
-    // (logo/横线)被切成一块一块(用户截图+逐像素亮度实测定案)
-    let inset = vec2f(0.5);
-    let texel = pos_uv.zw + inset + corner * max(size_uv.zw - 2.0 * inset, vec2f(0.0));
+    // Map the full texel domain to geometry. Rasterization already evaluates
+    // pixel centers; shrinking UVs here would resample and soften every glyph.
+    let texel = pos_uv.zw + corner * size_uv.zw;
     out.uv = texel / globals.atlas_size;
+    let first_center = pos_uv.zw + vec2f(0.5);
+    let last_center = first_center + max(size_uv.zw - vec2f(1.0), vec2f(0.0));
+    out.uv_bounds = vec4f(first_center / globals.atlas_size, last_center / globals.atlas_size);
     out.fg = fg.rgb;
     out.bg = bg.rgb;
     out.ink_mask = select(0.0, 1.0, size_uv.z > 0.0);
@@ -101,7 +102,9 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
         }
         return vec4f(mix(inp.fg, inp.bg, cov), 1.0);
     }
-    let tex = textureSample(glyphs, glyph_sampler, inp.uv);
+    // Clamp only outside edge centers, preserving exact 1:1 sampling inside
+    // while keeping fractional/scaled sprites from sampling atlas padding.
+    let tex = textureSample(glyphs, glyph_sampler, clamp(inp.uv, inp.uv_bounds.xy, inp.uv_bounds.zw));
     let ink = tex.a * inp.ink_mask;
     return vec4f(mix(inp.bg, tex.rgb * inp.fg, ink), 1.0);
 }
