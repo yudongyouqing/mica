@@ -604,6 +604,18 @@ impl WriteQueue {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).bytes
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(&self) -> Vec<u8> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .queue
+            .iter()
+            .flatten()
+            .copied()
+            .collect()
+    }
+
     pub fn free_bytes(&self) -> usize {
         let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         self.cap.saturating_sub(st.bytes)

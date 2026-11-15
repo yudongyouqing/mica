@@ -651,6 +651,11 @@ unsafe extern "system" fn qt_wndproc(
                     }
                     _ => char::from_u32(code).unwrap_or('\u{FFFD}'),
                 };
+                // Tab is always encoded on keydown; the character event has
+                // no Shift state and would append a second plain Tab.
+                if ch == '\t' {
+                    return;
+                }
                 // kitty 模式下 C0 已由 WM_KEYDOWN 侧编码成 CSI-u,这里再发
                 // 就是双发(主窗同款契约);可打印文本照旧走此处
                 if st.terminal.term.kitty_flags().any() && (ch as u32) < 0x20 {
@@ -667,7 +672,7 @@ unsafe extern "system" fn qt_wndproc(
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            // M5a/T8(M3b 打磨票清账):对齐主窗输入契约——Enter/Tab/Esc/
+            // M5a/T8(M3b 打磨票清账):对齐主窗输入契约——Enter/Esc/
             // Backspace/可打印走 WM_CHAR(修双发:旧代码两臂都写);kitty 时
             // 功能键 CSI-u;legacy 时方向/编辑键经 vkey_bytes(补修饰键,
             // 修 Ctrl+方向跳词/Shift+翻页等)。QT 无 keymap 拦截(单 pane)
@@ -686,8 +691,12 @@ unsafe extern "system" fn qt_wndproc(
                 };
                 if flags.any()
                     && let Some(key) = super::vk_to_key(vk)
-                    && let Some(bytes) =
-                        mica_core::protocol::kitty::kitty_encode(key, mods, kind, flags)
+                    && let Some(bytes) = mica_core::protocol::kitty::kitty_encode(
+                        key,
+                        super::remap_mods(mods),
+                        kind,
+                        flags,
+                    )
                 {
                     let _ = accept_qt_input(&mut st.terminal, &bytes);
                     return;
@@ -902,6 +911,133 @@ mod tests {
     // Visible test-owned QTs otherwise steal focus from each other, causing
     // production WM_ACTIVATE to hide a window while its test is feeding it.
     static QT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn qt_tab_messages_reach_real_pty_once_with_backtab_modifiers() {
+        use crate::app::keyboard_tests::{KeyboardState, isolated, probe_command, send_tab};
+        if isolated(
+            "app::quickterm::tests::qt_tab_messages_reach_real_pty_once_with_backtab_modifiers",
+        ) {
+            return;
+        }
+        let _lock = QT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let settings = mica_core::config::settings::Settings {
+            command: Some(probe_command()),
+            quick_terminal_key: None,
+            ..Default::default()
+        };
+        crate::app::seed_tls_for_tests(&settings);
+        unsafe { init(HWND(std::ptr::null_mut())) }.unwrap();
+        let hwnd = HWND(QT_HWND.with(std::cell::Cell::get) as *mut std::ffi::c_void);
+        struct Cleanup(HWND);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    SendMessageW(self.0, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+                }
+                forget_state();
+            }
+        }
+        let _cleanup = Cleanup(hwnd);
+        let keyboard = KeyboardState::new();
+        let text = || {
+            QT.with(|state| {
+                let state = state.borrow();
+                let terminal = &state.as_ref().unwrap().terminal;
+                (0..terminal.rows)
+                    .map(|row| {
+                        mica_render::frame::row_string(terminal.term.grid(), i32::from(row)).0
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        };
+        let until = |needle: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !text().contains(needle) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "QT input probe timeout: {}",
+                    text()
+                );
+                let mut message = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+                unsafe {
+                    while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                        &mut message,
+                        None,
+                        0,
+                        0,
+                        windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+                    )
+                    .as_bool()
+                    {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&message);
+                        windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&message);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        until("MICA_KEY_READY");
+        unsafe {
+            send_tab(hwnd, &keyboard, false, false);
+            send_tab(hwnd, &keyboard, true, false);
+            send_tab(hwnd, &keyboard, true, true);
+        }
+        let _ = accept_qt(b"\x04");
+        until("MICA_KEY_DONE");
+        assert!(
+            text().contains("MICA_KEY_BYTES=091B5B5A1B5B5A"),
+            "wrong QT native Tab stream: {}",
+            text()
+        );
+        QT.with(|state| {
+            let mut state = state.borrow_mut();
+            let terminal = &mut state.as_mut().unwrap().terminal;
+            let previous = std::mem::replace(&mut terminal.writeq, crate::app::WriteQueue::new());
+            previous.close();
+            terminal.term.feed(b"\x1b[>1u");
+            assert!(
+                terminal
+                    .term
+                    .kitty_flags()
+                    .contains(mica_core::protocol::kitty::KittyFlags::DISAMBIGUATE)
+            );
+        });
+        unsafe {
+            send_tab(hwnd, &keyboard, true, false);
+        }
+        let pending = QT.with(|state| {
+            state
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .terminal
+                .writeq
+                .pending_for_test()
+        });
+        assert_eq!(pending, b"\x1b[9;2u");
+        crate::app::KEY_REMAP.with(|remap| {
+            *remap.borrow_mut() =
+                vec![mica_core::keymap::KeyRemap::parse_pair("shift=ctrl").unwrap()]
+        });
+        unsafe {
+            send_tab(hwnd, &keyboard, true, false);
+        }
+        let pending = QT.with(|state| {
+            state
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .terminal
+                .writeq
+                .pending_for_test()
+        });
+        assert_eq!(
+            pending, b"\x1b[9;2u\x1b[9;5u",
+            "QT kitty encoding must apply the configured modifier remap"
+        );
+    }
 
     #[test]
     fn configured_height_and_hotkey_rebinding_reach_native_window() {

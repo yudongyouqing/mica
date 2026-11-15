@@ -36,7 +36,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TME_HOVER, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
     TrackMouseEvent, VIRTUAL_KEY, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_INSERT,
-    VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::HICON;
@@ -475,6 +475,8 @@ mod clipboard;
 pub(crate) mod crash;
 pub(crate) mod ipc;
 mod jumplist;
+#[cfg(test)]
+mod keyboard_tests;
 pub(crate) mod lifecycle;
 pub mod orphan; // pub:tests 直入(真进程集成回归,T02)
 pub(crate) mod pty_bridge;
@@ -2814,6 +2816,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
             };
+            // Tab (plain or modified) is handled on WM_KEYDOWN. Its companion
+            // WM_CHAR contains only U+0009 and loses modifier information.
+            if ch == '\t' {
+                return LRESULT(0);
+            }
             // kitty 模式下 C0 控制字符已由 WM_KEYDOWN 侧编码成 CSI-u,这里
             // 再发就是双发(Ctrl+字母/退格 0x08/Tab);可打印文本照旧走此处。
             // 代理对(上文已归并的 ch ≥ 0x10000)不受影响
@@ -2876,6 +2883,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if (0x30..=0x5A).contains(&vk) {
                     KEYMAP_ATE_CHAR.set(true);
                 }
+                return LRESULT(0);
+            }
+            // The search/rename editor owned Tab's character event before the
+            // keydown routing fix; keep it from reaching the terminal beneath.
+            if vk == VK_TAB.0 as u32 && (SEARCH_OPEN.get() || RENAME_OPEN.get()) {
                 return LRESULT(0);
             }
             if mods.ctrl && !mods.alt && !mods.shift && vk == 'C' as u32 {
@@ -4359,6 +4371,7 @@ fn vk_to_key(vk: u32) -> Option<mica_core::input::Key> {
 
 fn vk_to_trigger(vk: u32) -> Option<TriggerKey> {
     match vk {
+        _ if vk == VK_TAB.0 as u32 => Some(TriggerKey::Key(Key::Tab)),
         // VK 常量是关联 const,进不了 pattern——守卫链对齐 vkey_bytes
         0x41..=0x5A => Some(TriggerKey::Letter(vk as u8 as char)),
         0x30..=0x39 => Some(TriggerKey::Digit((vk - 0x30) as u8)),
@@ -4711,11 +4724,9 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
     let mut close_pane = false;
     let mut focus_dir: Option<input::Key> = None;
     TABS.with(|cell| {
-        if let Some(t) = cell
-            .borrow_mut()
-            .get_mut(ACTIVE.get())
-            .and_then(|tab| tab.active_pane())
-        {
+        let mut tabs = cell.borrow_mut();
+        let tab_count = tabs.len();
+        if let Some(t) = tabs.get_mut(ACTIVE.get()).and_then(|tab| tab.active_pane()) {
             match action {
                 Action::Copy => {
                     if let Some(text) = t.term.selection_text() {
@@ -4768,11 +4779,11 @@ fn execute_action(action: Action, hwnd: HWND) -> bool {
                 Action::NewTab => new_tab = true,
                 Action::CloseTab => close_idx = Some(ACTIVE.get()),
                 Action::NextTab => {
-                    let n = cell.borrow().len();
+                    let n = tab_count;
                     next_idx = Some((ACTIVE.get() + 1) % n.max(1));
                 }
                 Action::PrevTab => {
-                    let n = cell.borrow().len();
+                    let n = tab_count;
                     next_idx = Some((ACTIVE.get() + n.saturating_sub(1)) % n.max(1));
                 }
                 Action::GotoTab(n) => goto_idx = Some((n as usize).saturating_sub(1)),
@@ -5441,6 +5452,7 @@ fn vkey_bytes(vk: u32, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
     // #79 key-remap:encode 前转换修饰(动作判定已在上游完成)
     let mods = remap_mods(mods);
     let key = match VIRTUAL_KEY(vk as u16) {
+        VK_TAB => Key::Tab,
         VK_UP => Key::Up,
         VK_DOWN => Key::Down,
         VK_LEFT => Key::Left,
