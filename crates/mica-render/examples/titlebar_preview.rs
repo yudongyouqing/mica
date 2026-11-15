@@ -16,9 +16,24 @@ fn main() -> anyhow::Result<()> {
     let output = std::env::args_os()
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("output PNG path required"))?;
-    let settings = resolve("theme = Dracula\nbackground = #0c0c0c")
+    let mut settings = resolve("theme = Dracula\nbackground = #0c0c0c")
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    let scale = 1.5;
+    let comparison = std::env::args().any(|arg| arg == "--comparison");
+    let single = std::env::args().any(|arg| arg == "--single");
+    // 对照开关(仅改导出器本地副本,不动用户配置):关标题高亮出纯原生条
+    let no_highlight = std::env::args().any(|arg| arg == "--no-highlight");
+    let mut scale = 1.5;
+    if let Some(value) = std::env::args()
+        .position(|arg| arg == "--scale")
+        .and_then(|pos| std::env::args().nth(pos + 1))
+    {
+        scale = value
+            .parse::<f32>()
+            .map_err(|error| anyhow::anyhow!("--scale 需要数值: {error}"))?;
+    }
+    if no_highlight {
+        settings.strip.title_highlight = false;
+    }
     let sm = StripMetrics::from_scale_cfg(scale, &settings.strip);
     let families = [
         "Segoe UI",
@@ -32,8 +47,9 @@ fn main() -> anyhow::Result<()> {
         settings.strip.font_weight,
         None,
     )?;
-    let comparison = std::env::args().any(|arg| arg == "--comparison");
-    let (width, height) = if comparison {
+    let (width, height) = if single {
+        (1000u32, 80u32)
+    } else if comparison {
         (1000u32, 160u32)
     } else {
         (2032u32, 600u32)
@@ -60,9 +76,12 @@ fn main() -> anyhow::Result<()> {
     if comparison {
         rows = vec![(vec![("Mica — yudongyouqing".into(), true)], 1.0); 2];
     }
+    if single {
+        rows.truncate(1);
+    }
     let mut quads = Vec::new();
     for (index, (titles, focus)) in rows.into_iter().enumerate() {
-        let (size, weight) = if comparison && index == 0 {
+        let (size, weight) = if comparison && !single && index == 0 {
             (9.5, 400)
         } else {
             (settings.strip.font_size_pt, settings.strip.font_weight)
@@ -87,7 +106,10 @@ fn main() -> anyhow::Result<()> {
         }
         quads.extend(row);
     }
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
     let ctx = pollster::block_on(create_context(&instance, None))?;
     let mut renderer = Renderer::new(&ctx, wgpu::TextureFormat::Bgra8Unorm)?;
     renderer.set_clear_color(&settings.palette);

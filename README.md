@@ -94,7 +94,7 @@ command = pwsh.exe -NoLogo
 # 标签栏外观全量可配(strip-* 键集)
 strip-font-size = 11
 strip-font-weight = 600
-strip-bar-wash = 0.18
+strip-bar-wash = 0.08
 strip-tab-height = 36
 strip-animation-duration = 120
 ```
@@ -140,7 +140,7 @@ strip-title-highlight = true
 像素尺寸是 Mica 的扩展，不随 DPI 换算；请求外框落在所选显示器工作区内时逐像素精确，
 超出时按该显示器工作区约束（小屏上窗口整体收纳进工作区，而不是交给系统裁掉）。
 未设置时仍采用列/行配置。
-标题底色默认从主题强调色推导，`strip-title-highlight-color = auto` 恢复自动配色。
+标题默认使用低强度中性底，`strip-title-highlight-color = auto` 从标题文字色和条底推导；也可显式指定色值。
 
 `command` 用于之后新建的窗口、标签、分屏和 Quick Terminal。显式选择
 `--profile` 时使用该 profile；空 `command =` 恢复 Windows PowerShell 默认值。

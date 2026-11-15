@@ -460,8 +460,7 @@ pub struct StripExtras {
     pub hover: StripHover,
     /// 最大化态(2026-10-07):true 时最大化钮显还原图标(E923)
     pub zoomed: bool,
-    /// 窗口聚焦相位(2026-10-12):1.0 = 聚焦(条底 18% 提亮),0.0 = 失焦
-    /// (洗白至 30%)——**连续值**,app 侧动画驱动(WM_TIMER 渐进),
+    /// 窗口聚焦相位(2026-10-12):1.0 = 聚焦,0.0 = 失焦(颜色由配置合成)——**连续值**,app 侧动画驱动(WM_TIMER 渐进),
     /// 切换不跳变(上游 becomeMain/resignMain 语义的动画化)
     pub focus: f32,
     /// 活跃标签胶囊横移量(动画中):非零时活跃标签 x0 偏移此值,衰减到
@@ -607,7 +606,7 @@ pub fn find_row_matches(
 /// 用户裁定):第一行 = 窗口标题(活跃标签名,居中)+ 右端 caption 三键
 /// (— □ ×);第二行 = 均分标签占满 + 右端 "+" 开新标签;再下才是终端
 /// 主体。单标签时第二行整行隐藏(上游 hasTabBar 同款)。
-/// 条底 = 常态浅灰(终端底提亮 18%;失焦再洗至 30%,上游 becomeMain/
+/// 条底采用配置中的聚焦/失焦提亮比例(上游 becomeMain/
 /// resignMain 同款),活跃标签块 = 终端底色原样、上圆下方与内容区无缝
 /// 相接。strip 文字走**小号等宽路由**(9.5pt 共享图集,app 侧注入;
 /// 字号 12pt 的终端路由出的大字形会挤出 × 关闭区,用户实报)。
@@ -646,7 +645,7 @@ pub fn strip_quads(
     };
     let bg3 = [palette.bg.r, palette.bg.g, palette.bg.b];
     // 条底 = 常态浅灰(上游实测:标签栏比终端底亮;Ventura 版 14% 提亮同族,
-    // 默认 18%),失焦再洗一档(默认 30%;Tahoe becomeMain/resignMain 同款)。
+    // 比例由外置配置给出,聚焦/失焦分别合成。
     // focus 是 0..1 的动画相位(app 侧 WM_TIMER 渐进),切换不再跳变——
     // 这是"丝滑"的一半;另一半是活跃块滑动(capsule_dx)。
     // 全部颜色/比例可配(strip-* 键):显式色直通,auto 才走提亮推导
@@ -654,9 +653,13 @@ pub fn strip_quads(
     let wash = sm.bar_wash + (sm.bar_wash_unfocused - sm.bar_wash) * (1.0 - focus);
     let bar = sm.bar_c.unwrap_or_else(|| mix(bg3, [255, 255, 255], wash));
     // 活跃标签面色:聚焦 = 终端底原样(与内容一体);失焦同样洗白一档
-    let active_face = sm
-        .active_c
-        .unwrap_or_else(|| mix(bg3, [255, 255, 255], 0.18 * (1.0 - focus)));
+    let active_face = sm.active_c.unwrap_or_else(|| {
+        mix(
+            bg3,
+            [255, 255, 255],
+            sm.bar_wash_unfocused * 0.5 * (1.0 - focus),
+        )
+    });
     let white = sm
         .text_c
         .unwrap_or([palette.fg.r, palette.fg.g, palette.fg.b]);
@@ -733,11 +736,7 @@ pub fn strip_quads(
         left + pad_x
     };
     let title_face = if sm.title_highlight && text_w > 0.0 {
-        let accent = sm.title_highlight_color.unwrap_or([
-            palette.colors[4].r,
-            palette.colors[4].g,
-            palette.colors[4].b,
-        ]);
+        let accent = sm.title_highlight_color.unwrap_or(white);
         mix(
             bar,
             accent,
@@ -2014,12 +2013,12 @@ mod tests {
                 && q.fg[3] == 0.0),
             "活动标签块(第二行整高,上圆下方,等宽 {want_w})"
         );
-        // 条底浅灰:聚焦态 = 终端底 18% 提亮
+        // 条底浅灰:聚焦态 = 终端底 8% 提亮
         let p = Palette::DEFAULT;
         let want_bar = [
-            p.bg.r + ((255 - p.bg.r) as f32 * 0.18 + 0.5) as u8,
-            p.bg.g + ((255 - p.bg.g) as f32 * 0.18 + 0.5) as u8,
-            p.bg.b + ((255 - p.bg.b) as f32 * 0.18 + 0.5) as u8,
+            p.bg.r + ((255 - p.bg.r) as f32 * 0.08 + 0.5) as u8,
+            p.bg.g + ((255 - p.bg.g) as f32 * 0.08 + 0.5) as u8,
+            p.bg.b + ((255 - p.bg.b) as f32 * 0.08 + 0.5) as u8,
         ];
         assert!(
             out.iter().any(
@@ -2028,7 +2027,7 @@ mod tests {
                     && q.bg[1] == want_bar[1] as f32 / 255.0
                     && q.bg[2] == want_bar[2] as f32 / 255.0
             ),
-            "条底 = 浅灰(18% 提亮)"
+            "条底 = 浅灰(8% 提亮)"
         );
         // 关闭钮字形(E8BB)在:active 恒显(第二行)
         assert!(
