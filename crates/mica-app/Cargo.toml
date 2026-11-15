@@ -55,6 +55,7 @@ notify = { workspace = true }
 [target.'cfg(windows)'.dev-dependencies]
 mica-core = { path = "../mica-core" }
 windows = { workspace = true, features = [
+    "Win32_System_Console",
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Storage_FileSystem",

@@ -1250,7 +1250,14 @@ mod tests {
     /// 本测试的等价路径是"两批都绑 A":右半会呈红色,断言失败。
     #[test]
     fn split_batches_bind_own_atlas_pixels() {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: if cfg!(windows) {
+                wgpu::Backends::DX12
+            } else {
+                wgpu::Backends::all()
+            },
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
         let Ok(adapter) =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
         else {
@@ -1346,6 +1353,46 @@ mod tests {
             rb > 223 && rr < 32,
             "右半必须是 B 图集的蓝色,得 B={rb} R={rr}"
         );
+        // A pixel-aligned 1:1 glyph must reproduce texels, not resample an
+        // inset/shrunken UV domain. Alternating opaque/clear columns reveal blur.
+        let mut strokes = GlyphAtlas::new(256, 256);
+        let coverage: Vec<u8> = (0..12)
+            .flat_map(|_| (0..8).map(|x| if x % 2 == 0 { 255 } else { 0 }))
+            .collect();
+        let rect = strokes.insert(&GlyphBitmap::from_coverage(8, 12, coverage));
+        renderer.set_atlas(&strokes);
+        renderer.begin_frame_offscreen(&view, (256, 64));
+        renderer.draw_batch(&[quad(12.0, rect)], None);
+        renderer.end_frame();
+        let exact = read_pixels(&device, &queue, &target, size);
+        for x in 0..8usize {
+            let value = exact[(32 * 256 + 12 + x) * 4];
+            assert!(
+                if x % 2 == 0 { value > 250 } else { value < 5 },
+                "1:1 column {x} was blurred to {value}"
+            );
+        }
+        // Keep the original seam protection for non-integer/scaled sprite
+        // geometry. Adjacent solid tiles must never sample transparent gutters.
+        let tiles: Vec<_> = (0..16)
+            .map(|i| {
+                let mut tile = quad(12.25 + i as f32 * 7.75, rect_a);
+                tile.size_uv[0] = 7.75;
+                tile
+            })
+            .collect();
+        renderer.set_atlas(&atlas_a);
+        renderer.begin_frame_offscreen(&view, (256, 64));
+        renderer.draw_batch(&tiles, None);
+        renderer.end_frame();
+        let solid = read_pixels(&device, &queue, &target, size);
+        for x in 12..136usize {
+            let index = (32 * 256 + x) * 4;
+            assert!(
+                solid[index] < 5 && solid[index + 2] > 250,
+                "fractional sprite seam at {x}"
+            );
+        }
         // A saturated process still renders ordinary backgrounds and a visible
         // replacement in *green* foreground (magenta*green used to turn black).
         let quota = crate::font::atlas::ByteBudget::new(4);

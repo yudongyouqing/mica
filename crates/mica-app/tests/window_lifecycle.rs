@@ -83,6 +83,10 @@ fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
 }
 
 fn launch_config(wait_deferred: bool) -> (ChildGuard, std::path::PathBuf) {
+    launch_config_source(wait_deferred, "")
+}
+
+fn launch_config_source(wait_deferred: bool, source: &str) -> (ChildGuard, std::path::PathBuf) {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -91,7 +95,7 @@ fn launch_config(wait_deferred: bool) -> (ChildGuard, std::path::PathBuf) {
     let dir = iso.join("mica");
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("config");
-    std::fs::write(&cfg, b"").unwrap(); // 空文件 = 全默认且 watcher 启用
+    std::fs::write(&cfg, source).unwrap();
     let user = format!("micawincfg{unique}");
     *TEST_USER
         .get_or_init(|| Mutex::new(String::new()))
@@ -135,6 +139,287 @@ fn launch_config(wait_deferred: bool) -> (ChildGuard, std::path::PathBuf) {
         std::thread::sleep(Duration::from_millis(100));
     }
     (app, cfg)
+}
+
+#[test]
+fn configured_command_reaches_tabs_splits_windows_and_quick_terminal() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let markers = std::env::temp_dir().join(format!("mica shell markers {unique}"));
+    std::fs::create_dir_all(&markers).unwrap();
+    let script = format!(
+        "[IO.File]::WriteAllText(('{}' + '/' + $PID), ('configured' + ',' + $Host.UI.RawUI.WindowSize.Width + ',' + $Host.UI.RawUI.WindowSize.Height))",
+        markers
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .replace('\'', "''"),
+    );
+    let source = format!(
+        "command = powershell.exe -NoLogo -NoProfile -NoExit -Command \"{script}\"\nkeybind = insert=split_right\nwindow-width = 83\nwindow-height = 17\nwindow-padding-x = 36\nwindow-padding-y = 24\nstrip-title-height = 42\nstrip-hide-single-tab = false\nquick-terminal-height = 25\nquick-terminal-key = none\n"
+    );
+    mica_core::config::settings::resolve(&source).expect("valid test configuration");
+    let (app, cfg) = launch_config_source(true, &source);
+    let wait_markers = |want| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let count = std::fs::read_dir(&markers).unwrap().count();
+            if count >= want {
+                assert_eq!(count, want);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {want} configured shells, found {count}; diagnostics: {}",
+                cfg.display()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    // The main tab and hidden quick terminal must both use the configured shell.
+    wait_markers(2);
+    let grid_matches = || {
+        std::fs::read_dir(&markers)
+            .unwrap()
+            .filter(|entry| {
+                std::fs::read_to_string(entry.as_ref().unwrap().path()).unwrap()
+                    == "configured,83,17"
+            })
+            .count()
+    };
+    assert_eq!(
+        grid_matches(),
+        1,
+        "first shell must have the configured grid despite custom strip geometry"
+    );
+    assert!(wait_ready(Duration::from_secs(20)));
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    // SAFETY: post only to the window owned by this test's isolated process.
+    unsafe {
+        PostMessageW(
+            Some(first[0]),
+            windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            WPARAM(0x2d),
+            LPARAM(0),
+        )
+        .unwrap();
+    }
+    wait_markers(3);
+    assert!(cli(&["new-tab"]));
+    wait_markers(4);
+    assert!(cli(&["new-window"]));
+    wait_markers(5);
+    assert_eq!(
+        grid_matches(),
+        3,
+        "new tab and secondary window must retain the configured grid"
+    );
+    // Keep one target window for explicit --tab probes below.
+    let windows = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    let other = *windows.iter().find(|h| **h != first[0]).unwrap();
+    unsafe {
+        PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { IsWindow(Some(other)) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!unsafe { IsWindow(Some(other)) }.as_bool());
+
+    // A reload changes future sessions without restarting any of the five
+    // existing shells. The title confirms the production watcher applied it.
+    let updated = source
+        .replace("'configured'", "'reloaded'")
+        .replace("window-padding-x = 36", "window-padding-x = 48")
+        .replace("window-padding-y = 24", "window-padding-y = 36");
+    std::fs::write(&cfg, format!("{updated}title = CommandReloaded\n")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(first[0]) != "CommandReloaded" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(window_title(first[0]), "CommandReloaded");
+    assert!(cli(&["new-tab"]));
+    wait_markers(6);
+    let reloaded = std::fs::read_dir(&markers)
+        .unwrap()
+        .filter(|entry| {
+            std::fs::read_to_string(entry.as_ref().unwrap().path())
+                .unwrap()
+                .starts_with("reloaded,")
+        })
+        .count();
+    assert_eq!(
+        reloaded, 1,
+        "only the new shell should use the updated command"
+    );
+    let query_grid = |tab: usize, name: &str| -> (u16, u16) {
+        let path = cfg.parent().unwrap().join(name);
+        let command = format!(
+            "[IO.File]::WriteAllText('{}', ($Host.UI.RawUI.WindowSize.Width.ToString() + ',' + $Host.UI.RawUI.WindowSize.Height))\r",
+            path.display().to_string().replace('\'', "''")
+        );
+        assert!(cli(&[
+            "send",
+            &format!("--tab={tab}"),
+            "--literal",
+            &command
+        ]));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(source) = std::fs::read_to_string(&path)
+                && let Some((width, height)) = source.split_once(',')
+                && let (Ok(width), Ok(height)) = (width.parse(), height.parse())
+            {
+                break (width, height);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "query tab {tab} timed out: {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let active = query_grid(2, "active-reloaded");
+    assert_eq!(
+        query_grid(1, "background-reloaded"),
+        active,
+        "inactive tabs must receive updated padding without being activated"
+    );
+    let split = query_grid(0, "split-reloaded");
+    assert!(
+        split.0 <= active.0 / 2 + 1 && split.1 == active.1,
+        "inactive split pane must use its layout, got {split:?}, full grid {active:?}"
+    );
+    // Real native resize follows the same layout calculation for background tabs.
+    let mut rect = RECT::default();
+    unsafe {
+        GetWindowRect(first[0], &mut rect).unwrap();
+        windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            first[0],
+            None,
+            0,
+            0,
+            rect.right - rect.left + 60,
+            rect.bottom - rect.top + 40,
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        )
+        .unwrap();
+    }
+    let active = query_grid(2, "active-resized");
+    assert_eq!(query_grid(1, "background-resized"), active);
+    let split = query_grid(0, "split-resized");
+    assert!(split.0 <= active.0 / 2 + 1 && split.1 == active.1);
+
+    // Appearance reload on a minimized HWND must keep background PTYs at the
+    // cached real viewport, not resize them to Windows' icon client rectangle.
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+            first[0],
+            windows::Win32::UI::WindowsAndMessaging::SW_MINIMIZE,
+        )
+        .ok();
+    }
+    std::fs::write(&cfg, format!("{updated}title = MinimizedReload\n")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while window_title(first[0]) != "MinimizedReload" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(window_title(first[0]), "MinimizedReload");
+    assert_eq!(query_grid(1, "background-minimized"), active);
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+            first[0],
+            windows::Win32::UI::WindowsAndMessaging::SW_RESTORE,
+        )
+        .ok();
+    }
+}
+
+/// PMv2 线程上下文里读窗口外框与所在显示器工作区(物理像素),读毕恢复
+/// 原 DPI 上下文——测试进程本身未必 PMv2,不切会拿到虚拟化坐标。
+/// 返回 (窗口外框矩形, 工作区矩形)。
+fn outer_rect_and_work_area(hwnd: HWND) -> (RECT, RECT) {
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        };
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+        };
+        let previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let mut rect = RECT::default();
+        let rect_result = GetWindowRect(hwnd, &mut rect);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mon_ok = GetMonitorInfoW(mon, &mut mi);
+        SetThreadDpiAwarenessContext(previous);
+        rect_result.unwrap();
+        assert!(mon_ok.as_bool(), "GetMonitorInfoW 失败");
+        (rect, mi.rcWork)
+    }
+}
+
+/// 契约 A:工作区内的请求得到**精确**外框(任何屏幕都必须逐像素成立;
+/// 640×480 前提是工作区 ≥ 700×540,CI runner 与桌面机均满足)。
+#[test]
+fn pixel_size_configuration_sets_exact_native_outer_dimensions() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (app, _) = launch_config_source(
+        true,
+        "window-size-pixels = 640,480\nquick-terminal-key = none\n",
+    );
+    let windows = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    let (rect, _) = outer_rect_and_work_area(windows[0]);
+    assert_eq!(
+        (rect.right - rect.left, rect.bottom - rect.top),
+        (640, 480),
+        "工作区内请求必须精确落位"
+    );
+}
+
+/// 契约 B:超屏请求按**窗口所在显示器实际工作区**约束,期望随环境计算
+/// (不写死某 runner 的 OS 兜底值 1044×788);大屏(本机 2560×1440)上
+/// 期望即 2032×1041,保留 Windows Terminal 参考尺寸精确回归。
+/// 主窗与 IPC 副窗都验证;自动落位在缩窗后整窗必须仍在工作区内。
+#[test]
+fn oversized_pixel_size_request_constrains_to_monitor_work_area() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (app, _) = launch_config_source(
+        true,
+        "window-size-pixels = 2032,1041\nquick-terminal-key = none\n",
+    );
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let _first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let both = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    for (i, hwnd) in both.iter().enumerate() {
+        let (rect, work) = outer_rect_and_work_area(*hwnd);
+        let expected = (
+            2032.min(work.right - work.left),
+            1041.min(work.bottom - work.top),
+        );
+        assert_eq!(
+            (rect.right - rect.left, rect.bottom - rect.top),
+            expected,
+            "窗口 {i}:请求 2032×1041 应约束到工作区 {:?}",
+            (work.right - work.left, work.bottom - work.top)
+        );
+        assert!(
+            rect.left >= work.left
+                && rect.top >= work.top
+                && rect.right <= work.right
+                && rect.bottom <= work.bottom,
+            "窗口 {i} 自动落位越出工作区: rect={rect:?} work={work:?}"
+        );
+    }
 }
 
 /// #109:主窗 timer 7 还未执行时关闭,副窗的配置监听不能永久缺席。
