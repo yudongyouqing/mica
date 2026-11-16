@@ -34,6 +34,10 @@ static REAPED_FALLBACK_FORGET: AtomicUsize = AtomicUsize::new(0);
 static REAPER_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// 故障态:回收通道满/断。置位期间拒绝创建新会话(见 spawn_capacity_ok)。
 static DEGRADED: AtomicBool = AtomicBool::new(false);
+/// #124 诊断开关:仅在进程退出序开启——正常运行时每个 tab 关闭也走
+/// close_terminal,不能无条件刷计时日志;退出序关心的是"最后窗口关闭
+/// →进程消失"各相耗时(杀子/入队/COM+CPU drop)
+pub(crate) static EXIT_TRACING: AtomicBool = AtomicBool::new(false);
 
 /// reaper 领取的任务:child pid(回收确认移除注册表记录用)+ 会话本体
 /// (Arc:writer 线程持另一份;最后一份 Drop 杀子+收割,发生在 reaper
@@ -383,6 +387,7 @@ pub fn close_terminal(mut t: super::Terminal) {
     // writer 若阻塞在写端,由杀子引发的管道断/EOF 退场)→ 杀子(写端
     // 锁分离,绝不被阻塞写拖住)→ 会话**按值**交 reaper(Drop 完成 =
     // PTY 真实销毁,计数不提前)。UI 侧零阻塞。
+    let t_kill_start = std::time::Instant::now();
     t.writeq.close();
     t.pty_buf.close();
     t.session.kill_child();
@@ -415,6 +420,7 @@ pub fn close_terminal(mut t: super::Terminal) {
     reap_session_with_pid(child_pid, session);
     // 输出积压/写队列与后台线程共享:此处放本端引用,预算已在 close
     // 归还;Drop 兜底(close 未触达的异常路径)不双扣(释放 0)
+    let drops_t0 = std::time::Instant::now();
     drop(pty_buf);
     drop(writeq);
     drop(_permit); // 会话槽位归还(旧会话已 kill,槽位即时释放)
@@ -422,6 +428,13 @@ pub fn close_terminal(mut t: super::Terminal) {
     drop(router);
     drop(strip_router);
     drop(row_insts);
+    if EXIT_TRACING.load(Ordering::Relaxed) {
+        eprintln!(
+            "[exit][close_terminal] kill+enqueue +{}ms / drops(term+COM router) +{}ms",
+            drops_t0.duration_since(t_kill_start).as_millis(),
+            drops_t0.elapsed().as_millis()
+        );
+    }
 }
 
 #[cfg(test)]
