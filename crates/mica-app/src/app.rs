@@ -1080,6 +1080,9 @@ pub fn run() {
     while WINDOW_COUNT.load(std::sync::atomic::Ordering::SeqCst) > 0 {
         std::thread::sleep(Duration::from_millis(120));
     }
+    // #124 诊断:主线程离开 park 即将 process::exit——此后仍不退出 =
+    // CRT/DLL 卸载(loader lock)卡死,不是窗口逻辑
+    eprintln!("[exit] 主线程离开 park,run() 返回,即将 process::exit");
 }
 
 /// 起新窗口(2026-10-12 多窗口):新线程跑与主窗同构的窗口创建序——
@@ -2084,9 +2087,16 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
     // 计划原文把 join 排在杀 pty 之前,前提是"转发线程至多阻塞在 PostMessageW
     // 上(异步不阻塞,join 安全)";本实现它泊在 recv_block,pty 不断开就
     // 不醒,先杀后 join 才不悬挂(偏差已记 task 报告)。
-    eprintln!("[exit] step1: sentinel None");
+    // #124 诊断:退出序分相计时(单调毫秒,自 WM_QUIT 起)。close_terminal
+    // 内部还有 per-pane 细分,由 EXIT_TRACING 门控(正常运行不刷屏)
+    let exit_t0 = std::time::Instant::now();
+    let phase = |name: &str| {
+        eprintln!("[exit] {name} (+{}ms)", exit_t0.elapsed().as_millis());
+    };
+    lifecycle::EXIT_TRACING.store(true, std::sync::atomic::Ordering::Relaxed);
+    phase("step1: sentinel None");
     *hwnd_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    eprintln!("[exit] step2: watcher 留存(进程级,副窗仍在时热重载继续)");
+    phase("step2: watcher 留存(进程级,副窗仍在时热重载继续)");
     // 复核 4:watcher 是进程级服务(CONFIG_WATCHER),主窗退出不拆——
     // 进程最后一个窗口关闭时进程退出,watcher 随进程回收。
     // reload_param(旧 TLS 交接)同样不拆,留它自然终结。
@@ -2102,24 +2112,29 @@ unsafe fn message_loop(reload_param: Option<ReloadHandle>, hwnd_slot: SharedHwnd
     // 未响应")。GPU 泄漏换可靠退出(Alacritty/WezTerm 同款哲学),进程
     // 一死 OS 全额回收。reaper 不 join:进程退出不等排空,等价 forget
     // 但有界(通道容量 16)。
-    eprintln!("[exit] step5: reclaim terminals, leak only GPU");
+    phase("step5: reclaim terminals, leak only GPU");
     let tabs = TABS.with(|tabs| std::mem::take(&mut *tabs.borrow_mut()));
     for tab in tabs {
         for pane in tab.panes {
             lifecycle::close_terminal(pane.terminal);
         }
     }
+    phase("step5a: terminals reclaimed");
     let mut gpu = GPU.with(|g| g.borrow_mut().take());
     if let Some(gpu) = gpu.as_mut() {
         gpu.renderer.release_atlas_resources();
     }
     std::mem::forget(gpu);
+    phase("step5b: atlas released");
     crate::app::quickterm::forget_state();
+    phase("step5c: qt state forgotten");
     orphan::clear_sessions_for_exit(); // 干净退出:本进程注册表条目全清(T02)
+    phase("step5d: registry cleared");
     let (ok, fallback, inflight, degraded) = lifecycle::reaper_stats();
     eprintln!(
-        "[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight}/故障态 {degraded};pty 预留 {}B)",
-        pty_bridge::reserved_bytes()
+        "[exit] step6: done (reaper 已回收 {ok}/降级 forget {fallback}/在途 {inflight}/故障态 {degraded};pty 预留 {}B) (+{}ms)",
+        pty_bridge::reserved_bytes(),
+        exit_t0.elapsed().as_millis()
     );
 }
 
