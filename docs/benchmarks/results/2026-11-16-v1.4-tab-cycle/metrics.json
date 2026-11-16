@@ -1,0 +1,77 @@
+{
+ "source_head": "fc05aee53155ffdf0f44f81be98e13bceee1c158",
+ "exe_sha256": "d91ebad3e1be04cf43532a578307580c081a49574a7fb27b6b41efdedc1b5185",
+ "driver": "docs/benchmarks/results/2026-11-11-post-hardening/tab_cycle_driver.py",
+ "baseline": "docs/benchmarks/results/2026-11-11-post-hardening/",
+ "counters_not_sampled": [
+  "gpu_memory",
+  "child_process_memory"
+ ],
+ "result": {
+  "success": true,
+  "completed_rounds": 200,
+  "elapsed_s": 207.397,
+  "samples": 1246
+ },
+ "meta": {
+  "final_idle_cpu_s": 0.2031,
+  "final_idle_interval_s": 29.66,
+  "loop_cpu_s": 17.8438,
+  "loop_wall_s": 160.86,
+  "visible_samples": 1245,
+  "max_registry_total": 3,
+  "min_system_available_GiB": 3.49
+ },
+ "resources": {
+  "private_bytes": {
+   "baseline": 657543168.0,
+   "warm_median": 665096192.0,
+   "closed_min": 660312064.0,
+   "closed_max": 668155904.0,
+   "all_phase_peak": 717737984.0,
+   "second_half_slope_per_round": -1342.1312691269127,
+   "tail_first20_median": 668155904.0,
+   "tail_last20_median": 668065792.0
+  },
+  "working_set": {
+   "baseline": 370987008.0,
+   "warm_median": 377499648.0,
+   "closed_min": 374624256.0,
+   "closed_max": 378683392.0,
+   "all_phase_peak": 391204864.0,
+   "second_half_slope_per_round": 4044.8276507650767,
+   "tail_first20_median": 375668736.0,
+   "tail_last20_median": 375975936.0
+  },
+  "handles": {
+   "baseline": 670.0,
+   "warm_median": 674.0,
+   "closed_min": 669.0,
+   "closed_max": 679.0,
+   "all_phase_peak": 697.0,
+   "second_half_slope_per_round": -0.1494749474947495,
+   "tail_first20_median": 679.0,
+   "tail_last20_median": 669.0
+  },
+  "threads": {
+   "baseline": 40.0,
+   "warm_median": 41.0,
+   "closed_min": 36.0,
+   "closed_max": 42.0,
+   "all_phase_peak": 46.0,
+   "second_half_slope_per_round": -0.044842484248424845,
+   "tail_first20_median": 39.0,
+   "tail_last20_median": 36.0
+  },
+  "children": {
+   "baseline": 4.0,
+   "warm_median": 4.0,
+   "closed_min": 4.0,
+   "closed_max": 4.0,
+   "all_phase_peak": 6.0,
+   "second_half_slope_per_round": 0.0,
+   "tail_first20_median": 4.0,
+   "tail_last20_median": 4.0
+  }
+ }
+}
