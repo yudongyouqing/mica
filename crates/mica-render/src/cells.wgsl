@@ -86,7 +86,7 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
     // 平铺——短边贴满,长边裁切;采样坐标 = 像素坐标)。有字形/圆角的
     // quad 不混合图(其 bg 已是实色,与图叠加会双重压字)——图只在
     // 空白格"透出"
-    if (globals.bg_alpha_size.x > 0.5 && inp.ink_mask < 0.5 && inp.geo.z == 0.0 && inp.geo.w == 0.0) {
+    if (globals.bg_alpha_size.x > 0.0 && inp.ink_mask < 0.5 && inp.geo.z == 0.0 && inp.geo.w == 0.0) {
         let bgc = textureSample(bg_image, bg_sampler, bg_uv(inp.pos.xy));
         return vec4f(mix(inp.bg, bgc.rgb, globals.bg_alpha_size.x), 1.0);
     }

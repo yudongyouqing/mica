@@ -63,9 +63,6 @@ fn reaper_tx() -> &'static SyncSender<ReapTask> {
                     REAPER_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
                     REAPED_OK.fetch_add(1, Ordering::Relaxed);
                     if let Some(pid) = done_pid {
-                        super::orphan::remove_closed_session(pid);
-                    }
-                    if let Some(pid) = task.child_pid {
                         // 回收确认:Closing → Closed,记录移除
                         super::orphan::remove_closed_session(pid);
                     }

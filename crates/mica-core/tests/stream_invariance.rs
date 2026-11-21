@@ -20,16 +20,6 @@ fn feed_bytewise(s: &mut Surface, input: &[u8]) {
     }
 }
 
-/// 每个单一切点二分(矩阵在 assert_chunk_invariance 内联展开,每切点
-/// 用全新 Surface——本帮手保留给需要同面连续二分的后续场景)。
-#[allow(dead_code)]
-fn feed_all_splits(s: &mut Surface, input: &[u8]) {
-    for split in 1..input.len() {
-        s.feed(&input[..split]);
-        s.feed(&input[split..]);
-    }
-}
-
 /// 固定种子的伪随机块(确定性:失败可复现)。
 fn feed_random_chunks(s: &mut Surface, input: &[u8], seed: u64) {
     let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);

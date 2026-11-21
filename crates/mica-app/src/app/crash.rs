@@ -52,7 +52,11 @@ unsafe extern "system" fn native_crash_filter(info: *const EXCEPTION_POINTERS) -
             .map(|d| d.as_millis())
             .unwrap_or(0)
     ));
-    let rec = (*info).ExceptionRecord;
+    let rec = if info.is_null() {
+        std::ptr::null()
+    } else {
+        (*info).ExceptionRecord
+    };
     let code = if rec.is_null() {
         0
     } else {
@@ -113,6 +117,13 @@ pub fn install() {
             eprintln!("[crash] nested panic: {info}");
             return;
         }
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                IN_HOOK.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetGuard;
         let dir = crash_dir();
         let _ = std::fs::create_dir_all(&dir);
         let base = dir.join(format!(
@@ -155,7 +166,6 @@ pub fn install() {
                 windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING,
             );
         }
-        IN_HOOK.store(false, Ordering::SeqCst);
     }));
 }
 

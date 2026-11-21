@@ -37,12 +37,12 @@ cargo run --bin mica            # 运行(需要 Windows;其他平台是 stub)
 ## 提交与 PR
 
 - Conventional commits:`feat:` / `fix:` / `test:` / `docs:` / `chore:`,正文说明动机。
-- PR 到 `main`,标题同风格;描述里说清"改了什么、为什么、怎么验证的"。
+- 日常开发 PR 统一合入 `dev`（`main` 仅接受来自 `dev` 的发版合并，由 CI `merge-gate` 强制校验）；描述里说清"改了什么、为什么、怎么验证的"。
 - 提交署名用你自己的身份(git 配置好 user.name / user.email)。
 
 ## 声明的边界(不是 bug)
 
-以下是有意的阶段性欠账,提交"修复"它们之前请先开 issue 讨论:M0 阶段 CJK 字形显示 `?`、每帧全量重绘、多数 cell flags 忽略、渲染为轮询循环。路线图见 README。
+项目当前有意的阶段性边界（如 ConPTY 协议透传边界、DirectWrite 轻量连字范围、整窗分层透明等）集中记录在仓库根目录的 [`CLAUDE.md`](CLAUDE.md)「当前边界」小节，提交涉及这些边界的改动前请先开 issue 讨论。
 
 ## License
 

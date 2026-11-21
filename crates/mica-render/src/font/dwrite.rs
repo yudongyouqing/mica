@@ -613,7 +613,7 @@ impl DwriteRouter {
         if !Self::raster_dimensions_ok(uw as u32, uh as u32) {
             return Some(self.replacement());
         }
-        let mut canvas = vec![0f32; (uw * uh) as usize * 4]; // 非预乘 RGBA f32
+        let mut canvas = vec![0f32; (uw * uh) as usize * 4]; // 预乘 RGBA f32 合成,落盘前去预乘
         for (b, coverage, rgba) in layers {
             let color = rgba.map(|c| c.clamp(0.0, 1.0));
             for y in 0..(b.bottom - b.top).max(0) {
@@ -638,8 +638,13 @@ impl DwriteRouter {
         let (packed, _) = pixels.as_chunks_mut::<4>();
         let (floats, _) = canvas.as_chunks::<4>();
         for (dst, src) in packed.iter_mut().zip(floats.iter()) {
-            for (d, v) in dst.iter_mut().zip(src.iter()) {
-                *d = (v * 255.0).round() as u8;
+            let a = src[3].clamp(0.0, 1.0);
+            if a > 0.0 {
+                // 着色器按 straight-alpha 做 mix(bg, rgb * fg, a),需从预乘还原
+                dst[0] = ((src[0] / a).clamp(0.0, 1.0) * 255.0).round() as u8;
+                dst[1] = ((src[1] / a).clamp(0.0, 1.0) * 255.0).round() as u8;
+                dst[2] = ((src[2] / a).clamp(0.0, 1.0) * 255.0).round() as u8;
+                dst[3] = (a * 255.0).round() as u8;
             }
         }
         let bmp = GlyphBitmap {
@@ -700,9 +705,10 @@ impl GlyphRouter for DwriteRouter {
         let font = {
             let family = self.family_for(*chars.first()?)?;
             match (style.bold, style.italic) {
-                (true, _) => family.bold.clone(),
+                (true, true) => family.bold_italic.clone(),
+                (true, false) => family.bold.clone(),
                 (false, true) => family.italic.clone(),
-                _ => family.plain.clone(),
+                (false, false) => family.plain.clone(),
             }
         };
         let shape = shape_run(&self.factory, &font, self.em_size_dip, chars)??;
@@ -739,7 +745,10 @@ impl GlyphRouter for DwriteRouter {
             } else {
                 shape.glyph_indices.len()
             };
-            let cluster_chars = char_at[v] - char_at[u];
+            let cluster_chars = char_at[v].saturating_sub(char_at[u]);
+            if cluster_chars == 0 {
+                return None;
+            }
             if v - u >= 2 && cluster_chars >= 2 && next_glyph > start_glyph {
                 // 连字 cluster(多字符并成 ≥1 glyph):光栅化合成字形,
                 // 宽 = 该 cluster 所有 glyph advance 之和

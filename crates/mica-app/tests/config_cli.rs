@@ -70,3 +70,13 @@ fn validates_bom_and_reports_invalid_values_without_starting_a_session() {
     let (output, _) = cli(&["+validate-config"], None);
     assert!(output.status.success());
 }
+
+#[test]
+fn prints_version_without_starting_a_session() {
+    let (output, _) = cli(&["--version"], None);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        format!("mica {}", env!("CARGO_PKG_VERSION"))
+    );
+}

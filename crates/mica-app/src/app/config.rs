@@ -6,11 +6,10 @@ use notify::{Event, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
-/// 热重载组件打包:退出时按 哨兵置 None(共用,见 SharedHwnd)→ drop watcher
-/// → join 线程 拆除(序在 message_loop 的退出分支,先于既有 teardown)。
+/// 进程级配置监听保活句柄:存入 `CONFIG_WATCHER`,随进程生命期保活。
 pub(super) struct ReloadHandle {
-    pub(super) watcher: notify::RecommendedWatcher,
-    pub(super) thread: std::thread::JoinHandle<()>,
+    _watcher: notify::RecommendedWatcher,
+    _thread: std::thread::JoinHandle<()>,
 }
 
 /// 配置文件路径:`%APPDATA%\mica\config`;APPDATA 未设(理论上不存在,
@@ -64,7 +63,7 @@ fn format_config_error(path: &Path, err: &ConfigError, outcome: &str) -> String 
 /// 父目录并按路径过滤,原子替换/重建不失联)监听 config 文件,事件经 mpsc
 /// 交给去抖线程。None = 未监听(文件缺失或 watch 失败,热重载降级关闭)。
 /// 哨兵由 run() 统一建立后传入——与转发线程共用"窗口存活"这一个事实。
-pub(super) fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle> {
+pub(super) fn spawn_config_watcher() -> Option<ReloadHandle> {
     let path = config_path();
     if !path.exists() {
         eprintln!("config watcher: {} 不存在,热重载未启用", path.display());
@@ -89,10 +88,9 @@ pub(super) fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle
         );
         return None;
     }
-    let thread_slot = Arc::clone(&hwnd_slot);
     let thread = match std::thread::Builder::new()
         .name("config-watcher".into())
-        .spawn(move || debounce_loop(path, rx, thread_slot))
+        .spawn(move || debounce_loop(path, rx))
     {
         Ok(t) => t,
         Err(e) => {
@@ -100,7 +98,10 @@ pub(super) fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle
             return None; // watcher 随之 Drop,后端停止
         }
     };
-    Some(ReloadHandle { watcher, thread })
+    Some(ReloadHandle {
+        _watcher: watcher,
+        _thread: thread,
+    })
 }
 
 /// 去抖线程:notify 后端已按被监视文件过滤事件,收到的必是 config 的动静。
@@ -108,7 +109,7 @@ pub(super) fn spawn_config_watcher(hwnd_slot: SharedHwnd) -> Option<ReloadHandle
 /// 瞬时缺失窗——故收首个事件后持续吞事件,直到 300ms 静默窗走完才投递一次;
 /// 路径在静默结束时仍不存在(原子替换途中)则跳过本轮。通道断开(watcher
 /// 已 Drop)即退出。
-fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<notify::Result<Event>>, hwnd_slot: SharedHwnd) {
+fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<notify::Result<Event>>) {
     const QUIET: Duration = Duration::from_millis(300);
     loop {
         if rx.recv().is_err() {
@@ -127,7 +128,6 @@ fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<notify::Result<Event>>, hwnd_
         // 复核 4:广播到**全部**存活窗口(单投会让多窗配置漂移);
         // 无存活窗口(进程退出中)静默丢弃本轮
         let _ = window_registry::post_to_all_alive(WM_APP_CONFIG, WPARAM(0), LPARAM(0));
-        let _ = &hwnd_slot;
     }
 }
 
@@ -155,12 +155,18 @@ pub(super) unsafe fn reload_config(hwnd: HWND) {
         }
     };
     let families: Vec<&str> = settings.font_families.iter().map(String::as_str).collect();
-    let Ok(router) = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families) else {
-        warn_box("重建字体链失败,继续使用当前设置。");
-        return; // 保旧
-    };
-    eprintln!("font families in use: {:?}", router.families_in_use()); // 冒烟期观察回退链
-    let metrics = router.metrics();
+    let pane_count: usize = TABS.with(|tabs| tabs.borrow().iter().map(|tab| tab.panes.len()).sum());
+    let mut routers = Vec::with_capacity(pane_count.max(1));
+    for _ in 0..pane_count.max(1) {
+        let Ok(router) = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families) else {
+            warn_box("重建字体链失败,继续使用当前设置。");
+            return; // 保旧:任一 pane 失败均不破坏已装载状态
+        };
+        routers.push(router);
+    }
+    eprintln!("font families in use: {:?}", routers[0].families_in_use()); // 冒烟期观察回退链
+    let metrics = routers[0].metrics();
+    let mut routers = routers.into_iter();
 
     // 客户区像素尺寸不变(不碰窗口尺寸),终端区按新度量重算(减 strip)
     let mut rect = RECT::default();
@@ -175,18 +181,15 @@ pub(super) unsafe fn reload_config(hwnd: HWND) {
             }
         });
     }
-    let mut reloaded = false;
     TABS.with(|tabs| {
         // 全部标签全部 pane 一起换(T7):palette/字体是全局语义
         for tab in tabs.borrow_mut().iter_mut() {
             for pane in tab.panes.iter_mut() {
                 let t = &mut pane.terminal;
-                let Ok(router) = DwriteRouter::new(scaled_pt(settings.font_size_pt), &families)
-                else {
-                    return;
-                };
-                t.router = router;
-                // strip 字体/几何随配置(STRIP_CFG 已在上方更新):惰性建
+                if let Some(router) = routers.next() {
+                    t.router = router;
+                }
+                // strip 字体/几何随配置(STRIP_CFG 已在下方更新):惰性建
                 // 置空强制下一帧按新配置重建
                 t.strip_router = None;
                 t.metrics = metrics;
@@ -201,7 +204,6 @@ pub(super) unsafe fn reload_config(hwnd: HWND) {
                 t.palette = settings.palette;
             }
         }
-        reloaded = true;
     });
     // 窗口级同步:清屏色、键位表、建标签种子(T7:新标签跟随当前设置)
     GPU.with(|g| {
@@ -244,33 +246,32 @@ pub(super) unsafe fn reload_config(hwnd: HWND) {
     } else {
         let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), 1);
     }
+    let bg_alpha = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
+        0.9
+    } else {
+        settings.background_opacity
+    };
     BG_IMG_PATH.with(|b| *b.borrow_mut() = settings.background_image.clone());
+    BG_IMG_ALPHA.with(|a| a.set(bg_alpha));
     GPU.with(|g| {
         if let Some(gpu) = g.borrow_mut().as_mut() {
-            let path = settings
-                .background_image
-                .as_deref()
-                .map(std::path::Path::new);
-            let alpha = if (settings.background_opacity - 1.0).abs() < f32::EPSILON {
-                0.9
-            } else {
-                settings.background_opacity
-            };
-            if let Err(e) = gpu.renderer.set_background_image(path, alpha) {
-                eprintln!("[bg] {e}");
-            }
+            sync_background_image(&mut gpu.renderer);
         }
     });
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
-    // title 锁定值即时应用(此前要等下一次 shell 标题事件才生效)——
-    // 这也是"热重载确实执行"的外部观测面(测试读窗口文本)
-    if let Some(t) = TITLE_LOCK.with(|t| t.borrow().clone()) {
-        let _ = SetWindowTextW(hwnd, &HSTRING::from(t));
-    }
+    // title 锁定值即时应用;清空 title = 时恢复当前活跃标签标题
+    let win_title = TITLE_LOCK.with(|t| t.borrow().clone()).unwrap_or_else(|| {
+        TABS.with(|tabs| {
+            tabs.borrow()
+                .get(ACTIVE.get())
+                .map(|tab| pretty_title(&tab.title))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Mica".to_string())
+        })
+    });
+    let _ = SetWindowTextW(hwnd, &HSTRING::from(win_title));
     resize_all_grids(rect.right.max(1) as f32, rect.bottom.max(1) as f32);
     // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
-    if reloaded {
-        draw_frame();
-    }
+    draw_frame();
 }

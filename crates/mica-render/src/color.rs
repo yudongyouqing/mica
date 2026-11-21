@@ -5,9 +5,6 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 use mica_core::config::palette::Palette;
 
-/// xterm 256-color cube luminance levels.
-const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-
 fn rgb3(rgb: Rgb) -> [u8; 3] {
     [rgb.r, rgb.g, rgb.b]
 }
@@ -24,26 +21,7 @@ pub fn resolve(color: Color, palette: &Palette) -> [u8; 3] {
         | Color::Named(NamedColor::DimForeground) => rgb3(palette.fg),
         Color::Named(NamedColor::Background) => rgb3(palette.bg),
         Color::Named(named) => rgb3(palette.colors[(named as usize).min(15)]),
-        Color::Indexed(i) => resolve_indexed(i, palette),
-    }
-}
-
-fn resolve_indexed(i: u8, palette: &Palette) -> [u8; 3] {
-    match i {
-        0..=15 => rgb3(palette.colors[i as usize]),
-        16..=231 => {
-            let i = (i - 16) as usize;
-            [
-                CUBE_LEVELS[i / 36],
-                CUBE_LEVELS[(i % 36) / 6],
-                CUBE_LEVELS[i % 6],
-            ]
-        }
-        // 232..=255 grayscale ramp: 8 + 10*(i-232)
-        _ => {
-            let v = (8 + 10 * (u16::from(i) - 232)) as u8;
-            [v, v, v]
-        }
+        Color::Indexed(i) => rgb3(palette.query(usize::from(i))),
     }
 }
 

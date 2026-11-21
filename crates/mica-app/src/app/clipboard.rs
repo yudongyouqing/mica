@@ -2,7 +2,7 @@
 //! 失败全部静默降级(返回 None / bool)——剪贴板被占用是常态(其他
 //! 进程持有),终端不能为此弹窗或卡输入路径。
 
-use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 /// CF_UNICODETEXT(=13;Ole feature 只为这个常量不值得开)
 const CF_UNICODETEXT: u32 = 13;
 
@@ -51,18 +51,22 @@ pub fn set_text(text: &str) -> bool {
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes = wide.len() * 2;
     with_clipboard(|| unsafe {
-        let handle =
-            GlobalAlloc(GMEM_MOVEABLE, bytes).expect("clipboard GlobalAlloc(几百 KB 内)不失败");
+        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes).ok()?;
         let ptr = GlobalLock(handle) as *mut u16;
         if ptr.is_null() {
+            let _ = GlobalFree(Some(handle));
             return None;
         }
         // SAFETY:handle 按 bytes 分配,wide 恰好 bytes/2 个 u16
         std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
         let _ = GlobalUnlock(handle);
-        // SetClipboardData 接管句柄所有权;EmptyClipboard 先清旧格式
-        EmptyClipboard().ok()?;
-        SetClipboardData(CF_UNICODETEXT, Some(HANDLE(handle.0))).ok()?;
+        // SetClipboardData 成功后由系统接管句柄所有权;任一步失败需自释
+        if EmptyClipboard().is_err()
+            || SetClipboardData(CF_UNICODETEXT, Some(HANDLE(handle.0))).is_err()
+        {
+            let _ = GlobalFree(Some(handle));
+            return None;
+        }
         Some(())
     })
     .is_some()
