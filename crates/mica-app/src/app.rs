@@ -2823,12 +2823,9 @@ fn draw_frame() {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_GETOBJECT => {
-            // 最小 UIA 撤线(1.0.8):深度 UIA 查询(Narrator/FindAll)实测
-            // 触发 native 闪退(native crash,Rust panic hook 与 SEH filter
-            // 均接不住;FindAll TreeScope::Element 稳定复现)。半吊子
-            // provider 与 defterm 同理是陷阱——撤分派,走系统默认 host
-            // provider(Narrator 仍可读窗口标题),自定义汇总等 provider
-            // 崩溃根因修复后恢复(uia.rs 模块与 COM 闭环测试保留)。
+            if let Some(r) = uia::handle_getobject(hwnd, wparam, lparam) {
+                return r;
+            }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_IME_SETCONTEXT | WM_IME_STARTCOMPOSITION => {

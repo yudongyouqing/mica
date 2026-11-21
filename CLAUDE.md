@@ -76,7 +76,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - DECSET 2026:sidecar 检测→帧持有管线单测全绿,但 ConPTY 不透传 2026(2026-10-03 真机探针实证 feed 零命中;同路径 OSC 8 可透传,唯 2026 被消费——ConPTY 自带同步缓冲)——直连 pty 场景生效,ConPTY 场景由其自身机制兜底
 - sidecar 快筛(M4b/D29 备胎,已启用):候选前缀深跑 + carry/open_seq 跨块续命;基准测试 `sidecar_throughput_budget`(#ignored,release 跑)预算 5%
 - 启动清理孤儿 ConPTY 宿主(M5c):强杀终端必留 OpenConsole 孤儿,管道断裂后 busy-loop——2026-10-03 冒烟事故实证 13 个孤儿各烧满 1 核;启动时按"父进程已死"清杀(真开着的 WT 父进程活着不受影响),与 minidump 崩溃恢复成对
-- UIA 撤线(1.0.8):深度查询(Narrator/FindAll)稳定触发 native crash(panic/SEH 均接不住,无 dmp)——自定义 provider 走系统 host provider 替代,Narrator 仍可读窗口标题;uia.rs 模块与 COM 闭环测试保留,崩溃根因修复后恢复分派
+- UIA(M5c/T2):`WM_GETOBJECT` 分派至自定义最小 `MicaProvider`(只答 Name 窗口语义摘要,其余经 Host provider 透传);1.0.8 深度查询崩溃根因为 `GetPatternProvider` 返回 `IUnknown::from_raw(null)` UB,已修复为 `Err(Error::empty())` 并以 `FindAll(TreeScope_Element/Subtree)` + `GetCurrentPattern` COM 集成测试回归锁定;完整 TextPattern/子元素树留后续增强
 - kitty graphics:ConPTY 剥离 APC(M4c 字节级实证,与 2026/OSC 52 同类)——Windows 主路径不可达,不实现;金丝雀测试 `conpty_strips_apc_today_canary` 变红 = 边界移动,重估(预研文档含 M5 立项建议)
 - OSC 133(2026-11-10 修正):本机26300和当前CI Server2025 build26100(镜像windows-2025-vs2026/20261103.298.1,run42820078822)均实测完整透传。旧“26100及以下剥离”依据被PSReadLine输入回显早退假通过掩盖,不再按该阈值外推。CI用MICA_CONPTY_OSC133_EXPECT=passthrough严格锁当前能力,客户端26300+保留透传回归,其他未知旧版本只探测报告。OSC7透传仍用于新标签目录继承。
 - 标签溢出滚动:滚轮+左右箭头+活跃自动跟随齐备(1.1,#39)
