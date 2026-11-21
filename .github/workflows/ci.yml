@@ -2,6 +2,7 @@ name: CI
 on:
   push:
     branches: [main, dev]
+    tags: ['v*']
   pull_request:
 
 # 计费止血(2026-10-22,Actions 免费额度 2000 计费分钟/月被烧穿):
@@ -112,6 +113,11 @@ jobs:
           $best = 0; $bestFrame = [double]::MaxValue
           foreach ($i in 1..3) {
             cargo test --release -p mica-render bench -- --ignored --nocapture 2>&1 | Tee-Object -FilePath bench.log | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Get-Content bench.log
+              Write-Error "bench round $i failed with exit code $LASTEXITCODE"
+              exit $LASTEXITCODE
+            }
             $m = (Select-String -Path bench.log -Pattern 'BENCH cells_per_sec=(\d+) frame_us=(\d+)')
             if ($m) {
               $c = [double]$m.Matches[0].Groups[1].Value
@@ -119,6 +125,11 @@ jobs:
               if ($c -gt $best) { $best = $c; $bestFrame = $f }
             }
             if ($i -lt 3) { Start-Sleep -Seconds 10 }
+          }
+          if ($best -le 0) {
+            Get-Content bench.log
+            Write-Error "no BENCH output parsed across 3 rounds"
+            exit 1
           }
           "BENCH cells_per_sec=$best frame_us=$bestFrame" | Tee-Object -FilePath bench-best.log | Out-Null
       - name: Gate against baseline

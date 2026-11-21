@@ -12,7 +12,7 @@ use windows::Win32::UI::Accessibility::{
     ProviderOptions_ServerSideProvider, UIA_NamePropertyId, UIA_PATTERN_ID, UIA_PROPERTY_ID,
     UiaHostProviderFromHwnd, UiaReturnRawElementProvider,
 };
-use windows::core::{IUnknown, Interface, Result, implement};
+use windows::core::{Error, IUnknown, Result, implement};
 
 /// UIA Name 的进程级快照:draw_frame 每帧刷新(N 个标签,活跃标题)。
 pub static UIA_NAME: Mutex<String> = Mutex::new(String::new());
@@ -46,8 +46,8 @@ impl IRawElementProviderSimple_Impl for MicaProvider_Impl {
     }
 
     fn GetPatternProvider(&self, _pattern: UIA_PATTERN_ID) -> Result<IUnknown> {
-        // null = 无 pattern 支持;最小范围即收(D33)
-        Ok(unsafe { IUnknown::from_raw(std::ptr::null_mut()) })
+        // S_OK + null out-param (无 pattern 支持;不得用 from_raw(null) 造 UB NonNull)
+        Err(Error::empty())
     }
 
     fn GetPropertyValue(&self, id: UIA_PROPERTY_ID) -> Result<VARIANT> {

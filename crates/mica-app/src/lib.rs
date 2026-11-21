@@ -25,6 +25,10 @@ pub fn handle_cli() -> i32 {
     app::crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("--version" | "-V") => {
+            println!("mica {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
         Some("+show-config") => {
             let flags = &args[1..];
             if flags == ["--path"] {
@@ -111,7 +115,7 @@ pub fn handle_cli() -> i32 {
                     // scan_all 匹配;wsl distro 名本身就是 profile 名)
                     let mut req = IpcRequest::new(next_id(), "new-tab");
                     req.profile = Some(name);
-                    dispatch_ipc(req, String::new())
+                    dispatch_ipc(req)
                 }
             }
         }
@@ -136,9 +140,9 @@ pub fn handle_cli() -> i32 {
             let mut req = IpcRequest::new(next_id(), "new-tab");
             req.profile = profile;
             req.font_size = font_size;
-            dispatch_ipc(req, "powershell.exe -NoLogo".into())
+            dispatch_ipc(req)
         }
-        Some("new-window") => dispatch_ipc(IpcRequest::new(next_id(), "new-window"), String::new()),
+        Some("new-window") => dispatch_ipc(IpcRequest::new(next_id(), "new-window")),
         // #44:向运行中的实例注入输入(tmux send-keys 同义)。
         // `mica send [--tab=N | --qt] [--literal] 文本...`;默认展开转义
         // (\r=回车 \e=Esc \\=反斜杠);连不上实例 = 错误退出,绝不自启
@@ -213,17 +217,14 @@ pub fn handle_cli() -> i32 {
             );
             2
         }
-        None => dispatch_ipc(
-            IpcRequest::new(next_id(), "activate"),
-            "powershell.exe -NoLogo".into(),
-        ),
+        None => dispatch_ipc(IpcRequest::new(next_id(), "activate")),
     }
 }
 
 /// IPC 分发核心:连得上→发帧退出;连不上→有 profile 就带环境变量自启动,
 /// 无 profile 就纯 GUI 启动。
 #[cfg(windows)]
-fn dispatch_ipc(req: mica_core::ipc::IpcRequest, fallback_shell: String) -> i32 {
+fn dispatch_ipc(req: mica_core::ipc::IpcRequest) -> i32 {
     match app::ipc::send_request(&req, 3_000) {
         // 已有实例应答:applied/queued 均算受理成功
         Ok(resp) => {
@@ -240,7 +241,6 @@ fn dispatch_ipc(req: mica_core::ipc::IpcRequest, fallback_shell: String) -> i32 
         // AccessDenied/Timeout/Disconnected 都说明实例活着或结果未知——
         // 自启会造双实例或重复操作(复核 2)
         Err(mica_core::ipc::IpcError::NoInstance) => {
-            let _ = &fallback_shell;
             if let Some(p) = &req.profile {
                 // Still on the CLI thread, before any GUI/message loop:
                 // validate and prime the snapshot for the first WSL tab.
@@ -285,6 +285,5 @@ pub fn run() {
 #[cfg(not(windows))]
 pub fn handle_cli() -> i32 {
     eprintln!("mica-app only runs on Windows.");
-    1;
-    unreachable!()
+    1
 }

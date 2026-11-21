@@ -162,6 +162,7 @@ pub struct PtyBacklog {
     cur_gen: AtomicU64,
     state: Mutex<BlState>,
     space: Condvar,
+    retry_cv: Condvar,
 }
 
 impl PtyBacklog {
@@ -178,30 +179,39 @@ impl PtyBacklog {
                 retry_needed: false,
             }),
             space: Condvar::new(),
+            retry_cv: Condvar::new(),
         })
     }
 
     /// 专职唤醒重试线程:独立于转发线程(背压堵 push / EOF 退场后仍
-    /// 自愈);仅在 retry_needed 时补投,已成功投递的绝不重发。
-    /// 会话关闭(close)后自然退场。
+    /// 自愈);空闲时在 Condvar 挂起零轮询功耗,仅在 retry_needed 时
+    /// 立即补投并按 40ms 退避重试;会话关闭(close)即时唤醒退场。
     pub fn spawn_monitor(self: &Arc<Self>) {
         let b = Arc::clone(self);
         std::thread::Builder::new()
             .name("wake-monitor".into())
             .spawn(move || {
+                let mut st = b.state.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
+                    while !b.closed.load(Ordering::Acquire)
+                        && (!st.retry_needed || st.data.is_empty())
+                    {
+                        st = b.retry_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                    }
                     if b.closed.load(Ordering::Acquire) {
                         return;
                     }
                     // 整个"读 retry→补投→清位"在 state 锁内:与
                     // arm_wake 的"投递→置位"互斥,旧成功不清新失败(复核 6)
-                    {
-                        let mut st = b.state.lock().unwrap_or_else(|e| e.into_inner());
-                        if st.retry_needed && !st.data.is_empty() && b.wake.wake(b.pane_id) {
-                            st.retry_needed = false;
-                        }
+                    if st.retry_needed && !st.data.is_empty() && b.wake.wake(b.pane_id) {
+                        st.retry_needed = false;
+                        continue;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    let (guard, _) = b
+                        .retry_cv
+                        .wait_timeout(st, std::time::Duration::from_millis(40))
+                        .unwrap_or_else(|e| e.into_inner());
+                    st = guard;
                 }
             })
             .expect("spawn wake monitor");
@@ -269,6 +279,7 @@ impl PtyBacklog {
         let ok = self.wake.wake(self.pane_id);
         if !ok {
             st.retry_needed = true;
+            self.retry_cv.notify_one();
         }
     }
 
@@ -337,9 +348,9 @@ impl PtyBacklog {
 
     /// 会话终结:关闭 + 释放存量 + 唤醒全部等待者。
     pub fn close(&self) {
-        self.closed.store(true, Ordering::Release);
         let released = {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.closed.store(true, Ordering::Release);
             let n = st.data.len() as u64;
             st.data.clear();
             st.wake_pending = false;
@@ -349,6 +360,7 @@ impl PtyBacklog {
         BUDGET.release(released);
         BUDGET.notify_all();
         self.space.notify_all();
+        self.retry_cv.notify_all();
     }
 }
 

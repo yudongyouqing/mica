@@ -22,8 +22,11 @@ $app = Start-Process -FilePath $Exe -ArgumentList "--multi" -PassThru
 $env:APPDATA = $prev
 
 try {
+    $safeUser = ($env:USERNAME -replace '[^A-Za-z0-9]', '_')
+    if (-not $safeUser) { $safeUser = 'default' }
+    $pipePath = "\\.\pipe\mica-$safeUser"
     $deadline = (Get-Date).AddSeconds(20)
-    do { Start-Sleep -Milliseconds 400; $up = Test-Path "\\.\pipe\mica" } while (-not $up -and (Get-Date) -lt $deadline)
+    do { Start-Sleep -Milliseconds 400; $up = Test-Path $pipePath } while (-not $up -and (Get-Date) -lt $deadline)
     if (-not $up) { throw "管道未就绪" }
     Start-Sleep -Seconds 3
 

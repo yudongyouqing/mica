@@ -823,12 +823,12 @@ mod tests {
     fn mouse_mode_maps_decset_bits() {
         let mut s = Surface::new(ScreenSize::new(10, 3));
         assert_eq!(s.mouse_mode(), MouseMode::Off);
-        s.feed(b"[?1002;1006h");
+        s.feed(b"\x1b[?1002;1006h");
         assert_eq!(s.mouse_mode(), MouseMode::Drag);
         assert!(s.mouse_sgr(), "1006 = SGR");
-        s.feed(b"[?1003h[?1002l");
+        s.feed(b"\x1b[?1003h\x1b[?1002l");
         assert_eq!(s.mouse_mode(), MouseMode::Motion);
-        s.feed(b"[?1000l[?1003l[?1006l");
+        s.feed(b"\x1b[?1000l\x1b[?1003l\x1b[?1006l");
         assert_eq!(s.mouse_mode(), MouseMode::Off);
         assert!(!s.mouse_sgr());
     }
@@ -972,10 +972,13 @@ mod tests {
         assert!(s.take_clipboard_out().is_empty(), "排空语义");
         // 读向:provider 提供内容 → 应答进 pty_writes
         s.set_clipboard_provider(Arc::new(|| "board-content".to_string()));
-        let fmt = Arc::new(|t: &str| format!("]52;{t}"));
+        let fmt = Arc::new(|t: &str| format!("\x1b]52;{t}"));
         s.proxy
             .send_event(Event::ClipboardLoad(ClipboardType::Clipboard, fmt));
-        assert_eq!(s.take_pty_writes(), vec!["]52;board-content".to_string()]);
+        assert_eq!(
+            s.take_pty_writes(),
+            vec!["\x1b]52;board-content".to_string()]
+        );
         // 超限丢弃
         let big = "x".repeat(101 * 1024);
         s.proxy
@@ -988,13 +991,13 @@ mod tests {
     fn osc52_sequence_feed_reaches_store() {
         let mut s = Surface::new(ScreenSize::new(10, 3));
         // ESC ] 52 ; c ; <base64("hi")> BEL
-        s.feed(b"]52;c;aGk=");
+        s.feed(b"\x1b]52;c;aGk=\x07");
         assert_eq!(
             s.take_clipboard_out(),
             vec!["hi".to_string()],
             "ST 终止符形态也要过:"
         );
-        s.feed(b"]52;c;aGk=\\");
+        s.feed(b"\x1b]52;c;aGk=\x1b\\");
         assert_eq!(s.take_clipboard_out(), vec!["hi".to_string()]);
     }
 

@@ -146,7 +146,9 @@ pub struct Renderer {
     /// #77 背景图纹理(持有供 bind group;None = 无图)
     bg_texture: Option<wgpu::Texture>,
     bg_view: Option<wgpu::TextureView>,
-    bg_sampler: Option<wgpu::Sampler>,
+    _bg_placeholder: wgpu::Texture,
+    bg_placeholder_view: wgpu::TextureView,
+    bg_sampler: wgpu::Sampler,
     /// #77 当前背景参数(写 globals 的缓存)
     bg_param: [f32; 4],
     /// 帧目标(T05 分批绘制):begin_frame 建立,end_frame 呈现并取空。
@@ -449,6 +451,28 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
+        let bg_placeholder = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bg placeholder"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let bg_placeholder_view =
+            bg_placeholder.create_view(&wgpu::TextureViewDescriptor::default());
+        let bg_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("bg image"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..wgpu::SamplerDescriptor::default()
+        });
         Ok(Self {
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
@@ -476,7 +500,9 @@ impl Renderer {
             clear_color: bg_clear_color(&Palette::DEFAULT),
             bg_texture: None,
             bg_view: None,
-            bg_sampler: None,
+            _bg_placeholder: bg_placeholder,
+            bg_placeholder_view,
+            bg_sampler,
             bg_param: [0.0, 1.0, 1.0, 0.0],
             frame: None,
             frame_extent: (0, 0),
@@ -584,12 +610,6 @@ impl Renderer {
             if let Some(resource) = self.atlas_cache.remove(&id) {
                 self.retire_atlas(resource);
             }
-        }
-        if self.bg_sampler.is_none() {
-            self.bg_sampler = Some(
-                self.device
-                    .create_sampler(&wgpu::SamplerDescriptor::default()),
-            );
         }
         let id = atlas.identity();
         let mut old = self.atlas_cache.remove(&id);
@@ -789,40 +809,22 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&bg_view),
+                    resource: wgpu::BindingResource::TextureView(bg_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&bg_sampler),
+                    resource: wgpu::BindingResource::Sampler(bg_sampler),
                 },
             ],
         })
     }
 
-    /// #77 背景 (view, sampler) 句柄:有图取真源,无图建 1x1 占位
-    fn bg_resources(&self) -> (wgpu::TextureView, wgpu::Sampler) {
-        if let (Some(v), Some(s)) = (self.bg_view.clone(), self.bg_sampler.clone()) {
-            return (v, s);
-        }
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("bg placeholder"),
-            size: wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self
-            .device
-            .create_sampler(&wgpu::SamplerDescriptor::default());
-        (view, sampler)
+    /// #77 背景 (view, sampler) 句柄:有图取真源,无图复用预建 1x1 占位
+    fn bg_resources(&self) -> (&wgpu::TextureView, &wgpu::Sampler) {
+        (
+            self.bg_view.as_ref().unwrap_or(&self.bg_placeholder_view),
+            &self.bg_sampler,
+        )
     }
 
     /// #77 设置背景图:解码(png/jpeg/bmp/webp)→ 上传 → 重绑。
@@ -856,20 +858,13 @@ impl Renderer {
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        // w*4 不满足 256 对齐时逐行零垫(padded 布局)
-        let stride = w * 4;
-        let aligned = stride.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let mut buf = Vec::with_capacity((aligned * h) as usize);
-        for y in 0..h {
-            buf.extend_from_slice(&rgba.as_raw()[(y * w * 4) as usize..((y + 1) * w * 4) as usize]);
-            buf.resize(buf.len() + (aligned - stride) as usize, 0);
-        }
+        // wgpu::Queue::write_texture 接受紧凑行步长,无需额外复制补齐
         self.queue.write_texture(
             texture.as_image_copy(),
-            &buf,
+            rgba.as_raw(),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(aligned),
+                bytes_per_row: Some(w * 4),
                 rows_per_image: Some(h),
             },
             size,
@@ -881,7 +876,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// #77 bg 变更后重建 bind group(用已存图集 view 的克隆)
+    /// #77 bg 变更后重建 bind group(用已存图集 view 与共享 glyph_sampler)
     fn rebind_after_bg(&mut self) {
         for resource in self.atlas_cache.values_mut() {
             resource.bind_group = None;
@@ -890,12 +885,7 @@ impl Renderer {
             return;
         };
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("glyphs"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..wgpu::SamplerDescriptor::default()
-        });
+        let sampler = self.glyph_sampler.clone();
         self.bind_group = Some(self.rebuild_bind_group(&view, &sampler));
     }
 

@@ -40,7 +40,7 @@ impl KittyFlags {
 
     /// disambiguate 开启时,Esc/Enter/Tab/Backspace 等产生歧义的键走编码
     /// (普通可打印字符仍 None)。
-    fn disambiguate(self) -> bool {
+    pub fn disambiguate(self) -> bool {
         self.contains(Self::DISAMBIGUATE) || self.contains(Self::ALL_KEYS_AS_ESC)
     }
 }

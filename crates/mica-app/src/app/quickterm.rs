@@ -57,7 +57,6 @@ thread_local! {
 /// 创建 Quick Terminal(主窗 run() 尾调用;失败仅记日志——QT 是增强件)。
 /// 返回热键 id(0 = 未注册)。
 pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
-    let class_name: HSTRING = "mica_quickterm_class".into();
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: CS_HREDRAW | CS_VREDRAW,
@@ -74,7 +73,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     // 重复注册(热重载期)不致命
     let _ = RegisterClassExW(&wc);
 
-    // 尺寸:主显示器宽 100% × 高 40%
+    // 尺寸:当前显示器宽 100% × 配置高百分比,贴显示器顶边
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -93,7 +92,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         w!("Mica Quick Terminal"),
         WS_POPUP, // 初始隐藏,热键时显示
         mi.rcMonitor.left,
-        0,
+        mi.rcMonitor.top,
         w_px,
         h_px,
         None,
@@ -102,6 +101,18 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         None,
     )
     .expect("CreateWindowExW (quick terminal)");
+    struct InitHwndGuard(Option<HWND>);
+    impl Drop for InitHwndGuard {
+        fn drop(&mut self) {
+            if let Some(h) = self.0.take() {
+                QT_HWND.with(|c| c.set(0));
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(h);
+                }
+            }
+        }
+    }
+    let mut hwnd_guard = InitHwndGuard(Some(hwnd_qt));
     // 圆角(Win11 DWM,与主窗同款;下拉面板圆角是 Ghostty QT 观感)
     {
         let corner: i32 = windows::Win32::Graphics::Dwm::DWMWCP_ROUND.0;
@@ -263,7 +274,7 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     // poll_exits 轮不到它
     let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd_qt), 6, 1000, None);
     apply_hotkey(crate::app::quick_terminal_key().as_deref());
-    let _ = class_name; // 注册已用 w! 字面量
+    hwnd_guard.0 = None; // 初始化已全部成功,交由 QT 生命周期持有
     Ok(())
 }
 
@@ -288,6 +299,16 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     );
     match restarted {
         Ok((reader, new_gen)) => {
+            let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
+            term.set_cell_metrics(
+                t.metrics.cell_width.round() as u16,
+                t.metrics.line_height.round() as u16,
+            );
+            term.set_palette(&t.palette);
+            t.term = term;
+            t.row_insts.clear();
+            t.force_full = true;
+            t.session_gen = new_gen;
             crate::app::spawn_qt_forwarder(reader, Arc::clone(&t.pty_buf), 0xFF00, new_gen);
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 6, 1000, None);
         }
@@ -321,45 +342,12 @@ pub fn forget_state() {
     }
 }
 
-/// 切换:可见→隐藏;隐藏→显示+置顶激活。
-/// #44 send-text 的 QT 入口:向 QT pane 注入输入(bracketed paste 自动包)
 /// QT 是否已建(供 IPC 区分 bad_target 与 pty_write)。
 pub fn exists() -> bool {
     QT.with(|q| q.borrow().is_some())
 }
 
-/// 向 QT pane 注入输入(UI 快路径,非阻塞;当前 UI 侧 QT 输入经
-/// wndproc 直呼 accept_qt_input,此入口留作热键/脚本路径的公共面)。
-#[allow(dead_code)]
-pub fn send_text(bytes: &[u8]) -> bool {
-    QT.with(|q| {
-        let mut guard = q.borrow_mut();
-        let Some(st) = guard.as_mut() else {
-            return false;
-        };
-        let t = &mut st.terminal;
-        let payload = if t.term.bracketed_paste_active() {
-            let mut w = b"[200~".to_vec();
-            w.extend_from_slice(bytes);
-            w.extend_from_slice(b"[201~");
-            w
-        } else {
-            bytes.to_vec()
-        };
-        let flow = accept_qt_input(t, &payload);
-        if matches!(flow, crate::app::pty_bridge::InputFlow::Debt(_)) {
-            arm_qt_flush_timer();
-        }
-        matches!(
-            flow,
-            crate::app::pty_bridge::InputFlow::Accepted
-                | crate::app::pty_bridge::InputFlow::Debt(_)
-        )
-    })
-}
-
 /// 武装 QT 续灌定时器(id 7,30ms;清欠自动撤销)。
-#[allow(dead_code)]
 fn arm_qt_flush_timer() {
     let raw = QT_HWND.with(|c| c.get());
     if raw == 0 {
@@ -656,9 +644,11 @@ unsafe extern "system" fn qt_wndproc(
                 if ch == '\t' {
                     return;
                 }
-                // kitty 模式下 C0 已由 WM_KEYDOWN 侧编码成 CSI-u,这里再发
-                // 就是双发(主窗同款契约);可打印文本照旧走此处
-                if st.terminal.term.kitty_flags().any() && (ch as u32) < 0x20 {
+                // kitty disambiguate 模式下仅 Enter/Backspace/Tab/Esc 由 WM_KEYDOWN
+                // 编码成 CSI-u;其余 C0(Ctrl+C/Ctrl+D 等)必须放行给 PTY
+                if st.terminal.term.kitty_flags().disambiguate()
+                    && matches!(ch, '\r' | '\u{8}' | '\t' | '\x1b')
+                {
                     return;
                 }
                 // Windows 把退格发成 0x08,终端世界统一 DEL(0x7f)

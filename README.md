@@ -62,7 +62,7 @@ architecture; not affiliated with it.
 | `Ctrl+Shift+1..9` | 跳标签 |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | 下一/上一标签 |
 | `Ctrl+Shift+N` | 新窗口 |
-| `Alt+方向` | 分屏间跳焦点 |
+| `Ctrl+Alt+方向` | 分屏间跳焦点 |
 | `Ctrl+Shift+R` | 重开 shell(保留 cwd) |
 | `Ctrl+Shift+↑/↓` | 上一/下一 prompt(OSC 133) |
 
@@ -158,9 +158,9 @@ command = "C:\Program Files\PowerShell\7\pwsh.exe" -NoLogo
 
 ## 状态 / Status
 
-**1.1 已发布**(tag [v1.1.0](https://github.com/yudongyouqing/mica/releases/tag/v1.1.0),
-Release 附 MSI):标签栏重制、多窗口、tear-off、拖拽换序、动画、
-QT 闭环、strip-* 全量可配、`mica send` 程序化驱动。
+**1.4 已发布**(tag [v1.4.0](https://github.com/yudongyouqing/mica/releases/tag/v1.4.0),
+Release 附 MSI):全面加固(ConPTY 孤儿回收、资源泄漏治理、多窗口生命周期、分屏图集、
+IPC 协议、字节流分块不变性、输入/输出背压与渲染资源预算)、外部默认配置与标题栏细节打磨。
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
@@ -170,14 +170,13 @@ QT 闭环、strip-* 全量可配、`mica send` 程序化驱动。
 | M3 系统集成 | Profile/IPC/WSL、Quick Terminal、安装包 | ✅ |
 | M4 协议 | kitty keyboard、OSC 8/133、2026、graphics 预研 | ✅ |
 | M5 1.0 | 健壮性(崩溃档案/DPI v2/IME)、发布 | ✅ |
-| 1.1 打磨 | 标签栏/多窗口/tear-off/动画/全量可配/send | ✅ |
+| 1.1–1.4 | 标签栏/多窗口/tear-off/send、稳定性与资源全面加固、外部默认配置 | ✅ |
 
 ## 安装 / Install
 
 - **MSI**:GitHub [Releases](https://github.com/yudongyouqing/mica/releases)
   的 `mica.msi`(CI 产出,未签名——SmartScreen 提示选"仍要运行";
   个人项目暂不购代码签名证书)
-- **winget**:清单投递待做(#36)
 - **源码**:`cargo build --release`(Rust stable + Windows;
   `cargo run --bin mica` 直接跑)
 

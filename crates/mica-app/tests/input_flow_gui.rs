@@ -205,7 +205,7 @@ fn wm_timer_flush_is_really_wired_silent_shell() {
     // 块读,不依赖换行——注入的 x 串无换行。
     std::fs::write(
         cfg_dir.join("config"),
-        "shell = powershell.exe -NoProfile -Command $b=New-Object char[] 65536; while($true){ if([Console]::In.Read($b,0,65536) -le 0){break} }",
+        "command = powershell.exe -NoProfile -Command \"$b=New-Object char[] 65536; while($true){ if([Console]::In.Read($b,0,65536) -le 0){break} }\"",
     )
     .unwrap();
     let err_path = iso.join("stderr.log");
@@ -289,7 +289,7 @@ if ($sus -eq 0) { Write-Output "none" }
     let mut timeouts = 0;
     let mut queued_replies = 0usize;
     let mut sent_total = 0usize;
-    for i in 0..70 {
+    for _ in 0..70 {
         sent_total += chunk.len();
         if cli(&["send", "--tab=0", "--literal", chunk.as_str()]) {
             queued_replies += 1; // Accepted/Queued 都 exit 0;饱和后为 Queued
@@ -298,11 +298,6 @@ if ($sus -eq 0) { Write-Output "none" }
             // 但字节未接收,从总量中扣除)
             sent_total -= chunk.len();
             break; // 通道+暂存都满:停止注入
-        }
-        if i > 190 {
-            // 通道应已饱和(1.5MiB 容量 / 24KiB ≈ 64 次)——若 64 次后
-            // 仍全部成功说明 shell 在排水(挂起失效),测试前提被破坏
-            break;
         }
     }
 
@@ -439,11 +434,6 @@ foreach ($pid2 in $seen) {
         "恢复后 writer 必须继续写出:wr {} → {}",
         written_before_resume,
         sp.wr
-    );
-    let written_now = sp.wr;
-    assert!(
-        written_now > written_before_resume,
-        "恢复后写出必须推进(基线 {written_before_resume} → {written_now})"
     );
     // 守恒(r5-3):q+s+infl+wr+fail 与已接收的差只允许 [0, 64]
     // (probe 探针 5B 与 DSR 应答 8B 等协议杂项也走同一队列——它们

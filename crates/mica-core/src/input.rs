@@ -81,12 +81,17 @@ pub fn mouse_report(sgr: bool, pressed: bool, button: u8, x: u16, y: u16, mods: 
     }
     if sgr {
         let state = if pressed { b'M' } else { b'm' };
-        format!("[<{cb};{x};{y}{}", state as char).into_bytes()
+        format!("\x1b[<{cb};{x};{y}{}", state as char).into_bytes()
     } else {
-        // X10:release 编码为按钮 3;motion 位(32)由调用方并入 button
-        let b = if pressed { cb.min(255) as u8 } else { 3 };
-        let cx = 32 + (x.saturating_sub(1)).min(222) as u8;
-        let cy = 32 + (y.saturating_sub(1)).min(222) as u8;
+        // X10/normal:Cb = 32 + button(+mods);release 用按钮 3 保留修饰位;
+        // 坐标 = 32 + 1-based(限 33..=255)
+        let mod_bits = (if mods.shift { 4u32 } else { 0 })
+            + (if mods.alt { 8 } else { 0 })
+            + (if mods.ctrl { 16 } else { 0 });
+        let raw_cb = if pressed { cb } else { 3 + mod_bits };
+        let b = (32 + raw_cb).min(255) as u8;
+        let cx = 32 + x.clamp(1, 223) as u8;
+        let cy = 32 + y.clamp(1, 223) as u8;
         vec![0x1b, b'[', b'M', b, cx, cy]
     }
 }
@@ -160,21 +165,21 @@ mod tests {
         let m = Mods::default();
         assert_eq!(
             mouse_report(true, true, 0, 12, 4, m),
-            b"[<0;12;4M".to_vec()
+            b"\x1b[<0;12;4M".to_vec()
         );
         assert_eq!(
             mouse_report(true, false, 2, 99, 30, m),
-            b"[<2;99;30m".to_vec()
+            b"\x1b[<2;99;30m".to_vec()
         );
         // 滚轮只发按压
         assert_eq!(
             mouse_report(true, true, 64, 1, 1, m),
-            b"[<64;1;1M".to_vec()
+            b"\x1b[<64;1;1M".to_vec()
         );
         // 拖动 motion:32|0
         assert_eq!(
             mouse_report(true, true, 32, 5, 5, m),
-            b"[<32;5;5M".to_vec()
+            b"\x1b[<32;5;5M".to_vec()
         );
         let mc = Mods {
             ctrl: true,
@@ -182,21 +187,29 @@ mod tests {
         };
         assert_eq!(
             mouse_report(true, true, 0, 1, 1, mc),
-            b"[<16;1;1M".to_vec()
+            b"\x1b[<16;1;1M".to_vec()
         );
     }
 
-    /// legacy X10:ESC M b x y,release=3,坐标 32 基
+    /// legacy X10:ESC [ M Cb Cx Cy,Cb = 32 + button(+mods),release=3,坐标 33..=255
     #[test]
     fn mouse_report_legacy_forms() {
         let m = Mods::default();
         assert_eq!(
             mouse_report(false, true, 0, 1, 1, m),
-            vec![0x1b, b'[', b'M', 0, 32, 32]
+            vec![0x1b, b'[', b'M', 32, 33, 33]
         );
         assert_eq!(
             mouse_report(false, false, 0, 10, 2, m),
-            vec![0x1b, b'[', b'M', 3, 41, 33]
+            vec![0x1b, b'[', b'M', 35, 42, 34]
+        );
+        let mc = Mods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            mouse_report(false, false, 0, 300, 1, mc),
+            vec![0x1b, b'[', b'M', 32 + 3 + 16, 255, 33]
         );
     }
 
