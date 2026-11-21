@@ -73,6 +73,7 @@ fn launch_isolated() -> ChildGuard {
         .stderr(std::fs::File::create(iso.join("stderr.log")).unwrap())
         .spawn()
         .expect("launch mica");
+    note_app_stderr(iso.join("stderr.log"));
     ChildGuard(child)
 }
 
@@ -103,6 +104,7 @@ fn launch_config_source(wait_deferred: bool, source: &str) -> (ChildGuard, std::
         .unwrap_or_else(|e| e.into_inner()) = user.clone();
     let log_path = iso.join("stderr.log");
     eprintln!("Window lifecycle diagnostics: {}", log_path.display());
+    note_app_stderr(log_path.clone());
     let mut command = Command::new(env!("CARGO_BIN_EXE_mica"));
     command
         .arg("--multi")
@@ -399,7 +401,9 @@ fn oversized_pixel_size_request_constrains_to_monitor_work_area() {
     assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
     let _first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
     assert!(cli(&["new-window"]), "开副窗失败");
-    let both = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    // 8×CPU 负载实测副窗创建可超 10s(首帧 185ms → 1263ms)——窗口等待
+    // 与 #124 退出死线同证据定档:30s
+    let both = wait_windows(app.0.id(), 2, Duration::from_secs(30));
     for (i, hwnd) in both.iter().enumerate() {
         let (rect, work) = outer_rect_and_work_area(*hwnd);
         let expected = (
@@ -471,7 +475,11 @@ fn config_watcher_survives_close_before_deferred_init() {
     );
     // SAFETY: 本测试隔离副窗。
     unsafe { PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap() };
-    assert!(wait_exit(&mut app.0, Duration::from_secs(5)));
+    assert!(wait_exit_or_dump(
+        &mut app.0,
+        Duration::from_secs(5),
+        Duration::from_secs(30)
+    ));
 }
 
 /// 读窗口标题(热重载 title 即时应用的观测面)。
@@ -522,7 +530,11 @@ fn config_reload_survives_main_close() {
     unsafe {
         let _ = PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0));
     }
-    assert!(wait_exit(&mut app.0, Duration::from_secs(5)));
+    assert!(wait_exit_or_dump(
+        &mut app.0,
+        Duration::from_secs(5),
+        Duration::from_secs(30)
+    ));
 }
 
 /// 复核 4:多窗同时更新——广播到全部存活窗口,无漂移。
@@ -550,7 +562,11 @@ fn both_windows_reload_from_broadcast() {
             let _ = PostMessageW(Some(*h), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
-    assert!(wait_exit(&mut app.0, Duration::from_secs(5)));
+    assert!(wait_exit_or_dump(
+        &mut app.0,
+        Duration::from_secs(5),
+        Duration::from_secs(30)
+    ));
 }
 
 /// CLI 过 IPC 驱动实例(activate/new-tab/new-window)。
@@ -662,6 +678,47 @@ fn wait_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
     }
 }
 
+/// #124:记录本用例 app 的 stderr 路径,供 wait_exit 超时转储——
+/// 失败瞬间能看到退出序各相计时与 reaper 计数,而不是只剩断言红。
+static APP_STDERR: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+fn note_app_stderr(path: std::path::PathBuf) {
+    *APP_STDERR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(path);
+}
+/// #124 两段式死线(2026-11-16 实测定档):退出序本身 ≤50ms(分相计时
+/// 见 app [exit] 日志),而 `std::process::exit` 之后的 CRT/驱动卸载段
+/// 空闲 ~500ms、冷跑 ~1.9s、8×CPU 负载实测 15–20s(30s 内必退,无停滞;
+/// profile 与 -NoProfile 基线逐毫秒一致——shell 无关)。故:
+/// - 5s 处不 fail,转储诊断(退出序分相 + reaper 计数)继续等;
+/// - 30s 处才 fail——那是真停滞,且诊断已在手。
+fn wait_exit_or_dump(child: &mut std::process::Child, diag_at: Duration, hard: Duration) -> bool {
+    if wait_exit(child, diag_at) {
+        return true;
+    }
+    let log = APP_STDERR
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    match log {
+        Some(path) => {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            eprintln!(
+                "[wait_exit] {} 未退(卸载段争用拉伸,#124 实测负载下 15–20s),继续等到硬死线;app stderr({}):\n{content}",
+                diag_at.as_secs(),
+                path.display()
+            );
+        }
+        None => eprintln!(
+            "[wait_exit] {} 未退(未记录 stderr 路径),继续等到硬死线",
+            diag_at.as_secs()
+        ),
+    }
+    wait_exit(child, hard.saturating_sub(diag_at))
+}
+
 /// 模拟 caption ×:向 HTCLOSE 区投 NCLBUTTONDOWN(应用据此走关闭路径)。
 /// 坐标取窗口右上角内侧(× 按钮区,NCHITTEST 的 HTCLOSE 带)。
 fn caption_close(hwnd: HWND) {
@@ -694,7 +751,7 @@ fn last_window_close_exits_process() {
         let _ = PostMessageW(Some(ws[0]), WM_CLOSE, WPARAM(0), LPARAM(0));
     }
     assert!(
-        wait_exit(&mut app.0, Duration::from_secs(5)),
+        wait_exit_or_dump(&mut app.0, Duration::from_secs(5), Duration::from_secs(30)),
         "关最后窗口后 5s 内进程必须退出"
     );
 }
@@ -734,7 +791,7 @@ fn caption_close_destroys_window_keeps_process() {
         let _ = PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0));
     }
     assert!(
-        wait_exit(&mut app.0, Duration::from_secs(5)),
+        wait_exit_or_dump(&mut app.0, Duration::from_secs(5), Duration::from_secs(30)),
         "关 B 后应退出"
     );
 }
@@ -772,7 +829,7 @@ fn ipc_survives_main_window_close() {
         let _ = PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0));
     }
     assert!(
-        wait_exit(&mut app.0, Duration::from_secs(5)),
+        wait_exit_or_dump(&mut app.0, Duration::from_secs(5), Duration::from_secs(30)),
         "最后窗口关闭应退出"
     );
 }
@@ -793,7 +850,61 @@ fn rapid_close_both_windows_exits() {
         }
     }
     assert!(
-        wait_exit(&mut app.0, Duration::from_secs(5)),
+        wait_exit_or_dump(&mut app.0, Duration::from_secs(5), Duration::from_secs(30)),
         "快速连关后进程必须退出"
     );
+}
+
+/// #124 复现工件(手动矩阵,#[ignore]):量化"最后窗口关闭 → 进程消失"
+/// 的单调时间,并转储 app 退出序分相计时。可重放对照:
+/// - 无 profile 对照:MICA_EXIT_REPRO_COMMAND="pwsh.exe -NoLogo -NoProfile"
+/// - 真实 profile:不设该变量(默认 shell 走 $PROFILE——它在
+///   USERPROFILE\Documents,不随 APPDATA 隔离,#124 的首要嫌疑噪声源)
+/// - 负载由外部驱动控制,本测试不造负载
+///
+/// cargo test -p mica-app --test window_lifecycle exit_close_to_exit_timing -- --ignored --nocapture
+#[test]
+#[ignore]
+fn exit_close_to_exit_timing() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let source = match std::env::var("MICA_EXIT_REPRO_COMMAND") {
+        Ok(command) => format!("command = {command}\nquick-terminal-key = none\n"),
+        Err(_) => "quick-terminal-key = none\n".to_string(),
+    };
+    let (mut app, cfg) = launch_config_source(true, &source);
+    assert!(wait_ready(Duration::from_secs(20)), "IPC 未就绪");
+    let first = wait_windows(app.0.id(), 1, Duration::from_secs(10));
+    assert!(cli(&["new-window"]), "开副窗失败");
+    let both = wait_windows(app.0.id(), 2, Duration::from_secs(10));
+    let other = both.iter().find(|h| **h != first[0]).copied().unwrap();
+    // 与 ipc_survives 同序:先关主窗(其线程退出序跑完后 park),再关
+    // 副窗——最后一击正是 #124 断言的"最后窗口关闭"
+    // SAFETY: 本测试的子进程窗口
+    unsafe {
+        let _ = PostMessageW(Some(first[0]), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { IsWindow(Some(first[0])) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!unsafe { IsWindow(Some(first[0])) }.as_bool(), "主窗未销毁");
+    let t_last_close = Instant::now();
+    // SAFETY: 同上
+    unsafe {
+        let _ = PostMessageW(Some(other), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    let exited = wait_exit_or_dump(&mut app.0, Duration::from_secs(5), Duration::from_secs(30));
+    let elapsed = t_last_close.elapsed();
+    println!(
+        "EXIT_TIMING close→exit = {}ms (exited_within_30s={exited})",
+        elapsed.as_millis()
+    );
+    let log = cfg.parent().unwrap().parent().unwrap().join("stderr.log");
+    println!("---- app exit log ({}) ----", log.display());
+    for line in std::fs::read_to_string(&log).unwrap_or_default().lines() {
+        if line.contains("[exit]") || line.contains("[lifecycle]") {
+            println!("{line}");
+        }
+    }
+    assert!(exited, "30s 内未退出:真停滞而非慢(见上方分相计时)");
 }

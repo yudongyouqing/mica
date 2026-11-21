@@ -51,7 +51,7 @@ fn write_placeholder_ico(path: &std::path::Path) {
     let sizes: Vec<Vec<u8>> = SIZES.iter().map(|&sz| bmp_entry(sz)).collect();
     let mut cur = 6 + SIZES.len() * 16;
     for (&sz, bmp) in SIZES.iter().zip(&sizes) {
-        let b = sz.min(255) as u8; // 256 按格式存 0
+        let b = if sz >= 256 { 0 } else { sz as u8 }; // 256 按格式存 0
         dir.extend([
             b,
             b,
@@ -73,8 +73,8 @@ fn write_placeholder_ico(path: &std::path::Path) {
         cur += bmp.len();
     }
     let mut ico = dir;
-    for sz in SIZES {
-        ico.extend(bmp_entry(sz));
+    for bmp in sizes {
+        ico.extend(bmp);
     }
     std::fs::write(path, ico).expect("write ico");
 }

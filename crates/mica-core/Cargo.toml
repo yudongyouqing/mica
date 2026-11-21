@@ -6,13 +6,15 @@ license.workspace = true
 description = "Terminal core: screen state machine, pty, input encoding (no GUI deps)"
 
 [dependencies]
-base64 = { workspace = true }
 alacritty_terminal = { workspace = true }
 include_dir = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading"] }

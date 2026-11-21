@@ -70,14 +70,13 @@ impl Palette {
         match index {
             0..=15 => self.colors[index],
             16..=231 => {
-                // 立方坐标 c = index - 16;r=c/36、g=c/6%6、b=c%6;
-                // 每级 × 51(0,51,…,255)
+                // 标准 xterm 6×6×6 立方色阶(与 mica-render/src/color.rs 同源)
+                const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
                 let c = index - 16;
-                let lv = |axis: u32| ((c / 6usize.pow(axis)) % 6 * 51) as u8;
                 Rgb {
-                    r: lv(2),
-                    g: lv(1),
-                    b: lv(0),
+                    r: CUBE_LEVELS[c / 36],
+                    g: CUBE_LEVELS[(c / 6) % 6],
+                    b: CUBE_LEVELS[c % 6],
                 }
             }
             232..=255 => {
@@ -235,10 +234,18 @@ mod tests {
     #[test]
     fn query_cube_and_grayscale_anchors() {
         let p = Palette::DEFAULT;
-        // 立方角:16=(0,0,0)黑、17=(0,0,1)蓝 51、21=(0,0,5)蓝 255、
-        // 231=(5,5,5)白、196=(5,0,0)红 255
+        // 立方角与中间级:16=(0,0,0)黑、17=(0,0,1)蓝 95、21=(0,0,5)蓝 255、
+        // 59=(1,1,1)灰 95、231=(5,5,5)白、196=(5,0,0)红 255
         assert_eq!(p.query(16), Rgb { r: 0, g: 0, b: 0 });
-        assert_eq!(p.query(17), Rgb { r: 0, g: 0, b: 51 });
+        assert_eq!(p.query(17), Rgb { r: 0, g: 0, b: 95 });
+        assert_eq!(
+            p.query(59),
+            Rgb {
+                r: 95,
+                g: 95,
+                b: 95
+            }
+        );
         assert_eq!(p.query(21), Rgb { r: 0, g: 0, b: 255 });
         assert_eq!(
             p.query(231),

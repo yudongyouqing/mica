@@ -230,14 +230,14 @@ impl Canvas {
 
 /// 交叉族表:cp<<8 | up<<6 | right<<4 | down<<2 | left(0/1/2=无/细/粗)
 const LINES_TAB: [u32; 68] = [
-    0x250011, 0x250122, 0x250244, 0x250388, 0x250c41, 0x250d81, 0x250e42, 0x250f82, 0x251050,
-    0x251190, 0x251260, 0x2513a0, 0x251405, 0x251509, 0x251606, 0x25170a, 0x251814, 0x251918,
-    0x251a24, 0x251b28, 0x251c45, 0x251d85, 0x251e46, 0x251f49, 0x252086, 0x252189, 0x25224a,
-    0x25238a, 0x252454, 0x252594, 0x252664, 0x252758, 0x252894, 0x2529a4, 0x252a68, 0x252ba8,
-    0x252c15, 0x252d25, 0x252e19, 0x252f29, 0x253026, 0x253129, 0x25321a, 0x25332a, 0x253451,
-    0x253591, 0x253661, 0x2537a1, 0x253852, 0x253992, 0x253a62, 0x253ba2, 0x253c55, 0x253d96,
-    0x253e69, 0x253f59, 0x254056, 0x254159, 0x254269, 0x2543a6, 0x2544a6, 0x254596, 0x254666,
-    0x25476a, 0x2548a9, 0x2549a6, 0x254aa9, 0x254baa,
+    0x250011, 0x250122, 0x250244, 0x250388, 0x250c14, 0x250d24, 0x250e18, 0x250f28, 0x251005,
+    0x251106, 0x251209, 0x25130a, 0x251450, 0x251560, 0x251690, 0x2517a0, 0x251841, 0x251942,
+    0x251a81, 0x251b82, 0x251c54, 0x251d64, 0x251e94, 0x251f58, 0x252098, 0x2521a4, 0x252268,
+    0x2523a8, 0x252445, 0x252546, 0x252685, 0x252749, 0x252889, 0x252986, 0x252a4a, 0x252b8a,
+    0x252c15, 0x252d16, 0x252e25, 0x252f26, 0x253019, 0x25311a, 0x253229, 0x25332a, 0x253451,
+    0x253552, 0x253661, 0x253762, 0x253891, 0x253992, 0x253aa1, 0x253ba2, 0x253c55, 0x253d56,
+    0x253e65, 0x253f66, 0x254095, 0x254159, 0x254299, 0x254396, 0x2544a5, 0x25455a, 0x254669,
+    0x2547a6, 0x25486a, 0x25499a, 0x254aa9, 0x254baa,
 ];
 
 // ---------- 制表符 U+2500-257F ----------
@@ -257,17 +257,21 @@ fn draw_box(cp: u32, c: &mut Canvas) -> bool {
     };
     let line = |c: &mut Canvas, up: u32, right: u32, down: u32, left: u32| {
         let hw = |v: u32| if v == 2 { half_h } else { half_l };
+        let hv = up.max(down);
+        let hh = left.max(right);
+        let cx = if hv != 0 { hw(hv) } else { 0.0 };
+        let cy = if hh != 0 { hw(hh) } else { 0.0 };
         if left != 0 {
-            hseg(c, 0.0, mx, hw(left));
+            hseg(c, 0.0, mx + cx, hw(left));
         }
         if right != 0 {
-            hseg(c, mx, w, hw(right));
+            hseg(c, mx - cx, w, hw(right));
         }
         if up != 0 {
-            vseg(c, 0.0, my, hw(up));
+            vseg(c, 0.0, my + cy, hw(up));
         }
         if down != 0 {
-            vseg(c, my, h, hw(down));
+            vseg(c, my - cy, h, hw(down));
         }
     };
     let dline = |c: &mut Canvas, vert: bool| {
@@ -324,30 +328,30 @@ fn draw_box(cp: u32, c: &mut Canvas) -> bool {
         0x2552..=0x256C => {
             // 双线族:一边双以 heavy 表达(小格上与真双线不可分辨)
             let (u, r, d, l): (u32, u32, u32, u32) = match cp {
-                0x2552 => (2, 0, 0, 1),
-                0x2553 => (1, 0, 0, 2),
-                0x2554 => (2, 0, 0, 2),
-                0x2555 => (2, 1, 0, 0),
-                0x2556 => (1, 2, 0, 0),
-                0x2557 => (2, 2, 0, 0),
-                0x2558 => (0, 0, 2, 1),
-                0x2559 => (0, 0, 1, 2),
-                0x255A => (0, 0, 2, 2),
-                0x255B => (0, 1, 2, 0),
-                0x255C => (0, 2, 1, 0),
-                0x255D => (0, 2, 2, 0),
-                0x255E => (1, 0, 1, 2),
-                0x255F => (2, 0, 2, 1),
-                0x2560 => (2, 0, 1, 2),
-                0x2561 => (1, 2, 1, 0),
-                0x2562 => (2, 1, 2, 0),
-                0x2563 => (2, 2, 1, 0),
-                0x2564 => (0, 1, 2, 2),
-                0x2565 => (0, 2, 1, 2),
-                0x2566 => (0, 2, 2, 1),
+                0x2552 => (0, 2, 1, 0),
+                0x2553 => (0, 1, 2, 0),
+                0x2554 => (0, 2, 2, 0),
+                0x2555 => (0, 0, 1, 2),
+                0x2556 => (0, 0, 2, 1),
+                0x2557 => (0, 0, 2, 2),
+                0x2558 => (1, 2, 0, 0),
+                0x2559 => (2, 1, 0, 0),
+                0x255A => (2, 2, 0, 0),
+                0x255B => (1, 0, 0, 2),
+                0x255C => (2, 0, 0, 1),
+                0x255D => (2, 0, 0, 2),
+                0x255E => (1, 2, 1, 0),
+                0x255F => (2, 1, 2, 0),
+                0x2560 => (2, 2, 2, 0),
+                0x2561 => (1, 0, 1, 2),
+                0x2562 => (2, 0, 2, 1),
+                0x2563 => (2, 0, 2, 2),
+                0x2564 => (0, 2, 1, 2),
+                0x2565 => (0, 1, 2, 1),
+                0x2566 => (0, 2, 2, 2),
                 0x2567 => (1, 2, 0, 2),
-                0x2568 => (2, 1, 0, 2),
-                0x2569 => (2, 2, 0, 1),
+                0x2568 => (2, 1, 0, 1),
+                0x2569 => (2, 2, 0, 2),
                 0x256A => (1, 2, 1, 2),
                 0x256B => (2, 1, 2, 1),
                 0x256C => (2, 2, 2, 2),
@@ -355,31 +359,51 @@ fn draw_box(cp: u32, c: &mut Canvas) -> bool {
             };
             line(c, u, r, d, l);
         }
-        0x256D => c.arc(
-            mx,
-            my,
-            my.min(mx),
-            std::f32::consts::PI,
-            std::f32::consts::PI * 1.5,
-            half_l,
-        ),
-        0x256E => c.arc(
-            mx,
-            my,
-            my.min(mx),
-            std::f32::consts::PI * 1.5,
-            std::f32::consts::PI * 2.0,
-            half_l,
-        ),
-        0x256F => c.arc(mx, my, my.min(mx), 0.0, std::f32::consts::FRAC_PI_2, half_l),
-        0x2570 => c.arc(
-            mx,
-            my,
-            my.min(mx),
-            std::f32::consts::FRAC_PI_2,
-            std::f32::consts::PI,
-            half_l,
-        ),
+        0x256D => {
+            let r = mx.min(my);
+            c.arc(
+                mx + r,
+                my + r,
+                r,
+                std::f32::consts::PI,
+                std::f32::consts::PI * 1.5,
+                half_l,
+            );
+            vseg(c, my + r, h, half_l);
+            hseg(c, mx + r, w, half_l);
+        }
+        0x256E => {
+            let r = mx.min(my);
+            c.arc(
+                mx - r,
+                my + r,
+                r,
+                std::f32::consts::PI * 1.5,
+                std::f32::consts::PI * 2.0,
+                half_l,
+            );
+            vseg(c, my + r, h, half_l);
+            hseg(c, 0.0, mx - r, half_l);
+        }
+        0x256F => {
+            let r = mx.min(my);
+            c.arc(mx - r, my - r, r, 0.0, std::f32::consts::FRAC_PI_2, half_l);
+            vseg(c, 0.0, my - r, half_l);
+            hseg(c, 0.0, mx - r, half_l);
+        }
+        0x2570 => {
+            let r = mx.min(my);
+            c.arc(
+                mx + r,
+                my - r,
+                r,
+                std::f32::consts::FRAC_PI_2,
+                std::f32::consts::PI,
+                half_l,
+            );
+            vseg(c, 0.0, my - r, half_l);
+            hseg(c, mx + r, w, half_l);
+        }
         0x2571 => c.line(0.0, h, w, 0.0, half_l),
         0x2572 => c.line(0.0, 0.0, w, h, half_l),
         0x2573 => {
@@ -535,11 +559,27 @@ fn draw_geometric(cp: u32, c: &mut Canvas) -> bool {
         }
         0x25D0 => {
             c.fill_ellipse(mx, my, r, r);
-            c.fill_rect(0.0, 0.0, mx, h);
+            c.carve_rect(mx, 0.0, w, h);
+            c.arc(
+                mx,
+                my,
+                r - h * 0.05,
+                0.0,
+                std::f32::consts::PI * 2.0,
+                h * 0.06,
+            );
         }
         0x25D1 => {
             c.fill_ellipse(mx, my, r, r);
-            c.fill_rect(mx, 0.0, w, h);
+            c.carve_rect(0.0, 0.0, mx, h);
+            c.arc(
+                mx,
+                my,
+                r - h * 0.05,
+                0.0,
+                std::f32::consts::PI * 2.0,
+                h * 0.06,
+            );
         }
         _ => return false,
     }
@@ -558,13 +598,14 @@ fn draw_braille(cp: u32, c: &mut Canvas) -> bool {
         }
     };
     let (l, rr) = (w * 0.28, w * 0.72);
+    // ISO/TR 11548-1: bit 0..2 = 左列 1..3, bit 3..5 = 右列 4..6, bit 6..7 = 底行 7..8
     dot(c, 0, l, h * 0.145);
     dot(c, 1, l, h * 0.375);
     dot(c, 2, l, h * 0.605);
-    dot(c, 3, l, h * 0.835);
-    dot(c, 4, rr, h * 0.145);
-    dot(c, 5, rr, h * 0.375);
-    dot(c, 6, rr, h * 0.605);
+    dot(c, 3, rr, h * 0.145);
+    dot(c, 4, rr, h * 0.375);
+    dot(c, 5, rr, h * 0.605);
+    dot(c, 6, l, h * 0.835);
     dot(c, 7, rr, h * 0.835);
     true
 }
@@ -575,6 +616,19 @@ fn draw_powerline(cp: u32, c: &mut Canvas) -> bool {
     let (w, h) = (c.w, c.h);
     let t = (h / 10.0).clamp(1.0, 3.0);
     let half = t / 2.0;
+    let ellipse_arc = |c: &mut Canvas, cx: f32, cy: f32, rx: f32, ry: f32, a0: f32, a1: f32| {
+        let steps = 20;
+        let mut px = cx + a0.cos() * rx;
+        let mut py = cy + a0.sin() * ry;
+        for i in 1..=steps {
+            let a = a0 + (a1 - a0) * i as f32 / steps as f32;
+            let x = cx + a.cos() * rx;
+            let y = cy + a.sin() * ry;
+            c.line(px, py, x, y, half);
+            px = x;
+            py = y;
+        }
+    };
     match cp {
         // 三角满格无缝(斜边角到角)
         0xE0B0 => {
@@ -582,22 +636,44 @@ fn draw_powerline(cp: u32, c: &mut Canvas) -> bool {
             // 左缘细实条:顶点处三角薄如刀尖,中心采样漏墨=平铺露缝
             c.fill_rect(-0.5, 0.0, 0.5, h);
         }
-        0xE0B1 => c.fill_poly(&[(w, 0.0), (w, h), (0.0, h / 2.0)]),
+        0xE0B1 => {
+            c.line(0.0, 0.0, w, h / 2.0, half);
+            c.line(w, h / 2.0, 0.0, h, half);
+        }
         0xE0B2 => {
             c.fill_poly(&[(w, 0.0), (0.0, h / 2.0), (w, h)]);
             c.fill_rect(w - 0.5, 0.0, w + 0.5, h);
         }
-        0xE0B3 => c.fill_poly(&[(0.0, 0.0), (w, 0.0), (w / 2.0, h)]),
-        // 圆帽贴边
+        0xE0B3 => {
+            c.line(w, 0.0, 0.0, h / 2.0, half);
+            c.line(0.0, h / 2.0, w, h, half);
+        }
+        // 圆帽贴边(实心与细弧)
         0xE0B4 => c.fill_ellipse(0.0, h / 2.0, w * 0.95, h / 2.0),
-        0xE0B5 => c.fill_ellipse(w, h / 2.0, w * 0.95, h / 2.0),
+        0xE0B5 => ellipse_arc(
+            c,
+            0.0,
+            h / 2.0,
+            w * 0.95,
+            h / 2.0,
+            -std::f32::consts::FRAC_PI_2,
+            std::f32::consts::FRAC_PI_2,
+        ),
         0xE0B6 => c.fill_ellipse(w, h / 2.0, w * 0.95, h / 2.0),
-        0xE0B7 => c.fill_ellipse(0.0, h / 2.0, w * 0.95, h / 2.0),
-        // 斜线分隔
-        0xE0B8 => c.line(0.0, h, w, 0.0, half),
+        0xE0B7 => ellipse_arc(
+            c,
+            w,
+            h / 2.0,
+            w * 0.95,
+            h / 2.0,
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI * 1.5,
+        ),
+        // 斜线与三角分隔
+        0xE0B8 => c.fill_poly(&[(0.0, 0.0), (w, h), (0.0, h)]),
         0xE0B9 => c.line(0.0, 0.0, w, h, half),
-        0xE0BA => c.line(0.0, h, w, 0.0, half),
-        0xE0BB => c.line(0.0, 0.0, w, h, half),
+        0xE0BA => c.fill_poly(&[(w, 0.0), (w, h), (0.0, h)]),
+        0xE0BB => c.line(0.0, h, w, 0.0, half),
         _ => return false,
     }
     true
@@ -626,17 +702,27 @@ mod tests {
 
     #[test]
     fn corners_touch_all_edges() {
-        let (w, h) = (10.0, 21.0);
-        let (_, _, cov) = draw(0x250C, w, h).unwrap();
+        let (w, h) = (10.0f32, 21.0f32);
         let midx = (w / 2.0).floor() as usize;
         let midy = (h / 2.0).floor() as usize;
-        assert!(cov[midx] > 200, "┌ 顶边竖笔缺墨");
-        assert!(cov[midy * w as usize] > 200, "┌ 左边横笔缺墨");
-        let (_, _, cov) = draw(0x2518, w, h).unwrap();
         let bottom = (h as usize - 1) * w as usize + midx;
         let right = midy * w as usize + w as usize - 1;
-        assert!(cov[bottom] > 200, "┘ 底边竖笔缺墨");
-        assert!(cov[right] > 200, "┘ 右边横笔缺墨");
+        // ┌ (U+250C LIGHT DOWN AND RIGHT): 底边竖笔 + 右边横笔
+        let (_, _, cov) = draw(0x250C, w, h).unwrap();
+        assert!(cov[bottom] > 200, "┌ 底边竖笔缺墨");
+        assert!(cov[right] > 200, "┌ 右边横笔缺墨");
+        assert_eq!(cov[midx], 0, "┌ 顶边应无墨");
+        assert_eq!(cov[midy * w as usize], 0, "┌ 左边应无墨");
+        // ┘ (U+2518 LIGHT UP AND LEFT): 顶边竖笔 + 左边横笔
+        let (_, _, cov) = draw(0x2518, w, h).unwrap();
+        assert!(cov[midx] > 200, "┘ 顶边竖笔缺墨");
+        assert!(cov[midy * w as usize] > 200, "┘ 左边横笔缺墨");
+        assert_eq!(cov[bottom], 0, "┘ 底边应无墨");
+        assert_eq!(cov[right], 0, "┘ 右边应无墨");
+        // ╭ (U+256D ARC DOWN AND RIGHT): 圆角贴底边与右边
+        let (_, _, cov) = draw(0x256D, w, h).unwrap();
+        assert!(cov[bottom] > 200, "╭ 底边缺墨");
+        assert!(cov[right] > 200, "╭ 右边缺墨");
     }
 
     #[test]
@@ -675,7 +761,15 @@ mod tests {
         let blank = draw(0x2800, w, h).unwrap().2;
         assert!(blank.iter().all(|&v| v == 0), "空白盲文无墨");
         let one = draw(0x2801, w, h).unwrap().2;
-        assert!(one.iter().any(|&v| v > 200), "Bit1 点应有墨");
+        assert!(one.iter().any(|&v| v > 200), "Bit0(dot 1) 应有墨");
+        // U+2808 = bit 3 = dot 4 (右上角,不是左下角)
+        let dot4 = draw(0x2808, w, h).unwrap().2;
+        let idx = |x: usize, y: usize| y * w as usize + x;
+        assert!(dot4[idx(7, 3)] > 200, "dot 4 应在右上角");
+        assert_eq!(dot4[idx(2, 17)], 0, "dot 4 不应在左下角");
+        // U+2840 = bit 6 = dot 7 (左下角)
+        let dot7 = draw(0x2840, w, h).unwrap().2;
+        assert!(dot7[idx(2, 17)] > 200, "dot 7 应在左下角");
     }
 
     #[test]

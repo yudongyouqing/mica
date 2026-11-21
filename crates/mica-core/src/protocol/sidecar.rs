@@ -406,7 +406,7 @@ fn candidate_starts(window: &[u8]) -> Vec<usize> {
 /// 由调用方续命)。
 fn seq_end(window: &[u8], start: usize) -> usize {
     if window[start..].starts_with(CSI_START) {
-        return (start + CSI_START.len()).min(window.len());
+        return (start + CSI_START.len() + 1).min(window.len());
     }
     let tail = &window[start..];
     for (k, &b) in tail.iter().enumerate().skip(1) {
@@ -491,25 +491,25 @@ mod tests {
     fn osc133_exit_code_dual_forms() {
         let mark = |e: &SidecarEvents| kinds(e);
         assert_eq!(
-            mark(&scan(b"]133;D;err=0\x07")),
+            mark(&scan(b"\x1b]133;D;err=0\x07")),
             vec![SidecarEvent::Mark(ShellMark::CommandEnd { exit: Some(0) })]
         );
         assert_eq!(
-            mark(&scan(b"]133;D;127\x07")),
+            mark(&scan(b"\x1b]133;D;127\x07")),
             vec![SidecarEvent::Mark(ShellMark::CommandEnd {
                 exit: Some(127)
             })]
         );
         assert_eq!(
-            mark(&scan(b"]133;D;err=-1\x07")),
+            mark(&scan(b"\x1b]133;D;err=-1\x07")),
             vec![SidecarEvent::Mark(ShellMark::CommandEnd { exit: Some(-1) })]
         );
         assert_eq!(
-            mark(&scan(b"]133;D;err=x\x07")),
+            mark(&scan(b"\x1b]133;D;err=x\x07")),
             vec![SidecarEvent::Mark(ShellMark::CommandEnd { exit: None })]
         );
         assert_eq!(
-            mark(&scan(b"]133;D\x07")),
+            mark(&scan(b"\x1b]133;D\x07")),
             vec![SidecarEvent::Mark(ShellMark::CommandEnd { exit: None })]
         );
     }
@@ -650,5 +650,22 @@ mod tests {
         // 完整 needle 落在块尾,终结符 h 在下一块
         assert_eq!(p.scan(b"\x1b[?2026"), SidecarEvents::default());
         assert_eq!(kinds(&p.scan(b"h")), vec![SidecarEvent::SyncBegin]);
+    }
+
+    #[test]
+    fn csi2026_offsets_point_past_finalizer() {
+        let input = b"ab\x1b[?2026hmiddle\x1b[?2026ltail";
+        let e = scan(input);
+        assert_eq!(
+            kinds(&e),
+            vec![SidecarEvent::SyncBegin, SidecarEvent::SyncEnd]
+        );
+        assert_eq!(e.events[0].offset, 10);
+        assert_eq!(&input[..e.events[0].offset], b"ab\x1b[?2026h");
+        assert_eq!(e.events[1].offset, 24);
+        assert_eq!(
+            &input[..e.events[1].offset],
+            b"ab\x1b[?2026hmiddle\x1b[?2026l"
+        );
     }
 }

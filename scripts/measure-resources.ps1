@@ -83,12 +83,10 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
 
     $kids = Get-ChildTree $TargetPid
     $kidCpuNow = @{}
-    $kidCpuSum = 0.0
     foreach ($k in $kids) {
         if ($null -ne $k.CPU) {
             $key = "{0}|{1}" -f $k.Id, $k.StartTime.Ticks
             $kidCpuNow[$key] = [double]$k.CPU
-            $kidCpuSum += [double]$k.CPU
         }
     }
     # 增量只对两拍都在且键相同(同 pid 且未复用)的子进程累计;
@@ -106,7 +104,7 @@ while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
     try {
         $gpuKb = [math]::Round((
             (Get-Counter '\GPU Process Memory(*)\Total Committed' -ErrorAction Stop).CounterSamples |
-                Where-Object { $_.InstanceName -match "pid_$TargetPid" } |
+                Where-Object { $_.InstanceName -match "^pid_${TargetPid}_" } |
                 Measure-Object CookedValue -Sum).Sum / 1KB, 0)
     } catch { $gpuKb = "" }
 

@@ -3,6 +3,7 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directories: ["/", "/crates/*"]
+    target-branch: "dev"
     schedule:
       interval: weekly
     commit-message:
@@ -10,6 +11,7 @@ updates:
     labels: [dependencies]
   - package-ecosystem: github-actions
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: weekly
     commit-message:

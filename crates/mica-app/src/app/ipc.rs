@@ -388,11 +388,24 @@ pub fn send_request(req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, Ip
 /// 存活到 CreateNamedPipeW 返回——管道是进程级单例,只建一次。
 struct UserSecurity {
     _sd: Box<windows::Win32::Security::SECURITY_DESCRIPTOR>,
-    _acl: *mut windows::Win32::Security::ACL,
+    acl: *mut windows::Win32::Security::ACL,
     sa: windows::Win32::Security::SECURITY_ATTRIBUTES,
 }
 
-// ACL 原始指针经 Box 持有;仅主线程建管路径使用
+impl Drop for UserSecurity {
+    fn drop(&mut self) {
+        if !self.acl.is_null() {
+            // SAFETY: acl 由 SetEntriesInAclW 通过 LocalAlloc 分配,且本结构唯一持有
+            unsafe {
+                windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
+                    self.acl as _,
+                )));
+            }
+        }
+    }
+}
+
+// ACL 原始指针由本结构唯一持有并在 Drop 释放;仅主线程建管路径使用
 unsafe impl Send for UserSecurity {}
 
 fn build_user_acl() -> Option<UserSecurity> {
@@ -429,7 +442,7 @@ fn build_user_acl() -> Option<UserSecurity> {
             let _ = CloseHandle(token);
             return None;
         }
-        let mut buf = vec![0u8; len as usize];
+        let mut buf = vec![0usize; (len as usize).div_ceil(std::mem::size_of::<usize>())];
         if GetTokenInformation(
             token,
             TokenUser,
@@ -479,10 +492,6 @@ fn build_user_acl() -> Option<UserSecurity> {
             lpSecurityDescriptor: sd.as_mut() as *mut _ as *mut core::ffi::c_void,
             bInheritHandle: windows::Win32::Foundation::FALSE,
         };
-        Some(UserSecurity {
-            _sd: sd,
-            _acl: acl,
-            sa,
-        })
+        Some(UserSecurity { _sd: sd, acl, sa })
     }
 }
