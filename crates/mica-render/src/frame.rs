@@ -2091,7 +2091,6 @@ mod bench {
             } else {
                 Damage::Lines(vec![round % 24])
             };
-            rows.clear();
             build_rows(
                 &s,
                 &mut router,

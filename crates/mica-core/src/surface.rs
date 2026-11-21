@@ -208,8 +208,10 @@ pub struct Surface {
     cwd: Option<String>,
     /// OSC 133 行属性表(D37):持久累积,超 `MAX_MARKS` 淘汰最旧。
     marks: Vec<MarkRecord>,
-    /// jump 锚(D37):上次 jump_prompt 的目标(行 + epoch);手动滚动即重置。
-    jump_ref: Option<(i32, usize)>,
+    /// jump 锚(D37):上次 jump_prompt 的目标(行 + 单调 epoch);手动滚动即重置。
+    jump_ref: Option<(i32, i64)>,
+    /// 超出 SCROLLBACK_LIMIT 后从历史顶部淘汰的累计行数,用于构造单调 epoch。
+    evicted_lines: u64,
     /// 活动选区的端点(begin/update 时记录;extend_edge 用其列——上游
     /// region 私有且 to_range 给的是排序 span,分不出端点在哪侧)。
     sel_end: Point,
@@ -223,16 +225,18 @@ pub struct RowMark {
     pub line: i32,
 }
 
-/// 行属性表的内部记录:行号 + 记录瞬间的 history 深度(epoch)。
-/// 消费时换算:`current = line - (hist_now - epoch)`——内容上滚 = 行号
-/// 减小 = history 同步增长的恒等式。resize 重排会破恒等式(近似,v1 接受,
-/// M5a 冒烟把关);alt screen 的标记视同废弃。
+/// 行属性表的内部记录:行号 + 记录瞬间的单调滚动深度(evicted_lines + history_size)。
+/// 消费时换算:`current = line - (epoch_now - epoch)`——即使 scrollback 顶满
+/// `SCROLLBACK_LIMIT` 行并淘汰旧历史,单调 epoch 仍与内容上滚保持精确一致。
 #[derive(Debug, Clone, Copy)]
 struct MarkRecord {
     mark: crate::protocol::sidecar::ShellMark,
     line: i32,
-    epoch: usize,
+    epoch: i64,
 }
+
+/// 滚动历史行数上限(与 Config::scrolling_history 同源)。
+const SCROLLBACK_LIMIT: usize = 10_000;
 
 /// 行属性表上限:长会话千级 prompt 足够,jump 只关心最近的。
 const MAX_MARKS: usize = 4096;
@@ -241,7 +245,7 @@ impl Surface {
     pub fn new(size: ScreenSize) -> Self {
         let proxy = EventProxy::default();
         let config = Config {
-            scrolling_history: 10_000,
+            scrolling_history: SCROLLBACK_LIMIT,
             // kitty keyboard(M4a/D27):激活上游状态机(mode 栈/查询应答);
             // 输入编码器在 protocol::kitty,app 按 kitty_flags() 分流
             kitty_keyboard: true,
@@ -260,7 +264,48 @@ impl Surface {
             sync_output: false,
             marks: Vec::new(),
             jump_ref: None,
+            evicted_lines: 0,
             sel_end: Point::new(Line(0), Column(0)),
+        }
+    }
+
+    fn monotonic_epoch(&self) -> i64 {
+        self.evicted_lines as i64 + self.term.grid().history_size() as i64
+    }
+
+    /// 喂入解析器并在 scrollback 触顶时精确累计淘汰行数,确保单调 epoch 不停滞。
+    fn advance_tracked(&mut self, slice: &[u8]) {
+        if slice.is_empty() {
+            return;
+        }
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            self.parser.advance(&mut self.term, slice);
+            return;
+        }
+        let hist = self.term.grid().history_size();
+        // 远未触顶的快路径:零额外开销
+        if hist + slice.len() + self.size.screen_lines < SCROLLBACK_LIMIT {
+            self.parser.advance(&mut self.term, slice);
+            return;
+        }
+        // 临近或已达 SCROLLBACK_LIMIT:分小块放宽上限 → 喂入 → 统计超额淘汰数 → 恢复上限
+        for chunk in slice.chunks(4096) {
+            if self.term.mode().contains(TermMode::ALT_SCREEN) {
+                self.parser.advance(&mut self.term, chunk);
+                continue;
+            }
+            let headroom = chunk.len() + self.size.screen_lines.max(1) * 4;
+            self.term
+                .grid_mut()
+                .update_history(SCROLLBACK_LIMIT + headroom);
+            self.parser.advance(&mut self.term, chunk);
+            if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+                let now_hist = self.term.grid().history_size();
+                if now_hist > SCROLLBACK_LIMIT {
+                    self.evicted_lines += (now_hist - SCROLLBACK_LIMIT) as u64;
+                }
+                self.term.grid_mut().update_history(SCROLLBACK_LIMIT);
+            }
         }
     }
 
@@ -291,10 +336,10 @@ impl Surface {
                 }
                 SidecarEvent::Mark(mark) => {
                     // 先喂到事件位置,光标即标记行(视口坐标,0=顶)
-                    self.parser.advance(&mut self.term, &bytes[last..le.offset]);
+                    self.advance_tracked(&bytes[last..le.offset]);
                     last = le.offset;
                     let line = self.term.grid().cursor.point.line.0;
-                    let epoch = self.term.grid().history_size();
+                    let epoch = self.monotonic_epoch();
                     self.marks.push(MarkRecord {
                         mark: *mark,
                         line,
@@ -307,7 +352,7 @@ impl Surface {
                 }
             }
         }
-        self.parser.advance(&mut self.term, &bytes[last..]);
+        self.advance_tracked(&bytes[last..]);
     }
 
     /// 当前是否处于同步输出窗口(2026h 起 2026l/超时止)。app 的
@@ -324,14 +369,18 @@ impl Surface {
     }
 
     /// OSC 133 行属性表(D37):换算到当前视口坐标的标记行,幂等读。
-    /// 持久累积(上限 MAX_MARKS);换算恒等式见 `MarkRecord`。
+    /// 已滚出历史上限的标记自动过滤;换算恒等式见 `MarkRecord`。
     pub fn shell_marks(&self) -> Vec<RowMark> {
-        let now = self.term.grid().history_size() as i32;
+        let now = self.monotonic_epoch();
+        let min_line = -(self.term.grid().history_size() as i64);
         self.marks
             .iter()
-            .map(|r| RowMark {
-                mark: r.mark,
-                line: r.line - (now - r.epoch as i32),
+            .filter_map(|r| {
+                let line = i64::from(r.line) - (now - r.epoch);
+                (line >= min_line).then_some(RowMark {
+                    mark: r.mark,
+                    line: line as i32,
+                })
             })
             .collect()
     }
@@ -489,16 +538,20 @@ impl Surface {
     /// 活动屏内的目标只能归底跟随——无法滚出负偏移,天然限制)。
     /// next 越过最新 prompt = 回底部跟随。返回是否发生滚动(需重绘)。
     pub fn jump_prompt(&mut self, forward: bool) -> bool {
-        let hist = self.term.grid().history_size() as i32;
+        let now = self.monotonic_epoch();
+        let min_line = -(self.term.grid().history_size() as i64);
         let ref_line = match self.jump_ref {
-            Some((l, e)) => l - (hist - e as i32),
+            Some((l, e)) => (i64::from(l) - (now - e)).max(min_line) as i32,
             None => -(self.term.grid().display_offset() as i32),
         };
         let prompts: Vec<i32> = self
             .marks
             .iter()
             .filter(|m| matches!(m.mark, crate::protocol::sidecar::ShellMark::PromptStart))
-            .map(|m| m.line - (hist - m.epoch as i32))
+            .filter_map(|m| {
+                let line = i64::from(m.line) - (now - m.epoch);
+                (line >= min_line).then_some(line as i32)
+            })
             .collect();
         let target = if forward {
             prompts.into_iter().filter(|&l| l > ref_line).min()
@@ -512,7 +565,7 @@ impl Surface {
                 if delta != 0 {
                     self.term.scroll_display(Scroll::Delta(delta));
                 }
-                self.jump_ref = Some((l, hist as usize));
+                self.jump_ref = Some((l, now));
                 delta != 0
             }
             None => {
@@ -1307,5 +1360,50 @@ mod tests {
         s.set_cell_metrics(12, 24);
         s.proxy.send_event(Event::TextAreaSizeRequest(format));
         assert_eq!(s.take_pty_writes(), vec!["10x3x12x24".to_string()]);
+    }
+
+    /// 滚回超过 10,000 行上限后:淘汰的历史提示符自动过滤,保留的提示符
+    /// 坐标仍精确指向对应文本行且 jump_prompt 不漂移(#136)。
+    #[test]
+    fn shell_marks_stay_accurate_past_scrollback_cap() {
+        let mut s = Surface::new(ScreenSize::new(40, 10));
+        // 提示符 A:将被超过 10,000 行的新输出淘汰出历史
+        s.feed(b"\x1b]133;A\x07PROMPT_A\r\n");
+        let chunk = "fill line\r\n".repeat(200);
+        for _ in 0..51 {
+            s.feed(chunk.as_bytes());
+        }
+        // 此时已超过 10,000 行历史上限,再插入提示符 B 与后续 50 行 + 提示符 C
+        s.feed(b"\x1b]133;A\x07PROMPT_B\r\n");
+        s.feed("after b\r\n".repeat(50).as_bytes());
+        s.feed(b"\x1b]133;A\x07PROMPT_C\r\n");
+
+        assert_eq!(
+            s.grid().history_size(),
+            SCROLLBACK_LIMIT,
+            "历史上限应保持 10,000"
+        );
+        let marks = s.shell_marks();
+        assert_eq!(marks.len(), 2, "已淘汰的 PROMPT_A 应被过滤,仅剩 B/C");
+
+        let row_text = |s: &Surface, line: i32| -> String {
+            (0..8).map(|c| s.grid()[Line(line)][Column(c)].c).collect()
+        };
+        assert_eq!(
+            row_text(&s, marks[0].line),
+            "PROMPT_B",
+            "PROMPT_B 坐标应精确"
+        );
+        assert_eq!(
+            row_text(&s, marks[1].line),
+            "PROMPT_C",
+            "PROMPT_C 坐标应精确"
+        );
+        assert!(s.jump_prompt(false), "应能跳回 PROMPT_B");
+        assert_eq!(
+            row_text(&s, -(s.display_offset() as i32)),
+            "PROMPT_B",
+            "jump_prompt 必须精准落位 PROMPT_B"
+        );
     }
 }
