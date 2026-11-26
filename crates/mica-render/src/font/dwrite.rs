@@ -53,6 +53,15 @@ impl FamilyFaces {
     }
 }
 
+/// Collapse the three horizontally offset ClearType samples symmetrically.
+fn grayscale_coverage(raw: &[u8]) -> Vec<u8> {
+    raw.as_chunks::<3>()
+        .0
+        .iter()
+        .map(|&[r, g, b]| ((u16::from(r) + u16::from(g) + u16::from(b) + 1) / 3) as u8)
+        .collect()
+}
+
 pub struct DwriteRouter {
     factory: IDWriteFactory,
     families: Vec<FamilyFaces>,
@@ -412,9 +421,7 @@ impl DwriteRouter {
                 .CreateAlphaTexture(DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, &mut raw)
                 .ok()?
         };
-        // 亚像素三通道即三份水平错位的 coverage:取 R 通道,单通道做墨量
-        // 是亚像素纹理转灰度的标准做法(等价灰度 AA,合 R8 图集)
-        let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
+        let coverage = grayscale_coverage(&raw);
         let rect = self
             .atlas
             .borrow_mut()
@@ -490,7 +497,7 @@ impl DwriteRouter {
             {
                 return blank_glyph();
             }
-            let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
+            let coverage = grayscale_coverage(&raw);
             let rect = self
                 .atlas
                 .borrow_mut()
@@ -594,7 +601,7 @@ impl DwriteRouter {
                     .CreateAlphaTexture(DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, &mut raw)
                     .ok()?
             };
-            let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
+            let coverage = grayscale_coverage(&raw);
             layers.push((bounds, coverage, [color.r, color.g, color.b, color.a]));
         }
         if layers.is_empty() {

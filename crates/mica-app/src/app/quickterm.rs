@@ -851,7 +851,7 @@ fn qt_draw(st: &mut QtState) {
                 instances.push(mica_render::frame::CellInstance {
                     pos_uv: [x + g.offset_px[0], g.offset_px[1], g.uv[0], g.uv[1]],
                     size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                    fg,
+                    fg: mica_render::frame::glyph_tint(fg, g.color),
                     bg,
                 });
             }

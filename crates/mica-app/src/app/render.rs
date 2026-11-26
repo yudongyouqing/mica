@@ -296,9 +296,6 @@ pub(super) fn draw_frame() {
                     t.rows,
                 )
             {
-                let phase = HOVER_ANIM.with(std::cell::Cell::get);
-                let hh = 2.0 + (hl.h - 2.0) * (1.0 - (1.0 - phase).powi(3));
-                let y = hl.y + hl.h - hh;
                 let c = t.palette.colors[12];
                 let color = [
                     c.r as f32 / 255.0,
@@ -306,21 +303,13 @@ pub(super) fn draw_frame() {
                     c.b as f32 / 255.0,
                     0.0,
                 ];
-                for inst in &mut insts {
-                    if (inst.pos_uv[0] + inst.size_uv[0]).min(hl.x + hl.w)
-                        - inst.pos_uv[0].max(hl.x)
-                        > 0.01
-                        && (inst.pos_uv[1] + inst.size_uv[1]).min(y + hh) - inst.pos_uv[1].max(y)
-                            > 0.01
-                    {
-                        inst.fg = if inst.size_uv[2] > 0.0 {
-                            [0.05, 0.05, 0.05, 0.0]
-                        } else {
-                            color
-                        };
-                        inst.bg = color;
-                    }
-                }
+                let h = hl.h.min(2.0);
+                insts.push(mica_render::frame::CellInstance {
+                    pos_uv: [hl.x, hl.y + hl.h - h, 0.0, 0.0],
+                    size_uv: [hl.w, h, 0.0, 0.0],
+                    fg: color,
+                    bg: color,
+                });
             }
             let (sx, sy, sw, sh_r) = pane_scissor(rect, (area_w, area_h), sh);
             pane_batches.push(PaneBatch {
@@ -558,12 +547,15 @@ pub(super) fn draw_frame() {
                         search_overlay.push(mica_render::frame::CellInstance {
                             pos_uv: [tx + g.offset_px[0], ty + g.offset_px[1], g.uv[0], g.uv[1]],
                             size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                            fg: [
-                                t.palette.fg.r as f32 / 255.0,
-                                t.palette.fg.g as f32 / 255.0,
-                                t.palette.fg.b as f32 / 255.0,
-                                0.0,
-                            ],
+                            fg: mica_render::frame::glyph_tint(
+                                [
+                                    t.palette.fg.r as f32 / 255.0,
+                                    t.palette.fg.g as f32 / 255.0,
+                                    t.palette.fg.b as f32 / 255.0,
+                                    0.0,
+                                ],
+                                g.color,
+                            ),
                             bg: [
                                 bar_bg[0] as f32 / 255.0,
                                 bar_bg[1] as f32 / 255.0,
@@ -573,43 +565,6 @@ pub(super) fn draw_frame() {
                         });
                     }
                     tx += g.size_px[0].max(t.metrics.cell_width);
-                }
-            }
-        }
-        // #58 静态下划线:全部可见路径常显
-        {
-            let offset_s = t.term.display_offset() as i32;
-            let grid = t.term.grid();
-            let u_c = [
-                t.palette.colors[12].r,
-                t.palette.colors[12].g,
-                t.palette.colors[12].b,
-            ];
-            let u_cf = [
-                u_c[0] as f32 / 255.0,
-                u_c[1] as f32 / 255.0,
-                u_c[2] as f32 / 255.0,
-                0.0,
-            ];
-            if let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id) {
-                for view in 0..t.rows as i32 {
-                    let line = view - offset_s;
-                    let grid_row = &grid[Line(line)];
-                    if !(0..t.cols as usize).any(|c| matches!(grid_row[Column(c)].c, '/' | '\\')) {
-                        continue;
-                    }
-                    let (text, cell_of) = mica_render::frame::row_string(grid, line);
-                    for (col, cells) in all_path_spans(&text, &cell_of) {
-                        let x = pr.x + col as f32 * t.metrics.cell_width;
-                        let y = pr.y + (view as f32 + 1.0) * t.metrics.line_height - 2.0;
-                        let w = cells as f32 * t.metrics.cell_width;
-                        search_overlay.push(mica_render::frame::CellInstance {
-                            pos_uv: [x, y, 0.0, 0.0],
-                            size_uv: [w, 2.0, 0.0, 0.0],
-                            fg: u_cf,
-                            bg: u_cf,
-                        });
-                    }
                 }
             }
         }

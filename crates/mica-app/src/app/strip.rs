@@ -127,16 +127,6 @@ pub(super) fn strip_anim_step() -> bool {
     } else if t0 >= 0.0 {
         CAPS_T0.with(|t| t.set(-1.0));
     }
-    // 悬停反色动画:120ms ease-out,从下划线长到整块
-    if HOVER_PATH.with(|h| h.borrow().is_some()) {
-        let a = HOVER_ANIM.with(std::cell::Cell::get);
-        if a < 1.0 {
-            HOVER_ANIM.with(|a| a.set((a.get() + 0.015 / 0.120).min(1.0)));
-            busy = true;
-        }
-    } else {
-        HOVER_ANIM.with(|a| a.set(1.0)); // 不在路径上:无动画态
-    }
     // 邻位滑移:指数衰减(15ms 一拍 ×0.72 ≈ 105ms 收敛),全落定即停
     TAB_DX.with(|d| {
         let mut d = d.borrow_mut();

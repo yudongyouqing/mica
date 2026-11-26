@@ -1343,6 +1343,26 @@ mod tests {
             rb > 223 && rr < 32,
             "右半必须是 B 图集的蓝色,得 B={rb} R={rr}"
         );
+
+        let mut translucent = GlyphAtlas::new(256, 256);
+        let rect = translucent.insert(&GlyphBitmap::from_coverage(8, 12, vec![128; 8 * 12]));
+        let mut color_quad = quad(32.0, rect);
+        color_quad.fg = crate::frame::glyph_tint(color_quad.fg, true);
+        renderer.set_atlas(&translucent);
+        renderer.begin_frame_offscreen(&view, (256, 64));
+        renderer.draw_batch(&[quad(12.0, rect), color_quad], None);
+        renderer.end_frame();
+        let blended = read_pixels(&device, &queue, &target, size);
+        let red = |x: usize| blended[(32 * 256 + x) * 4 + 2];
+        assert!(
+            red(16).abs_diff(188) <= 1,
+            "grayscale blends in linear light"
+        );
+        assert!(
+            red(36).abs_diff(128) <= 1,
+            "colored glyph keeps native blend"
+        );
+
         // A pixel-aligned 1:1 glyph must reproduce texels, not resample an
         // inset/shrunken UV domain. Alternating opaque/clear columns reveal blur.
         let mut strokes = GlyphAtlas::new(256, 256);

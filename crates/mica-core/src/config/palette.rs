@@ -13,6 +13,8 @@ pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
     pub cursor: Rgb,
+    pub cursor_text: Rgb,
+    pub faint_opacity: f32,
     /// #90 最小对比度阈值(0=关;非配置键——Settings 合成时由
     /// minimum-contrast 写入,渲染着色层消费)
     pub minimum_contrast: f32,
@@ -56,6 +58,7 @@ impl Palette {
             "foreground" => self.fg = parse_hex(value)?,
             "background" => self.bg = parse_hex(value)?,
             "cursor-color" => self.cursor = parse_hex(value)?,
+            "cursor-text" => self.cursor_text = parse_hex(value)?,
             "selection-foreground" => self.selection_fg = parse_hex(value)?,
             "selection-background" => self.selection_bg = parse_hex(value)?,
             _ => {} // 未知键静默跳过(合成层同理)

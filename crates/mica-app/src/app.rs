@@ -232,9 +232,6 @@ thread_local! {
     /// None = 光标不在路径上(WM_MOUSEMOVE 每次刷新,替代 300ms 气泡)
     static HOVER_PATH: RefCell<Option<PathHover>> =
         const { RefCell::new(None) };
-    /// #58 悬停反色动画相位(0 = 2px 下划线,1 = 整块):进入/换路径时
-    /// 归零,timer 5 推进(120ms ease-out)——"从下划线滑成整块"
-    static HOVER_ANIM: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
     /// strip 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的反馈
     /// (const 初始化用字面量——Default::default 不是 const fn)
     static HOVER_STRIP: std::cell::Cell<mica_render::frame::StripHover> = const {

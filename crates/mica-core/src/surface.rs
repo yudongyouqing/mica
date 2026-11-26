@@ -15,6 +15,7 @@ pub use alacritty_terminal::grid::Scroll as ScrollCommand;
 pub use alacritty_terminal::index::{Column, Line, Point, Side};
 pub use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Cell;
+pub use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 /// 光标样式直通(DECSCUSR 承载;vte 枚举含 HollowBlock 等变体,
 /// 消费方按 Block/Underline/Beam 三类归一)。

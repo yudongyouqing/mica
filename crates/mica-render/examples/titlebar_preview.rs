@@ -1,5 +1,5 @@
 //! Export actual DirectWrite + wgpu chrome without opening/focusing a window.
-//! cargo run -p mica-render --example titlebar_preview -- output.png
+//! cargo run -p mica-render --example titlebar_preview -- output.png --theme "Kanagawa Wave"
 #[cfg(not(windows))]
 fn main() {
     eprintln!("DirectWrite preview requires Windows");
@@ -13,24 +13,36 @@ fn main() -> anyhow::Result<()> {
         frame::{StripExtras, StripMetrics, strip_quads},
         pipeline::{Renderer, create_context},
     };
-    let output = std::env::args_os()
-        .nth(1)
+    let mut args = std::env::args_os().skip(1);
+    let output = args
+        .next()
         .ok_or_else(|| anyhow::anyhow!("output PNG path required"))?;
-    let mut settings = resolve("theme = Dracula\nbackground = #0c0c0c")
-        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    let comparison = std::env::args().any(|arg| arg == "--comparison");
-    let single = std::env::args().any(|arg| arg == "--single");
-    // 对照开关(仅改导出器本地副本,不动用户配置):关标题高亮出纯原生条
-    let no_highlight = std::env::args().any(|arg| arg == "--no-highlight");
+    let mut config = "theme = Dracula\nbackground = #0c0c0c".to_owned();
+    let mut comparison = false;
+    let mut single = false;
+    let mut no_highlight = false;
     let mut scale = 1.5;
-    if let Some(value) = std::env::args()
-        .position(|arg| arg == "--scale")
-        .and_then(|pos| std::env::args().nth(pos + 1))
-    {
-        scale = value
-            .parse::<f32>()
-            .map_err(|error| anyhow::anyhow!("--scale 需要数值: {error}"))?;
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--theme") => {
+                let name = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--theme requires a name"))?;
+                config = format!("theme = {}", name.to_string_lossy());
+            }
+            Some("--comparison") => comparison = true,
+            Some("--single") => single = true,
+            Some("--no-highlight") => no_highlight = true,
+            Some("--scale") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--scale requires a number"))?;
+                scale = value.to_string_lossy().parse::<f32>()?;
+            }
+            _ => anyhow::bail!("unknown option: {arg:?}"),
+        }
     }
+    let mut settings = resolve(&config).map_err(|error| anyhow::anyhow!("{error:?}"))?;
     if no_highlight {
         settings.strip.title_highlight = false;
     }

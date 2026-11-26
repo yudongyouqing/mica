@@ -248,7 +248,7 @@ pub(super) fn all_path_spans(text: &str, cell_of: &[usize]) -> Vec<(usize, usize
 
 pub(super) fn update_hover_path(px: i32, py: i32) -> bool {
     let span = hover_path_span(px, py);
-    let changed = HOVER_PATH.with(|h| {
+    HOVER_PATH.with(|h| {
         let mut old = h.borrow_mut();
         if *old == span {
             false
@@ -256,12 +256,7 @@ pub(super) fn update_hover_path(px: i32, py: i32) -> bool {
             *old = span;
             true
         }
-    });
-    if changed && span.is_some() {
-        HOVER_ANIM.with(|a| a.set(0.0));
-        ensure_anim_timer();
-    }
-    changed
+    })
 }
 
 fn hover_path_span(px: i32, py: i32) -> Option<PathHover> {
@@ -292,6 +287,14 @@ fn hover_path_span(px: i32, py: i32) -> Option<PathHover> {
         }
         let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), point.line.0);
         let (column, cells) = span_of_token(&text, &cell_of, point.column.0)?;
+        let row = &t.term.grid()[point.line];
+        if (column..column + cells).any(|c| {
+            row[Column(c)]
+                .flags
+                .contains(mica_core::surface::CellFlags::HIDDEN)
+        }) {
+            return None;
+        }
         Some(PathHover {
             pane_id,
             line: point.line.0,
@@ -341,7 +344,11 @@ pub(super) fn link_at(px: i32, py: i32) -> Option<String> {
             return None;
         }
         let (line, col) = (point.line.0, point.column.0);
-        if let Some(l) = t.term.grid()[Line(line)][Column(col)].hyperlink() {
+        let cell = &t.term.grid()[Line(line)][Column(col)];
+        if cell.flags.contains(mica_core::surface::CellFlags::HIDDEN) {
+            return None;
+        }
+        if let Some(l) = cell.hyperlink() {
             return Some(l.uri().to_string());
         }
         // #58:OSC 8 未命中 → 行文本路径检测(编译器输出裸路径可点击)

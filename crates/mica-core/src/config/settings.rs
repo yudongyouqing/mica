@@ -19,7 +19,7 @@ pub use crate::config::defaults::{DEFAULT_FAMILIES, DEFAULT_FONT_SIZE_PT};
 /// `strip-tab-corner-radius`、`strip-wide-tabs`(Ghostty `gtk-wide-tabs`
 /// 同义)、`strip-hide-single-tab`、`strip-bar-color`/`-active-tab-color`/
 /// `-text-color`/`-dim-color`(auto|#rrggbb)、`strip-bar-wash`/
-/// `-unfocused`(0..1,auto 条底的提亮比例)、
+/// `-unfocused`(0..1,auto 条底的加深比例)、
 /// `strip-animation-duration`/`-focus`(ms,0=关)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StripCfg {
@@ -130,8 +130,8 @@ impl Default for Settings {
 
 // Neutral construction state, not a second table of product defaults. Every
 // user-facing value is populated from the default configuration before use.
-fn default_state() -> &'static (Settings, [bool; 3]) {
-    static DEFAULTS: std::sync::OnceLock<(Settings, [bool; 3])> = std::sync::OnceLock::new();
+fn default_state() -> &'static (Settings, [bool; 4]) {
+    static DEFAULTS: std::sync::OnceLock<(Settings, [bool; 4])> = std::sync::OnceLock::new();
     DEFAULTS.get_or_init(|| {
         let mut settings = Settings {
             command: None,
@@ -187,7 +187,7 @@ fn default_state() -> &'static (Settings, [bool; 3]) {
             parse,
             values: Vec::new(),
         };
-        let mut explicit = [false; 3];
+        let mut explicit = [false; 4];
         apply_pairs(&mut settings, pairs, &mut errors, &mut explicit);
         assert!(errors.is_empty(), "invalid built-in defaults: {errors:?}");
         finish_palette(&mut settings, &explicit);
@@ -218,7 +218,7 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
 
     let mut settings = default_state().0.clone();
     // 选区/光标是否被任何层显式设置(theme 或用户);[0]=selection-fg
-    // [1]=selection-bg [2]=cursor——缺省派生(见尾部)不覆盖显式值
+    // [1]=selection-bg [2]=cursor-color [3]=cursor-text
     let mut explicit = default_state().1;
 
     // theme 片段在用户片段之前应用:用户键可以覆盖主题同名键
@@ -249,7 +249,7 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
     }
 }
 
-fn finish_palette(settings: &mut Settings, explicit: &[bool; 3]) {
+fn finish_palette(settings: &mut Settings, explicit: &[bool; 4]) {
     // Ghostty 缺省语义(上游 renderer/generic.zig 实证):selection/cursor
     // 未显式配置时**动态互换/跟前景**——选区底 = 前景、选区字 = 背景、
     // 光标 = 前景。不是常量:用户只改 foreground 时选区光标随之走
@@ -262,18 +262,21 @@ fn finish_palette(settings: &mut Settings, explicit: &[bool; 3]) {
     if !explicit[2] {
         settings.palette.cursor = settings.palette.fg;
     }
+    if !explicit[3] {
+        settings.palette.cursor_text = settings.palette.bg;
+    }
     // #90 minimum-contrast 是渲染参数非调色板项:合成尾写入
     settings.palette.minimum_contrast = settings.minimum_contrast;
 }
 
 /// 键集分派:font-family 追加、font-size 限幅、色键(含 selection-*)走
-/// Palette;未知键(含 cursor-text——块光标反色绘制已等价)静默跳过
+/// Palette;未知键静默跳过
 /// ——Ghostty 同款容忍。explicit 记录选区/光标是否显式设置(缺省派生用)。
 fn apply_pairs(
     settings: &mut Settings,
     pairs: Vec<(String, String)>,
     err: &mut ConfigError,
-    explicit: &mut [bool; 3],
+    explicit: &mut [bool; 4],
 ) {
     // 首个显式 font-family 重置默认链(Ghostty 配置语义:显式键覆盖默认值),
     // 之后的声明追加
@@ -384,20 +387,18 @@ fn apply_pairs(
                 }
             }
             "background-image" => settings.background_image = (!value.is_empty()).then_some(value),
-            "background-opacity" | "minimum-contrast" => {
+            "background-opacity" | "minimum-contrast" | "faint-opacity" => {
                 let lower = if key == "background-opacity" {
                     0.05
                 } else {
                     0.0
                 };
                 match value.parse::<f32>() {
-                    Ok(n) if n.is_finite() && (lower..=1.0).contains(&n) => {
-                        if key == "background-opacity" {
-                            settings.background_opacity = n;
-                        } else {
-                            settings.minimum_contrast = n;
-                        }
-                    }
+                    Ok(n) if n.is_finite() && (lower..=1.0).contains(&n) => match key.as_str() {
+                        "background-opacity" => settings.background_opacity = n,
+                        "faint-opacity" => settings.palette.faint_opacity = n,
+                        _ => settings.minimum_contrast = n,
+                    },
                     _ => err
                         .values
                         .push(format!("{key} must be a finite number in {lower}..1")),
@@ -486,22 +487,24 @@ fn apply_pairs(
                     ));
                 }
             }
-            "cursor-color" | "selection-foreground" | "selection-background"
-                if value.is_empty() || value.eq_ignore_ascii_case("auto") =>
-            {
+            "cursor-color" | "cursor-text" | "selection-foreground" | "selection-background" => {
                 let slot = match key.as_str() {
                     "selection-foreground" => 0,
                     "selection-background" => 1,
-                    _ => 2,
+                    "cursor-color" => 2,
+                    _ => 3,
                 };
-                explicit[slot] = false;
+                if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+                    explicit[slot] = false;
+                } else if let Err(reason) = settings.palette.apply_pair(&key, &value) {
+                    err.values.push(format!("{key}: {reason}"));
+                } else {
+                    explicit[slot] = true;
+                }
             }
-            "palette" | "foreground" | "background" | "cursor-color" => {
+            "palette" | "foreground" | "background" => {
                 if let Err(reason) = settings.palette.apply_pair(&key, &value) {
                     err.values.push(format!("{key}: {reason}"));
-                }
-                if key == "cursor-color" {
-                    explicit[2] = true;
                 }
             }
             // strip 外观(2026-10-12 全量可配);gtk-wide-tabs 是 Ghostty
@@ -601,13 +604,6 @@ fn apply_pairs(
                         .push(format!("{key} 应为 0-2000 的毫秒数,得 `{value}`")),
                 }
             }
-            "selection-foreground" | "selection-background" => {
-                if let Err(reason) = settings.palette.apply_pair(&key, &value) {
-                    err.values.push(format!("{key}: {reason}"));
-                }
-                let slot = if key == "selection-background" { 1 } else { 0 };
-                explicit[slot] = true;
-            }
             _ => {}
         }
     }
@@ -694,6 +690,8 @@ mod tests {
         assert_eq!(Settings::default().keymap, Keymap::wt_default());
         assert_eq!(Settings::default().window_width, 100);
         assert_eq!(Settings::default().window_height, 30);
+        assert_eq!(Settings::default().window_padding_x, 8.0);
+        assert_eq!(Settings::default().window_padding_y, 6.0);
         assert_eq!(Settings::default().quick_terminal_height, 40);
         // The old Rust table contained later duplicate arrow bindings. Lookup
         // used the first occurrence, so migration must preserve prompt jumps.
@@ -712,7 +710,7 @@ mod tests {
             StripCfg {
                 font_weight: 600,
                 title_centered: true,
-                title_highlight: true,
+                title_highlight: false,
                 title_highlight_color: None,
                 title_highlight_opacity: 0.06,
                 title_highlight_radius: 4.0,
@@ -725,8 +723,8 @@ mod tests {
                 wide_tabs: true,
                 hide_single: true,
                 bar: None,
-                bar_wash: 0.08,
-                bar_wash_unfocused: 0.12,
+                bar_wash: 0.0,
+                bar_wash_unfocused: 0.04,
                 active_tab: None,
                 text: None,
                 dim: None,
@@ -749,6 +747,10 @@ mod tests {
             "minimum-contrast = inf",
             "minimum-contrast = -1",
             "minimum-contrast = 2",
+            "faint-opacity = -0.1",
+            "faint-opacity = 1.1",
+            "faint-opacity = NaN",
+            "cursor-text = invalid",
             "window-position = one,2",
             "mouse-right-click = bad",
             "copy-on-select = bad",
@@ -840,6 +842,25 @@ mod tests {
         assert_eq!(s.theme_name.as_deref(), Some("Dracula"));
         assert_eq!(s.palette.bg.r, 0x00, "用户 background 覆盖主题");
         assert_eq!(s.palette.colors[1].r, 0xff, "palette 槽来自主题(#ff5555)");
+    }
+
+    #[test]
+    fn cursor_text_preserves_theme_value_until_overridden_or_reset() {
+        let source = "theme = Kanagawa Wave\nbackground = #123456\nfaint-opacity = 0.25\n";
+        let p = resolve(source).unwrap().palette;
+        assert_eq!(p.cursor, parse_hex("#dcd7ba").unwrap());
+        assert_eq!(p.cursor_text, parse_hex("#1f1f28").unwrap());
+        assert_eq!(p.faint_opacity, 0.25);
+        let p = resolve(&format!("{source}cursor-text = #abcdef"))
+            .unwrap()
+            .palette;
+        assert_eq!(p.cursor_text, parse_hex("#abcdef").unwrap());
+        for reset in ["", "auto"] {
+            let p = resolve(&format!("{source}cursor-text = {reset}"))
+                .unwrap()
+                .palette;
+            assert_eq!(p.cursor_text, p.bg);
+        }
     }
 
     /// Ghostty 缺省选区/光标语义(上游 generic.zig):未显式配置时

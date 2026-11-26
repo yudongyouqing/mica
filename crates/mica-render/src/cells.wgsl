@@ -5,7 +5,7 @@
 // 圆角扩展(2026-10 UI 对标):无字形 quad 的 fg/bg alpha 槽复用为
 //   bg.w = 上圆角半径,fg.w = 下圆角半径(px,0=方角);fg.rgb 同时复用为
 //   底衬色——blend:None 下无 alpha 混合,圆角 AA 只能 premix 已知底色。
-// 字形 quad 的 fg 是墨色,不得启用圆角(半径恒 0)。
+// 字形 quad 的 fg 是墨色，fg.w < 0 表示彩色位图。
 const CORNERS = array<vec2f, 6>(
     vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0),
     vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0),
@@ -77,9 +77,16 @@ fn rounded_coverage(local: vec2f, size_px: vec2f, r_top: f32, r_bot: f32) -> f32
     return 1.0 - smoothstep(-0.7, 0.7, d);
 }
 
-// RGBA 图集(D19):灰度字形 texel = (白, coverage) → rgb*fg 染色、a 做 ink,
-// 与 M1 的 R8 单通道行为逐位等价;彩色字形 texel = (原色, 不透明度),渲染
-// 实例对彩色字形 fg 填白即得原色——一条公式覆盖两种格式。
+fn srgb_to_linear(c: vec3f) -> vec3f {
+    return select(pow((c + 0.055) / 1.055, vec3f(2.4)), c / 12.92,
+                  c <= vec3f(0.04045));
+}
+
+fn linear_to_srgb(c: vec3f) -> vec3f {
+    return select(1.055 * pow(c, vec3f(1.0 / 2.4)) - 0.055, 12.92 * c,
+                  c <= vec3f(0.0031308));
+}
+
 @fragment
 fn fs(inp: VsOut) -> @location(0) vec4f {
     // #77 背景图采样:空白 quad(bg==fg 同色)的底换图采样(cover
@@ -106,7 +113,17 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
     // while keeping fractional/scaled sprites from sampling atlas padding.
     let tex = textureSample(glyphs, glyph_sampler, clamp(inp.uv, inp.uv_bounds.xy, inp.uv_bounds.zw));
     let ink = tex.a * inp.ink_mask;
-    return vec4f(mix(inp.bg, tex.rgb * inp.fg, ink), 1.0);
+    if (ink == 0.0) {
+        return vec4f(inp.bg, 1.0);
+    }
+    let fg = tex.rgb * inp.fg;
+    if (ink == 1.0 || inp.geo.w < 0.0) {
+        return vec4f(mix(inp.bg, fg, ink), 1.0);
+    }
+    // The swapchain stores display RGB. Only grayscale glyph edges blend
+    // in linear light before being encoded back to that same RGB space.
+    let linear = mix(srgb_to_linear(inp.bg), srgb_to_linear(fg), ink);
+    return vec4f(linear_to_srgb(linear), 1.0);
 }
 
 // #77 cover 平铺:屏幕像素坐标 → 图 UV。短边贴满视口,长边按比例

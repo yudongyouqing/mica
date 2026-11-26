@@ -5,22 +5,37 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 use mica_core::config::palette::Palette;
 
-fn rgb3(rgb: Rgb) -> [u8; 3] {
+pub(crate) fn rgb3(rgb: Rgb) -> [u8; 3] {
     [rgb.r, rgb.g, rgb.b]
 }
 
-/// Resolve any terminal color to RGB through the palette. Default-ink colors
-/// become `palette.fg`/`palette.bg`; other named colors (including `Dim*` and
-/// `Cursor`) fall through to `palette.colors[15]`; the vte parser does not
-/// emit them in practice.
+pub(crate) fn mix(from: [u8; 3], to: [u8; 3], amount: f32) -> [u8; 3] {
+    std::array::from_fn(|i| {
+        let start = f32::from(from[i]);
+        (start + (f32::from(to[i]) - start) * amount).round() as u8
+    })
+}
+
+/// Resolve terminal colors from the theme, including the separate dim names.
 pub fn resolve(color: Color, palette: &Palette) -> [u8; 3] {
+    let dim = |rgb| mix(rgb3(palette.bg), rgb3(rgb), palette.faint_opacity);
     match color {
-        Color::Spec(rgb) => [rgb.r, rgb.g, rgb.b],
-        Color::Named(NamedColor::Foreground)
-        | Color::Named(NamedColor::BrightForeground)
-        | Color::Named(NamedColor::DimForeground) => rgb3(palette.fg),
+        Color::Spec(rgb) => rgb3(rgb),
+        Color::Named(NamedColor::Foreground | NamedColor::BrightForeground) => rgb3(palette.fg),
         Color::Named(NamedColor::Background) => rgb3(palette.bg),
-        Color::Named(named) => rgb3(palette.colors[(named as usize).min(15)]),
+        Color::Named(NamedColor::Cursor) => rgb3(palette.cursor),
+        Color::Named(NamedColor::DimForeground) => dim(palette.fg),
+        Color::Named(
+            named @ (NamedColor::DimBlack
+            | NamedColor::DimRed
+            | NamedColor::DimGreen
+            | NamedColor::DimYellow
+            | NamedColor::DimBlue
+            | NamedColor::DimMagenta
+            | NamedColor::DimCyan
+            | NamedColor::DimWhite),
+        ) => dim(palette.colors[named as usize - NamedColor::DimBlack as usize]),
+        Color::Named(named) => rgb3(palette.colors[named as usize]),
         Color::Indexed(i) => rgb3(palette.query(usize::from(i))),
     }
 }
@@ -30,6 +45,24 @@ mod tests {
     use super::*;
     use alacritty_terminal::vte::ansi::Rgb;
     use mica_core::config::palette::Palette;
+
+    #[test]
+    fn dim_named_colors_use_the_base_slot_and_foreground() {
+        let p = Palette {
+            bg: Rgb { r: 0, g: 0, b: 0 },
+            fg: Rgb {
+                r: 90,
+                g: 60,
+                b: 30,
+            },
+            ..Palette::DEFAULT
+        };
+        assert_eq!(resolve(Color::Named(NamedColor::DimRed), &p), [102, 51, 51]);
+        assert_eq!(
+            resolve(Color::Named(NamedColor::DimForeground), &p),
+            [45, 30, 15]
+        );
+    }
 
     #[test]
     fn named_defaults_resolve_to_palette_ink() {
