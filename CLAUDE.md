@@ -81,7 +81,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - OSC 133(2026-11-10 修正):本机26300和当前CI Server2025 build26100(镜像windows-2025-vs2026/20261103.298.1,run42820078822)均实测完整透传。旧“26100及以下剥离”依据被PSReadLine输入回显早退假通过掩盖,不再按该阈值外推。CI用MICA_CONPTY_OSC133_EXPECT=passthrough严格锁当前能力,客户端26300+保留透传回归,其他未知旧版本只探测报告。OSC7透传仍用于新标签目录继承。
 - 标签溢出滚动:滚轮+左右箭头+活跃自动跟随齐备(1.1,#39)
 - 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段)
-- 标签 tear-off(1.1 软版,#35):拖出标签行即撕开独立窗,同 shell/cwd/标题重开——**进程不迁移**(COM/线程本地 !Send 架构),活进程迁移留后续增强
+- 标签跨窗移动限同一进程。转移 Surface、PTY、输入队列与分屏布局，目标窗口按本地 DPI 重建 DirectWrite 路由并接管输出通知。
 - 输入管线控制字节纪律(1.2):**任何消费了 Ctrl+字母 键的分支都必须置 KEYMAP_ATE_CHAR**(keymap 分支 2026-10 修过,硬编码粘贴/复制分支 1.2 补齐——漏置 = 伴生控制字节泄漏 pty,PSReadLine 当二次快捷键,粘贴双份实证);新增硬编码键分支时照此
 - Tab 键族契约(1.4):Tab 全族走 WM_KEYDOWN 编码(普通=09、Shift=CSI Z,kitty 协商时 CSI-u),WM_CHAR 的伴随 09 必须吞(漏吞=双发);`vk_to_trigger` 与 `vkey_bytes` 的 VK 集合同步维护——缺 VK_TAB 曾令 Shift+Tab 丢修饰、Ctrl+Tab 快捷键整体不可达(#125);主窗与 QT 同契约
 - defterm 整体撤除(1.0.2):RRVA 一级注册实测是陷阱——装完即劫持默认终端且无 COM 实现接管,console 程序全弹 0xC0000142。真实现(ITerminalHandoff)完成前不再注册

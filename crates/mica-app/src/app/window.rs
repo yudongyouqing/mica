@@ -3,6 +3,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::*;
+use std::sync::mpsc;
+use windows::Win32::Foundation::POINT;
 
 // WM_NCCALCSIZE makes the entire window the client area. Account for our
 // own strip exactly once; round up so a fractional cell never loses a column.
@@ -301,11 +303,14 @@ unsafe fn create_and_place_window(
     hinstance: HINSTANCE,
     settings: &Settings,
     is_primary: bool,
+    drop_at: Option<POINT>,
 ) -> Option<HWND> {
     // 窗口先建(哑尺寸):DPI 播种需要 hwnd,而字体 router 的 pt 又要
     // 乘 DPI_SCALE;精确网格尺寸在播种后 SetWindowPos 定。
     // 落位优先级(#89):主窗 window-position 配置 > 光标屏锚定(#41),副窗恒光标屏。
-    let (wx, wy) = if is_primary {
+    let (wx, wy) = if let Some(pt) = drop_at {
+        (pt.x - 40, pt.y - 16)
+    } else if is_primary {
         settings
             .window_position
             .unwrap_or_else(cursor_workarea_origin)
@@ -415,11 +420,11 @@ unsafe fn bootstrap_window(
     hinstance: HINSTANCE,
     settings: &Settings,
     is_primary: bool,
-    tear_seed: Option<(String, Option<String>, String)>,
+    drop_at: Option<POINT>,
     t0: Option<std::time::Instant>,
 ) -> Option<(HWND, SharedHwnd)> {
     let start_translucent = seed_window_settings(settings);
-    let hwnd = create_and_place_window(hinstance, settings, is_primary)?;
+    let hwnd = create_and_place_window(hinstance, settings, is_primary, drop_at)?;
 
     if CURSOR_BLINK.with(std::cell::Cell::get) {
         let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 1, 500, None);
@@ -454,19 +459,12 @@ unsafe fn bootstrap_window(
         }
     }
 
-    // M3a:CLI/IPC 自启动路径经 MICA_START_PROFILE 指定首标签 profile
-    let start_profile = std::env::var("MICA_START_PROFILE").ok();
-    if start_profile.is_some() {
-        std::env::remove_var("MICA_START_PROFILE");
-    }
-    // 首标签:tear-off 种子优先(#35),否则 profile/默认
-    match tear_seed {
-        Some((shell, cwd, title)) => {
-            let _ = start_tab_with_shell(hwnd, &shell, None, cwd.as_deref(), title);
+    if drop_at.is_none() {
+        let profile = std::env::var("MICA_START_PROFILE").ok();
+        if profile.is_some() {
+            std::env::remove_var("MICA_START_PROFILE");
         }
-        None => {
-            let _ = start_tab_with_profile(hwnd, start_profile.as_deref(), None);
-        }
+        let _ = start_tab_with_profile(hwnd, profile.as_deref(), None);
     }
     // GPU 建后补一次 clear_color 与背景图(create_tab 不碰窗口资源)
     GPU.with(|g| {
@@ -491,11 +489,12 @@ unsafe fn bootstrap_window(
             t0.elapsed().as_millis()
         );
     }
-    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
-        hwnd,
-        windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
-    );
-
+    if drop_at.is_none() {
+        let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+            hwnd,
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+    }
     Some((hwnd, hwnd_slot))
 }
 
@@ -566,6 +565,7 @@ pub fn run() {
     }
     // #124 诊断:主线程离开 park 即将 process::exit——此后仍不退出 =
     // CRT/DLL 卸载(loader lock)卡死,不是窗口逻辑
+    orphan::clear_sessions_for_exit();
     eprintln!("[exit] 主线程离开 park,run() 返回,即将 process::exit");
 }
 
@@ -579,25 +579,108 @@ pub(super) fn spawn_window(profile: Option<String>) {
     spawn_window_impl(None);
 }
 
-/// #35 tear-off:带种子(shell/cwd/标题)开独立窗——软撕开:进程不迁移
-/// (COM/线程本地架构 !Send),同 shell 同目录重开续工作流
-pub(super) fn spawn_window_tear(shell: String, cwd: Option<String>, title: String) {
-    spawn_window_impl(Some((shell, cwd, title)));
+// A hidden destination owns no PTY until the source accepts its offer.
+struct EmptyWindow(SharedHwnd);
+
+impl Drop for EmptyWindow {
+    fn drop(&mut self) {
+        if let Some(raw) = *self.0.lock().unwrap() {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(raw as _)),
+                    WM_APP_CLOSE_EMPTY,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
 }
 
-fn spawn_window_impl(seed: Option<(String, Option<String>, String)>) {
-    std::thread::Builder::new()
+thread_local! {
+    static DETACHING: RefCell<Vec<(u64, mpsc::Receiver<EmptyWindow>)>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(super) fn detach_live_tab(id: u64, pos: POINT) {
+    let Some(source) = SHARED_HWND.with(|s| s.borrow().clone()) else {
+        return;
+    };
+    let (tx, rx) = mpsc::channel();
+    if DETACHING.with(|d| {
+        let mut pending = d.borrow_mut();
+        if pending.iter().any(|(tab, _)| *tab == id) {
+            return false;
+        }
+        pending.push((id, rx));
+        true
+    }) {
+        spawn_window_impl(Some((pos, source, tx)));
+    }
+}
+
+pub(super) fn finish_detach() {
+    let mut ready = Vec::new();
+    DETACHING.with(|pending| {
+        pending.borrow_mut().retain(|(id, rx)| match rx.try_recv() {
+            Ok(window) => {
+                ready.push((*id, window));
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        })
+    });
+    for (id, window) in ready {
+        let raw = *window.0.lock().unwrap();
+        if let Some(raw) = raw {
+            let hwnd = HWND(raw as _);
+            if transfer::send(id, hwnd, 0) {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindowAsync(
+                        hwnd,
+                        windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn spawn_window_impl(detach: Option<(POINT, SharedHwnd, mpsc::Sender<EmptyWindow>)>) {
+    if let Err(err) = std::thread::Builder::new()
         .name("mica-window".into())
         .spawn(move || unsafe {
             let settings = load_settings();
             let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
-            if let Some((_hwnd, hwnd_slot)) =
-                bootstrap_window(hinstance, &settings, false, seed, None)
-            {
-                message_loop(hwnd_slot);
+            let window = bootstrap_window(
+                hinstance,
+                &settings,
+                false,
+                detach.as_ref().map(|d| d.0),
+                None,
+            );
+            if let Some((_, source, tx)) = detach {
+                if let Some((_, slot)) = &window {
+                    let _ = tx.send(EmptyWindow(slot.clone()));
+                }
+                drop(tx);
+                if let Some(raw) = *source.lock().unwrap() {
+                    let _ = PostMessageW(
+                        Some(HWND(raw as _)),
+                        WM_APP_DETACH_READY,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+            if let Some((_, slot)) = window {
+                message_loop(slot);
             }
         })
-        .expect("spawn window thread");
+    {
+        eprintln!("could not start window thread: {err}");
+        finish_detach();
+    }
 }
 
 /// #59 非关键初始化(首帧后一拍,主线程):孤儿清理 / jumplist COM /
@@ -695,7 +778,7 @@ unsafe fn message_loop(hwnd_slot: SharedHwnd) {
     phase("step5b: atlas released");
     crate::app::quickterm::forget_state();
     phase("step5c: qt state forgotten");
-    orphan::clear_sessions_for_exit(); // 干净退出:本进程注册表条目全清(T02)
+    DETACHING.with(|pending| pending.borrow_mut().clear());
     phase("step5d: registry cleared");
     let (ok, fallback, inflight, degraded) = lifecycle::reaper_stats();
     eprintln!(

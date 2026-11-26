@@ -298,6 +298,10 @@ impl DwriteRouter {
         self.atlas.borrow().exhausted()
     }
 
+    pub fn font_size_pt(&self) -> f32 {
+        self.em_size_dip * 72.0 / 96.0
+    }
+
     pub fn metrics(&self) -> FontMetrics {
         self.metrics
     }

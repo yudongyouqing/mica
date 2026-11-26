@@ -388,6 +388,27 @@ pub(super) fn draw_frame() {
                 bg: line,
             })
             .collect();
+        if rects.len() > 1
+            && let Some((_, rect)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
+        {
+            let ink = [
+                f32::from(fg.r) / 255.0,
+                f32::from(fg.g) / 255.0,
+                f32::from(fg.b) / 255.0,
+                0.0,
+            ];
+            strip.push(mica_render::frame::CellInstance {
+                pos_uv: [rect.x, rect.y, 0.0, 0.0],
+                size_uv: [
+                    (2.0 * sm.k).min(rect.w),
+                    t.metrics.line_height.min(rect.h),
+                    0.0,
+                    0.0,
+                ],
+                fg: ink,
+                bg: ink,
+            });
+        }
         strip.extend(mica_render::frame::strip_quads(
             &titles,
             strip_r,
@@ -395,6 +416,7 @@ pub(super) fn draw_frame() {
             &t.palette,
             &sm,
             mica_render::frame::StripExtras {
+                drop_slot: tab_drag::drop_slot(),
                 tab_colors,
                 exit_dot,
                 caption_x: Some(area_w - 3.0 * sm.caption_w),
@@ -436,6 +458,9 @@ pub(super) fn draw_frame() {
         }
         // #57 搜索:命中高亮 + 底部搜索条,收集进独立 overlay
         let mut search_overlay: Vec<mica_render::frame::CellInstance> = Vec::new();
+        if SEARCH_PANE.get() != Some(focused_pane_id) {
+            SEARCH_OPEN.set(false);
+        }
         let search_open = SEARCH_OPEN.with(std::cell::Cell::get);
         let rename_open = RENAME_OPEN.with(std::cell::Cell::get);
         if search_open || rename_open {
@@ -528,20 +553,11 @@ pub(super) fn draw_frame() {
                         }
                     }
                 }
-                let bar_y = pr.y + pr.h - t.metrics.line_height - 4.0;
-                let bar_w = (t.metrics.cell_width * 48.0).min(pr.w);
-                let bar_bg = [
-                    (t.palette.bg.r as u16 * 2 + 255) as u8 / 3,
-                    (t.palette.bg.g as u16 * 2 + 255) as u8 / 3,
-                    (t.palette.bg.b as u16 * 2 + 255) as u8 / 3,
-                ];
-                search_overlay.push(mk_quad(
-                    pr.x,
-                    bar_y,
-                    bar_w,
-                    t.metrics.line_height + 4.0,
-                    bar_bg,
-                ));
+                let (bar, button) = search_bar_geometry(pr, &t.metrics);
+                let blend = |bg: u8, fg: u8| ((u16::from(bg) * 7 + u16::from(fg)) / 8) as u8;
+                let (bg, fg) = (t.palette.bg, t.palette.fg);
+                let bar_bg = [blend(bg.r, fg.r), blend(bg.g, fg.g), blend(bg.b, fg.b)];
+                search_overlay.push(mk_quad(bar.x, bar.y, bar.w, bar.h, bar_bg));
                 let q = if rename_open {
                     RENAME_QUERY.with(|q| q.borrow().clone())
                 } else {
@@ -554,44 +570,65 @@ pub(super) fn draw_frame() {
                         format!("rename: {q}")
                     }
                 } else if q.is_empty() {
-                    "/(输入以搜索)".into()
+                    "搜索当前分屏".into()
+                } else if matches.is_empty() {
+                    format!("本分屏 · 无结果 · {q}")
                 } else {
-                    format!(
-                        "/{q}  {}/{}",
-                        if matches.is_empty() { 0 } else { cur + 1 },
-                        matches.len()
-                    )
+                    format!("本分屏 · {}/{} · {q}", cur + 1, matches.len())
                 };
-                let mut tx = pr.x + 2.0;
-                let ty = bar_y + 2.0;
-                for ch in label.chars().take(46) {
-                    let g = <DwriteRouter as mica_render::font::router::GlyphRouter>::route(
-                        &mut t.router,
-                        ch,
-                        mica_render::font::GlyphStyle::PLAIN,
-                    );
-                    if g.size_px[0] > 0.0 {
-                        search_overlay.push(mica_render::frame::CellInstance {
-                            pos_uv: [tx + g.offset_px[0], ty + g.offset_px[1], g.uv[0], g.uv[1]],
-                            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                            fg: mica_render::frame::glyph_tint(
-                                [
-                                    t.palette.fg.r as f32 / 255.0,
-                                    t.palette.fg.g as f32 / 255.0,
-                                    t.palette.fg.b as f32 / 255.0,
+                let end = bar.x + bar.w;
+                let labels = if rename_open {
+                    vec![(label.as_str(), bar.x, end)]
+                } else {
+                    vec![
+                        (label.as_str(), bar.x, end - 3.0 * button),
+                        ("↑", end - 3.0 * button, end - 2.0 * button),
+                        ("↓", end - 2.0 * button, end - button),
+                        ("×", end - button, end),
+                    ]
+                };
+                let ty = bar.y + 2.0;
+                for (label, left, right) in labels {
+                    let mut tx = left + 2.0;
+                    for ch in label.chars() {
+                        let g = <DwriteRouter as mica_render::font::router::GlyphRouter>::route(
+                            &mut t.router,
+                            ch,
+                            mica_render::font::GlyphStyle::PLAIN,
+                        );
+                        if tx + g.offset_px[0] + g.size_px[0] > right
+                            || ty + g.offset_px[1] + g.size_px[1] > bar.y + bar.h
+                        {
+                            break;
+                        }
+                        if g.size_px[0] > 0.0 {
+                            search_overlay.push(mica_render::frame::CellInstance {
+                                pos_uv: [
+                                    tx + g.offset_px[0],
+                                    ty + g.offset_px[1],
+                                    g.uv[0],
+                                    g.uv[1],
+                                ],
+                                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                                fg: mica_render::frame::glyph_tint(
+                                    [
+                                        t.palette.fg.r as f32 / 255.0,
+                                        t.palette.fg.g as f32 / 255.0,
+                                        t.palette.fg.b as f32 / 255.0,
+                                        0.0,
+                                    ],
+                                    g.color,
+                                ),
+                                bg: [
+                                    bar_bg[0] as f32 / 255.0,
+                                    bar_bg[1] as f32 / 255.0,
+                                    bar_bg[2] as f32 / 255.0,
                                     0.0,
                                 ],
-                                g.color,
-                            ),
-                            bg: [
-                                bar_bg[0] as f32 / 255.0,
-                                bar_bg[1] as f32 / 255.0,
-                                bar_bg[2] as f32 / 255.0,
-                                0.0,
-                            ],
-                        });
+                            });
+                        }
+                        tx += g.size_px[0].max(t.metrics.cell_width);
                     }
-                    tx += g.size_px[0].max(t.metrics.cell_width);
                 }
             }
         }

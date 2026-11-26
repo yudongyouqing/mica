@@ -153,6 +153,166 @@ fn launch_config_fixture(
 }
 
 #[test]
+fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
+    use windows::Win32::UI::{HiDpi::*, WindowsAndMessaging::*};
+    let _guard = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, cfg) = launch_config_source(
+        true,
+        "command = powershell.exe -NoLogo -NoProfile\nkeybind = insert=split_right\nkeybind = home=focus_left\nkeybind = end=focus_right\nstrip-hide-single-tab = false\nwindow-size-pixels = 620,400\nquick-terminal-key = none\n",
+    );
+    assert!(wait_ready(Duration::from_secs(15)));
+    let origin = wait_windows(app.0.id(), 1, Duration::from_secs(10))[0];
+    assert!(cli(&["new-tab"]));
+    let send =
+        |hwnd, msg, w, l| unsafe { SendMessageW(hwnd, msg, Some(WPARAM(w)), Some(LPARAM(l))) };
+    let type_line = |hwnd, command: String| {
+        for unit in command.encode_utf16().chain([13]) {
+            send(hwnd, WM_CHAR, usize::from(unit), 0);
+        }
+    };
+    let probe = |hwnd, step: &str| {
+        let path = cfg.with_file_name(step);
+        type_line(
+            hwnd,
+            format!(
+                "[IO.File]::WriteAllText('{}', \"$PID,$moveProof\")",
+                path.display().to_string().replace('\'', "''")
+            ),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(value) = std::fs::read_to_string(&path)
+                && !value.is_empty()
+            {
+                break value;
+            }
+            assert!(Instant::now() < deadline, "no shell response at {step}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    type_line(origin, "$moveProof='alive'".into());
+    let initial = probe(origin, "before");
+    assert!(initial.ends_with(",alive"));
+    send(origin, WM_KEYDOWN, 0x2d, 0);
+    type_line(origin, "$moveProof='right'".into());
+    let other = probe(origin, "right-before");
+    assert!(other.ends_with(",right"));
+    assert_ne!(other, initial);
+    send(origin, WM_KEYDOWN, 0x24, 0);
+    let old_dpi =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let pack = |x: i32, y: i32| ((x as u16 as usize) | ((y as u16 as usize) << 16)) as isize;
+    let dpi = unsafe { GetDpiForWindow(origin) } as f32 / 96.0;
+    let row = (48.0 * dpi) as i32;
+    let second = pack(335, row);
+    send(origin, WM_LBUTTONDOWN, 1, second);
+    send(origin, WM_MOUSEMOVE, 1, pack(335, 230));
+    send(origin, WM_KEYDOWN, 0x1b, 0);
+    send(origin, WM_LBUTTONUP, 0, pack(335, 230));
+    assert_eq!(windows_of(app.0.id()).len(), 1);
+    assert_eq!(probe(origin, "cancelled"), initial);
+    send(origin, WM_LBUTTONDOWN, 1, second);
+    send(origin, WM_MOUSEMOVE, 1, pack(335, 230));
+    send(origin, WM_LBUTTONUP, 0, pack(335, 230));
+    let windows = wait_windows(app.0.id(), 2, Duration::from_secs(15));
+    let detached = *windows.iter().find(|w| **w != origin).unwrap();
+    assert_eq!(probe(detached, "detached"), initial);
+    type_line(
+        detached,
+        "$Host.UI.RawUI.WindowTitle='MovedLivePane'".into(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while window_title(detached) != "MovedLivePane" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        window_title(detached),
+        "MovedLivePane",
+        "PTY output must wake the new UI thread"
+    );
+    unsafe {
+        SetWindowPos(origin, Some(HWND_TOP), 24, 24, 620, 400, SWP_SHOWWINDOW).unwrap();
+    }
+    let mut a = RECT::default();
+    let mut b = RECT::default();
+    unsafe {
+        GetWindowRect(origin, &mut a).unwrap();
+        GetWindowRect(detached, &mut b).unwrap();
+    }
+    let drop_point = pack(a.left + 40 - b.left, a.top + row - b.top);
+    send(detached, WM_LBUTTONDOWN, 1, pack(40, row));
+    send(detached, WM_MOUSEMOVE, 1, drop_point);
+    send(detached, WM_LBUTTONUP, 0, drop_point);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while unsafe { IsWindow(Some(detached)) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !unsafe { IsWindow(Some(detached)) }.as_bool(),
+        "empty detached window should close"
+    );
+    assert_eq!(probe(origin, "rejoined"), initial);
+    send(origin, WM_KEYDOWN, 0x23, 0);
+    assert_eq!(probe(origin, "right-rejoined"), other);
+
+    // Exercise the default single-tab title bar, including native WM_MOVING.
+    // Position only our two fixture windows under the pointer.
+    let updated = std::fs::read_to_string(&cfg).unwrap().replace(
+        "strip-hide-single-tab = false",
+        "strip-hide-single-tab = true",
+    );
+    std::fs::write(&cfg, format!("{updated}title = SingleTabDropTest\n")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while window_title(origin) != "SingleTabDropTest" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(window_title(origin), "SingleTabDropTest");
+    send(origin, WM_LBUTTONDOWN, 1, pack(40, row));
+    send(origin, WM_LBUTTONUP, 0, pack(40, 230));
+    let windows = wait_windows(app.0.id(), 2, Duration::from_secs(15));
+    let single = *windows.iter().find(|w| **w != origin).unwrap();
+    let mut cursor = windows::Win32::Foundation::POINT::default();
+    let mut moving = RECT::default();
+    unsafe {
+        GetCursorPos(&mut cursor).unwrap();
+        for hwnd in [origin, single] {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                cursor.x - 50,
+                cursor.y - 14,
+                620,
+                400,
+                SWP_SHOWWINDOW,
+            )
+            .unwrap();
+        }
+        GetWindowRect(single, &mut moving).unwrap();
+    }
+    send(
+        single,
+        WM_MOVING,
+        0,
+        std::ptr::from_mut(&mut moving) as isize,
+    );
+    send(single, WM_EXITSIZEMOVE, 0, 0);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while unsafe { IsWindow(Some(single)) }.as_bool() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !unsafe { IsWindow(Some(single)) }.as_bool(),
+        "native single-tab window should merge"
+    );
+    assert_eq!(probe(origin, "native-rejoined"), other);
+    unsafe {
+        SetThreadDpiAwarenessContext(old_dpi);
+    }
+    send(origin, WM_CLOSE, 0, 0);
+    assert!(wait_exit(&mut app.0, Duration::from_secs(20)));
+}
+
+#[test]
 fn configured_command_reaches_tabs_splits_windows_and_quick_terminal() {
     let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
     let unique = std::time::SystemTime::now()

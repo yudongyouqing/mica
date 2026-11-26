@@ -145,6 +145,7 @@ pub enum PushError {
 }
 
 struct BlState {
+    wake: Arc<dyn WakeSink>,
     data: Vec<u8>,
     /// 一条 wake 在途(已投递待消费)或待重试。消费批清标记。
     wake_pending: bool,
@@ -157,7 +158,6 @@ struct BlState {
 pub struct PtyBacklog {
     pane_id: u64,
     pane_cap: usize,
-    wake: Arc<dyn WakeSink>,
     closed: AtomicBool,
     cur_gen: AtomicU64,
     state: Mutex<BlState>,
@@ -170,10 +170,10 @@ impl PtyBacklog {
         Arc::new(Self {
             pane_id,
             pane_cap,
-            wake,
             closed: AtomicBool::new(false),
             cur_gen: AtomicU64::new(0),
             state: Mutex::new(BlState {
+                wake,
                 data: Vec::new(),
                 wake_pending: false,
                 retry_needed: false,
@@ -203,7 +203,7 @@ impl PtyBacklog {
                     }
                     // 整个"读 retry→补投→清位"在 state 锁内:与
                     // arm_wake 的"投递→置位"互斥,旧成功不清新失败(复核 6)
-                    if st.retry_needed && !st.data.is_empty() && b.wake.wake(b.pane_id) {
+                    if st.retry_needed && !st.data.is_empty() && st.wake.wake(b.pane_id) {
                         st.retry_needed = false;
                         continue;
                     }
@@ -215,6 +215,19 @@ impl PtyBacklog {
                 }
             })
             .expect("spawn wake monitor");
+    }
+
+    pub(super) fn move_wake(&self, slot: super::SharedHwnd) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.wake = Arc::new(WindowWake {
+            slot,
+            msg: super::WM_APP_RENDER,
+        });
+        st.wake_pending = false;
+        st.retry_needed = false;
+        if !st.data.is_empty() {
+            self.arm_wake_locked(&mut st);
+        }
     }
 
     fn cancelled(&self, epoch: u64) -> bool {
@@ -276,7 +289,7 @@ impl PtyBacklog {
             return;
         }
         st.wake_pending = true;
-        let ok = self.wake.wake(self.pane_id);
+        let ok = st.wake.wake(self.pane_id);
         if !ok {
             st.retry_needed = true;
             self.retry_cv.notify_one();

@@ -359,6 +359,8 @@ pub struct StripLayout {
 /// tab_dx 非 Copy(Vec)——拖拽挤压的邻位滑移量按原始下标对位。
 #[derive(Debug, Clone, Default)]
 pub struct StripExtras {
+    /// Insertion index indicated while a tab from another window is over the strip.
+    pub drop_slot: Option<usize>,
     /// Optional accents indexed like the tab titles.
     pub tab_colors: Vec<Option<[u8; 3]>>,
     /// D37 OSC 133 exit 状态点
@@ -535,6 +537,7 @@ pub fn strip_quads(
     extras: StripExtras,
 ) -> Vec<CellInstance> {
     let StripExtras {
+        drop_slot,
         tab_colors,
         exit_dot,
         caption_x,
@@ -567,7 +570,7 @@ pub fn strip_quads(
     let adv = |g: &crate::font::router::GlyphInfo| g.size_px[0].max(cw);
     // 单标签 = 无第二行(上游 hasTabBar 同款;strip-hide-single-tab = false
     // 可恒显):条高只余标题行
-    let single = sm.hide_single && titles.len() <= 1;
+    let single = sm.hide_single && titles.len() <= 1 && drop_slot.is_none();
     let eff_h = if single { sm.title_h } else { sm.h };
     // 全条底(两行同色;发丝线退役——活跃块要与内容区无缝相接)
     let strip_w = caption_x
@@ -803,6 +806,19 @@ pub fn strip_quads(
                     (sm.tab_top_r, 0.0),
                 ));
             }
+            if *active {
+                let left = (x0 + sm.tab_pad).max(0.0);
+                let width = (x0 + sm.tab_pad + 18.0 * k).min(right) - left;
+                if width > 0.0 {
+                    let ink = bg_of(white);
+                    out.push(CellInstance {
+                        pos_uv: [left, sm.h - 2.0 * k, 0.0, 0.0],
+                        size_uv: [width, 2.0 * k, 0.0, 0.0],
+                        fg: ink,
+                        bg: ink,
+                    });
+                }
+            }
             if let Some(color) = tab_colors.get(i).copied().flatten() {
                 let left = x0.max(0.0);
                 let width = (x0 + w).min(right) - left;
@@ -939,6 +955,18 @@ pub fn strip_quads(
                     });
                 }
             }
+        }
+        if let Some(slot) = drop_slot {
+            let width = (3.0 * k).min(right.max(0.0));
+            let x = (tabs_x0(sm) + slot.min(n) as f32 * span - shift)
+                .clamp(0.0, (right - width).max(0.0));
+            let ink = bg_of(white);
+            out.push(CellInstance {
+                pos_uv: [x, tab_y, 0.0, 0.0],
+                size_uv: [width, tab_d, 0.0, 0.0],
+                fg: ink,
+                bg: ink,
+            });
         }
         // pane 退出态(M5b/T3):第二行右端、"+" 左邻(标签标题截断吃不到);
         // 0 绿/非 0 红,文本止于状态点左
@@ -2007,6 +2035,24 @@ mod tests {
             "第二行无任何字形(隐藏)"
         );
         assert!(!out.iter().any(|q| q.bg == to_color([1, 2, 3])));
+        let preview = strip_quads(
+            &one,
+            &mut r,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &sm,
+            StripExtras {
+                caption_x: Some(400.0),
+                drop_slot: Some(1),
+                focus: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            preview.iter().any(|q| q.pos_uv[1] == sm.title_h
+                && q.size_uv == [3.0 * sm.k, sm.h - sm.title_h, 0.0, 0.0]),
+            "external drag exposes the insertion marker even for a single tab"
+        );
     }
 
     #[test]
