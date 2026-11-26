@@ -350,14 +350,14 @@ pub fn tab_w_now(n: usize, avail_w: f32, sm: &StripMetrics) -> f32 {
 }
 
 /// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数。
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct StripLayout {
     pub tab_scroll: i32,
 }
 
 /// strip 杂项参数打包(M5b/T3 起参数超限):状态点/pane 退出态/caption 区。
 /// tab_dx 非 Copy(Vec)——拖拽挤压的邻位滑移量按原始下标对位。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StripExtras {
     /// Insertion index indicated while a tab from another window is over the strip.
     pub drop_slot: Option<usize>,
@@ -602,19 +602,21 @@ pub fn strip_quads(
         .unwrap_or_default();
     let ell = router.route('\u{2026}', GlyphStyle::PLAIN);
     let ell_advance = router.ui_advance('\u{2026}').unwrap_or_else(|| adv(&ell));
-    let routed: Vec<_> = title
-        .chars()
-        .take(4096)
-        .map(|ch| {
-            let glyph = router.route(ch, GlyphStyle::PLAIN);
-            let advance = router
-                .ui_advance(ch)
-                .filter(|a| a.is_finite() && *a >= 0.0)
-                .unwrap_or_else(|| adv(&glyph));
-            (glyph, advance)
-        })
-        .collect();
-    let total_width: f32 = routed.iter().map(|(_, advance)| advance).sum();
+    let mut routed = Vec::with_capacity(title.len().min(128));
+    let mut total_width = 0.0;
+    // Stop querying invisible suffix glyphs once title overflow is established.
+    for ch in title.chars().take(4096) {
+        let glyph = router.route(ch, GlyphStyle::PLAIN);
+        let advance = router
+            .ui_advance(ch)
+            .filter(|a| a.is_finite() && *a >= 0.0)
+            .unwrap_or_else(|| adv(&glyph));
+        total_width += advance;
+        routed.push((glyph, advance));
+        if total_width > title_avail {
+            break;
+        }
+    }
     let mut text_w = 0.0;
     let mut n_take = 0;
     let with_ell = total_width > title_avail && ell_advance <= title_avail;

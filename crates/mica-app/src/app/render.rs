@@ -3,6 +3,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::*;
+thread_local! {
+    static STRIP_CACHE: RefCell<mica_render::strip_cache::StripCache> = RefCell::new(Default::default());
+}
 
 /// 窗口级 GPU 一次建:TAB_SEED 供 NewTab 复用启动设置。
 pub(super) unsafe fn init_window_gpu(hwnd: HWND) -> anyhow::Result<WindowGpu> {
@@ -343,6 +346,7 @@ pub(super) fn draw_frame() {
         });
         let sm = strip_metrics();
         if t.strip_router.is_none() {
+            STRIP_CACHE.with(|c| c.borrow_mut().clear());
             let cfg = STRIP_CFG.with(|c| c.borrow().clone());
             let mut fams: Vec<String> = match &cfg.font_family {
                 Some(f) => vec![f.clone()],
@@ -409,42 +413,51 @@ pub(super) fn draw_frame() {
                 bg: ink,
             });
         }
-        strip.extend(mica_render::frame::strip_quads(
-            &titles,
-            strip_r,
-            &ui_m,
-            &t.palette,
-            &sm,
-            mica_render::frame::StripExtras {
-                drop_slot: tab_drag::drop_slot(),
-                tab_colors,
-                exit_dot,
-                caption_x: Some(area_w - 3.0 * sm.caption_w),
-                layout: mica_render::frame::StripLayout {
-                    tab_scroll: TAB_SCROLL.with(std::cell::Cell::get),
-                },
-                pane_exit,
-                hover: HOVER_STRIP.with(std::cell::Cell::get),
-                zoomed: SHARED_HWND
-                    .with(|h| h.borrow().as_ref().and_then(|s| *s.lock().unwrap()))
-                    .is_some_and(|v| unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::IsZoomed(
-                            windows::Win32::Foundation::HWND(v as _),
-                        )
-                        .as_bool()
-                    }),
-                focus: FOCUS_PHASE.with(std::cell::Cell::get),
-                capsule_dx: capsule_dx_now(),
-                drag: DRAG_TAB.with(std::cell::Cell::get).map(|i| {
-                    (
-                        i,
-                        DRAG_SLOT.with(std::cell::Cell::get),
-                        DRAG_X.with(std::cell::Cell::get),
-                    )
-                }),
-                tab_dx: TAB_DX.with(|d| d.borrow().clone()),
-            },
-        ));
+        let atlas_key = {
+            let a = strip_r.atlas();
+            (a.identity(), a.version())
+        };
+        STRIP_CACHE.with(|cache| {
+            strip.extend_from_slice(
+                cache.borrow_mut().get(
+                    &titles,
+                    strip_r,
+                    &ui_m,
+                    &t.palette,
+                    &sm,
+                    mica_render::frame::StripExtras {
+                        drop_slot: tab_drag::drop_slot(),
+                        tab_colors,
+                        exit_dot,
+                        caption_x: Some(area_w - 3.0 * sm.caption_w),
+                        layout: mica_render::frame::StripLayout {
+                            tab_scroll: TAB_SCROLL.with(std::cell::Cell::get),
+                        },
+                        pane_exit,
+                        hover: HOVER_STRIP.with(std::cell::Cell::get),
+                        zoomed: SHARED_HWND
+                            .with(|h| h.borrow().as_ref().and_then(|s| *s.lock().unwrap()))
+                            .is_some_and(|v| unsafe {
+                                windows::Win32::UI::WindowsAndMessaging::IsZoomed(
+                                    windows::Win32::Foundation::HWND(v as _),
+                                )
+                                .as_bool()
+                            }),
+                        focus: FOCUS_PHASE.with(std::cell::Cell::get),
+                        capsule_dx: capsule_dx_now(),
+                        drag: DRAG_TAB.with(std::cell::Cell::get).map(|i| {
+                            (
+                                i,
+                                DRAG_SLOT.with(std::cell::Cell::get),
+                                DRAG_X.with(std::cell::Cell::get),
+                            )
+                        }),
+                        tab_dx: TAB_DX.with(|d| d.borrow().clone()),
+                    },
+                    atlas_key,
+                ),
+            )
+        });
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
         if let Some((url, hx, hy)) = HOVER_URL.with(|h| h.borrow().clone()) {
             strip.extend(mica_render::frame::tooltip_quads(
@@ -681,4 +694,70 @@ pub(super) fn draw_frame() {
         }
         gpu.renderer.end_frame();
     });
+}
+
+#[cfg(test)]
+mod titlebar_perf {
+    use super::*;
+    use mica_render::frame::{StripExtras, StripMetrics};
+    #[test]
+    #[ignore = "CPU titlebar layout benchmark using DirectWrite"]
+    fn titlebar_build_time() {
+        let mut router =
+            DwriteRouter::new_ui(11.0, &["Segoe UI", "Microsoft YaHei UI"], 600, None).unwrap();
+        let sm = StripMetrics::default();
+        let metrics = router.metrics();
+        let palette = Palette::DEFAULT;
+        for (name, title) in [
+            ("short", "PowerShell".to_string()),
+            ("long", "构建日志/Application/".repeat(256)),
+        ] {
+            let titles = vec![
+                (title, true),
+                ("tests".to_string(), false),
+                ("docs".to_string(), false),
+            ];
+            for animated in [false, true] {
+                let mut cache = mica_render::strip_cache::StripCache::default();
+                let mut samples = Vec::new();
+                for _ in 0..6 {
+                    let start = std::time::Instant::now();
+                    for i in 0..150 {
+                        let extras = StripExtras {
+                            caption_x: Some(840.0),
+                            focus: if animated {
+                                (i % 20) as f32 / 20.0
+                            } else {
+                                1.0
+                            },
+                            ..Default::default()
+                        };
+                        let owned = titles.clone();
+                        let mut out = Vec::new();
+                        let key = {
+                            let a = router.atlas();
+                            (a.identity(), a.version())
+                        };
+                        out.extend_from_slice(cache.get(
+                            &owned,
+                            &mut router,
+                            &metrics,
+                            &palette,
+                            &sm,
+                            extras,
+                            key,
+                        ));
+                        std::hint::black_box(out);
+                    }
+                    samples.push(start.elapsed().as_nanos() / 150);
+                }
+                samples.remove(0);
+                samples.sort_unstable();
+                eprintln!(
+                    "TITLEBAR {name} animated={animated} median_ns={}",
+                    samples[2]
+                );
+            }
+        }
+    }
 }
