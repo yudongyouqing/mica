@@ -18,6 +18,7 @@ font-family = Segoe Fluent Icons
 font-size = 12
 
 # Colors: empty theme means built-in colors; auto follows foreground/background.
+# Set both dark:NAME,light:NAME to follow the Windows appearance.
 theme =
 foreground = #ffffff
 background = #282c34
@@ -55,6 +56,8 @@ window-size-pixels =
 # Symmetric content padding in logical pixels (0..400), scaled with DPI.
 window-padding-x = 8
 window-padding-y = 6
+# Opacity of unfocused split content against the terminal background (0..1).
+unfocused-split-opacity = 0.94
 window-position =
 title =
 background-image =

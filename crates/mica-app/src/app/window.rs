@@ -232,6 +232,7 @@ fn seed_window_settings(settings: &Settings) -> bool {
     SESSION_COMMAND.with(|s| *s.borrow_mut() = settings.command.clone());
     CONTENT_PADDING
         .with(|p| *p.borrow_mut() = (settings.window_padding_x, settings.window_padding_y));
+    UNFOCUSED_SPLIT_OPACITY.with(|opacity| opacity.set(settings.unfocused_split_opacity));
     QUICK_TERMINAL_HEIGHT.with(|h| h.set(settings.quick_terminal_height));
     QUICK_TERMINAL_KEY.with(|k| *k.borrow_mut() = settings.quick_terminal_key.clone());
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
@@ -239,8 +240,22 @@ fn seed_window_settings(settings: &Settings) -> bool {
     start_translucent
 }
 
-/// 折叠原生非客户区并应用 Win11 DWM 视觉属性(暗色标题栏/Mica 材质/无描边/圆角)。
-unsafe fn configure_window_chrome(hwnd: HWND) {
+pub(super) fn apply_theme_chrome(hwnd: HWND, palette: &Palette) {
+    let bg = palette.bg;
+    let dark = i32::from(mica_render::color::relative_luminance([bg.r, bg.g, bg.b]) < 0.5);
+    // SAFETY: DWM copies this window attribute value during the call.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            std::ptr::from_ref(&dark).cast(),
+            std::mem::size_of_val(&dark) as u32,
+        );
+    }
+}
+
+/// Fold the non-client area and apply the DWM border and corner preferences.
+unsafe fn configure_window_chrome(hwnd: HWND, palette: &Palette) {
     // 创建即折叠原生边框(Win11 实测):创建路径里 NCCALCSIZE 先按默认
     // 计算落框,折叠(返回 0)仅在 FRAMECHANGED 强制重算时应用——不补
     // 这一发,窗口顶着原生标题栏+边框运行,与 strip 自绘的 caption
@@ -259,22 +274,7 @@ unsafe fn configure_window_chrome(hwnd: HWND) {
             | windows::Win32::UI::WindowsAndMessaging::SWP_NOACTIVATE,
     );
 
-    // 暗色标题栏;Win10 1809 前忽略失败
-    let dark: i32 = 1;
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_USE_IMMERSIVE_DARK_MODE,
-        &dark as *const i32 as *const std::ffi::c_void,
-        std::mem::size_of::<i32>() as u32,
-    );
-    // Mica 材质(T8,Win11 22H2+;DWMSBT_MAINWINDOW=2):老系统静默降级
-    let backdrop: i32 = 2;
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,
-        &backdrop as *const i32 as *const std::ffi::c_void,
-        std::mem::size_of::<i32>() as u32,
-    );
+    apply_theme_chrome(hwnd, palette);
     // 外框描边移除(2026-10-07 用户裁定:不要任何描边)——Win11 默认
     // 给窗口一圈 1px 边线,DWMWA_COLOR_NONE 关掉
     let no_border: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
@@ -333,7 +333,7 @@ unsafe fn create_and_place_window(
         "CreateWindowExW (second window)"
     });
 
-    configure_window_chrome(hwnd);
+    configure_window_chrome(hwnd, &settings.palette);
 
     // 首屏 DPI 播种(M5b/T4):窗口落在高 DPI 屏时,首建即正确字号
     {

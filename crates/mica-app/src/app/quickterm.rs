@@ -9,7 +9,11 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
-use mica_core::surface::{Damage, ScreenSize, Surface};
+use mica_core::{
+    config::settings::Settings,
+    layout::Rect,
+    surface::{Damage, ScreenSize, Surface},
+};
 use mica_render::font::dwrite::DwriteRouter;
 use mica_render::frame::{build_rows, repack};
 use mica_render::pipeline::{Renderer, create_context};
@@ -133,14 +137,13 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 
     // QT 终端状态:复用 TAB_SEED/CURRENT_PALETTE 建字体与 pty
     let (families, size_pt) = crate::app::tab_seed();
-    let size_pt = crate::app::scaled_pt(size_pt); // 字号随 DPI(与主窗单源)
-    let fam_ref: Vec<&str> = families.iter().map(String::as_str).collect();
-    let Ok(router) = DwriteRouter::new(size_pt, &fam_ref) else {
+    let Ok(router) = appearance_router(hwnd_qt, &families, size_pt) else {
         eprintln!("quickterm: 字体链失败,QT 禁用");
         return Err(());
     };
     let metrics = router.metrics();
     let palette = crate::app::current_palette();
+    super::window::apply_theme_chrome(hwnd_qt, &palette);
 
     // wgpu surface + renderer(独立于主窗;display handle 与主窗同款——
     // wgpu 30 在 DX12 后端要求显式 display handle,None 会 MissingDisplayHandle)
@@ -179,8 +182,8 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         .map_err(|_| ())?;
     renderer.set_clear_color(&palette);
 
-    let cols = ((w_px as f32 / metrics.cell_width).max(1.0)) as u16;
-    let rows = ((h_px as f32 / metrics.line_height).max(1.0)) as u16;
+    let area = Rect::new(0.0, 0.0, w_px as f32, h_px as f32);
+    let (cols, rows) = super::grid_size(area, &metrics);
     let mut term = Surface::new(ScreenSize::new(cols as usize, rows as usize));
     term.set_cell_metrics(
         metrics.cell_width.round() as u16,
@@ -782,6 +785,51 @@ unsafe fn unregister_hotkey() -> windows::core::Result<()> {
     unsafe { UnregisterHotKey(Some(hwnd), 1) }
 }
 
+fn appearance_router(
+    hwnd: HWND,
+    families: &[String],
+    size_pt: f32,
+) -> anyhow::Result<DwriteRouter> {
+    // SAFETY: this is the UI thread's Quick Terminal window.
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) };
+    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+    let families: Vec<&str> = families.iter().map(String::as_str).collect();
+    DwriteRouter::new((size_pt * scale).clamp(6.0, 72.0), &families)
+}
+
+pub(super) fn reload_appearance(settings: &Settings) {
+    QT.with(|q| {
+        let mut guard = q.borrow_mut();
+        let Some(st) = guard.as_mut() else { return };
+        let hwnd = HWND(QT_HWND.with(std::cell::Cell::get) as _);
+        let router = match appearance_router(hwnd, &settings.font_families, settings.font_size_pt) {
+            Ok(router) => router,
+            Err(error) => {
+                eprintln!("quickterm: cannot reload font settings: {error}");
+                return;
+            }
+        };
+        let t = &mut st.terminal;
+        t.metrics = router.metrics();
+        t.router = router;
+        t.palette = settings.palette;
+        t.term.set_palette(&settings.palette);
+        t.term.set_cell_metrics(
+            t.metrics.cell_width.round() as u16,
+            t.metrics.line_height.round() as u16,
+        );
+        let area = Rect::new(0.0, 0.0, st.config.width as f32, st.config.height as f32);
+        super::resize_terminal(t, area);
+        t.force_full = true;
+        st.renderer.set_clear_color(&settings.palette);
+        super::window::apply_theme_chrome(hwnd, &settings.palette);
+        // SAFETY: this is the Quick Terminal HWND on its owning thread.
+        if unsafe { IsWindowVisible(hwnd).as_bool() } {
+            qt_draw(st);
+        }
+    });
+}
+
 fn qt_draw(st: &mut QtState) {
     QT_LAST_FRAME.with(|f| f.set(Some(std::time::Instant::now())));
     #[cfg(test)]
@@ -1095,6 +1143,43 @@ mod tests {
 
     thread_local! {
         pub(super) static DRAW_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn reload_appearance_resizes_live_session_and_redraws_only_when_visible() {
+        let _lock = QT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let settings = mica_core::config::settings::resolve("quick-terminal-key = none").unwrap();
+        crate::app::seed_tls_for_tests(&settings);
+        unsafe { init(HWND(std::ptr::null_mut())) }.expect("quickterm init");
+        let hwnd = HWND(QT_HWND.with(std::cell::Cell::get) as _);
+        let original_cols = QT.with(|q| q.borrow().as_ref().unwrap().terminal.cols);
+        let before = DRAW_COUNT.with(std::cell::Cell::get);
+        let wave =
+            mica_core::config::settings::resolve("theme = Kanagawa Wave\nfont-size = 20").unwrap();
+        reload_appearance(&wave);
+        assert_eq!(DRAW_COUNT.with(std::cell::Cell::get), before);
+        QT.with(|q| {
+            let mut guard = q.borrow_mut();
+            let terminal = &mut guard.as_mut().unwrap().terminal;
+            assert!(terminal.cols < original_cols);
+            assert_eq!(terminal.palette, wave.palette);
+            assert!(terminal.force_full);
+            terminal.term.feed(b"\x1b]11;?\x07");
+            assert_eq!(
+                terminal.term.take_pty_writes(),
+                vec!["\x1b]11;rgb:1f1f/1f1f/2828\x07".to_string()]
+            );
+        });
+        unsafe { toggle() };
+        let shown = DRAW_COUNT.with(std::cell::Cell::get);
+        reload_appearance(&settings);
+        assert_eq!(DRAW_COUNT.with(std::cell::Cell::get), shown + 1);
+        assert_eq!(
+            QT.with(|q| q.borrow().as_ref().unwrap().terminal.cols),
+            original_cols
+        );
+        unsafe { SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))) };
+        forget_state();
     }
 
     #[test]

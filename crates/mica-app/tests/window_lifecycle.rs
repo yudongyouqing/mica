@@ -12,6 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmGetWindowAttribute};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
     IsWindowVisible, PostMessageW, SendMessageW, WM_CLOSE, WM_NCLBUTTONDOWN,
@@ -77,8 +78,7 @@ fn launch_isolated() -> ChildGuard {
     ChildGuard(child)
 }
 
-/// 预置(空但存在的)config 文件启动:热重载 watcher 只在文件存在时
-/// 建立(spawn_config_watcher 的契约)。
+/// Start with an existing, empty config file.
 fn launch_with_config() -> (ChildGuard, std::path::PathBuf) {
     launch_config(true)
 }
@@ -88,6 +88,13 @@ fn launch_config(wait_deferred: bool) -> (ChildGuard, std::path::PathBuf) {
 }
 
 fn launch_config_source(wait_deferred: bool, source: &str) -> (ChildGuard, std::path::PathBuf) {
+    launch_config_fixture(wait_deferred, Some(source))
+}
+
+fn launch_config_fixture(
+    wait_deferred: bool,
+    source: Option<&str>,
+) -> (ChildGuard, std::path::PathBuf) {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -96,7 +103,9 @@ fn launch_config_source(wait_deferred: bool, source: &str) -> (ChildGuard, std::
     let dir = iso.join("mica");
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = dir.join("config");
-    std::fs::write(&cfg, source).unwrap();
+    if let Some(source) = source {
+        std::fs::write(&cfg, source).unwrap();
+    }
     let user = format!("micawincfg{unique}");
     *TEST_USER
         .get_or_init(|| Mutex::new(String::new()))
@@ -488,6 +497,51 @@ fn window_title(hwnd: windows::Win32::Foundation::HWND) -> String {
     // SAFETY: 缓冲与长度对应
     let n = unsafe { GetWindowTextW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+#[test]
+fn creating_first_config_reloads_open_window() {
+    let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, cfg) = launch_config_fixture(true, None);
+    let hwnd = wait_windows(app.0.id(), 1, Duration::from_secs(10))[0];
+    let chrome_dark = || {
+        let mut dark = 0i32;
+        let result = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                std::ptr::from_mut(&mut dark).cast(),
+                std::mem::size_of_val(&dark) as u32,
+            )
+        };
+        result.ok().map(|()| dark != 0)
+    };
+    let initial_chrome = chrome_dark();
+    assert!(!cfg.exists());
+    let candidate = cfg.with_file_name("new-config");
+    std::fs::write(
+        &candidate,
+        "title = FirstConfigCreated\ntheme = Kanagawa Lotus\n",
+    )
+    .unwrap();
+    std::fs::rename(candidate, &cfg).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while window_title(hwnd) != "FirstConfigCreated" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(window_title(hwnd), "FirstConfigCreated");
+    if let Some(dark) = initial_chrome {
+        assert!(dark, "the initial terminal background is dark");
+        assert_eq!(chrome_dark(), Some(false), "Lotus selects light DWM chrome");
+    }
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+    assert!(wait_exit_or_dump(
+        &mut app.0,
+        Duration::from_secs(5),
+        Duration::from_secs(30)
+    ));
 }
 
 /// 复核 4:主窗先关后改配置——watcher 是进程级服务,热重载必须继续

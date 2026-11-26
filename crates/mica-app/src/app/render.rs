@@ -120,6 +120,7 @@ struct PaneBatch {
     pane_id: u64,
     scissor: (u32, u32, u32, u32),
     insts: Vec<mica_render::frame::CellInstance>,
+    opacity: f32,
 }
 
 /// 合帧窗:数据到 → 5ms 内的同批输出并成一帧(打字回显无感,突发
@@ -182,6 +183,7 @@ pub(super) fn draw_frame() {
                 )
             })
             .collect();
+        let tab_colors = guard.iter().map(|tab| tab.color).collect();
         // pane 退出态(M5b/T3):strip 右侧标签(标题后缀会被长标题截断吃掉)
         let pane_exit = guard
             .get(ACTIVE.get())
@@ -211,8 +213,10 @@ pub(super) fn draw_frame() {
             - sh;
         use mica_core::layout::Rect;
         let area = terminal_area(area_w, area_h + sh, sh);
-        let rects: Vec<(u64, Rect)> = active.layout.rects(area);
+        let divider_width = DPI_SCALE.with(std::cell::Cell::get).round().max(1.0);
+        let (rects, dividers) = active.layout.rects_and_dividers(area, divider_width);
         let focused_pane_id = active.active_pane_id().unwrap_or(0);
+        let unfocused_opacity = UNFOCUSED_SPLIT_OPACITY.with(std::cell::Cell::get);
 
         // T05 分批绘制:每 pane 一批(自己的图集 + scissor 到 pane 矩形),
         // strip/搜索 overlay 是焦点图集的独立批(pane 区外,无 scissor)。
@@ -316,6 +320,11 @@ pub(super) fn draw_frame() {
                 pane_id: pane.id,
                 scissor: (sx, sy, sw, sh_r),
                 insts,
+                opacity: if pane.id == focused_pane_id {
+                    1.0
+                } else {
+                    unfocused_opacity
+                },
             });
         }
 
@@ -362,13 +371,31 @@ pub(super) fn draw_frame() {
             return; // 惰性建失败:本帧放弃,下帧重试
         };
         let ui_m = strip_r.metrics();
-        let mut strip = mica_render::frame::strip_quads(
+        let channel = |bg: u8, fg: u8| (f32::from(bg) * 0.86 + f32::from(fg) * 0.14) / 255.0;
+        let (bg, fg) = (t.palette.bg, t.palette.fg);
+        let line = [
+            channel(bg.r, fg.r),
+            channel(bg.g, fg.g),
+            channel(bg.b, fg.b),
+            0.0,
+        ];
+        let mut strip: Vec<_> = dividers
+            .into_iter()
+            .map(|r| mica_render::frame::CellInstance {
+                pos_uv: [r.x, r.y, 0.0, 0.0],
+                size_uv: [r.w, r.h, 0.0, 0.0],
+                fg: line,
+                bg: line,
+            })
+            .collect();
+        strip.extend(mica_render::frame::strip_quads(
             &titles,
             strip_r,
             &ui_m,
             &t.palette,
             &sm,
             mica_render::frame::StripExtras {
+                tab_colors,
                 exit_dot,
                 caption_x: Some(area_w - 3.0 * sm.caption_w),
                 layout: mica_render::frame::StripLayout {
@@ -395,7 +422,7 @@ pub(super) fn draw_frame() {
                 }),
                 tab_dx: TAB_DX.with(|d| d.borrow().clone()),
             },
-        );
+        ));
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
         if let Some((url, hx, hy)) = HOVER_URL.with(|h| h.borrow().clone()) {
             strip.extend(mica_render::frame::tooltip_quads(
@@ -568,34 +595,6 @@ pub(super) fn draw_frame() {
                 }
             }
         }
-        // #87 标签色条(标签顶 2px):自定义色标签一眼区分(读 TabState.color)
-        if guard.iter().any(|tab| tab.color.is_some()) {
-            let sm2 = strip_metrics();
-            let w_tab = mica_render::frame::equal_tab_w(titles.len(), area_w, &sm2);
-            let shift_r = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm2.tab_min_w;
-            for (i, tab) in guard.iter().enumerate() {
-                let Some(c) = tab.color else {
-                    continue;
-                };
-                let x0 =
-                    mica_render::frame::tabs_x0(&sm2) + i as f32 * (w_tab + sm2.tab_gap) - shift_r;
-                let x1 = x0 + w_tab;
-                if x1 > 0.0 && x0 < area_w {
-                    let cf = [
-                        c[0] as f32 / 255.0,
-                        c[1] as f32 / 255.0,
-                        c[2] as f32 / 255.0,
-                        0.0,
-                    ];
-                    search_overlay.push(mica_render::frame::CellInstance {
-                        pos_uv: [x0.max(0.0), sm2.title_h + 2.0 * sm2.k, 0.0, 0.0],
-                        size_uv: [(x1 - x0).min(area_w - x0.max(0.0)), 2.0, 0.0, 0.0],
-                        fg: cf,
-                        bg: cf,
-                    });
-                }
-            }
-        }
         strip.extend(search_overlay);
         strip_batch = (focused_pane_id, strip);
     });
@@ -623,7 +622,8 @@ pub(super) fn draw_frame() {
                     return; // 批构建后 pane 已关:整批丢弃
                 };
                 gpu.renderer.set_atlas(&p.terminal.router.atlas());
-                gpu.renderer.draw_batch(insts, Some(*scissor));
+                gpu.renderer
+                    .draw_batch_with_opacity(insts, Some(*scissor), batch.opacity);
             });
         }
         // strip + 搜索 overlay:焦点图集,无 scissor(strip 在 pane 区外)

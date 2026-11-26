@@ -21,6 +21,7 @@ winres = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
+    "UI_ViewManagement",
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",

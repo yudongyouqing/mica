@@ -16,6 +16,19 @@ pub(crate) fn mix(from: [u8; 3], to: [u8; 3], amount: f32) -> [u8; 3] {
     })
 }
 
+/// #90 WCAG 相对亮度(sRGB 简化线性化)
+pub fn relative_luminance(rgb: [u8; 3]) -> f32 {
+    let c = |v: u8| {
+        let s = f32::from(v) / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * c(rgb[0]) + 0.7152 * c(rgb[1]) + 0.0722 * c(rgb[2])
+}
+
 /// Resolve terminal colors from the theme, including the separate dim names.
 pub fn resolve(color: Color, palette: &Palette) -> [u8; 3] {
     let dim = |rgb| mix(rgb3(palette.bg), rgb3(rgb), palette.faint_opacity);

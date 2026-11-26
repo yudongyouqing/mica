@@ -50,8 +50,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ERASEBKGND, WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMOUSEMOVE, WM_PAINT,
-    WM_RBUTTONDOWN, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
-    WS_OVERLAPPEDWINDOW,
+    WM_RBUTTONDOWN, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
@@ -232,6 +232,8 @@ thread_local! {
     /// None = 光标不在路径上(WM_MOUSEMOVE 每次刷新,替代 300ms 气泡)
     static HOVER_PATH: RefCell<Option<PathHover>> =
         const { RefCell::new(None) };
+    static UNFOCUSED_SPLIT_OPACITY: std::cell::Cell<f32> =
+        std::cell::Cell::new(Settings::default().unfocused_split_opacity);
     /// strip 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的反馈
     /// (const 初始化用字面量——Default::default 不是 const fn)
     static HOVER_STRIP: std::cell::Cell<mica_render::frame::StripHover> = const {
@@ -1720,6 +1722,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 绘制节奏由消息循环控制;这里只清掉无效区积压
             let _ = ValidateRect(Some(hwnd), None);
             LRESULT(0)
+        }
+        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+            if config::system_theme_changed() {
+                let _ = PostMessageW(Some(hwnd), WM_APP_CONFIG, WPARAM(0), LPARAM(0));
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_APP_CONFIG => {
             // 配置热重载(watch 线程去抖后投递);主线程执行,失败保旧

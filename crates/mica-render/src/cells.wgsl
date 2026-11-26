@@ -5,6 +5,7 @@
 // 圆角扩展(2026-10 UI 对标):无字形 quad 的 fg/bg alpha 槽复用为
 //   bg.w = 上圆角半径,fg.w = 下圆角半径(px,0=方角);fg.rgb 同时复用为
 //   底衬色——blend:None 下无 alpha 混合,圆角 AA 只能 premix 已知底色。
+// Negative bg.w opts a terminal backdrop into wallpaper sampling.
 // 字形 quad 的 fg 是墨色，fg.w < 0 表示彩色位图。
 const CORNERS = array<vec2f, 6>(
     vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0),
@@ -19,6 +20,7 @@ struct Globals {
     /// #77 背景图:alpha 1 = 启用,alpha 0 = 禁用;xy = 图像像素尺寸
     /// (cover 平铺采样归一在 shader 做)
     bg_alpha_size: vec4f,
+    pane_tint: vec4f,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var glyphs: texture_2d<f32>;
@@ -87,15 +89,20 @@ fn linear_to_srgb(c: vec3f) -> vec3f {
                   c <= vec3f(0.0031308));
 }
 
+fn pane_color(rgb: vec3f) -> vec4f {
+    if (globals.pane_tint.w < 1.0) {
+        return vec4f(mix(globals.pane_tint.rgb, rgb, globals.pane_tint.w), 1.0);
+    }
+    return vec4f(rgb, 1.0);
+}
+
 @fragment
 fn fs(inp: VsOut) -> @location(0) vec4f {
-    // #77 背景图采样:空白 quad(bg==fg 同色)的底换图采样(cover
-    // 平铺——短边贴满,长边裁切;采样坐标 = 像素坐标)。有字形/圆角的
-    // quad 不混合图(其 bg 已是实色,与图叠加会双重压字)——图只在
-    // 空白格"透出"
-    if (globals.bg_alpha_size.x > 0.0 && inp.ink_mask < 0.5 && inp.geo.z == 0.0 && inp.geo.w == 0.0) {
+    // Only marked terminal backdrops sample the image. UI and decorations
+    // keep their solid fill even when drawn in the same batch.
+    if (globals.bg_alpha_size.x > 0.0 && inp.ink_mask < 0.5 && inp.geo.z < 0.0) {
         let bgc = textureSample(bg_image, bg_sampler, bg_uv(inp.pos.xy));
-        return vec4f(mix(inp.bg, bgc.rgb, globals.bg_alpha_size.x), 1.0);
+        return pane_color(mix(inp.bg, bgc.rgb, globals.bg_alpha_size.x));
     }
     if (inp.geo.z > 0.0 || inp.geo.w > 0.0) {
         // fg.w < 0 哨兵 = 未知底衬(悬浮层):圆角外硬 discard——premix AA
@@ -105,25 +112,25 @@ fn fs(inp: VsOut) -> @location(0) vec4f {
         let cov = rounded_coverage(inp.local, inp.geo.xy, inp.geo.z, r_bot);
         if (hard) {
             if (cov < 0.5) { discard; }
-            return vec4f(inp.bg, 1.0);
+            return pane_color(inp.bg);
         }
-        return vec4f(mix(inp.fg, inp.bg, cov), 1.0);
+        return pane_color(mix(inp.fg, inp.bg, cov));
     }
     // Clamp only outside edge centers, preserving exact 1:1 sampling inside
     // while keeping fractional/scaled sprites from sampling atlas padding.
     let tex = textureSample(glyphs, glyph_sampler, clamp(inp.uv, inp.uv_bounds.xy, inp.uv_bounds.zw));
     let ink = tex.a * inp.ink_mask;
     if (ink == 0.0) {
-        return vec4f(inp.bg, 1.0);
+        return pane_color(inp.bg);
     }
     let fg = tex.rgb * inp.fg;
     if (ink == 1.0 || inp.geo.w < 0.0) {
-        return vec4f(mix(inp.bg, fg, ink), 1.0);
+        return pane_color(mix(inp.bg, fg, ink));
     }
     // The swapchain stores display RGB. Only grayscale glyph edges blend
     // in linear light before being encoded back to that same RGB space.
     let linear = mix(srgb_to_linear(inp.bg), srgb_to_linear(fg), ink);
-    return vec4f(linear_to_srgb(linear), 1.0);
+    return pane_color(linear_to_srgb(linear));
 }
 
 // #77 cover 平铺:屏幕像素坐标 → 图 UV。短边贴满视口,长边按比例

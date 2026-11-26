@@ -74,6 +74,7 @@ pub struct Settings {
     /// Symmetric content padding in logical pixels (scaled with DPI).
     pub window_padding_x: f32,
     pub window_padding_y: f32,
+    pub unfocused_split_opacity: f32,
     /// Quick Terminal height as a percentage of monitor height (creation only).
     pub quick_terminal_height: u8,
     /// 回退链按序;重复 `font-family` 追加(D9 链语义)
@@ -149,6 +150,7 @@ fn default_state() -> &'static (Settings, [bool; 4]) {
             window_size_pixels: None,
             window_padding_x: 0.0,
             window_padding_y: 0.0,
+            unfocused_split_opacity: 0.0,
             mouse_hide_while_typing: false,
             minimum_contrast: 0.0,
             window_position: None,
@@ -211,6 +213,15 @@ impl ConfigError {
 
 /// 合成用户 config(可空串 = 全默认)。任何错误 → Err(调用方保旧)。
 pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
+    resolve_for_theme_mode(user_source, || true)
+}
+
+/// The UI shell supplies its system appearance. CLI and other core-only
+/// callers use the dark entry via `resolve`. Query the system only for a pair.
+pub fn resolve_for_theme_mode(
+    user_source: &str,
+    prefer_dark: impl FnOnce() -> bool,
+) -> Result<Settings, ConfigError> {
     let user_source = user_source.strip_prefix('\u{feff}').unwrap_or(user_source);
     let mut err = ConfigError::default();
     let (user_pairs, parse_errors) = parse::parse(user_source);
@@ -228,8 +239,22 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
         .find(|(k, _)| k == "theme")
         .map(|(_, v)| (!v.is_empty()).then(|| v.clone()))
         .unwrap_or_else(|| settings.theme_name.clone());
+    let mut selected_theme = None;
     if let Some(name) = theme_name {
-        match theme::find_theme(&name) {
+        match select_theme(&name, prefer_dark) {
+            Ok((name, other)) => {
+                selected_theme = Some(name.to_owned());
+                if let Some(other) = other
+                    && let Err(reason) = theme::find_theme(other)
+                {
+                    err.values.push(reason);
+                }
+            }
+            Err(reason) => err.values.push(reason),
+        }
+    }
+    if let Some(name) = &selected_theme {
+        match theme::find_theme(name) {
             Ok(source) => {
                 let (pairs, theme_errors) = parse::parse(&source);
                 err.parse.extend(theme_errors);
@@ -239,6 +264,7 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
         }
     }
     apply_pairs(&mut settings, user_pairs, &mut err, &mut explicit);
+    settings.theme_name = selected_theme;
 
     finish_palette(&mut settings, &explicit);
 
@@ -246,6 +272,42 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
         Ok(settings)
     } else {
         Err(err)
+    }
+}
+
+fn select_theme(
+    value: &str,
+    prefer_dark: impl FnOnce() -> bool,
+) -> Result<(&str, Option<&str>), String> {
+    if !(value.starts_with("dark:") || value.starts_with("light:")) {
+        return Ok((value, None));
+    }
+    let mut dark = None;
+    let mut light = None;
+    let invalid = || "theme must specify one dark:NAME and one light:NAME".to_owned();
+    for part in value.split(',') {
+        let (mode, name) = part.trim().split_once(':').ok_or_else(invalid)?;
+        let name = name.trim();
+        let slot = match mode {
+            "dark" => &mut dark,
+            "light" => &mut light,
+            _ => return Err(invalid()),
+        };
+        if name.is_empty() || slot.is_some() {
+            return Err(invalid());
+        }
+        *slot = Some(name);
+    }
+    match (dark, light) {
+        (Some(dark), Some(light)) => {
+            let (selected, other) = if prefer_dark() {
+                (dark, light)
+            } else {
+                (light, dark)
+            };
+            Ok((selected, Some(other)))
+        }
+        _ => Err(invalid()),
     }
 }
 
@@ -387,7 +449,10 @@ fn apply_pairs(
                 }
             }
             "background-image" => settings.background_image = (!value.is_empty()).then_some(value),
-            "background-opacity" | "minimum-contrast" | "faint-opacity" => {
+            "background-opacity"
+            | "minimum-contrast"
+            | "faint-opacity"
+            | "unfocused-split-opacity" => {
                 let lower = if key == "background-opacity" {
                     0.05
                 } else {
@@ -397,6 +462,7 @@ fn apply_pairs(
                     Ok(n) if n.is_finite() && (lower..=1.0).contains(&n) => match key.as_str() {
                         "background-opacity" => settings.background_opacity = n,
                         "faint-opacity" => settings.palette.faint_opacity = n,
+                        "unfocused-split-opacity" => settings.unfocused_split_opacity = n,
                         _ => settings.minimum_contrast = n,
                     },
                     _ => err
@@ -750,6 +816,7 @@ mod tests {
             "faint-opacity = -0.1",
             "faint-opacity = 1.1",
             "faint-opacity = NaN",
+            "unfocused-split-opacity = 1.5",
             "cursor-text = invalid",
             "window-position = one,2",
             "mouse-right-click = bad",
@@ -842,6 +909,32 @@ mod tests {
         assert_eq!(s.theme_name.as_deref(), Some("Dracula"));
         assert_eq!(s.palette.bg.r, 0x00, "用户 background 覆盖主题");
         assert_eq!(s.palette.colors[1].r, 0xff, "palette 槽来自主题(#ff5555)");
+    }
+
+    #[test]
+    fn paired_theme_defaults_to_dark_without_a_system_preference() {
+        let source = "theme = light:Kanagawa Lotus, dark:Kanagawa Wave";
+        let settings = resolve(source).unwrap();
+        assert_eq!(settings.theme_name.as_deref(), Some("Kanagawa Wave"));
+        assert_eq!(settings.palette.bg, parse_hex("#1f1f28").unwrap());
+        let settings = resolve_for_theme_mode(source, || false).unwrap();
+        assert_eq!(settings.theme_name.as_deref(), Some("Kanagawa Lotus"));
+        assert_eq!(settings.palette.bg, parse_hex("#f2ecbc").unwrap());
+        assert!(
+            resolve_for_theme_mode("theme = Kanagawa Wave", || {
+                panic!("single themes should not query system appearance")
+            })
+            .is_ok()
+        );
+        for invalid in [
+            "theme = dark:Kanagawa Wave",
+            "theme = dark:Kanagawa Wave,dark:Kanagawa Lotus",
+            "theme = dark:Kanagawa Wave,light:",
+            "theme = dark:Kanagawa Wave,light:MissingTheme",
+            "theme = dark:Kanagawa Wave,light:Kanagawa Lotus,unknown:Foo",
+        ] {
+            assert!(resolve(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

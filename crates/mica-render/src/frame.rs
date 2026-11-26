@@ -13,7 +13,7 @@ use mica_core::config::palette::Palette;
 use mica_core::config::settings::StripCfg;
 use mica_core::surface::{CursorShape, Damage, Surface};
 
-use crate::color::{mix, resolve, rgb3};
+use crate::color::{mix, relative_luminance, resolve, rgb3};
 use crate::font::GlyphStyle;
 use crate::font::metrics::FontMetrics;
 use crate::font::router::GlyphRouter;
@@ -43,6 +43,7 @@ pub fn resource_fingerprint(surface: &Surface, shared_ui: &impl std::hash::Hash)
 /// One drawable quad. `pos_uv = [x_px, y_px, u, v]` (u/v are atlas pixel coordinates),
 /// `size_uv = [w_px, h_px, uw, uvh]` (screen pixels + atlas pixel extent).
 /// 背景 quad 与空白格均用 `blank` 形态:uv 尺寸 0,shader 墨恒 0。
+/// For non-glyph quads, negative bg.w opts into wallpaper sampling.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CellInstance {
@@ -52,22 +53,11 @@ pub struct CellInstance {
     pub bg: [f32; 4],
 }
 
+pub(crate) const BACKGROUND_IMAGE_FILL: f32 = -1.0;
+
 /// Preserve original colors and native blending for a colored atlas entry.
 pub fn glyph_tint(fg: [f32; 4], colored: bool) -> [f32; 4] {
     if colored { [1.0, 1.0, 1.0, -1.0] } else { fg }
-}
-
-/// #90 WCAG 相对亮度(sRGB 简化线性化)
-fn rel_lum(rgb: [u8; 3]) -> f32 {
-    let c = |v: u8| {
-        let s = f32::from(v) / 255.0;
-        if s <= 0.03928 {
-            s / 12.92
-        } else {
-            ((s + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * c(rgb[0]) + 0.7152 * c(rgb[1]) + 0.0722 * c(rgb[2])
 }
 
 /// #90 最小对比度强制:对比低于 min 时把 fg 推向白或黑(朝更远的极端
@@ -78,8 +68,8 @@ pub fn enforce_contrast(fg: [u8; 3], bg: [u8; 3], min: f32) -> [u8; 3] {
     }
     // min 是 0..1 归一化(Ghostty 同义);WCAG 对比域 1..21 → 映射后比
     let target = min * 21.0;
-    let lb = rel_lum(bg);
-    let lf = rel_lum(fg);
+    let lb = relative_luminance(bg);
+    let lf = relative_luminance(fg);
     let cur = (lf.max(lb) + 0.05) / (lf.min(lb) + 0.05);
     if cur >= target {
         return fg;
@@ -87,7 +77,7 @@ pub fn enforce_contrast(fg: [u8; 3], bg: [u8; 3], min: f32) -> [u8; 3] {
     let dark_bg = lb < 0.5;
     let mut out = fg;
     for _ in 0..24 {
-        let l = rel_lum(out);
+        let l = relative_luminance(out);
         let ratio = (l.max(lb) + 0.05) / (l.min(lb) + 0.05);
         if ratio >= target {
             break;
@@ -369,6 +359,8 @@ pub struct StripLayout {
 /// tab_dx 非 Copy(Vec)——拖拽挤压的邻位滑移量按原始下标对位。
 #[derive(Debug, Clone, Default)]
 pub struct StripExtras {
+    /// Optional accents indexed like the tab titles.
+    pub tab_colors: Vec<Option<[u8; 3]>>,
     /// D37 OSC 133 exit 状态点
     pub exit_dot: Option<ExitDot>,
     /// T8 系统按钮区起点(客户区坐标)
@@ -543,6 +535,7 @@ pub fn strip_quads(
     extras: StripExtras,
 ) -> Vec<CellInstance> {
     let StripExtras {
+        tab_colors,
         exit_dot,
         caption_x,
         layout,
@@ -809,6 +802,19 @@ pub fn strip_quads(
                     bar,
                     (sm.tab_top_r, 0.0),
                 ));
+            }
+            if let Some(color) = tab_colors.get(i).copied().flatten() {
+                let left = x0.max(0.0);
+                let width = (x0 + w).min(right) - left;
+                if width > 0.0 {
+                    let color = bg_of(color);
+                    out.push(CellInstance {
+                        pos_uv: [left, tab_y + 2.0 * k, 0.0, 0.0],
+                        size_uv: [width, 2.0, 0.0, 0.0],
+                        fg: color,
+                        bg: color,
+                    });
+                }
             }
             // 标题:等宽格步进,超宽以省略号截断(× 区前留呼吸)
             let close_x = x0 + w - sm.tab_close_w;
@@ -1172,14 +1178,7 @@ fn rebuild_all(
 }
 
 /// 行内格子的前景/背景对(选中 > 反色,光标由调用处按形状另行处理)。
-fn cell_colors(
-    cell: &Cell,
-    selection: Option<&SelectionRange>,
-    buffer_line: i32,
-    col: usize,
-    palette: &Palette,
-) -> ([u8; 3], [u8; 3]) {
-    let selected = cell_selected(selection, cell, buffer_line, col);
+fn cell_colors(cell: &Cell, selected: bool, palette: &Palette) -> ([u8; 3], [u8; 3]) {
     let (mut fg, mut bg) = if selected {
         (rgb3(palette.selection_fg), rgb3(palette.selection_bg))
     } else {
@@ -1347,20 +1346,20 @@ fn build_row_into(
     row.glyphs.clear();
     row.bg.reserve(cols);
     let y = line as f32 * metrics.line_height;
+    let terminal_bg = rgb3(palette.bg);
     let mut bar = None;
     let mut decorations = Vec::new();
     for col in 0..cols {
         let cell = &grid[Line(buffer_line)][Column(col)];
         let cursor_here = display_offset == 0 && line == cursor_line && col == cursor_col;
-        let (mut fg, mut bg) = cell_colors(cell, selection, buffer_line, col, palette);
+        let selected = cell_selected(selection, cell, buffer_line, col);
+        let (mut fg, mut bg) = cell_colors(cell, selected, palette);
+        let block_cursor = cursor_here && cursor == Some(CursorShape::Block);
         if cursor_here {
             match cursor {
                 Some(CursorShape::Block) => {
                     let cursor_bg = rgb3(palette.cursor);
-                    if bg == cursor_bg
-                        && (cell.flags.contains(Flags::INVERSE)
-                            || cell_selected(selection, cell, buffer_line, col))
-                    {
+                    if bg == cursor_bg && (cell.flags.contains(Flags::INVERSE) || selected) {
                         std::mem::swap(&mut fg, &mut bg);
                     } else {
                         (fg, bg) = (rgb3(palette.cursor_text), cursor_bg);
@@ -1381,7 +1380,11 @@ fn build_row_into(
         } else {
             fg = bg;
         }
-        row.bg.push(blank(x, y, metrics, fg, bg));
+        let mut background = blank(x, y, metrics, fg, bg);
+        if bg == terminal_bg && !selected && !block_cursor && !cell.flags.contains(Flags::INVERSE) {
+            background.bg[3] = BACKGROUND_IMAGE_FILL;
+        }
+        row.bg.push(background);
     }
     if let Some((shape, x, y)) = bar {
         row.glyphs.push(cursor_bar(shape, x, y, metrics, palette));
@@ -1716,13 +1719,13 @@ mod tests {
     fn contrast_enforcement() {
         // 深底深字(黑底 #111):推白
         let dark_fg = enforce_contrast([17, 17, 17], [10, 10, 10], 0.6);
-        let lum = rel_lum(dark_fg);
-        let ratio =
-            (lum.max(rel_lum([10, 10, 10])) + 0.05) / (lum.min(rel_lum([10, 10, 10])) + 0.05);
+        let lum = relative_luminance(dark_fg);
+        let ratio = (lum.max(relative_luminance([10, 10, 10])) + 0.05)
+            / (lum.min(relative_luminance([10, 10, 10])) + 0.05);
         assert!(ratio >= 12.0, "深底深字推白后 ratio={ratio}");
         // 白底白字(245 vs 250 真低对比):推黑
         let light_fg = enforce_contrast([245, 245, 245], [250, 250, 250], 0.6);
-        assert!(rel_lum(light_fg) < 0.5, "白底白字推黑");
+        assert!(relative_luminance(light_fg) < 0.5, "白底白字推黑");
         // 已达标:直通
         assert_eq!(
             enforce_contrast([255, 255, 255], [0, 0, 0], 0.6),
@@ -1977,6 +1980,7 @@ mod tests {
             StripExtras {
                 caption_x: Some(400.0),
                 focus: 1.0,
+                tab_colors: vec![Some([1, 2, 3])],
                 ..Default::default()
             },
         );
@@ -2002,6 +2006,40 @@ mod tests {
                 .any(|q| q.size_uv[2] > 0.0 && q.pos_uv[1] >= sm.title_h),
             "第二行无任何字形(隐藏)"
         );
+        assert!(!out.iter().any(|q| q.bg == to_color([1, 2, 3])));
+    }
+
+    #[test]
+    fn tab_accent_uses_narrow_tab_geometry_and_drag_position() {
+        let mut router = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let sm = StripMetrics {
+            wide: false,
+            ..StripMetrics::default()
+        };
+        let accent = [0x12, 0x34, 0x56];
+        let quads = strip_quads(
+            &[("one".into(), true), ("two".into(), false)],
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &sm,
+            StripExtras {
+                caption_x: Some(400.0),
+                focus: 1.0,
+                tab_colors: vec![Some(accent), None],
+                drag: Some((0, 1, 150.0)),
+                ..Default::default()
+            },
+        );
+        let rule = quads.iter().find(|q| q.bg == to_color(accent)).unwrap();
+        assert_eq!(rule.pos_uv, [150.0, sm.title_h + 2.0, 0.0, 0.0]);
+        assert_eq!(rule.size_uv, [sm.tab_min_w, 2.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -2062,7 +2100,7 @@ mod tests {
         let bg = to_color([40, 20, 10]);
         assert_eq!((insts[0].fg, insts[0].bg), (faint, bg));
         assert_eq!((insts[1].fg, insts[1].bg), (bg, faint));
-        assert_eq!(insts[2].fg, insts[2].bg);
+        assert_eq!(insts[2].fg[..3], insts[2].bg[..3]);
         assert!(!insts[5..].iter().any(|q| q.pos_uv[0] == 16.0));
         let strike = insts.last().unwrap();
         assert_eq!(strike.pos_uv, [24.0, 8.0, 0.0, 0.0]);
@@ -2073,7 +2111,7 @@ mod tests {
             ..Palette::DEFAULT
         };
         let cell = &surface.grid()[Line(0)][Column(1)];
-        let (fg, bg) = cell_colors(cell, None, 0, 1, &p);
+        let (fg, bg) = cell_colors(cell, false, &p);
         assert_eq!(fg, bg, "minimum contrast must preserve fully faint text");
     }
 
