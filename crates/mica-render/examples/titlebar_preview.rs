@@ -21,6 +21,7 @@ fn main() -> anyhow::Result<()> {
     let mut comparison = false;
     let mut single = false;
     let mut no_highlight = false;
+    let mut hover_close = false;
     let mut scale = 1.5;
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -33,6 +34,7 @@ fn main() -> anyhow::Result<()> {
             Some("--comparison") => comparison = true,
             Some("--single") => single = true,
             Some("--no-highlight") => no_highlight = true,
+            Some("--hover-close") => hover_close = true,
             Some("--scale") => {
                 let value = args
                     .next()
@@ -111,6 +113,13 @@ fn main() -> anyhow::Result<()> {
             &settings.palette,
             &sm,
             StripExtras {
+                hover: mica_render::frame::StripHover {
+                    tab: hover_close
+                        .then(|| titles.iter().position(|(_, active)| *active))
+                        .flatten(),
+                    caption: hover_close.then_some(mica_render::frame::CaptionBtn::Close),
+                    ..Default::default()
+                },
                 tab_shortcuts: (1..=titles.len()).map(|i| Some(format!("⌃⇧{i}"))).collect(),
                 caption_x: Some(width as f32 - 3.0 * sm.caption_w),
                 focus,

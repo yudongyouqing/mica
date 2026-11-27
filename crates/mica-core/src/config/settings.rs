@@ -35,6 +35,10 @@ pub struct StripCfg {
     pub tab_h: f32,
     pub tab_min_w: f32,
     pub tab_corner_r: f32,
+    pub caption_width_ratio: f32,
+    pub caption_icon_padding: f32,
+    pub tab_close_width_ratio: f32,
+    pub tab_close_icon_padding: f32,
     pub wide_tabs: bool,
     pub hide_single: bool,
     pub bar: Option<Rgb>,
@@ -172,6 +176,10 @@ fn default_state() -> &'static (Settings, [bool; 4]) {
                 tab_h: 0.0,
                 tab_min_w: 0.0,
                 tab_corner_r: 0.0,
+                caption_width_ratio: 0.0,
+                caption_icon_padding: 0.0,
+                tab_close_width_ratio: 0.0,
+                tab_close_icon_padding: 0.0,
                 wide_tabs: false,
                 hide_single: false,
                 bar: None,
@@ -603,6 +611,24 @@ fn apply_pairs(
                     .values
                     .push(format!("strip-font-size 应为 4-24 的数字,得 `{value}`")),
             },
+            "strip-caption-width-ratio"
+            | "strip-caption-icon-padding"
+            | "strip-tab-close-width-ratio"
+            | "strip-tab-close-icon-padding" => {
+                let padding = key.ends_with("-padding");
+                let range = if padding { 0.0..=0.49 } else { 0.1..=4.0 };
+                match value.parse::<f32>() {
+                    Ok(n) if n.is_finite() && range.contains(&n) => match key.as_str() {
+                        "strip-caption-width-ratio" => settings.strip.caption_width_ratio = n,
+                        "strip-caption-icon-padding" => settings.strip.caption_icon_padding = n,
+                        "strip-tab-close-width-ratio" => settings.strip.tab_close_width_ratio = n,
+                        _ => settings.strip.tab_close_icon_padding = n,
+                    },
+                    _ => err
+                        .values
+                        .push(format!("{key} must be a finite number in {range:?}")),
+                }
+            }
             "strip-title-height"
             | "strip-tab-height"
             | "strip-tab-min-width"
@@ -786,6 +812,10 @@ mod tests {
                 tab_h: 34.0,
                 tab_min_w: 128.0,
                 tab_corner_r: 12.0,
+                caption_width_ratio: 1.125,
+                caption_icon_padding: 0.34,
+                tab_close_width_ratio: 0.75,
+                tab_close_icon_padding: 0.33,
                 wide_tabs: true,
                 hide_single: false,
                 bar: None,
@@ -816,6 +846,10 @@ mod tests {
             "faint-opacity = -0.1",
             "faint-opacity = 1.1",
             "faint-opacity = NaN",
+            "strip-caption-icon-padding = 0.5",
+            "strip-tab-close-icon-padding = -0.01",
+            "strip-caption-width-ratio = NaN",
+            "strip-tab-close-width-ratio = 0",
             "unfocused-split-opacity = 1.5",
             "cursor-text = invalid",
             "window-position = one,2",

@@ -195,8 +195,6 @@ pub const TAB_MAX_W_BASE: f32 = 220.0;
 /// 标签间缝与左右内边距(逻辑 px)
 pub const TAB_GAP_BASE: f32 = 2.0;
 pub const TAB_PAD_BASE: f32 = 10.0;
-/// × 关闭钮预留区宽(每标签恒留——宽度稳定,悬停不回流)
-pub const TAB_CLOSE_W_BASE: f32 = 24.0;
 
 /// 缩放后的 strip 运行时几何(单源:渲染与 hit-test 都从这里取)。
 /// scale = 窗口 DPI/96(M5b 的 DPI_SCALE);cfg = 用户配置。
@@ -223,6 +221,8 @@ pub struct StripMetrics {
     pub tab_gap: f32,
     pub tab_pad: f32,
     pub tab_close_w: f32,
+    pub tab_close_icon_padding: f32,
+    pub caption_icon_padding: f32,
     /// caption 单键宽(— □ ×)
     pub caption_w: f32,
     /// 标签块上圆角半径(下缘直角:活跃块与终端区无缝相接)
@@ -272,9 +272,11 @@ impl StripMetrics {
             tab_max_w: TAB_MAX_W_BASE * s,
             tab_gap: TAB_GAP_BASE * s,
             tab_pad: TAB_PAD_BASE * s,
-            tab_close_w: TAB_CLOSE_W_BASE * s,
+            tab_close_w: ((cfg.tab_h - 10.0) * s).max(1.0) * cfg.tab_close_width_ratio,
+            tab_close_icon_padding: cfg.tab_close_icon_padding,
+            caption_icon_padding: cfg.caption_icon_padding,
             plus_w: TAB_PLUS_W_BASE * s,
-            caption_w: 46.0 * s,
+            caption_w: cfg.title_h * s * cfg.caption_width_ratio,
             tab_top_r: cfg.tab_corner_r * s,
             arrow_w: 24.0 * s,
             chip_r: 6.0 * s,
@@ -815,20 +817,13 @@ pub fn strip_quads(
             }
             let g = router.route(*glyph, GlyphStyle::PLAIN);
             if g.size_px[0] > 0.0 {
-                // 图标双向真居中(2026-10-12 用户实测纠偏):pos 即墨盒左上,
-                // 居中 = 容器 ±(容器尺寸-墨尺寸)/2,**不带 offset_px**——
-                // 那是基线相关量,带上会双重偏移(× 曾偏下、caption 曾斜)
-                out.push(CellInstance {
-                    pos_uv: [
-                        bx + (sm.caption_w - g.size_px[0]) / 2.0,
-                        (sm.title_h - g.size_px[1]) / 2.0,
-                        g.uv[0],
-                        g.uv[1],
-                    ],
-                    size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                    fg: glyph_tint(bg_of(ink), g.color),
-                    bg: bg_of(face),
-                });
+                out.push(centered_icon(
+                    &g,
+                    [bx, 0.0, sm.caption_w, sm.title_h],
+                    sm.caption_icon_padding,
+                    ink,
+                    face,
+                ));
             }
         }
     }
@@ -1020,17 +1015,13 @@ pub fn strip_quads(
             if hovered {
                 let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
                 if g.size_px[0] > 0.0 {
-                    out.push(CellInstance {
-                        pos_uv: [
-                            close_x + (sm.tab_close_w - g.size_px[0]) * 0.5,
-                            pill_y + (pill_h - g.size_px[1]) * 0.5,
-                            g.uv[0],
-                            g.uv[1],
-                        ],
-                        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                        fg: glyph_tint(bg_of(ink), g.color),
-                        bg: bg_of(backdrop),
-                    });
+                    out.push(centered_icon(
+                        &g,
+                        [close_x, pill_y, sm.tab_close_w, pill_h],
+                        sm.tab_close_icon_padding,
+                        ink,
+                        backdrop,
+                    ));
                 }
             }
             // Clip every tab to the same visible domain used by hit testing.
@@ -1458,6 +1449,32 @@ fn decoration_quads(
         out.push(q(x, bottom - 1.0, w));
     }
     out
+}
+
+/// Place a font icon by its ink bounds, with padding proportional to its containing row height.
+/// Its hit rectangle remains shared with the app's pointer routing.
+fn centered_icon(
+    g: &crate::font::router::GlyphInfo,
+    rect: [f32; 4],
+    vertical_padding: f32,
+    ink: [u8; 3],
+    backdrop: [u8; 3],
+) -> CellInstance {
+    let edge = g.size_px[0].max(g.size_px[1]).max(1.0);
+    let visual_edge = rect[3] * (1.0 - 2.0 * vertical_padding);
+    let scale = visual_edge.min(rect[2]).max(0.0) / edge;
+    let (w, h) = (g.size_px[0] * scale, g.size_px[1] * scale);
+    CellInstance {
+        pos_uv: [
+            rect[0] + (rect[2] - w) * 0.5,
+            rect[1] + (rect[3] - h) * 0.5,
+            g.uv[0],
+            g.uv[1],
+        ],
+        size_uv: [w, h, g.uv[2], g.uv[3]],
+        fg: glyph_tint(to_color(ink), g.color),
+        bg: to_color(backdrop),
+    }
 }
 
 /// 光标条实例(D20):Underline=底部 2px、Beam=左侧 1.2px;色 = palette.cursor。
@@ -2108,6 +2125,73 @@ mod tests {
         );
         let body = 900.0 - sm.plus_w - 14.0 * sm.k - sm.tab_gap * 2.0;
         assert_eq!(equal_tab_w(2, 900.0, &sm), body / 2.0, "两标签均分");
+    }
+
+    #[test]
+    fn close_icons_follow_row_padding_ratios() {
+        for scale in [1.0, 1.5, 2.0] {
+            for title_height in [24.0, 32.0, 64.0, 128.0] {
+                let mut router = FakeRouter {
+                    atlas_w: 128.0,
+                    atlas_h: 128.0,
+                    glyph_w: 32.0 * scale,
+                    glyph_h: 32.0 * scale,
+                    wide: |_| false,
+                };
+                let cfg = StripCfg {
+                    title_h: title_height,
+                    tab_h: title_height + 2.0,
+                    ..Default::default()
+                };
+                let sm = StripMetrics::from_scale_cfg(scale, &cfg);
+                let caption = 900.0 * scale;
+                let out = strip_quads(
+                    &[("terminal".into(), true)],
+                    &mut router,
+                    &metrics_8x16(),
+                    &Palette::DEFAULT,
+                    &sm,
+                    StripExtras {
+                        caption_x: Some(caption),
+                        focus: 1.0,
+                        hover: StripHover {
+                            tab: Some(0),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                assert!((sm.caption_w / sm.title_h - 1.125).abs() < 0.001);
+                let controls = out
+                    .iter()
+                    .filter(|q| {
+                        q.size_uv[2] > 0.0
+                            && q.pos_uv[0] >= caption
+                            && q.pos_uv[1] >= 0.0
+                            && q.pos_uv[1] + q.size_uv[1] <= sm.title_h
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(controls.len(), 3);
+                for q in controls {
+                    let icon = q.size_uv[0].max(q.size_uv[1]);
+                    assert!((icon / sm.title_h - 0.32).abs() < 0.001);
+                    assert!((q.pos_uv[1] - (sm.title_h - q.size_uv[1]) * 0.5).abs() <= 0.5);
+                }
+                let x = tabs_x0(&sm);
+                let pill_height = (sm.tab_h - 10.0 * scale).max(1.0);
+                let close = out
+                    .iter()
+                    .find(|q| {
+                        q.size_uv[2] > 0.0
+                            && q.pos_uv[1] >= sm.title_h
+                            && q.pos_uv[0] < x + sm.tab_close_w
+                    })
+                    .expect("hover close icon");
+                assert!(
+                    (close.size_uv[0].max(close.size_uv[1]) / pill_height - 0.34).abs() < 0.001
+                );
+            }
+        }
     }
 
     #[test]

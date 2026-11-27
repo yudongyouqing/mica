@@ -91,6 +91,11 @@ strip-title-height = 32
 strip-tab-height = 34
 strip-tab-min-width = 128
 strip-tab-corner-radius = 12
+# Controls scale with their containing row. Padding is the fraction on each side.
+strip-caption-width-ratio = 1.125
+strip-caption-icon-padding = 0.34
+strip-tab-close-width-ratio = 0.75
+strip-tab-close-icon-padding = 0.33
 strip-wide-tabs = true
 strip-hide-single-tab = false
 strip-bar-color = auto

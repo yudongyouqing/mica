@@ -32,6 +32,29 @@
 .compact .screen {padding-top:20px}
 .unfocused .titleline>* {opacity:.58}
 @media(max-width:650px) {.seg {flex-wrap:wrap}.compact .titleline{padding-left:10px}.compact .tab{min-width:120px}.titleline .dragspace{min-width:10px}}
+
+/* Control geometry follows its containing row, including custom row heights. */
+.compact {--title-row-h:32px;--tab-face-h:24px;--caption-icon-padding:.34;--tab-icon-padding:.33}
+.compact .titleline {height:var(--title-row-h)}
+.compact .bar {height:calc(var(--tab-face-h) + 10px)}
+.compact .tab {height:var(--tab-face-h)}
+.compact .sys {width:calc(var(--title-row-h) * 1.125);font-size:calc(var(--title-row-h) * .5)}
+.compact .sys:last-child {position:relative;font-size:0}
+.compact .closeTab {width:calc(var(--tab-face-h) * .75);height:100%;font-size:0}
+.compact .sys:last-child::before,.compact .sys:last-child::after,
+.compact .closeTab::before,.compact .closeTab::after {
+ content:"";position:absolute;left:50%;top:50%;background:currentColor;
+ transform:translate(-50%,-50%) rotate(45deg);pointer-events:none;
+}
+.compact .sys:last-child::before,.compact .sys:last-child::after {
+ width:calc(var(--title-row-h) * (1 - 2 * var(--caption-icon-padding)) * 1.41421356);
+ height:max(1px,calc(var(--title-row-h) * .025));
+}
+.compact .closeTab::before,.compact .closeTab::after {
+ width:calc(var(--tab-face-h) * (1 - 2 * var(--tab-icon-padding)) * 1.41421356);
+ height:max(1px,calc(var(--tab-face-h) * .035));
+}
+.compact .sys:last-child::after,.compact .closeTab::after {transform:translate(-50%,-50%) rotate(-45deg)}
 </style>
 <main>
 <header><span class="brand"><span class="mark" aria-hidden="true">›_</span>Mica</span><span class="sub">桌面终端设计预览</span></header>
