@@ -66,6 +66,10 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - `docs/superpowers/plans/2026-10-03-m5b-robustness.md` — M5b 计划(健壮五件;wgpu lost 双钩子/DbgHelp/try_wait/Ime/winres-manifest API 全核实;冒烟抓到 restart 双借真 bug——T1 崩溃档案首秀定位)。
 - 里程碑:M0→M4(✅)→ M5 1.0(tag v1.0.0)→ 1.1(tag v1.1.0)→ 1.2(tag v1.2.0,send-text/启动优化 -424ms/回看搜索/路径点击/粘贴双份修复)→ **1.3 发布完成(2026-10-23,tag v1.3.0)**:透明度(Ctrl+Shift+O 两档+`background-opacity`)、窗口背景图(`background-image`,空白格混合)、右键粘贴(`mouse-right-click=paste`)、回看导出(Ctrl+Shift+S)、key-remap 修饰键重映射、`window-position`、重开最近关闭标签(Ctrl+Shift+Z)、`minimum-contrast`、标签改名与着色(rename_tab+OSC 1337);仓库转 Public(Actions 免费不限量+CI 止血三连:并发取消/msi+perf 仅主干与 tag/纯文档免跑)→ **1.4(2026-11-15,tag v1.4.0,PR #119)**:设置集中外置与三层合成、PowerShell 7 默认 shell、`window-size-pixels` 精确外框(按显示器工作区约束,OS 不再代裁)、居中标题与弱中性底(11pt/600,用户评审定案)、字形采样全域 UV 修复(1px 白列 255→143 的发虚根除)、Tab 键族修复(Shift+Tab=CSI Z、Ctrl+Tab 快捷键可达,#123/#125)→ **1.4.1(2026-11-21,tag v1.4.1,PR #127/#128/#133/#139/#140)**:全库审计与稳定性/安全修复(UIA `GetPatternProvider` 空指针 UB 根除并恢复 `WM_GETOBJECT` 派发与深度查询回归、回看标记漂移与渲染缓存/剪贴板/IPC/崩溃转储加固、退出计时与 `launch_argv` 稳定性修复)、依赖全面升级(`wgpu` 30.0.2/`notify` 8.2.2/`base64` 0.23.1 等 + Dependabot 指向 `dev`)、`app.rs` 单体拆分(5,856→2,021 行 + 6 子模块)并合并主/副窗启动重复逻辑。→ 票箱:**空**(#36 winget 用户关账:项目完善前不做)。
 
+## 1.5.0 打包准备
+
+当前候选安装包包含紧凑双行标题栏、按栏高比例计算的窗口控件、同进程标签跨窗迁移、渲染与配置热重载修复。发布构建与 MSI 版本统一为 1.5.0。用户级 MSI 默认安装到用户本地应用目录的 Programs/Mica 文件夹，安装包包含的程序位于 bin 子目录。公开发布仍走 dev → main PR、tag、Release 流程。
+
 ## 当前边界(M3 后的声明欠账,不是 bug——修它们要过设计,别当 bug 顺手改)
 
 - 连字:Cascadia 系需 TextLayout 级引擎(analyzer+liga/calt 不触发),管线已备,probe 阴性自动回退——换引擎留 M3
