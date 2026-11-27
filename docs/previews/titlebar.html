@@ -23,7 +23,8 @@
 .compact .tab.active {color:color-mix(in srgb,var(--fg) 65%,white);background:color-mix(in srgb,var(--fg) 21%,var(--bg));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--fg) 23%,transparent)}
 .compact.lotus .tab.active {color:var(--fg)}
 .compact .tab.active:after {display:none}
-.compact .tab.active .shortcut {color:inherit;font-weight:600}
+.compact .shortcut {border:1px solid color-mix(in srgb,var(--fg) 18%,transparent);background:color-mix(in srgb,var(--fg) 6%,transparent);border-radius:4px;margin-right:7px;padding:0 4px;font:10px/16px "Segoe UI Symbol","Segoe UI",sans-serif}
+.compact .tab.active .shortcut {color:inherit;font-weight:400}
 .compact .closeTab {position:absolute;left:3px;width:18px;padding:0;font-size:12px;opacity:0}
 .compact .tab:is(:hover,:focus-within) .closeTab {opacity:.85}
 .compact .tab:is(:hover,:focus-within)>button:first-child {padding-left:21px}
@@ -59,7 +60,7 @@ function draw(){
   tab.onkeydown=e=>{if(!['ArrowLeft','ArrowRight'].includes(e.key))return;e.preventDefault();active=sessions[(sessions.indexOf(s)+(e.key==='ArrowLeft'?-1:1)+sessions.length)%sessions.length];draw();el('tabs').querySelector('[aria-selected=true]').focus()};
   const close=document.createElement('button');close.className='closeTab';close.textContent='×';close.setAttribute('aria-label','关闭 '+s.name);close.onclick=()=>{const i=sessions.indexOf(s);sessions.splice(i,1);if(s===active)active=sessions[Math.min(i,sessions.length-1)];if(!active)hideWindow();draw()};
   wrap.ondragstart=()=>{dragged=s};wrap.ondragover=e=>{e.preventDefault();wrap.classList.add('over')};wrap.ondragleave=()=>wrap.classList.remove('over');wrap.ondragend=()=>{dragged=null;document.querySelectorAll('.over').forEach(n=>n.classList.remove('over'))};wrap.ondrop=e=>{e.preventDefault();if(!dragged)return;const i=sessions.indexOf(s);sessions.splice(sessions.indexOf(dragged),1);sessions.splice(i,0,dragged);draw()};
-  const shortcut=document.createElement('span');shortcut.className='shortcut';shortcut.textContent='Ctrl+'+(sessions.indexOf(s)+1);shortcut.setAttribute('aria-hidden','true');tab.title=s.name;wrap.append(tab,shortcut,close);el('tabs').append(wrap);
+  const shortcut=document.createElement('span');shortcut.className='shortcut';shortcut.textContent='⌃⇧'+(sessions.indexOf(s)+1);shortcut.setAttribute('aria-hidden','true');tab.title=s.name;wrap.append(tab,shortcut,close);el('tabs').append(wrap);
  }
  if(active){el('windowpath').textContent=active.cwd;el('screen').innerHTML=examples[active.example][1]+'<div class="cmd"><span class="caret"></span></div>';el('tabs').querySelector('.active')?.scrollIntoView({block:'nearest',inline:'nearest'})}
  el('status').textContent=sessions.length+' 个标签 · '+(el('win').classList.contains('compact')?'紧凑双行':'单行');
@@ -80,8 +81,8 @@ function setLayout(id) {
 }
 for(const id of ['compact','soft','line'])el(id).onclick=()=>setLayout(id);
 document.addEventListener('keydown',event=>{
- if(event.ctrlKey && /^[1-9]$/.test(event.key)){
-  const session=sessions[Number(event.key)-1];
+ if(event.ctrlKey && event.shiftKey && /^[1-9]$/.test(event.code.replace('Digit',''))){
+  const session=sessions[Number(event.code.replace('Digit',''))-1];
   if(session){event.preventDefault();active=session;draw();}
  }
 });

@@ -979,6 +979,19 @@ fn shape_run(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ui_modifier_icons_have_visible_glyphs() {
+        let mut router =
+            DwriteRouter::new_ui(9.5, &["Segoe UI", "Segoe UI Symbol"], 400, None).unwrap();
+        for ch in ['⌃', '⇧', '⎇', '⊞'] {
+            let glyph = router.route(ch, GlyphStyle::PLAIN);
+            assert!(
+                glyph.size_px[0] > 0.0 && glyph.size_px[1] > 0.0,
+                "missing keyboard icon {ch}"
+            );
+        }
+    }
+
+    #[test]
     fn ui_semibold_selects_real_font_face_without_bolding_terminal_font() {
         let normal = super::DwriteRouter::new(11.0, &["Segoe UI"]).unwrap();
         let ui = super::DwriteRouter::new_ui(11.0, &["Segoe UI"], 600, None).unwrap();

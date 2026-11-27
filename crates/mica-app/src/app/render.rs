@@ -355,6 +355,7 @@ pub(super) fn draw_frame() {
             for fb in [
                 "Segoe UI",
                 "Microsoft YaHei UI",
+                "Segoe UI Symbol",
                 "Segoe UI Emoji",
                 "Segoe Fluent Icons",
             ] {

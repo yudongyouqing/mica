@@ -595,12 +595,12 @@ pub fn strip_quads(
     });
 
     // ---- 第一行:窗口标题(活跃标签名,居中;caption 左界内,超宽省略号)
-    let title_y = (sm.title_h - metrics.line_height).max(0.0) / 2.0;
+    let mut title_y = (sm.title_h - metrics.line_height).max(0.0) / 2.0;
     let left = 28.0 * k;
     let folder = rgb3(palette.colors[4]);
     out.push(rounded(
         12.0 * k,
-        (sm.title_h - 9.0 * k) * 0.5,
+        (sm.title_h - 11.0 * k) * 0.5 + 2.0 * k,
         12.0 * k,
         9.0 * k,
         folder,
@@ -609,7 +609,7 @@ pub fn strip_quads(
     ));
     out.push(rounded(
         12.0 * k,
-        (sm.title_h - 9.0 * k) * 0.5 - 2.0 * k,
+        (sm.title_h - 11.0 * k) * 0.5,
         5.0 * k,
         3.0 * k,
         folder,
@@ -661,6 +661,21 @@ pub fn strip_quads(
     }
     if with_ell {
         text_w += ell_advance;
+    }
+    let (ink_top, ink_bottom) = routed
+        .iter()
+        .take(n_take)
+        .map(|(g, _)| g)
+        .chain(with_ell.then_some(&ell))
+        .filter(|g| g.size_px[1] > 0.0)
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(top, bottom), g| {
+            (
+                top.min(g.offset_px[1]),
+                bottom.max(g.offset_px[1] + g.size_px[1]),
+            )
+        });
+    if ink_top.is_finite() && ink_bottom.is_finite() {
+        title_y = (sm.title_h - (ink_bottom - ink_top)) * 0.5 - ink_top;
     }
     let text_x = if sm.title_centered {
         center - text_w * 0.5
@@ -880,12 +895,13 @@ pub fn strip_quads(
                 .get(i)
                 .and_then(|s| s.as_deref())
                 .unwrap_or("");
-            let shortcut_width = shortcut
+            let shortcut_ink_width = shortcut
                 .chars()
                 .map(|ch| router.ui_advance(ch).unwrap_or(cw))
                 .sum::<f32>();
+            let shortcut_width = shortcut_ink_width + 8.0 * k;
             let show_shortcut =
-                shortcut_width > 0.0 && label_right - label_left > shortcut_width + 50.0 * k;
+                shortcut_ink_width > 0.0 && label_right - label_left > shortcut_width + 50.0 * k;
             let text_right = label_right
                 - if show_shortcut {
                     shortcut_width + 10.0 * k
@@ -934,7 +950,19 @@ pub fn strip_quads(
                 tx += advance;
             }
             if show_shortcut {
-                let mut x = label_right - shortcut_width;
+                let hint_h = (metrics.line_height + 2.0 * k).min((pill_h - 2.0 * k).max(1.0));
+                let hint_y = pill_y + (pill_h - hint_h) * 0.5;
+                let hint_bg = mix(backdrop, ink2, 0.10);
+                out.push(rounded(
+                    label_right - shortcut_width,
+                    hint_y,
+                    shortcut_width,
+                    hint_h,
+                    hint_bg,
+                    backdrop,
+                    (3.0 * k, 3.0 * k),
+                ));
+                let mut x = label_right - shortcut_width + 4.0 * k;
                 for ch in shortcut.chars() {
                     let g = router.route(ch, GlyphStyle::PLAIN);
                     out.push(glyph_instance_rgba(
@@ -942,7 +970,7 @@ pub fn strip_quads(
                         text_y,
                         &g,
                         bg_of(ink2),
-                        bg_of(backdrop),
+                        bg_of(hint_bg),
                     ));
                     x += router.ui_advance(ch).unwrap_or(cw);
                 }
@@ -2038,6 +2066,62 @@ mod tests {
         );
         let body = 900.0 - sm.plus_w - 14.0 * sm.k - sm.tab_gap * 2.0;
         assert_eq!(equal_tab_w(2, 900.0, &sm), body / 2.0, "两标签均分");
+    }
+
+    #[test]
+    fn folder_and_visible_title_share_an_optical_center() {
+        for scale in [1.0, 1.5, 2.0] {
+            let mut router = FakeRouter {
+                atlas_w: 64.0,
+                atlas_h: 64.0,
+                glyph_w: 4.0 * scale,
+                glyph_h: 8.0 * scale,
+                wide: |_| false,
+            };
+            let sm = StripMetrics::from_scale(scale);
+            let p = Palette::DEFAULT;
+            let out = strip_quads(
+                &[("Folder".into(), true)],
+                &mut router,
+                &metrics_8x16(),
+                &p,
+                &sm,
+                StripExtras {
+                    caption_x: Some(600.0),
+                    focus: 1.0,
+                    ..Default::default()
+                },
+            );
+            let ink = out
+                .iter()
+                .filter(|q| q.size_uv[2] > 0.0 && q.pos_uv[0] < 400.0 && q.pos_uv[1] < sm.title_h)
+                .collect::<Vec<_>>();
+            let top = ink
+                .iter()
+                .map(|q| q.pos_uv[1])
+                .fold(f32::INFINITY, f32::min);
+            let bottom = ink
+                .iter()
+                .map(|q| q.pos_uv[1] + q.size_uv[1])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let blue = to_color(rgb3(p.colors[4]));
+            let icon = out
+                .iter()
+                .filter(|q| q.size_uv[2] == 0.0 && q.bg[..3] == blue[..3])
+                .collect::<Vec<_>>();
+            let icon_top = icon
+                .iter()
+                .map(|q| q.pos_uv[1])
+                .fold(f32::INFINITY, f32::min);
+            let icon_bottom = icon
+                .iter()
+                .map(|q| q.pos_uv[1] + q.size_uv[1])
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                ((top + bottom) - (icon_top + icon_bottom)).abs() <= 1.0,
+                "scale={scale} title={top}..{bottom} icon={icon_top}..{icon_bottom}"
+            );
+        }
     }
 
     #[test]

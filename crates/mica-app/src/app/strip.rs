@@ -32,10 +32,10 @@ pub(super) fn tab_shortcuts(count: usize) -> Vec<Option<String>> {
                             {
                                 let mut label = String::new();
                                 for (enabled, name) in [
-                                    (mods.ctrl, "Ctrl+"),
-                                    (mods.shift, "Shift+"),
-                                    (mods.alt, "Alt+"),
-                                    (mods.win, "Win+"),
+                                    (mods.ctrl, "⌃"),
+                                    (mods.shift, "⇧"),
+                                    (mods.alt, "⎇"),
+                                    (mods.win, "⊞"),
                                 ] {
                                     if enabled {
                                         label.push_str(name);
@@ -390,13 +390,13 @@ mod compact_tests {
         let original = KEYMAP.with(|keys| keys.replace(Settings::default().keymap));
         assert_eq!(
             tab_shortcuts(2),
-            vec![Some("Ctrl+Shift+1".into()), Some("Ctrl+Shift+2".into())]
+            vec![Some("⌃⇧1".into()), Some("⌃⇧2".into())]
         );
         KEYMAP.with(|keys| keys.borrow_mut().clear());
         assert_eq!(tab_shortcuts(2), vec![None, None]);
         let trigger = mica_core::keymap::parse_trigger("alt+1").unwrap();
         KEYMAP.with(|keys| keys.borrow_mut().bind(trigger, Action::GotoTab(1)));
-        assert_eq!(tab_shortcuts(2), vec![Some("Alt+1".into()), None]);
+        assert_eq!(tab_shortcuts(2), vec![Some("⎇1".into()), None]);
         KEYMAP.with(|keys| {
             keys.replace(original);
         });

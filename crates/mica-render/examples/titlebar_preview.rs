@@ -50,6 +50,7 @@ fn main() -> anyhow::Result<()> {
     let families = [
         "Segoe UI",
         "Microsoft YaHei UI",
+        "Segoe UI Symbol",
         "Segoe UI Emoji",
         "Segoe Fluent Icons",
     ];
@@ -110,9 +111,7 @@ fn main() -> anyhow::Result<()> {
             &settings.palette,
             &sm,
             StripExtras {
-                tab_shortcuts: (1..=titles.len())
-                    .map(|i| Some(format!("Ctrl+Shift+{i}")))
-                    .collect(),
+                tab_shortcuts: (1..=titles.len()).map(|i| Some(format!("⌃⇧{i}"))).collect(),
                 caption_x: Some(width as f32 - 3.0 * sm.caption_w),
                 focus,
                 ..Default::default()
