@@ -224,7 +224,7 @@ pub(super) fn strip_hit(px: i32, py: i32) -> Option<mica_render::frame::StripTab
     let right = mica_render::frame::tabs_right(area_w, &sm);
     // 溢出才显箭头(与渲染同判据);箭头绘制在固定屏幕坐标 [2k, 2k+arrow_w) /
     // [right-arrow_w, right),不随 TAB_SCROLL 偏移
-    if mica_render::frame::tabs_x0(&sm) + n as f32 * span > right + 0.5 {
+    if mica_render::frame::tab_scroll_max(n, area_w, &sm) > 0 {
         if x >= 2.0 * sm.k && x < 2.0 * sm.k + sm.arrow_w {
             return Some(StripTabHit::ArrowLeft);
         }
@@ -302,16 +302,9 @@ pub(super) fn tab_scroll_adjust(delta: i32) -> bool {
         .unwrap_or(0.0);
     let sm = strip_metrics();
     let n = TABS.with(|tabs| tabs.borrow().len());
-    let w = mica_render::frame::tab_w_now(n, area_w, &sm);
-    let need = mica_render::frame::tabs_x0(&sm) + n as f32 * (w + sm.tab_gap);
-    let right = mica_render::frame::tabs_right(area_w, &sm);
-    let max = if area_w <= 0.0 || need <= right {
-        0
-    } else {
-        ((need - right) / sm.tab_min_w).ceil() as i32
-    };
+    let max = mica_render::frame::tab_scroll_max(n, area_w, &sm);
     let old = TAB_SCROLL.with(std::cell::Cell::get);
-    let new = (old + delta).clamp(0, max);
+    let new = old.saturating_add(delta).clamp(0, max);
     if new != old {
         TAB_SCROLL.with(|s| s.set(new));
         true
@@ -327,26 +320,9 @@ pub(super) fn tab_follow_active() {
         .unwrap_or(0.0);
     let sm = strip_metrics();
     let n = TABS.with(|tabs| tabs.borrow().len());
-    let w = mica_render::frame::tab_w_now(n, area_w, &sm);
-    let right = mica_render::frame::tabs_right(area_w, &sm);
-    let visible = if area_w <= 0.0 {
-        i32::MAX
-    } else {
-        (((right - mica_render::frame::tabs_x0(&sm)) / (w + sm.tab_gap)).floor() as i32).max(1)
-    };
-    let active = ACTIVE.get() as i32;
-    let cur = TAB_SCROLL.with(std::cell::Cell::get);
-    let want = if active < cur + 1 {
-        (active - 1).max(0) // 左侧滚出:活跃前留一标签
-    } else if active > cur + visible.saturating_sub(1) {
-        active - visible + 1 // 右侧滚出
-    } else {
-        cur
-    };
-    if want != cur {
-        TAB_SCROLL.with(|s| s.set(want));
-        let _ = tab_scroll_adjust(0); // clamp
-    }
+    let cur = TAB_SCROLL.get();
+    let want = mica_render::frame::tab_follow_scroll(n, ACTIVE.get(), cur, area_w, &sm);
+    TAB_SCROLL.set(want);
 }
 
 /// 标签显示名(#81 导出文件名用):TITLE_LOCK 优先,回退标签自身标题

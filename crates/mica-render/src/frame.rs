@@ -349,6 +349,47 @@ pub fn tab_w_now(n: usize, avail_w: f32, sm: &StripMetrics) -> f32 {
     }
 }
 
+/// Scroll steps use tab_min_w pixels in every width policy. Half a physical
+/// pixel absorbs the round-off from equal-width division before ceil().
+pub fn tab_scroll_max(n: usize, avail_w: f32, sm: &StripMetrics) -> i32 {
+    if n == 0 || !avail_w.is_finite() || avail_w <= 0.0 {
+        return 0;
+    }
+    let need = tabs_x0(sm) + n as f32 * (tab_w_now(n, avail_w, sm) + sm.tab_gap) - sm.tab_gap;
+    let overflow = need - tabs_right(avail_w, sm);
+    if overflow <= 0.5 {
+        0
+    } else {
+        (overflow / sm.tab_min_w).ceil() as i32
+    }
+}
+
+/// Keep the active tab visible using the same pixel displacement as drawing.
+pub fn tab_follow_scroll(
+    n: usize,
+    active: usize,
+    current: i32,
+    avail_w: f32,
+    sm: &StripMetrics,
+) -> i32 {
+    let max = tab_scroll_max(n, avail_w, sm);
+    let current = current.clamp(0, max);
+    if max == 0 {
+        return 0;
+    }
+    let w = tab_w_now(n, avail_w, sm);
+    let left = tabs_x0(sm) + active.min(n - 1) as f32 * (w + sm.tab_gap);
+    let shift = current as f32 * sm.tab_min_w;
+    let next = if left - shift < tabs_x0(sm) {
+        ((left - tabs_x0(sm)) / sm.tab_min_w).floor() as i32
+    } else if left + w - shift > tabs_right(avail_w, sm) {
+        ((left + w - tabs_right(avail_w, sm)) / sm.tab_min_w).ceil() as i32
+    } else {
+        current
+    };
+    next.clamp(0, max)
+}
+
 /// strip 布局参数(T8 溢出滚动):tab_scroll = 向左滚过的标签数。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct StripLayout {
@@ -804,7 +845,8 @@ pub fn strip_quads(
         let inactive_face = mix(bar, white, 0.07);
         let n = titles.len();
         let w = tab_w_now(n, strip_w, sm);
-        let shift = layout.tab_scroll as f32 * sm.tab_min_w;
+        let shift =
+            layout.tab_scroll.clamp(0, tab_scroll_max(n, strip_w, sm)) as f32 * sm.tab_min_w;
         let right = tabs_right(strip_w, sm);
         out.push(rounded(
             tabs_x0(sm) - 2.0 * k,
@@ -1055,7 +1097,7 @@ pub fn strip_quads(
         // 溢出滚动箭头(#39):总占宽超右缘即显(左右缘各一,条底垫背
         // 遮住下层标签);点击步进 = tab_scroll_adjust(±1),hover 提亮
         let span = w + sm.tab_gap;
-        if tabs_x0(sm) + n as f32 * span > right + 0.5 {
+        if tab_scroll_max(n, strip_w, sm) > 0 {
             for (glyph, ax, hov) in [
                 ('\u{E76B}', 2.0 * k, hover.arrow_l),
                 ('\u{E76C}', right - sm.arrow_w, hover.arrow_r),
@@ -2066,6 +2108,78 @@ mod tests {
         );
         let body = 900.0 - sm.plus_w - 14.0 * sm.k - sm.tab_gap * 2.0;
         assert_eq!(equal_tab_w(2, 900.0, &sm), body / 2.0, "两标签均分");
+    }
+
+    #[test]
+    fn equal_tabs_never_scroll_for_rounding_noise_and_reclamp_after_resize() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let sm = StripMetrics::from_scale(scale);
+            for n in 1..=16 {
+                for width in (300..3000).step_by(7).map(|v| v as f32) {
+                    let minimum = tabs_x0(&sm) + n as f32 * (sm.tab_min_w + sm.tab_gap);
+                    if minimum <= tabs_right(width, &sm) {
+                        assert_eq!(
+                            tab_scroll_max(n, width, &sm),
+                            0,
+                            "n={n} width={width} scale={scale}"
+                        );
+                        assert_eq!(tab_follow_scroll(n, n - 1, 8, width, &sm), 0);
+                    }
+                }
+            }
+            let end = tabs_x0(&sm) + 5.0 * sm.tab_min_w + 4.0 * sm.tab_gap;
+            let just_fits = end + sm.plus_w + 8.0 * sm.k;
+            assert_eq!(tab_scroll_max(5, just_fits, &sm), 0);
+            assert_eq!(tab_scroll_max(5, just_fits - 0.4, &sm), 0);
+            let width = 600.0 * scale;
+            let max = tab_scroll_max(20, width, &sm);
+            assert!(max > 0);
+            let last = tab_follow_scroll(20, 19, 0, width, &sm);
+            assert!(last > 0 && last <= max);
+            assert_eq!(tab_follow_scroll(20, 0, last, width, &sm), 0);
+            assert_eq!(tab_follow_scroll(20, 19, last, 4000.0 * scale, &sm), 0);
+        }
+    }
+
+    #[test]
+    fn fitting_tabs_discard_a_stale_scroll_offset() {
+        let mut router = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let sm = StripMetrics::default();
+        let titles = (0..5)
+            .map(|i| (format!("tab-{i}"), i == 3))
+            .collect::<Vec<_>>();
+        let mut extras = StripExtras {
+            caption_x: Some(1400.0),
+            focus: 1.0,
+            ..Default::default()
+        };
+        let normal = strip_quads(
+            &titles,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &sm,
+            extras.clone(),
+        );
+        extras.layout.tab_scroll = 1;
+        let shifted = strip_quads(
+            &titles,
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &sm,
+            extras,
+        );
+        assert!(
+            normal == shifted,
+            "fitting tabs must fill the same rail even after scrolling a narrower window"
+        );
     }
 
     #[test]

@@ -167,6 +167,7 @@ pub(super) fn draw_frame() {
         rebuild_gpu_after_loss();
     }
     // 条高先取(动态:单标签隐藏第二行;取值含 TABS 借用,须在 guard 外)
+    let _ = tab_scroll_adjust(0);
     let sh = strip_h();
     // T05 批次容器:TABS 闭包填充,GPU 阶段消费(闭包早退 = 空批,
     // GPU 阶段退化为纯清屏帧)
