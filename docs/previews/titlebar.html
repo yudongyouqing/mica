@@ -6,13 +6,39 @@
 <link rel="icon" href="data:,">
 <style>
 *{box-sizing:border-box}body{margin:0;color:#272c29;background:#f2f2ed;font:15px/1.5 "Segoe UI","Microsoft YaHei",sans-serif}button,select{font:inherit;color:inherit}button{cursor:pointer;border:0;background:none}button:focus-visible,select:focus-visible{outline:2px solid #418678;outline-offset:-2px}main{max-width:1260px;margin:auto;padding:36px clamp(16px,5vw,76px)}header,.options,.row,.bar,.tab,.caption,footer,.tools{display:flex;align-items:center}.brand{display:flex;align-items:center;gap:10px;font-size:22px;font-weight:650;letter-spacing:-1px}.mark{display:grid;place-items:center;width:28px;height:28px;background:#2b3e38;color:#d7ecd9;border-radius:7px;font:600 14px/1 monospace}.sub{margin-left:auto;color:#616b64;font-size:13px}header{border-bottom:1px solid #cdd2ca;padding-bottom:18px}h1{font:500 clamp(29px,4vw,48px)/1.15 "Segoe UI","Microsoft YaHei",sans-serif;letter-spacing:-.055em;margin:40px 0 22px}.options{justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}.seg{display:inline-flex;border:1px solid #c2c9c0;padding:3px;border-radius:8px;gap:2px}.seg button,.tools button,select{font-size:13px;padding:6px 13px;border-radius:5px}.seg [aria-pressed=true]{color:#fff;background:#37473e}.tools{flex-wrap:wrap;gap:5px}.tools button,select{border:1px solid #c7cdc3;background:#f9faf6}#stage{padding:clamp(14px,4vw,51px) clamp(10px,3.3vw,44px);background:#dce1d6;border:1px solid #cbd3c8;border-radius:18px}.window{--bg:#1f1f28;--chrome:#25252f;--edge:#42424c;--muted:#a4a2a1;--fg:#dcd7ba;--mint:#98bb6c;--blue:#7e9cd8;--ochre:#e6c384;color:var(--fg);background:var(--bg);border:1px solid var(--edge);border-radius:10px;box-shadow:0 13px 35px #25332629;overflow:hidden;font-family:"Segoe UI","Microsoft YaHei",sans-serif}.lotus{--bg:#f2ecbc;--chrome:#eae5bf;--edge:#c8c5a5;--muted:#64665a;--fg:#43436c;--mint:#4d703c;--blue:#4d699b;--ochre:#825a32}.bar{height:42px;background:var(--chrome);border-bottom:1px solid var(--edge);padding-left:10px;gap:4px;user-select:none}.shellmark{font:700 16px/1 Consolas,monospace;color:var(--ochre);padding:0 7px}.tabs{align-self:stretch;display:flex;min-width:0;overflow:auto;scrollbar-width:none;align-items:center;gap:4px}.tab{width:156px;max-width:180px;min-width:70px;gap:5px;font-size:12px;color:var(--muted);height:30px;border-radius:5px;position:relative;flex-shrink:0}.tab>button:first-child{flex:1;min-width:0;text-overflow:ellipsis;overflow:hidden;white-space:nowrap;text-align:left;padding:5px 4px 5px 10px}.tab.active{background:var(--bg);color:var(--fg);box-shadow:inset 0 0 0 1px var(--edge);font-weight:600}.closeTab{opacity:0;width:24px;font-size:14px}.tab:is(.active,:hover,:focus-within) .closeTab{opacity:.8}.line .bar{background:var(--bg)}.line .tab.active{background:transparent;box-shadow:none}.line .active:after{content:"";position:absolute;bottom:-5px;left:10px;width:18px;height:2px;background:var(--ochre)}.tab.over{box-shadow:inset 3px 0 var(--mint)}.add,.sys{font:16px/1 "Segoe UI",sans-serif;color:var(--muted);height:100%;flex:none}.add{width:30px}.dragspace{flex:1;min-width:24px;height:100%;cursor:grab}.caption{height:100%;margin-left:auto}.sys{width:36px}.sys:hover,.add:hover,.tab:hover{background:color-mix(in srgb,var(--fg) 8%,transparent)}.sys:last-child:hover{background:#aa424a;color:white}.unfocused .bar>*{opacity:.58}.screen{font:14px/1.75 "Cascadia Mono",Consolas,"Microsoft YaHei",monospace;padding:32px clamp(16px,3vw,35px);min-height:326px;overflow:auto}.cmd{color:var(--fg)}.path{color:var(--blue)}.ok{color:var(--mint)}.hint{color:var(--muted)}.gold{color:var(--ochre)}.cmd:before{content:"❯ ";color:var(--mint)}pre{font:inherit;margin:8px 0 24px;white-space:pre-wrap;overflow-wrap:anywhere}.caret{display:inline-block;width:8px;height:16px;background:var(--fg);vertical-align:middle}footer{justify-content:space-between;margin-top:18px;font-size:12px;color:#626c64;gap:8px;flex-wrap:wrap}details{margin:18px 0;color:#556258;font-size:13px}summary{cursor:pointer}a{color:#355e50;margin-right:14px}#stage.max{padding:0}#reopen{padding:8px 14px;border:1px solid #a8b4a6;border-radius:5px}button[hidden],section[hidden]{display:none}@media(max-width:650px){main{padding:18px 12px}.bar{padding-left:1px;gap:0}.shellmark{display:none}.sys{width:24px}.tab{max-width:116px}.screen{font-size:12px}.dragspace{min-width:8px}#stage{padding:10px 5px}.options{align-items:flex-start}.tools button,select{padding:5px 8px}h1{margin-top:26px}}@media(forced-colors:active){.tab.active{outline:2px solid Highlight}}
+
+.titleline {display:none}
+.shortcut {color:var(--muted);font-size:10px;font-weight:400;white-space:nowrap;padding-right:10px;pointer-events:none}
+.window:not(.compact) .shortcut {display:none}
+.compact .titleline {display:flex;height:32px;align-items:center;padding-left:14px;gap:8px;user-select:none}
+.folder-icon {width:13px;height:10px;background:var(--blue);border-radius:2px;position:relative;opacity:.8;flex:none}
+.folder-icon:before {content:"";position:absolute;left:0;top:-2px;width:6px;height:3px;background:inherit;border-radius:2px}
+.windowpath {color:var(--muted);font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.titleline .dragspace {align-self:stretch}
+.compact .bar {height:34px;background:var(--bg);border:0;padding:0 8px 6px;gap:5px}
+.compact .shellmark,.compact .bar>.dragspace {display:none}
+.compact .tabs {border-radius:16px;background:color-mix(in srgb,var(--fg) 7%,var(--bg));flex:1;gap:0;padding:2px;align-self:stretch}
+.compact .tab {flex:1 1 0;width:auto;max-width:none;min-width:115px;height:24px;gap:0;border-radius:13px}
+.compact .tab>button:first-child {text-align:center;font-size:11px;padding:3px 5px 3px 12px}
+.compact .tab.active {color:color-mix(in srgb,var(--fg) 65%,white);background:color-mix(in srgb,var(--fg) 21%,var(--bg));box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--fg) 23%,transparent)}
+.compact.lotus .tab.active {color:var(--fg)}
+.compact .tab.active:after {display:none}
+.compact .tab.active .shortcut {color:inherit;font-weight:600}
+.compact .closeTab {position:absolute;left:3px;width:18px;padding:0;font-size:12px;opacity:0}
+.compact .tab:is(:hover,:focus-within) .closeTab {opacity:.85}
+.compact .tab:is(:hover,:focus-within)>button:first-child {padding-left:21px}
+.compact .add {width:27px;height:27px;border:1px solid color-mix(in srgb,var(--fg) 16%,transparent);border-radius:50%;font-size:17px}
+.compact .screen {padding-top:20px}
+.unfocused .titleline>* {opacity:.58}
+@media(max-width:650px) {.seg {flex-wrap:wrap}.compact .titleline{padding-left:10px}.compact .tab{min-width:120px}.titleline .dragspace{min-width:10px}}
 </style>
 <main>
 <header><span class="brand"><span class="mark" aria-hidden="true">›_</span>Mica</span><span class="sub">桌面终端设计预览</span></header>
 <h1>窗口标题栏</h1>
-<div class="options"><div class="seg" aria-label="标题栏样式"><button id="soft" aria-pressed="true">嵌入式标签</button><button id="line" aria-pressed="false">极简线标</button></div>
+<div class="options"><div class="seg" aria-label="标题栏样式"><button id="compact" aria-pressed="true">紧凑双行</button><button id="soft" aria-pressed="false">嵌入式标签</button><button id="line" aria-pressed="false">极简线标</button></div>
 <div class="tools"><select id="theme" aria-label="终端主题"><option>Kanagawa Wave</option><option>Kanagawa Lotus</option></select><button id="focus" aria-pressed="false">模拟失焦</button><button id="reset">复位</button></div></div>
-<div id="stage"><button id="reopen" hidden>重新打开预览窗口</button><section id="win" class="window" aria-label="Mica 窗口预览">
+<div id="stage"><button id="reopen" hidden>重新打开预览窗口</button><section id="win" class="window compact" aria-label="Mica 窗口预览">
+<div class="titleline"><span class="folder-icon" aria-hidden="true"></span><span id="windowpath" class="windowpath"></span><div class="dragspace" title="窗口拖动区"></div></div>
 <div class="bar"><span class="shellmark" aria-hidden="true">›_</span><div class="tabs" id="tabs" role="tablist" aria-label="终端会话"></div><button id="add" class="add" aria-label="新建标签">+</button><div class="dragspace" title="原生窗口拖动区"></div><div class="caption"><button class="sys" id="min" aria-label="折叠终端内容">−</button><button class="sys" id="max" aria-label="最大化预览">□</button><button class="sys" id="exitwin" aria-label="关闭预览窗口">×</button></div></div>
 <div id="screen" class="screen" role="tabpanel"></div></section></div>
 <footer><span>点按切换会话，拖动标签调整顺序。</span><span id="status" aria-live="polite"></span></footer>
@@ -33,17 +59,32 @@ function draw(){
   tab.onkeydown=e=>{if(!['ArrowLeft','ArrowRight'].includes(e.key))return;e.preventDefault();active=sessions[(sessions.indexOf(s)+(e.key==='ArrowLeft'?-1:1)+sessions.length)%sessions.length];draw();el('tabs').querySelector('[aria-selected=true]').focus()};
   const close=document.createElement('button');close.className='closeTab';close.textContent='×';close.setAttribute('aria-label','关闭 '+s.name);close.onclick=()=>{const i=sessions.indexOf(s);sessions.splice(i,1);if(s===active)active=sessions[Math.min(i,sessions.length-1)];if(!active)hideWindow();draw()};
   wrap.ondragstart=()=>{dragged=s};wrap.ondragover=e=>{e.preventDefault();wrap.classList.add('over')};wrap.ondragleave=()=>wrap.classList.remove('over');wrap.ondragend=()=>{dragged=null;document.querySelectorAll('.over').forEach(n=>n.classList.remove('over'))};wrap.ondrop=e=>{e.preventDefault();if(!dragged)return;const i=sessions.indexOf(s);sessions.splice(sessions.indexOf(dragged),1);sessions.splice(i,0,dragged);draw()};
-  wrap.append(tab,close);el('tabs').append(wrap);
+  const shortcut=document.createElement('span');shortcut.className='shortcut';shortcut.textContent='Ctrl+'+(sessions.indexOf(s)+1);shortcut.setAttribute('aria-hidden','true');tab.title=s.name;wrap.append(tab,shortcut,close);el('tabs').append(wrap);
  }
- if(active){el('screen').innerHTML=examples[active.example][1]+'<div class="cmd"><span class="caret"></span></div>';el('tabs').querySelector('.active')?.scrollIntoView({block:'nearest',inline:'nearest'})}
- el('status').textContent=sessions.length+' 个标签 · 42 px 标题栏';
+ if(active){el('windowpath').textContent=active.cwd;el('screen').innerHTML=examples[active.example][1]+'<div class="cmd"><span class="caret"></span></div>';el('tabs').querySelector('.active')?.scrollIntoView({block:'nearest',inline:'nearest'})}
+ el('status').textContent=sessions.length+' 个标签 · '+(el('win').classList.contains('compact')?'紧凑双行':'单行');
 }
 function hideWindow(){el('win').hidden=true;el('reopen').hidden=false}
-function reset(){sessions=examples.map(([name],example)=>({name,example}));active=sessions[0];serial=1;el('win').hidden=false;el('reopen').hidden=true;el('screen').hidden=false;el('stage').classList.remove('max');el('win').classList.remove('unfocused');el('focus').setAttribute('aria-pressed',false);draw()}
+function reset(){sessions=[{name:'PowerShell',example:1,cwd:'~/Documents'},{name:'◐ cargo test · 正在运行',example:2,cwd:'~/code/mica'},{name:'~/code/mica',example:0,cwd:'~/code/mica'},{name:'ssh · dev-server',example:1,cwd:'dev-server · ~/services'},{name:'docs · configuration',example:0,cwd:'~/code/mica/docs'}];active=sessions[2];serial=1;el('win').hidden=false;el('reopen').hidden=true;el('screen').hidden=false;el('stage').classList.remove('max');el('win').classList.remove('unfocused');el('focus').setAttribute('aria-pressed',false);draw()}
 el('reset').onclick=reset;el('reopen').onclick=reset;el('exitwin').onclick=hideWindow;el('max').onclick=()=>el('stage').classList.toggle('max');el('min').onclick=()=>{el('screen').hidden=!el('screen').hidden};
-el('add').onclick=()=>{active={name:'PowerShell '+(++serial),example:1};sessions.push(active);draw()};
+el('add').onclick=()=>{active={name:'PowerShell '+(++serial),example:1,cwd:'~/Documents'};sessions.push(active);draw()};
 el('focus').onclick=()=>el('focus').setAttribute('aria-pressed',el('win').classList.toggle('unfocused'));
 el('theme').onchange=()=>el('win').classList.toggle('lotus',el('theme').selectedIndex===1);
-for(const id of ['soft','line'])el(id).onclick=()=>{el('win').classList.toggle('line',id==='line');for(const k of ['soft','line'])el(k).setAttribute('aria-pressed',k===id)};
+function setLayout(id) {
+ el('win').classList.toggle('compact',id==='compact');
+ el('win').classList.toggle('line',id==='line');
+ const caption=el('win').querySelector('.caption');
+ (id==='compact'?el('win').querySelector('.titleline'):el('win').querySelector('.bar')).append(caption);
+ for(const k of ['compact','soft','line'])el(k).setAttribute('aria-pressed',k===id);
+ draw();
+}
+for(const id of ['compact','soft','line'])el(id).onclick=()=>setLayout(id);
+document.addEventListener('keydown',event=>{
+ if(event.ctrlKey && /^[1-9]$/.test(event.key)){
+  const session=sessions[Number(event.key)-1];
+  if(session){event.preventDefault();active=session;draw();}
+ }
+});
 reset();
+setLayout("compact");
 </script></html>

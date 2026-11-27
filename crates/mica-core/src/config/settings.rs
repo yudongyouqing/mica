@@ -752,7 +752,7 @@ mod tests {
         assert_eq!(resolve(&source).unwrap(), Settings::default());
         assert_eq!(Settings::default().font_size_pt, 12.0);
         assert_eq!(Settings::default().palette, Palette::DEFAULT);
-        assert_eq!(Settings::default().strip.font_size_pt, 11.0);
+        assert_eq!(Settings::default().strip.font_size_pt, 9.5);
         assert_eq!(Settings::default().keymap, Keymap::wt_default());
         assert_eq!(Settings::default().window_width, 100);
         assert_eq!(Settings::default().window_height, 30);
@@ -774,20 +774,20 @@ mod tests {
         assert_eq!(
             Settings::default().strip,
             StripCfg {
-                font_weight: 600,
-                title_centered: true,
+                font_weight: 400,
+                title_centered: false,
                 title_highlight: false,
                 title_highlight_color: None,
                 title_highlight_opacity: 0.06,
                 title_highlight_radius: 4.0,
                 font_family: Some("Segoe UI".into()),
-                font_size_pt: 11.0,
+                font_size_pt: 9.5,
                 title_h: 32.0,
-                tab_h: 36.0,
-                tab_min_w: 88.0,
-                tab_corner_r: 8.0,
+                tab_h: 34.0,
+                tab_min_w: 128.0,
+                tab_corner_r: 12.0,
                 wide_tabs: true,
-                hide_single: true,
+                hide_single: false,
                 bar: None,
                 bar_wash: 0.0,
                 bar_wash_unfocused: 0.04,

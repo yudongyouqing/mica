@@ -79,20 +79,20 @@ quick-terminal-height = 40
 # Tab/title strip: geometry in logical pixels; animations in milliseconds.
 # UI fonts are separate from terminal grid fonts; strip-font-family is an alias.
 window-title-font-family = Segoe UI
-strip-font-size = 11
+strip-font-size = 9.5
 # DirectWrite weights: 400 regular, 600 semibold, 700 bold.
-strip-font-weight = 600
-strip-title-align = center
+strip-font-weight = 400
+strip-title-align = left
 strip-title-highlight = false
 strip-title-highlight-color = auto
 strip-title-highlight-opacity = 0.06
 strip-title-highlight-radius = 4
 strip-title-height = 32
-strip-tab-height = 36
-strip-tab-min-width = 88
-strip-tab-corner-radius = 8
+strip-tab-height = 34
+strip-tab-min-width = 128
+strip-tab-corner-radius = 12
 strip-wide-tabs = true
-strip-hide-single-tab = true
+strip-hide-single-tab = false
 strip-bar-color = auto
 strip-active-tab-color = auto
 strip-text-color = auto

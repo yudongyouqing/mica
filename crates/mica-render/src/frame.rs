@@ -361,8 +361,10 @@ pub struct StripLayout {
 pub struct StripExtras {
     /// Insertion index indicated while a tab from another window is over the strip.
     pub drop_slot: Option<usize>,
+    pub window_title: Option<String>,
     /// Optional accents indexed like the tab titles.
     pub tab_colors: Vec<Option<[u8; 3]>>,
+    pub tab_shortcuts: Vec<Option<String>>,
     /// D37 OSC 133 exit 状态点
     pub exit_dot: Option<ExitDot>,
     /// T8 系统按钮区起点(客户区坐标)
@@ -538,7 +540,9 @@ pub fn strip_quads(
 ) -> Vec<CellInstance> {
     let StripExtras {
         drop_slot,
+        window_title,
         tab_colors,
+        tab_shortcuts,
         exit_dot,
         caption_x,
         layout,
@@ -559,11 +563,18 @@ pub fn strip_quads(
     let focus = focus.clamp(0.0, 1.0);
     let wash = sm.bar_wash + (sm.bar_wash_unfocused - sm.bar_wash) * (1.0 - focus);
     let bar = sm.bar_c.unwrap_or_else(|| mix(bg3, [0; 3], wash));
-    let active_face = sm.active_c.unwrap_or(bg3);
+    let active_face = sm
+        .active_c
+        .unwrap_or_else(|| mix(bar, rgb3(palette.fg), 0.21));
     let white = sm
         .text_c
         .unwrap_or([palette.fg.r, palette.fg.g, palette.fg.b]);
-    let ink2 = sm.dim_c.unwrap_or_else(|| mix(white, bar, 0.35));
+    let dim_mix = if relative_luminance(bg3) > 0.5 {
+        0.10
+    } else {
+        0.35
+    };
+    let ink2 = sm.dim_c.unwrap_or_else(|| mix(white, bar, dim_mix));
     let k = sm.k;
     let cw = metrics.cell_width;
     // 等宽格步进的字符步长:宽字形(CJK)按墨宽推进,窄字符不小于格宽
@@ -585,7 +596,26 @@ pub fn strip_quads(
 
     // ---- 第一行:窗口标题(活跃标签名,居中;caption 左界内,超宽省略号)
     let title_y = (sm.title_h - metrics.line_height).max(0.0) / 2.0;
-    let left = 8.0 * k;
+    let left = 28.0 * k;
+    let folder = rgb3(palette.colors[4]);
+    out.push(rounded(
+        12.0 * k,
+        (sm.title_h - 9.0 * k) * 0.5,
+        12.0 * k,
+        9.0 * k,
+        folder,
+        bar,
+        (1.5 * k, 1.5 * k),
+    ));
+    out.push(rounded(
+        12.0 * k,
+        (sm.title_h - 9.0 * k) * 0.5 - 2.0 * k,
+        5.0 * k,
+        3.0 * k,
+        folder,
+        bar,
+        (1.0 * k, 0.0),
+    ));
     let right = (caption_x.unwrap_or(strip_w) - 8.0 * k).max(left);
     let center = (strip_w * 0.5).clamp(left, right);
     let pad_x = if sm.title_highlight { 8.0 * k } else { 0.0 };
@@ -595,11 +625,13 @@ pub fn strip_quads(
         right - left
     } - 2.0 * pad_x)
         .max(0.0);
-    let title = titles
-        .iter()
-        .find(|(_, active)| *active)
-        .map(|(t, _)| t.as_str())
-        .unwrap_or_default();
+    let title = window_title.as_deref().unwrap_or_else(|| {
+        titles
+            .iter()
+            .find(|(_, active)| *active)
+            .map(|(t, _)| t.as_str())
+            .unwrap_or_default()
+    });
     let ell = router.route('\u{2026}', GlyphStyle::PLAIN);
     let ell_advance = router.ui_advance('\u{2026}').unwrap_or_else(|| adv(&ell));
     let mut routed = Vec::with_capacity(title.len().min(128));
@@ -659,7 +691,7 @@ pub fn strip_quads(
         ));
     }
     let mut tx = text_x;
-    let title_ink = mix(ink2, white, focus);
+    let title_ink = mix(ink2, white, 0.3 * focus);
     for (g, advance) in routed.iter().take(n_take) {
         if g.size_px[0] > 0.0 {
             out.push(CellInstance {
@@ -749,16 +781,25 @@ pub fn strip_quads(
     if !single {
         let tab_y = sm.title_h;
         let tab_d = sm.h - sm.title_h;
-        let text_y = sm.title_h + (tab_d - metrics.line_height).max(0.0) / 2.0;
-        let inactive_face = if active_face == sm.bar_c.unwrap_or(bg3) {
-            mix(bar, [0; 3], (sm.bar_wash_unfocused * 2.0).min(1.0))
-        } else {
-            bar
-        };
+        let rail_y = tab_y + 2.0 * k;
+        let rail_h = (tab_d - 6.0 * k).max(1.0);
+        let pill_y = rail_y + 2.0 * k;
+        let pill_h = (rail_h - 4.0 * k).max(1.0);
+        let text_y = pill_y + (pill_h - metrics.line_height) * 0.5;
+        let inactive_face = mix(bar, white, 0.07);
         let n = titles.len();
         let w = tab_w_now(n, strip_w, sm);
         let shift = layout.tab_scroll as f32 * sm.tab_min_w;
         let right = tabs_right(strip_w, sm);
+        out.push(rounded(
+            tabs_x0(sm) - 2.0 * k,
+            rail_y,
+            (right - tabs_x0(sm) + 4.0 * k).max(0.0),
+            rail_h,
+            inactive_face,
+            bar,
+            (rail_h * 0.5, rail_h * 0.5),
+        ));
         // 拖拽槽位序(挤压式):被拖标签占目标槽,其余按原序填空——拖住的
         // 手粘光标(左缘 = drag_x),邻位实时让位;松手 app 侧提交顺序
         let (drag_idx, drag_slot, drag_x) = match drag {
@@ -786,6 +827,7 @@ pub fn strip_quads(
             if x0 + w <= 0.0 || (i != drag_idx && x0 >= right) {
                 continue; // 滚出可视区的标签不发射(被拖标签恒画)
             }
+            let tab_start = out.len();
             let hovered = hover.tab == Some(i) && i != drag_idx;
             let hover_face = mix(inactive_face, white, 0.05);
             let (backdrop, ink) = if *active {
@@ -795,31 +837,28 @@ pub fn strip_quads(
             } else {
                 (inactive_face, ink2)
             };
-            // 标签块:上圆下方——活跃块 = 终端底色,下缘直抵内容区无缝
-            // 相接(macOS 原生标签形制);非活跃悬停轻提亮
-            if backdrop != bar || *active || hovered {
+            if *active || hovered {
+                let radius = sm.tab_top_r.min(pill_h * 0.5);
+                let border = mix(backdrop, white, 0.18);
                 out.push(rounded(
                     x0,
-                    tab_y,
+                    pill_y,
                     w,
-                    tab_d,
-                    backdrop,
-                    bar,
-                    (sm.tab_top_r, 0.0),
+                    pill_h,
+                    border,
+                    inactive_face,
+                    (radius, radius),
                 ));
-            }
-            if *active {
-                let left = (x0 + sm.tab_pad).max(0.0);
-                let width = (x0 + sm.tab_pad + 18.0 * k).min(right) - left;
-                if width > 0.0 {
-                    let ink = bg_of(white);
-                    out.push(CellInstance {
-                        pos_uv: [left, sm.h - 2.0 * k, 0.0, 0.0],
-                        size_uv: [width, 2.0 * k, 0.0, 0.0],
-                        fg: ink,
-                        bg: ink,
-                    });
-                }
+                let inset = k.min(pill_h * 0.25);
+                let r = (radius - inset).max(0.0);
+                out.push(rounded_hard(
+                    x0 + inset,
+                    pill_y + inset,
+                    (w - 2.0 * inset).max(0.0),
+                    (pill_h - 2.0 * inset).max(0.0),
+                    backdrop,
+                    r,
+                ));
             }
             if let Some(color) = tab_colors.get(i).copied().flatten() {
                 let left = x0.max(0.0);
@@ -834,33 +873,87 @@ pub fn strip_quads(
                     });
                 }
             }
-            // 标题:等宽格步进,超宽以省略号截断(× 区前留呼吸)
-            let close_x = x0 + w - sm.tab_close_w;
-            let mut tx = x0 + sm.tab_pad;
-            for ch in title.chars() {
-                let g = router.route(ch, GlyphStyle::PLAIN);
+            let close_x = x0;
+            let label_left = x0 + sm.tab_close_w;
+            let label_right = (x0 + w).min(right) - sm.tab_pad;
+            let shortcut = tab_shortcuts
+                .get(i)
+                .and_then(|s| s.as_deref())
+                .unwrap_or("");
+            let shortcut_width = shortcut
+                .chars()
+                .map(|ch| router.ui_advance(ch).unwrap_or(cw))
+                .sum::<f32>();
+            let show_shortcut =
+                shortcut_width > 0.0 && label_right - label_left > shortcut_width + 50.0 * k;
+            let text_right = label_right
+                - if show_shortcut {
+                    shortcut_width + 10.0 * k
+                } else {
+                    0.0
+                };
+            let available = (text_right - label_left).max(0.0);
+            let style = GlyphStyle {
+                bold: *active,
+                italic: false,
+            };
+            let mut label = Vec::new();
+            let mut label_width = 0.0;
+            let mut truncated = false;
+            for ch in title.chars().take(4096) {
+                let g = router.route(ch, style);
                 let advance = router.ui_advance(ch).unwrap_or_else(|| adv(&g));
-                if tx + advance + ell_advance > close_x - 6.0 * k {
-                    if ell.size_px[0] > 0.0 {
-                        out.push(CellInstance {
-                            pos_uv: [
-                                tx + ell.offset_px[0],
-                                text_y + ell.offset_px[1],
-                                ell.uv[0],
-                                ell.uv[1],
-                            ],
-                            size_uv: [ell.size_px[0], ell.size_px[1], ell.uv[2], ell.uv[3]],
-                            fg: glyph_tint(bg_of(ink), ell.color),
-                            bg: bg_of(backdrop),
-                        });
-                    }
+                if label_width + advance > available {
+                    truncated = true;
                     break;
                 }
+                label_width += advance;
+                label.push((g, advance));
+            }
+            if truncated {
+                while label_width + ell_advance > available {
+                    let Some((_, advance)) = label.pop() else {
+                        break;
+                    };
+                    label_width -= advance;
+                }
+                if ell_advance <= available {
+                    label.push((ell, ell_advance));
+                    label_width += ell_advance;
+                }
+            }
+            let mut tx = label_left + (available - label_width).max(0.0) * 0.5;
+            for (g, advance) in label {
+                out.push(glyph_instance_rgba(
+                    tx,
+                    text_y,
+                    &g,
+                    bg_of(ink),
+                    bg_of(backdrop),
+                ));
+                tx += advance;
+            }
+            if show_shortcut {
+                let mut x = label_right - shortcut_width;
+                for ch in shortcut.chars() {
+                    let g = router.route(ch, GlyphStyle::PLAIN);
+                    out.push(glyph_instance_rgba(
+                        x,
+                        text_y,
+                        &g,
+                        bg_of(ink2),
+                        bg_of(backdrop),
+                    ));
+                    x += router.ui_advance(ch).unwrap_or(cw);
+                }
+            }
+            if hovered {
+                let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
                 if g.size_px[0] > 0.0 {
                     out.push(CellInstance {
                         pos_uv: [
-                            tx + g.offset_px[0],
-                            text_y + g.offset_px[1],
+                            close_x + (sm.tab_close_w - g.size_px[0]) * 0.5,
+                            pill_y + (pill_h - g.size_px[1]) * 0.5,
                             g.uv[0],
                             g.uv[1],
                         ],
@@ -869,27 +962,23 @@ pub fn strip_quads(
                         bg: bg_of(backdrop),
                     });
                 }
-                tx += advance;
             }
-            // × 关闭钮(Fluent ChromeClose E8BB):激活常显(次级灰)、
-            // 悬停浮现(主色);胶囊内双向真居中(不带 offset,见 caption 注),
-            // 点区在 WM_LBUTTONDOWN 同几何
-            if *active || hovered {
-                let kink = if *active { ink2 } else { white };
-                let g = router.route('\u{E8BB}', GlyphStyle::PLAIN);
-                if g.size_px[0] > 0.0 {
-                    out.push(CellInstance {
-                        pos_uv: [
-                            close_x + (sm.tab_close_w - g.size_px[0]) / 2.0,
-                            tab_y + (tab_d - g.size_px[1]) / 2.0,
-                            g.uv[0],
-                            g.uv[1],
-                        ],
-                        size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                        fg: glyph_tint(bg_of(kink), g.color),
-                        bg: bg_of(backdrop),
-                    });
+            // Clip every tab to the same visible domain used by hit testing.
+            // Texture coordinates track geometry clipping so glyphs stay sharp.
+            for quad in &mut out[tab_start..] {
+                let x = quad.pos_uv[0];
+                let width = quad.size_uv[0];
+                let left = x.max(tabs_x0(sm));
+                let end = (x + width).min(right);
+                if end <= left || width <= 0.0 {
+                    quad.size_uv = [0.0; 4];
+                    continue;
                 }
+                let uv_width = quad.size_uv[2];
+                quad.pos_uv[2] += (left - x) / width * uv_width;
+                quad.size_uv[2] = (end - left) / width * uv_width;
+                quad.pos_uv[0] = left;
+                quad.size_uv[0] = end - left;
             }
         }
         // "+" 开新标签(第二行右端;Chrome/WT/Tahoe 都在标签行右端,
@@ -900,18 +989,26 @@ pub fn strip_quads(
             let face = mix(bar, white, 0.05);
             // "+":开标签的主入口,恒白(旧 dim 在浅灰条上实测不可见)
             let (glyph_bg, ink) = if hovered { (face, white) } else { (bar, white) };
-            if hovered {
-                let r = tab_d / 2.0;
-                out.push(rounded(
-                    x + (sm.plus_w - tab_d) / 2.0,
-                    tab_y,
-                    tab_d,
-                    tab_d,
-                    face,
-                    bar,
-                    (r, r),
-                ));
-            }
+            let diameter = rail_h.min(sm.plus_w - 2.0 * k);
+            let circle_y = rail_y + (rail_h - diameter) * 0.5;
+            let circle_x = x + (sm.plus_w - diameter) * 0.5;
+            out.push(rounded(
+                circle_x,
+                circle_y,
+                diameter,
+                diameter,
+                mix(bar, white, 0.16),
+                bar,
+                (diameter * 0.5, diameter * 0.5),
+            ));
+            out.push(rounded_hard(
+                circle_x + k,
+                circle_y + k,
+                diameter - 2.0 * k,
+                diameter - 2.0 * k,
+                glyph_bg,
+                (diameter - 2.0 * k) * 0.5,
+            ));
             let g = router.route('+', GlyphStyle::PLAIN);
             if g.size_px[0] > 0.0 {
                 out.push(CellInstance {
@@ -1583,7 +1680,10 @@ mod tests {
             glyph_h: 12.0,
             wide: |_| false,
         };
-        let metrics = StripMetrics::default();
+        let metrics = StripMetrics {
+            title_centered: true,
+            ..StripMetrics::default()
+        };
         let width = 600.0;
         let caption = width - 3.0 * metrics.caption_w;
         let quads = strip_quads(
@@ -1734,11 +1834,10 @@ mod tests {
                             ..Default::default()
                         },
                     );
-                    assert!(
-                        !plain.iter().any(|q| q.size_uv[2] == 0.0
-                            && q.bg[3] > 0.0
-                            && q.pos_uv[1] < sm.title_h)
-                    );
+                    assert!(!plain.iter().any(|q| q.size_uv[2] == 0.0
+                        && q.bg[3] > 0.0
+                        && q.pos_uv[0] >= 28.0 * sm.k
+                        && q.pos_uv[1] < sm.title_h));
                 }
             }
         }
@@ -1942,6 +2041,77 @@ mod tests {
     }
 
     #[test]
+    fn compact_tabs_clip_at_the_visible_rail_edge() {
+        let mut router = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let sm = StripMetrics::default();
+        let width = 240.0;
+        let out = strip_quads(
+            &(0..5)
+                .map(|i| ("很长的窗口标题".repeat(6), i == 0))
+                .collect::<Vec<_>>(),
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &sm,
+            StripExtras {
+                caption_x: Some(width - 3.0 * sm.caption_w),
+                focus: 1.0,
+                ..Default::default()
+            },
+        );
+        let right = tabs_right(width, &sm);
+        for q in out.iter().filter(|q| {
+            q.size_uv[2] > 0.0 && q.pos_uv[1] >= sm.title_h && q.pos_uv[0] < right - sm.arrow_w
+        }) {
+            assert!(q.pos_uv[0] >= tabs_x0(&sm));
+            assert!(q.pos_uv[0] + q.size_uv[0] <= right + 1.0);
+        }
+    }
+
+    #[test]
+    fn compact_chrome_has_shared_rail_and_inset_capsule() {
+        let mut router = FakeRouter {
+            atlas_w: 64.0,
+            atlas_h: 64.0,
+            glyph_w: 4.0,
+            glyph_h: 8.0,
+            wide: |_| false,
+        };
+        let sm = StripMetrics::default();
+        let out = strip_quads(
+            &[("one".into(), true), ("two".into(), false)],
+            &mut router,
+            &metrics_8x16(),
+            &Palette::DEFAULT,
+            &sm,
+            StripExtras {
+                caption_x: Some(400.0),
+                focus: 1.0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            out.iter()
+                .any(|q| q.size_uv[0] > 300.0 && q.bg[3] > 0.0 && q.fg[3] == q.bg[3]),
+            "all tabs share a rounded rail"
+        );
+        let w = tab_w_now(2, 400.0 + 3.0 * sm.caption_w, &sm);
+        assert!(
+            out.iter().any(|q| q.size_uv[0] == w
+                && q.size_uv[1] < sm.tab_h
+                && q.bg[3] > 0.0
+                && q.fg[3] == q.bg[3]),
+            "active capsule is inset with four rounded corners"
+        );
+    }
+
+    #[test]
     fn strip_two_tabs_active_block_and_close() {
         let mut r = FakeRouter {
             atlas_w: 64.0,
@@ -1964,15 +2134,14 @@ mod tests {
             },
         );
         let sm = StripMetrics::default();
-        // 活动标签块:第二行整高(title_h 起)、上圆下方、面色 = 终端底
         let want_w = equal_tab_w(2, 400.0 + 3.0 * sm.caption_w, &sm);
         assert!(
             out.iter().any(|q| q.size_uv[0] == want_w
-                && q.size_uv[1] == sm.h - sm.title_h
-                && q.pos_uv[1] == sm.title_h
-                && q.bg[3] == sm.tab_top_r
-                && q.fg[3] == 0.0),
-            "活动标签块(第二行整高,上圆下方,等宽 {want_w})"
+                && q.pos_uv[1] > sm.title_h
+                && q.size_uv[1] < sm.tab_h
+                && q.bg[3] > 0.0
+                && q.fg[3] == q.bg[3]),
+            "inset active capsule"
         );
         let want_bar = to_color(rgb3(Palette::DEFAULT.bg));
         assert!(
@@ -2006,7 +2175,10 @@ mod tests {
             &mut r,
             &metrics_8x16(),
             &Palette::DEFAULT,
-            &StripMetrics::default(),
+            &StripMetrics {
+                hide_single: true,
+                ..StripMetrics::default()
+            },
             StripExtras {
                 caption_x: Some(400.0),
                 focus: 1.0,
@@ -2014,7 +2186,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let sm = StripMetrics::default();
+        let sm = StripMetrics {
+            hide_single: true,
+            ..StripMetrics::default()
+        };
         // 条底只到标题行底
         assert!(
             out.iter()

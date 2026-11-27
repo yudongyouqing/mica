@@ -803,7 +803,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let local = px as f32 + shift
                         - mica_render::frame::tabs_x0(&sm)
                         - idx as f32 * (w + sm.tab_gap);
-                    if n > 1 && local >= w - sm.tab_close_w {
+                    if local >= 0.0 && local < sm.tab_close_w {
                         close_tab(idx);
                         return LRESULT(0);
                     }

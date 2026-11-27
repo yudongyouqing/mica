@@ -239,8 +239,8 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
         GetWindowRect(origin, &mut a).unwrap();
         GetWindowRect(detached, &mut b).unwrap();
     }
-    let drop_point = pack(a.left + 40 - b.left, a.top + row - b.top);
-    send(detached, WM_LBUTTONDOWN, 1, pack(40, row));
+    let drop_point = pack(a.left + 80 - b.left, a.top + row - b.top);
+    send(detached, WM_LBUTTONDOWN, 1, pack(80, row));
     send(detached, WM_MOUSEMOVE, 1, drop_point);
     send(detached, WM_LBUTTONUP, 0, drop_point);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -267,8 +267,8 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(window_title(origin), "SingleTabDropTest");
-    send(origin, WM_LBUTTONDOWN, 1, pack(40, row));
-    send(origin, WM_LBUTTONUP, 0, pack(40, 230));
+    send(origin, WM_LBUTTONDOWN, 1, pack(80, row));
+    send(origin, WM_LBUTTONUP, 0, pack(80, 230));
     let windows = wait_windows(app.0.id(), 2, Duration::from_secs(15));
     let single = *windows.iter().find(|w| **w != origin).unwrap();
     let mut cursor = windows::Win32::Foundation::POINT::default();

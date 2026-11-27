@@ -4,6 +4,60 @@
 
 use super::*;
 
+thread_local! {
+    static SHORTCUTS: RefCell<Option<(Keymap,Vec<Option<String>>)>> = const { RefCell::new(None) };
+}
+
+/// Show only numeric accelerators that actually select this tab.
+pub(super) fn tab_shortcuts(count: usize) -> Vec<Option<String>> {
+    KEYMAP.with(|keys| {
+        let keys = keys.borrow();
+        SHORTCUTS.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.as_ref().is_none_or(|(previous, _)| previous != &*keys) {
+                let hints = (1..=9)
+                    .map(|i| {
+                        if i > 9 {
+                            return None;
+                        }
+                        for mask in 1..16 {
+                            let mods = Mods {
+                                ctrl: mask & 1 != 0,
+                                shift: mask & 2 != 0,
+                                alt: mask & 4 != 0,
+                                win: mask & 8 != 0,
+                            };
+                            if keys.lookup(mods, TriggerKey::Digit(i as u8))
+                                == Some(Action::GotoTab(i as u8))
+                            {
+                                let mut label = String::new();
+                                for (enabled, name) in [
+                                    (mods.ctrl, "Ctrl+"),
+                                    (mods.shift, "Shift+"),
+                                    (mods.alt, "Alt+"),
+                                    (mods.win, "Win+"),
+                                ] {
+                                    if enabled {
+                                        label.push_str(name);
+                                    }
+                                }
+                                label.push(char::from(b'0' + i as u8));
+                                return Some(label);
+                            }
+                        }
+                        None
+                    })
+                    .collect::<Vec<_>>();
+                *memo = Some((keys.clone(), hints));
+            }
+            let hints = &memo.as_ref().expect("shortcut cache initialized").1;
+            (0..count)
+                .map(|i| hints.get(i).cloned().flatten())
+                .collect()
+        })
+    })
+}
+
 /// strip/顶栏运行时几何(DPI 缩放 + 用户配置单源,渲染与 hit-test 同取):
 /// 150% 屏上物理常量曾致条高/× 与字体错位(2026-10-06 用户实测);
 /// strip-* 配置键热重载时经 STRIP_CFG 生效(2026-10-12 全量可配)
@@ -326,4 +380,25 @@ pub(super) fn pretty_title(raw: &str) -> String {
             .to_string();
     }
     t.to_string()
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    #[test]
+    fn accelerators_follow_enabled_numeric_bindings() {
+        let original = KEYMAP.with(|keys| keys.replace(Settings::default().keymap));
+        assert_eq!(
+            tab_shortcuts(2),
+            vec![Some("Ctrl+Shift+1".into()), Some("Ctrl+Shift+2".into())]
+        );
+        KEYMAP.with(|keys| keys.borrow_mut().clear());
+        assert_eq!(tab_shortcuts(2), vec![None, None]);
+        let trigger = mica_core::keymap::parse_trigger("alt+1").unwrap();
+        KEYMAP.with(|keys| keys.borrow_mut().bind(trigger, Action::GotoTab(1)));
+        assert_eq!(tab_shortcuts(2), vec![Some("Alt+1".into()), None]);
+        KEYMAP.with(|keys| {
+            keys.replace(original);
+        });
+    }
 }

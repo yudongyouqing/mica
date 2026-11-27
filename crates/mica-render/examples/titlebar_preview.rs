@@ -71,8 +71,10 @@ fn main() -> anyhow::Result<()> {
         (
             vec![
                 ("PowerShell 7".into(), false),
-                ("项目 / mica".into(), true),
-                ("Claude".into(), false),
+                ("构建日志".into(), false),
+                ("~/code/mica".into(), true),
+                ("ssh · dev-server".into(), false),
+                ("docs · configuration".into(), false),
             ],
             1.0,
         ),
@@ -108,6 +110,9 @@ fn main() -> anyhow::Result<()> {
             &settings.palette,
             &sm,
             StripExtras {
+                tab_shortcuts: (1..=titles.len())
+                    .map(|i| Some(format!("Ctrl+Shift+{i}")))
+                    .collect(),
                 caption_x: Some(width as f32 - 3.0 * sm.caption_w),
                 focus,
                 ..Default::default()

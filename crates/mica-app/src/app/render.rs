@@ -427,7 +427,9 @@ pub(super) fn draw_frame() {
                     &sm,
                     mica_render::frame::StripExtras {
                         drop_slot: tab_drag::drop_slot(),
+                        window_title: lock.clone().or_else(|| t.term.cwd().map(str::to_owned)),
                         tab_colors,
+                        tab_shortcuts: tab_shortcuts(titles.len()),
                         exit_dot,
                         caption_x: Some(area_w - 3.0 * sm.caption_w),
                         layout: mica_render::frame::StripLayout {
