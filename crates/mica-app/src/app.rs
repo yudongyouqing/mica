@@ -448,11 +448,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     match msg {
         tab_drag::PREVIEW => tab_drag::preview(hwnd, wparam.0 != 0, lparam),
         windows::Win32::UI::WindowsAndMessaging::WM_MOVING => {
+            set_window_dragging(true);
             tab_drag::native_move(hwnd, false);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE => {
             tab_drag::native_move(hwnd, true);
+            set_window_dragging(false);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED if DRAG_TAB.get().is_some() => {
@@ -818,6 +820,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         DRAG_X.with(|x| x.set(idx as f32 * span));
                         CAPS_T0.with(|t| t.set(-1.0)); // 切换滑移让位给手粘光标
                         let _ = SetCapture(hwnd);
+                        draw_frame();
                     }
                     return LRESULT(0);
                 }
@@ -1692,17 +1695,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 最大化态拖 caption = 还原并继续拖(#34):无边框窗 DefWindowProc
             // 不自动还原,手动 SC_RESTORE 后进入移动循环(SC_MOVE|HTCAPTION,
             // Chrome 同款手法)。还原位置暂取旧矩形(光标跟随重定位留打磨)
-            if wparam.0 as u32 == HTCAPTION
-                && windows::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd).as_bool()
-            {
-                let _ = SendMessageW(
-                    hwnd,
-                    WM_SYSCOMMAND,
-                    Some(WPARAM(SC_RESTORE as usize)),
-                    Some(LPARAM(0)),
-                );
-                let _ = SendMessageW(hwnd, WM_SYSCOMMAND, Some(WPARAM(0xF012)), Some(lparam));
-                return LRESULT(0);
+            if wparam.0 as u32 == HTCAPTION {
+                set_window_dragging(true);
+                let result = if windows::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd).as_bool() {
+                    let _ = SendMessageW(
+                        hwnd,
+                        WM_SYSCOMMAND,
+                        Some(WPARAM(SC_RESTORE as usize)),
+                        Some(LPARAM(0)),
+                    );
+                    SendMessageW(hwnd, WM_SYSCOMMAND, Some(WPARAM(0xF012)), Some(lparam))
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                };
+                // Also restore after a simple press or Esc-cancelled move.
+                set_window_dragging(false);
+                return result;
             }
             // 系统按钮(T8):SC 命令驱动最小化/最大化;关闭走销毁路径
             match wparam.0 as u32 {

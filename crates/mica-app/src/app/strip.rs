@@ -5,11 +5,25 @@
 use super::*;
 
 thread_local! {
+    static WINDOW_DRAGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SHORTCUTS: RefCell<Option<(Keymap,Vec<Option<String>>)>> = const { RefCell::new(None) };
+}
+
+pub(super) fn set_window_dragging(dragging: bool) {
+    if WINDOW_DRAGGING.replace(dragging) != dragging {
+        draw_frame();
+    }
+}
+
+pub(super) fn shortcuts_hidden() -> bool {
+    WINDOW_DRAGGING.get() || DRAG_TAB.get().is_some() || tab_drag::drop_slot().is_some()
 }
 
 /// Show only numeric accelerators that actually select this tab.
 pub(super) fn tab_shortcuts(count: usize) -> Vec<Option<String>> {
+    if shortcuts_hidden() {
+        return Vec::new();
+    }
     KEYMAP.with(|keys| {
         let keys = keys.borrow();
         SHORTCUTS.with(|memo| {
@@ -361,6 +375,38 @@ pub(super) fn pretty_title(raw: &str) -> String {
 #[cfg(test)]
 mod compact_tests {
     use super::*;
+    #[test]
+    fn moving_any_window_hides_hints_until_move_finishes() {
+        let original = KEYMAP.with(|keys| keys.replace(Settings::default().keymap));
+        for count in [1, 5] {
+            assert_eq!(tab_shortcuts(count).len(), count);
+            set_window_dragging(true);
+            assert!(tab_shortcuts(count).is_empty());
+            set_window_dragging(true);
+            assert!(tab_shortcuts(count).is_empty());
+            set_window_dragging(false);
+            assert_eq!(tab_shortcuts(count).len(), count);
+        }
+        KEYMAP.with(|keys| {
+            keys.replace(original);
+        });
+    }
+
+    #[test]
+    fn dragging_a_tab_suppresses_its_accelerator_hints() {
+        let original = KEYMAP.with(|keys| keys.replace(Settings::default().keymap));
+        DRAG_TAB.set(Some(0));
+        assert!(tab_shortcuts(2).is_empty());
+        DRAG_TAB.set(None);
+        assert_eq!(
+            tab_shortcuts(2),
+            vec![Some("⌃⇧1".into()), Some("⌃⇧2".into())]
+        );
+        KEYMAP.with(|keys| {
+            keys.replace(original);
+        });
+    }
+
     #[test]
     fn accelerators_follow_enabled_numeric_bindings() {
         let original = KEYMAP.with(|keys| keys.replace(Settings::default().keymap));

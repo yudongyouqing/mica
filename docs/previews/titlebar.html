@@ -55,6 +55,8 @@
  height:max(1px,calc(var(--tab-face-h) * .035));
 }
 .compact .sys:last-child::after,.compact .closeTab::after {transform:translate(-50%,-50%) rotate(-45deg)}
+
+.window.dragging .shortcut {display:none}
 </style>
 <main>
 <header><span class="brand"><span class="mark" aria-hidden="true">›_</span>Mica</span><span class="sub">桌面终端设计预览</span></header>
@@ -82,7 +84,7 @@ function draw(){
   const tab=document.createElement('button');tab.textContent=s.name;tab.setAttribute('role','tab');tab.setAttribute('aria-selected',s===active);tab.tabIndex=s===active?0:-1;tab.onclick=()=>{active=s;draw()};
   tab.onkeydown=e=>{if(!['ArrowLeft','ArrowRight'].includes(e.key))return;e.preventDefault();active=sessions[(sessions.indexOf(s)+(e.key==='ArrowLeft'?-1:1)+sessions.length)%sessions.length];draw();el('tabs').querySelector('[aria-selected=true]').focus()};
   const close=document.createElement('button');close.className='closeTab';close.textContent='×';close.setAttribute('aria-label','关闭 '+s.name);close.onclick=()=>{const i=sessions.indexOf(s);sessions.splice(i,1);if(s===active)active=sessions[Math.min(i,sessions.length-1)];if(!active)hideWindow();draw()};
-  wrap.ondragstart=()=>{dragged=s};wrap.ondragover=e=>{e.preventDefault();wrap.classList.add('over')};wrap.ondragleave=()=>wrap.classList.remove('over');wrap.ondragend=()=>{dragged=null;document.querySelectorAll('.over').forEach(n=>n.classList.remove('over'))};wrap.ondrop=e=>{e.preventDefault();if(!dragged)return;const i=sessions.indexOf(s);sessions.splice(sessions.indexOf(dragged),1);sessions.splice(i,0,dragged);draw()};
+  wrap.ondragstart=()=>{dragged=s;el('win').classList.add('dragging')};wrap.ondragover=e=>{e.preventDefault();wrap.classList.add('over')};wrap.ondragleave=()=>wrap.classList.remove('over');wrap.ondragend=()=>{dragged=null;el('win').classList.remove('dragging');document.querySelectorAll('.over').forEach(n=>n.classList.remove('over'))};wrap.ondrop=e=>{e.preventDefault();el('win').classList.remove('dragging');if(!dragged)return;const i=sessions.indexOf(s);sessions.splice(sessions.indexOf(dragged),1);sessions.splice(i,0,dragged);draw()};
   const shortcut=document.createElement('span');shortcut.className='shortcut';shortcut.textContent='⌃⇧'+(sessions.indexOf(s)+1);shortcut.setAttribute('aria-hidden','true');tab.title=s.name;wrap.append(tab,shortcut,close);el('tabs').append(wrap);
  }
  if(active){el('windowpath').textContent=active.cwd;el('screen').innerHTML=examples[active.example][1]+'<div class="cmd"><span class="caret"></span></div>';el('tabs').querySelector('.active')?.scrollIntoView({block:'nearest',inline:'nearest'})}
@@ -109,6 +111,13 @@ document.addEventListener('keydown',event=>{
   if(session){event.preventDefault();active=session;draw();}
  }
 });
+document.querySelector('.titleline').addEventListener('pointerdown',event=>{
+ if(event.button===0 && !event.target.closest('button'))el('win').classList.add('dragging');
+});
+document.addEventListener('pointerup',()=>el('win').classList.remove('dragging'));
+document.addEventListener('pointercancel',()=>el('win').classList.remove('dragging'));
+window.addEventListener('blur',()=>el('win').classList.remove('dragging'));
+document.addEventListener('keydown',event=>{if(event.key==='Escape')el('win').classList.remove('dragging')});
 reset();
 setLayout("compact");
 </script></html>

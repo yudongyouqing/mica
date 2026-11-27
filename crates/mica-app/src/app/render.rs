@@ -246,6 +246,7 @@ pub(super) fn draw_frame() {
                 let shared_ui = (pane.id == focused_pane_id).then(|| {
                     (
                         &titles,
+                        shortcuts_hidden(),
                         SEARCH_OPEN.with(std::cell::Cell::get),
                         SEARCH_QUERY.with(|q| q.borrow().clone()),
                         HOVER_URL.with(|h| h.borrow().as_ref().map(|(url, _, _)| url.clone())),
