@@ -37,8 +37,6 @@ use windows::Win32::System::Pipes::{
 };
 use windows::core::{HSTRING, PCWSTR};
 
-use crate::app::window_registry;
-
 /// 单客户端读期限:半帧慢客户端最长占用服务这么久。
 const READ_DEADLINE: Duration = Duration::from_secs(5);
 /// UI 应答期限:入队后 UI 未在此期限内回话,回 timeout(不承诺执行)。
@@ -166,7 +164,8 @@ fn process_request(pipe: HANDLE, tx: &mpsc::Sender<IncomingRequest>) -> IpcRespo
     }
 
     let request_started = Instant::now();
-    if req.op == "new-tab"
+    if matches!(req.op.as_str(), "new-tab" | "new-window")
+        && req.command.is_none()
         && let Some(name) = req.profile.as_deref()
     {
         // Only the IPC worker may wait for an explicit unknown profile. Join
@@ -179,34 +178,8 @@ fn process_request(pipe: HANDLE, tx: &mpsc::Sender<IncomingRequest>) -> IpcRespo
         }
     }
 
-    // ---- 入队 → 唤醒(顺序即修复:先 send 后 Post)----
-    let (reply_tx, reply_rx) = mpsc::sync_channel::<IpcResponse>(1);
-    if tx
-        .send(IncomingRequest {
-            req: req.clone(),
-            reply: reply_tx,
-        })
-        .is_err()
-    {
-        return IpcResponse::error(req.id, IpcError::NoWindow);
-    }
-    let posted = window_registry::post_to_alive(
-        crate::app::WM_APP_IPC,
-        windows::Win32::Foundation::WPARAM(0),
-        windows::Win32::Foundation::LPARAM(0),
-    );
-    if !posted {
-        // 无存活窗口:已入队的请求稍后被 UI 排空时丢弃(reply 通道已断)
-        eprintln!("ipc: 无存活窗口接收请求");
-        return IpcResponse::error(req.id, IpcError::NoWindow);
-    }
-
-    // ---- 等应答(UI 处理后 reply;超时只承诺"未确认",不谎报成功;
-    // 请求可能已被执行——客户端文案明确"结果未知")----
-    match reply_rx.recv_timeout(REPLY_DEADLINE.saturating_sub(request_started.elapsed())) {
-        Ok(r) => r,
-        Err(_) => IpcResponse::error(req.id, IpcError::Timeout),
-    }
+    let _ = tx; // The IPC worker dispatches directly to each owning UI mailbox.
+    super::window_ipc::dispatch(req, request_started + REPLY_DEADLINE)
 }
 
 /// 增量读请求帧到完整/坏帧;期限到 → Transport(慢客户端不占死服务)。
@@ -258,9 +231,14 @@ const WRITE_GRACE: Duration = Duration::from_secs(2);
 /// 锁定这两面)。
 fn write_response_and_finish(pipe: HANDLE, resp: &IpcResponse) {
     let frame = encode_frame(resp);
-    let mut written = 0u32;
-    // SAFETY: 帧远小于出站缓冲,不会阻塞
-    let _ = unsafe { WriteFile(pipe, Some(&frame), Some(&mut written), None) };
+    let frame = if frame.len() > MAX_FRAME_BYTES {
+        encode_frame(&IpcResponse::error(resp.id, IpcError::FrameTooLarge))
+    } else {
+        frame
+    };
+    if bounded_write(pipe, &frame, WRITE_GRACE).is_err() {
+        return;
+    }
     let deadline = Instant::now() + WRITE_GRACE;
     while Instant::now() < deadline {
         let mut avail = 0u32;
@@ -269,6 +247,64 @@ fn write_response_and_finish(pipe: HANDLE, resp: &IpcResponse) {
             break; // 客户端已断开:可立即收尾
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Cancel a synchronous pipe write if a peer stops reading. The watchdog owns
+/// a real duplicate of this thread handle; it is joined before later IO starts,
+/// so a delayed cancellation can never affect the following connection.
+fn bounded_write(pipe: HANDLE, bytes: &[u8], budget: Duration) -> Result<(), IpcError> {
+    use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+    let mut thread = HANDLE::default();
+    unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            GetCurrentThread(),
+            GetCurrentProcess(),
+            &mut thread,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+    }
+    .map_err(|_| IpcError::Transport)?;
+    let raw = thread.0 as isize;
+    let (done, completion) = mpsc::sync_channel::<()>(1);
+    let watchdog = std::thread::Builder::new()
+        .name("ipc-write-deadline".into())
+        .spawn(move || {
+            if completion.recv_timeout(budget).is_err() {
+                loop {
+                    unsafe {
+                        let _ = windows::Win32::System::IO::CancelSynchronousIo(HANDLE(raw as _));
+                    }
+                    if completion.recv_timeout(Duration::from_millis(5)).is_ok() {
+                        break;
+                    }
+                }
+            }
+            unsafe {
+                let _ = CloseHandle(HANDLE(raw as _));
+            }
+        });
+    let watchdog = match watchdog {
+        Ok(thread) => thread,
+        Err(_) => {
+            unsafe {
+                let _ = CloseHandle(thread);
+            }
+            return Err(IpcError::Transport);
+        }
+    };
+    let mut written = 0;
+    let result = unsafe { WriteFile(pipe, Some(bytes), Some(&mut written), None) };
+    let _ = done.try_send(());
+    let _ = watchdog.join();
+    if result.is_ok() && written as usize == bytes.len() {
+        Ok(())
+    } else {
+        Err(IpcError::Transport)
     }
 }
 
@@ -330,12 +366,11 @@ pub fn send_request(req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, Ip
 
     // ---- 写入(未送达 = 未执行,可安全重试)----
     let frame = encode_frame(req);
-    let mut written = 0u32;
-    // SAFETY: 整帧写出;帧 < 出站缓冲,不阻塞
-    let w_ok = unsafe { WriteFile(pipe, Some(&frame), Some(&mut written), None) }.is_ok();
-    if !w_ok || written as usize != frame.len() {
-        return Err(IpcError::Transport); // 未送达:可安全重试
-    }
+    bounded_write(
+        pipe,
+        &frame,
+        deadline.saturating_duration_since(Instant::now()),
+    )?;
 
     // ---- 读响应(请求可能已执行;断开/超时都是"结果未知")----
     let mut buf: Vec<u8> = Vec::with_capacity(256);
@@ -386,10 +421,10 @@ pub fn send_request(req: &IpcRequest, timeout_ms: u32) -> Result<IpcResponse, Ip
 /// CreateNamedPipeW 以 1305/unknown revision 拒绝,2026-11-02 实证)。
 /// 返回值(sd/acl 的 Box + 借用它们的 SECURITY_ATTRIBUTES)必须整体
 /// 存活到 CreateNamedPipeW 返回——管道是进程级单例,只建一次。
-struct UserSecurity {
+pub(crate) struct UserSecurity {
     _sd: Box<windows::Win32::Security::SECURITY_DESCRIPTOR>,
     acl: *mut windows::Win32::Security::ACL,
-    sa: windows::Win32::Security::SECURITY_ATTRIBUTES,
+    pub(crate) sa: windows::Win32::Security::SECURITY_ATTRIBUTES,
 }
 
 impl Drop for UserSecurity {
@@ -408,7 +443,7 @@ impl Drop for UserSecurity {
 // ACL 原始指针由本结构唯一持有并在 Drop 释放;仅主线程建管路径使用
 unsafe impl Send for UserSecurity {}
 
-fn build_user_acl() -> Option<UserSecurity> {
+pub(crate) fn build_user_acl() -> Option<UserSecurity> {
     use windows::Win32::Security::Authorization::{
         EXPLICIT_ACCESS_W, GRANT_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
     };
@@ -493,5 +528,39 @@ fn build_user_acl() -> Option<UserSecurity> {
             bInheritHandle: windows::Win32::Foundation::FALSE,
         };
         Some(UserSecurity { _sd: sd, acl, sa })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stalled_response_write_is_cancelled_and_next_write_works() {
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe {
+            windows::Win32::System::Pipes::CreatePipe(&mut read, &mut write, None, 4096).unwrap();
+        }
+        let read = ClientPipe(read);
+        let write = ClientPipe(write);
+        let started = Instant::now();
+        assert!(
+            bounded_write(
+                write.0,
+                &vec![b'x'; 2 * 1024 * 1024],
+                Duration::from_millis(100)
+            )
+            .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(read);
+        drop(write);
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe {
+            windows::Win32::System::Pipes::CreatePipe(&mut read, &mut write, None, 4096).unwrap();
+        }
+        let _read = ClientPipe(read);
+        let write = ClientPipe(write);
+        assert!(bounded_write(write.0, b"ok", Duration::from_secs(1)).is_ok());
     }
 }

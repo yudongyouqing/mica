@@ -4,6 +4,9 @@
 #[cfg(windows)]
 pub mod app; // tests 直入(UIA 集成测试要真窗口走真 WM_GETOBJECT)
 
+#[cfg(windows)]
+mod cli;
+
 /// GUI 入口(main 无参数 / IPC 连不上时的自启动路径)。
 #[cfg(windows)]
 pub fn run() {
@@ -15,7 +18,7 @@ pub fn run() {
 /// - `new-tab [profile]` / `wsl [distro]` / `list-profiles`
 #[cfg(windows)]
 pub fn handle_cli() -> i32 {
-    use mica_core::ipc::{IpcError, IpcRequest, IpcStatus};
+    use mica_core::ipc::IpcRequest;
     use std::sync::atomic::{AtomicU64, Ordering};
     static REQ_ID: AtomicU64 = AtomicU64::new(1);
     fn next_id() -> u64 {
@@ -24,9 +27,25 @@ pub fn handle_cli() -> i32 {
     // 崩溃档案(M5b/T1):任何后续 panic 都有 dmp——先于一切安装
     app::crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg != "--multi") {
+        attach_cli_console();
+    }
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => {
             println!("mica {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "mica [new-tab|new-window] [profile] [--cwd DIR] [--command CMD] [--env KEY=VALUE] [--font-size N] [--json]\n\
+mica list [--json]\n\
+mica focus (--pane=ID|--tab=N|--qt)\n\
+mica send [--pane=ID|--tab=N|--qt] [--literal] [--] TEXT...\n\
+mica read [--pane=ID|--tab=N|--qt] [--lines N] [--scrollback] [--json]\n\
+mica badge [--pane=ID|--tab=N|--qt] --state none|idle|running|attention [--text TEXT] [--sticky]\n\
+mica watch [--pane=ID] [--events exit,cwd,prompt,title,badge,lifecycle]\n\
+mica wsl [distro] | list-profiles | +show-config --default | +validate-config"
+            );
             0
         }
         Some("+show-config") => {
@@ -119,87 +138,21 @@ pub fn handle_cli() -> i32 {
                 }
             }
         }
-        Some("new-tab") => {
-            // mica new-tab [profile] [--font-size N](T9 每标签字号)
-            let mut profile = None;
-            let mut font_size = None;
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--font-size" | "-f" => {
-                        if let Some(v) = args.get(i + 1).and_then(|a| a.parse::<f32>().ok()) {
-                            font_size = Some(v);
-                            i += 1;
+        Some("new-tab" | "new-window" | "list" | "focus" | "send" | "read" | "badge" | "watch") => {
+            match cli::parse(&args, next_id()) {
+                Ok(cli::Command::Control { request, json }) => run_control(*request, json),
+                Ok(cli::Command::Watch { pane_id, events }) => {
+                    match app::events::watch(pane_id, events.as_deref()) {
+                        Ok(()) => 0,
+                        Err(error) => {
+                            eprintln!("mica watch: {}", error.code());
+                            1
                         }
                     }
-                    _ if profile.is_none() => profile = args.get(i).cloned(),
-                    _ => {}
                 }
-                i += 1;
-            }
-            let mut req = IpcRequest::new(next_id(), "new-tab");
-            req.profile = profile;
-            req.font_size = font_size;
-            dispatch_ipc(req)
-        }
-        Some("new-window") => dispatch_ipc(IpcRequest::new(next_id(), "new-window")),
-        // #44:向运行中的实例注入输入(tmux send-keys 同义)。
-        // `mica send [--tab=N | --qt] [--literal] 文本...`;默认展开转义
-        // (\r=回车 \e=Esc \\=反斜杠);连不上实例 = 错误退出,绝不自启
-        Some("send") => {
-            let mut tab: Option<i64> = None;
-            let mut literal = false;
-            let mut words: Vec<&str> = Vec::new();
-            for a in args.iter().skip(1) {
-                match a.as_str() {
-                    "--qt" => tab = Some(-1),
-                    "--literal" => literal = true,
-                    s if s.starts_with("--tab=") => match s[6..].parse::<i64>() {
-                        Ok(n) => tab = Some(n),
-                        Err(_) => {
-                            eprintln!("mica send: --tab 后应为标签序号(0 起),得 `{}`", &s[6..]);
-                            return 2;
-                        }
-                    },
-                    s => words.push(s),
-                }
-            }
-            if words.is_empty() {
-                eprintln!("用法: mica send [--tab=N | --qt] [--literal] 文本...");
-                eprintln!("  \\r 回车  \\e Esc  \\\\ 反斜杠(--literal 关闭转义)");
-                return 2;
-            }
-            let joined = words.join(" ");
-            let text = if literal {
-                joined
-            } else {
-                String::from_utf8_lossy(&mica_core::ipc::unescape_send(&joined)).into_owned()
-            };
-            let mut req = IpcRequest::new(next_id(), "send-text");
-            req.text = Some(text);
-            req.tab = tab;
-            match app::ipc::send_request(&req, 3_000) {
-                Ok(resp) => match resp.status {
-                    IpcStatus::Applied | IpcStatus::Queued => 0,
-                    IpcStatus::Error => {
-                        eprintln!(
-                            "mica send: 被拒绝({})",
-                            resp.detail.as_deref().unwrap_or("unknown")
-                        );
-                        1
-                    }
-                },
-                Err(IpcError::NoInstance) => {
-                    eprintln!("mica send: 无运行中的 mica 实例(IPC 不通)");
-                    1
-                }
-                Err(IpcError::Disconnected) => {
-                    eprintln!("mica send: 连接在请求送达后断开——文本可能已注入,请勿盲目重试");
-                    1
-                }
-                Err(e) => {
-                    eprintln!("mica send: 失败({})", e.code());
-                    1
+                Err(error) => {
+                    eprintln!("mica: {error}");
+                    2
                 }
             }
         }
@@ -221,60 +174,288 @@ pub fn handle_cli() -> i32 {
     }
 }
 
-/// IPC 分发核心:连得上→发帧退出;连不上→有 profile 就带环境变量自启动,
-/// 无 profile 就纯 GUI 启动。
+/// Release uses the Windows GUI subsystem. Attach only for CLI commands and
+/// preserve explicitly redirected streams, including JSON/NDJSON pipelines.
 #[cfg(windows)]
-fn dispatch_ipc(req: mica_core::ipc::IpcRequest) -> i32 {
-    match app::ipc::send_request(&req, 3_000) {
-        // 已有实例应答:applied/queued 均算受理成功
-        Ok(resp) => {
-            if resp.status == mica_core::ipc::IpcStatus::Error {
-                eprintln!(
-                    "mica: 请求被拒绝({})",
-                    resp.detail.as_deref().unwrap_or("unknown")
-                );
-                return 1; // 真实错误:非零退出,不再谎报成功
-            }
-            0
-        }
-        // 管道不存在(无实例):**唯一**可安全自启的形态。Busy/
-        // AccessDenied/Timeout/Disconnected 都说明实例活着或结果未知——
-        // 自启会造双实例或重复操作(复核 2)
-        Err(mica_core::ipc::IpcError::NoInstance) => {
-            if let Some(p) = &req.profile {
-                // Still on the CLI thread, before any GUI/message loop:
-                // validate and prime the snapshot for the first WSL tab.
-                let built_in = mica_core::profile::scan_static()
-                    .iter()
-                    .any(|profile| profile.name.eq_ignore_ascii_case(p));
-                if !built_in
-                    && !mica_core::profile::scan_all()
-                        .iter()
-                        .any(|profile| profile.name.eq_ignore_ascii_case(p))
-                {
-                    eprintln!("mica: 未知 profile `{p}`(WSL 枚举失败或超时也可能导致此错误)");
-                    return 1;
+fn attach_cli_console() {
+    use windows::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    let streams = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|kind| {
+        let handle = unsafe { GetStdHandle(kind) }
+            .ok()
+            .filter(|h| !h.is_invalid());
+        (kind, handle)
+    });
+    // Fails harmlessly if already attached or the parent has no console.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok() {
+        for (kind, handle) in streams {
+            if let Some(handle) = handle {
+                unsafe {
+                    let _ = SetStdHandle(kind, handle);
                 }
-                // SAFETY: 多线程前调用(单线程 CLI)
-                unsafe { std::env::set_var("MICA_START_PROFILE", p) };
             }
+        }
+    }
+}
+
+/// Compatibility path for activate and WSL profile launches.
+#[cfg(windows)]
+fn dispatch_ipc(request: mica_core::ipc::IpcRequest) -> i32 {
+    run_control(request, false)
+}
+
+#[cfg(windows)]
+fn run_control(mut request: mica_core::ipc::IpcRequest, json: bool) -> i32 {
+    use mica_core::ipc::IpcError;
+    if let Some(cwd) = &request.cwd {
+        match std::path::absolute(cwd) {
+            Ok(path) => request.cwd = Some(path.to_string_lossy().into_owned()),
+            Err(error) => {
+                eprintln!("mica: 无法解析启动目录: {error}");
+                return 2;
+            }
+        }
+    }
+    let response = match app::ipc::send_request(&request, 3_000) {
+        Ok(response) => Ok(response),
+        Err(IpcError::NoInstance) if matches!(request.op.as_str(), "new-tab" | "new-window") => {
+            start_instance(&request)
+        }
+        Err(IpcError::NoInstance) if request.op == "activate" => {
             app::run();
-            0
+            return 0;
         }
-        // 结果未知类:请求可能已被执行,明确警示勿盲目重试
-        Err(mica_core::ipc::IpcError::Disconnected) => {
-            eprintln!("mica: 连接在请求送达后断开——请求可能已执行,请勿盲目重试");
+        Err(error) => Err(error),
+    };
+    match response {
+        Ok(response) if response.status == mica_core::ipc::IpcStatus::Error => {
+            eprintln!(
+                "mica {}: {}",
+                request.op,
+                response.detail.as_deref().unwrap_or("unknown")
+            );
             1
         }
-        Err(mica_core::ipc::IpcError::Timeout) => {
-            eprintln!("mica: 实例未在期限内应答——请求可能已执行,请勿盲目重试");
-            1
-        }
-        Err(e) => {
-            eprintln!("mica: IPC 失败({})", e.code());
+        Ok(response) => output_response(&request.op, response, json),
+        Err(error) => {
+            eprintln!("mica {}: {}", request.op, error.code());
+            if matches!(error, IpcError::Timeout | IpcError::Disconnected) {
+                eprintln!("请求可能已执行,请勿盲目重试");
+            }
             1
         }
     }
+}
+
+/// A launch command returns when its first pane is ready, including --json.
+/// Only NoInstance reaches this path; ambiguous transport failures never spawn.
+#[cfg(windows)]
+fn start_instance(
+    request: &mica_core::ipc::IpcRequest,
+) -> Result<mica_core::ipc::IpcResponse, mica_core::ipc::IpcError> {
+    use mica_core::ipc::IpcError;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| IpcError::Transport)?
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("mica-start-{}-{stamp}", std::process::id()));
+    std::fs::create_dir(&dir).map_err(|_| IpcError::Transport)?;
+    struct StartupFiles(std::path::PathBuf);
+    impl Drop for StartupFiles {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0.join("response.json"));
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+    let files = StartupFiles(dir);
+    let response_path = files.0.join("response.json");
+    let child = spawn_gui(request, &response_path)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        // A collision loser writes its forwarded ACK and exits. Check liveness
+        // before the file so a just-published ACK cannot be missed at exit.
+        let exited = child.exited()?;
+        if let Ok(bytes) = std::fs::read(&response_path)
+            && let Ok(response) = serde_json::from_slice::<mica_core::ipc::IpcResponse>(&bytes)
+        {
+            if response.id != request.id {
+                return Err(IpcError::BadJson);
+            }
+            return Ok(response);
+        }
+        if exited {
+            return Err(IpcError::SpawnFailed);
+        }
+        if Instant::now() >= deadline {
+            return Err(IpcError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// Do not inherit arbitrary handles from the short-lived CLI: a pipe writer
+/// retained by the GUI would keep JSON pipelines open until the window closed.
+#[cfg(windows)]
+struct GuiProcess(windows::Win32::Foundation::HANDLE);
+#[cfg(windows)]
+impl Drop for GuiProcess {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+#[cfg(windows)]
+impl GuiProcess {
+    fn exited(&self) -> Result<bool, mica_core::ipc::IpcError> {
+        use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        match unsafe { windows::Win32::System::Threading::WaitForSingleObject(self.0, 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(mica_core::ipc::IpcError::Transport),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spawn_gui(
+    request: &mica_core::ipc::IpcRequest,
+    response_path: &std::path::Path,
+) -> Result<GuiProcess, mica_core::ipc::IpcError> {
+    use mica_core::ipc::IpcError;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION,
+        STARTUPINFOW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+    let executable = std::env::current_exe().map_err(|_| IpcError::Transport)?;
+    let application: Vec<u16> = executable.as_os_str().encode_wide().chain([0]).collect();
+    // Windows filenames cannot contain a quote; the sole argument is fixed.
+    let mut command: Vec<u16> = std::iter::once(b'"' as u16)
+        .chain(executable.as_os_str().encode_wide())
+        .chain("\" --multi".encode_utf16())
+        .chain([0])
+        .collect();
+    let mut vars: Vec<_> = std::env::vars_os()
+        .filter(|(key, _)| {
+            let key = key.to_string_lossy();
+            !key.eq_ignore_ascii_case("MICA_START_REQUEST")
+                && !key.eq_ignore_ascii_case("MICA_START_RESPONSE")
+        })
+        .collect();
+    vars.push((
+        "MICA_START_REQUEST".into(),
+        serde_json::to_string(request)
+            .map_err(|_| IpcError::BadJson)?
+            .into(),
+    ));
+    vars.push((
+        "MICA_START_RESPONSE".into(),
+        response_path.as_os_str().to_owned(),
+    ));
+    vars.sort_by_cached_key(|(key, _)| key.to_string_lossy().to_uppercase());
+    let mut environment = Vec::<u16>::new();
+    for (key, value) in vars {
+        environment.extend(key.encode_wide());
+        environment.push(b'=' as u16);
+        environment.extend(value.encode_wide());
+        environment.push(0);
+    }
+    environment.push(0);
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    // SAFETY: writable command, double-NUL Unicode env and startup buffers live
+    // through this call. Child inherits zero handles and creates no console.
+    unsafe {
+        CreateProcessW(
+            PCWSTR(application.as_ptr()),
+            Some(PWSTR(command.as_mut_ptr())),
+            None,
+            None,
+            false,
+            DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT,
+            Some(environment.as_ptr().cast()),
+            PCWSTR::null(),
+            &startup,
+            &mut process,
+        )
+        .map_err(|_| IpcError::SpawnFailed)?;
+        let _ = windows::Win32::Foundation::CloseHandle(process.hThread);
+    }
+    Ok(GuiProcess(process.hProcess))
+}
+
+#[cfg(windows)]
+fn output_response(op: &str, response: mica_core::ipc::IpcResponse, json: bool) -> i32 {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    let result =
+        if json {
+            writeln!(
+                stdout,
+                "{}",
+                response.data.unwrap_or(serde_json::Value::Null)
+            )
+        } else if op == "read-text" {
+            match response.data.and_then(|data| {
+                serde_json::from_value::<mica_core::ipc::ReadTextResult>(data).ok()
+            }) {
+                Some(snapshot) => stdout.write_all(snapshot.text.as_bytes()),
+                None => {
+                    eprintln!("mica read: invalid response");
+                    return 1;
+                }
+            }
+        } else if op == "list" {
+            let Some(panes) = response.data.and_then(|data| {
+                serde_json::from_value::<Vec<mica_core::ipc::PaneInfo>>(data).ok()
+            }) else {
+                eprintln!("mica list: invalid response");
+                return 1;
+            };
+            fn clean(value: &str) -> String {
+                value
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect()
+            }
+            let mut table = String::from("PANE\tWINDOW\tTAB\tPID\tSTATE\tCWD\tTITLE\n");
+            for pane in panes {
+                let state = match pane.prompt_state {
+                    mica_core::ipc::PromptState::Idle => "idle",
+                    mica_core::ipc::PromptState::Running => "running",
+                    mica_core::ipc::PromptState::Unknown => "unknown",
+                };
+                use std::fmt::Write as _;
+                let _ = writeln!(
+                    table,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    pane.pane_id,
+                    pane.window_id,
+                    pane.tab_index,
+                    pane.pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    state,
+                    clean(pane.cwd.as_deref().unwrap_or("-")),
+                    clean(&pane.title)
+                );
+            }
+            stdout.write_all(table.as_bytes())
+        } else {
+            Ok(())
+        };
+    if result.is_err() {
+        return 1;
+    }
+    0
 }
 
 #[cfg(not(windows))]

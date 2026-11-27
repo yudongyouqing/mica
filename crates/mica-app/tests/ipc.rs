@@ -52,6 +52,7 @@ fn launch_isolated() -> ChildGuard {
         .as_nanos();
     let iso = std::env::temp_dir().join(format!("mica-ipc-{unique}"));
     std::fs::create_dir_all(&iso).unwrap();
+    write_test_config(&iso);
     // 唯一管道身份:USERNAME 派生管道名;LOCALAPPDATA 隔离状态目录
     // (pty 注册表不再写用户真实文件)
     let user = format!("micatest{unique}");
@@ -74,6 +75,15 @@ fn launch_isolated() -> ChildGuard {
             .spawn()
             .expect("launch mica"),
     )
+}
+
+fn write_test_config(iso: &std::path::Path) {
+    std::fs::create_dir_all(iso.join("mica")).unwrap();
+    std::fs::write(
+        iso.join("mica/config"),
+        "command = cmd.exe /Q /K\nquick-terminal-key = none\n",
+    )
+    .unwrap();
 }
 
 fn pipe_name() -> String {
@@ -105,7 +115,7 @@ fn wait_ready(timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let ok = Command::new(env!("CARGO_BIN_EXE_mica"))
-            .args(["send", "--literal", "x"])
+            .args(["send", "--literal", ""])
             .env("USERNAME", test_user())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -488,9 +498,9 @@ fn non_reading_client_does_not_block_server() {
     unsafe { windows::Win32::Foundation::CloseHandle(ha).ok() };
 }
 
-/// 复核 3:new-window 是异步派发——必须回 Queued 而非 Applied。
+/// Creation now acknowledges the actual pane, including its stable identity.
 #[test]
-fn new_window_responds_queued_not_applied() {
+fn new_window_responds_applied_with_pane_metadata() {
     let _g = guard().lock().unwrap_or_else(|e| e.into_inner());
     let _app = launch_isolated();
     assert!(wait_ready(Duration::from_secs(20)));
@@ -503,7 +513,11 @@ fn new_window_responds_queued_not_applied() {
     // SAFETY: 测试侧句柄
     unsafe { windows::Win32::Foundation::CloseHandle(h).ok() };
     assert_eq!(resp.id, 701);
-    assert_eq!(resp.status, IpcStatus::Queued, "异步派发只承诺入队");
+    assert_eq!(resp.status, IpcStatus::Applied);
+    let pane: mica_core::ipc::PaneInfo =
+        serde_json::from_value(resp.data.expect("new pane metadata")).unwrap();
+    assert!(pane.pane_id > 0);
+    assert!(pane.pid.is_some());
     // 等副窗真的出现(派发兑现),再关掉它收尾:关最后窗口进程退出
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut two = false;
@@ -515,7 +529,7 @@ fn new_window_responds_queued_not_applied() {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    assert!(two, "Queued 之后副窗应实际创建");
+    assert!(two, "Applied must mean the second window exists");
 }
 
 /// 复核 6:连接的管道必须属于**自己启动的实例**——GetNamedPipeServerProcessId
@@ -535,4 +549,505 @@ fn server_pid_is_the_launched_instance() {
     unsafe { windows::Win32::Foundation::CloseHandle(h).ok() };
     assert!(ok, "GetNamedPipeServerProcessId 失败");
     assert_eq!(server_pid, app.0.id(), "管道服务端必须是本测试启动的实例");
+}
+
+fn exchange(request: &IpcRequest) -> IpcResponse {
+    let pipe = connect(Duration::from_secs(5)).expect("connect isolated control pipe");
+    assert!(write_bytes(pipe, &encode_frame(request)));
+    let response = read_response(pipe, Duration::from_secs(6));
+    unsafe { windows::Win32::Foundation::CloseHandle(pipe).ok() };
+    response.expect("bounded control response")
+}
+
+fn pane_list() -> Vec<mica_core::ipc::PaneInfo> {
+    let response = exchange(&IpcRequest::new(800, "list"));
+    assert_eq!(response.status, IpcStatus::Applied, "{response:?}");
+    serde_json::from_value(response.data.unwrap()).unwrap()
+}
+
+fn ordinary_pane_count() -> usize {
+    pane_list()
+        .into_iter()
+        .filter(|pane| !pane.is_quick_terminal)
+        .count()
+}
+
+fn cli_output(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_mica"))
+        .args(args)
+        .env("USERNAME", test_user())
+        .output()
+        .expect("CLI invocation")
+}
+
+#[test]
+fn pane_control_round_trip_preserves_identity_env_cwd_and_badges() {
+    use mica_core::ipc::{BadgeState, PaneInfo, ReadTextResult};
+    let _guard = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let _app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)));
+    let cwd = std::env::temp_dir();
+    let mut create = IpcRequest::new(801, "new-tab");
+    create.command = Some("cmd.exe /Q /K".into());
+    create.cwd = Some(cwd.to_string_lossy().into());
+    // Raw clients cannot override the reserved name, including Windows casing.
+    create.env = Some(std::collections::BTreeMap::from([
+        ("MICA_TEST_VAR".into(), "42".into()),
+        ("mica_pane_id".into(), "spoofed".into()),
+    ]));
+    let response = exchange(&create);
+    assert_eq!(response.status, IpcStatus::Applied, "{response:?}");
+    let pane: PaneInfo = serde_json::from_value(response.data.unwrap()).unwrap();
+    assert_eq!(pane.cwd.as_deref(), create.cwd.as_deref());
+    assert!(pane.pid.is_some());
+    assert_eq!(ordinary_pane_count(), 2);
+    let id = pane.pane_id;
+    let mut send = IpcRequest::new(802, "send-text");
+    send.pane_id = Some(id);
+    send.text = Some("echo MICA_CTRL_%MICA_PANE_ID%_%MICA_TEST_VAR%\r".into());
+    assert!(matches!(
+        exchange(&send).status,
+        IpcStatus::Applied | IpcStatus::Queued
+    ));
+    let expected = format!("MICA_CTRL_{id}_42");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let mut read = IpcRequest::new(803, "read-text");
+        read.pane_id = Some(id);
+        read.lines = Some(usize::MAX);
+        read.include_scrollback = Some(true);
+        let response = exchange(&read);
+        assert_eq!(response.status, IpcStatus::Applied, "{response:?}");
+        let snapshot: ReadTextResult = serde_json::from_value(response.data.unwrap()).unwrap();
+        if snapshot.text.contains(&expected) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing {expected:?} in {:?}",
+            snapshot.text
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut badge = IpcRequest::new(804, "set-badge");
+    badge.pane_id = Some(id);
+    badge.badge_state = Some(BadgeState::Attention);
+    badge.badge_text = Some("等待审批".repeat(20));
+    assert_eq!(exchange(&badge).status, IpcStatus::Applied);
+    let marked = pane_list()
+        .into_iter()
+        .find(|p| p.pane_id == id)
+        .unwrap()
+        .badge
+        .unwrap();
+    assert_eq!(marked.text.unwrap().chars().count(), 32);
+    let mut focus = IpcRequest::new(805, "focus");
+    focus.pane_id = Some(id);
+    assert_eq!(exchange(&focus).status, IpcStatus::Applied);
+    assert!(
+        pane_list()
+            .into_iter()
+            .find(|p| p.pane_id == id)
+            .unwrap()
+            .badge
+            .is_none()
+    );
+    badge.badge_sticky = Some(true);
+    assert_eq!(exchange(&badge).status, IpcStatus::Applied);
+    assert_eq!(exchange(&focus).status, IpcStatus::Applied);
+    assert!(
+        pane_list()
+            .into_iter()
+            .find(|p| p.pane_id == id)
+            .unwrap()
+            .badge
+            .unwrap()
+            .sticky
+    );
+    // List all windows and address the original pane even when another window exists.
+    let mut second = IpcRequest::new(806, "new-window");
+    second.command = Some("cmd.exe /Q /K".into());
+    let response = exchange(&second);
+    assert_eq!(response.status, IpcStatus::Applied, "{response:?}");
+    let other: PaneInfo = serde_json::from_value(response.data.unwrap()).unwrap();
+    assert_ne!(other.window_id, pane.window_id);
+    assert_ne!(other.pane_id, id);
+    assert_eq!(ordinary_pane_count(), 3);
+    assert_eq!(exchange(&focus).status, IpcStatus::Applied);
+    let list = cli_output(&["list", "--json"]);
+    assert!(list.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Vec<PaneInfo>>(&list.stdout)
+            .unwrap()
+            .into_iter()
+            .filter(|pane| !pane.is_quick_terminal)
+            .count(),
+        3
+    );
+    for op in ["focus", "send-text", "read-text", "set-badge"] {
+        let mut bad = IpcRequest::new(807, op);
+        bad.pane_id = Some(u64::MAX);
+        bad.text = Some("x".into());
+        bad.badge_state = Some(BadgeState::Idle);
+        assert_eq!(exchange(&bad).detail.as_deref(), Some("bad_target"));
+    }
+    let before = ordinary_pane_count();
+    create.cwd = Some(
+        cwd.join("mica-directory-that-does-not-exist-9a3f")
+            .to_string_lossy()
+            .into(),
+    );
+    assert_eq!(exchange(&create).status, IpcStatus::Error);
+    assert_eq!(ordinary_pane_count(), before);
+}
+
+#[test]
+fn watch_delivers_ndjson_without_occupying_control_pipe() {
+    use std::io::BufRead;
+    let _guard = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let _app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)));
+    let id = pane_list()[0].pane_id;
+    let pane_arg = format!("--pane={id}");
+    let mut watch = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_mica"))
+            .args(["watch", &pane_arg, "--events", "badge,prompt,cwd"])
+            .env("USERNAME", test_user())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = watch.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut received = None;
+    while Instant::now() < deadline {
+        let output = cli_output(&[
+            "badge",
+            &pane_arg,
+            "--state",
+            "running",
+            "--text",
+            "watch-test",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!pane_list().is_empty());
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(150)) {
+            received = Some(line);
+            break;
+        }
+        // Toggle to guarantee a state change after the subscriber has connected.
+        let _ = cli_output(&["badge", &pane_arg, "--state", "idle"]);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&received.expect("live badge event")).unwrap();
+    assert_eq!(value["type"], "badge_changed");
+    assert_eq!(value["pane_id"], id);
+    // Emit an entire fast command lifecycle in a single write. The final idle
+    // state alone must not erase its CommandEnd exit event.
+    let script = "powershell.exe -NoLogo -NoProfile -Command \"[Console]::Write(([char]27)+']133;C'+[char]7+([char]27)+']133;D;0'+[char]7+([char]27)+']133;A'+[char]7+([char]27)+']133;B'+[char]7+([char]27)+']7;file:///C:/'+[char]7)\"\\r";
+    assert!(cli_output(&["send", &pane_arg, script]).status.success());
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let (mut exit, mut cwd) = (false, false);
+    while Instant::now() < deadline && !(exit && cwd) {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            exit |= event["type"] == "prompt_state_changed" && event["exit_code"] == 0;
+            cwd |= event["type"] == "cwd_changed";
+        }
+    }
+    assert!(exit && cwd, "fast completion={exit}, cwd={cwd}");
+    drop(watch);
+    drop(rx);
+    reader.join().unwrap();
+}
+
+#[test]
+fn quick_terminal_has_identity_and_destroying_it_keeps_list_working() {
+    use mica_core::ipc::{PaneInfo, ReadTextResult};
+    let _guard = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let _app = launch_isolated();
+    assert!(wait_ready(Duration::from_secs(20)));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let qt: PaneInfo = loop {
+        if let Some(pane) = pane_list().into_iter().find(|p| p.is_quick_terminal) {
+            break pane;
+        }
+        assert!(Instant::now() < deadline, "QT must initialize");
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    let pane_arg = format!("--pane={}", qt.pane_id);
+    assert!(
+        cli_output(&["send", &pane_arg, "echo QT_%MICA_PANE_ID%\\r"])
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let output = cli_output(&["read", "--qt", "--json"]);
+        assert!(output.status.success());
+        let snapshot: ReadTextResult = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(snapshot.pane_id, qt.pane_id);
+        if snapshot.text.contains(&format!("QT_{}", qt.pane_id)) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{:?}", snapshot.text);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let hwnd = windows::Win32::Foundation::HWND(qt.window_id as usize as _);
+    let created = cli_output(&["new-window", "--command", "cmd.exe /Q /K", "--json"]);
+    assert!(created.status.success());
+    let secondary: PaneInfo = serde_json::from_slice(&created.stdout).unwrap();
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(windows::Win32::Foundation::HWND(
+                secondary.window_id as usize as _,
+            )),
+            windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+        )
+        .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let panes = pane_list();
+        assert!(
+            panes.iter().any(|p| p.pane_id == qt.pane_id),
+            "closing a secondary window must preserve QT's owner"
+        );
+        if !panes.iter().any(|p| p.pane_id == secondary.pane_id) {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for _ in 0..2 {
+        assert!(cli_output(&["focus", &pane_arg]).status.success());
+        assert!(
+            unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) }.as_bool()
+        );
+    }
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(hwnd),
+            windows::Win32::UI::WindowsAndMessaging::WM_CLOSE,
+            windows::Win32::Foundation::WPARAM(0),
+            windows::Win32::Foundation::LPARAM(0),
+        )
+        .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if !pane_list().iter().any(|p| p.pane_id == qt.pane_id) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "closed QT must leave the owner index"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(ordinary_pane_count(), 1);
+}
+
+#[test]
+fn read_only_cli_without_instance_exits_instead_of_starting_gui() {
+    let _guard = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let user = format!("micaabsent{}", std::process::id());
+    for args in [
+        vec!["list"],
+        vec!["read"],
+        vec!["watch"],
+        vec!["focus", "--pane=1"],
+        vec!["send", "x"],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_mica"))
+            .args(&args)
+            .env("USERNAME", &user)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1), "{args:?}");
+    }
+}
+
+#[test]
+fn first_instance_launch_returns_json_and_propagates_options() {
+    let _guard = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let user = format!("micastart{unique}");
+    *TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = user.clone();
+    let iso = std::env::temp_dir().join(format!("mica-first-{unique}"));
+    std::fs::create_dir_all(&iso).unwrap();
+    write_test_config(&iso);
+    let output = Command::new(env!("CARGO_BIN_EXE_mica"))
+        .args(["new-tab", "--command", "cmd.exe /Q /K", "--cwd"])
+        .arg(".")
+        .current_dir(&iso)
+        .args([
+            "--env",
+            "MICA_TEST_VAR=first",
+            "--font-size",
+            "12",
+            "--json",
+        ])
+        .env("USERNAME", &user)
+        .env("APPDATA", &iso)
+        .env("LOCALAPPDATA", &iso)
+        .env("MICA_CRASH_NOPROMPT", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "CLI status {:?}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Own and clean up the detached server process too, even when assertions fail.
+    let pipe = connect(Duration::from_secs(3)).expect("new first instance pipe");
+    let mut pid = 0;
+    unsafe {
+        windows::Win32::System::Pipes::GetNamedPipeServerProcessId(pipe, &mut pid).unwrap();
+        windows::Win32::Foundation::CloseHandle(pipe).ok();
+    }
+    struct StartedGui(u32);
+    impl Drop for StartedGui {
+        fn drop(&mut self) {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &self.0.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let _gui = StartedGui(pid);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pane: mica_core::ipc::PaneInfo =
+        serde_json::from_slice(&output.stdout).expect("first pane JSON");
+    assert_eq!(pane.cwd.as_deref(), iso.to_str());
+    assert_eq!(
+        ordinary_pane_count(),
+        1,
+        "do not create an extra default pane"
+    );
+    let id = format!("--pane={}", pane.pane_id);
+    assert!(
+        cli_output(&["send", &id, "echo START_%MICA_PANE_ID%_%MICA_TEST_VAR%\\r"])
+            .status
+            .success()
+    );
+    let expected = format!("START_{}_first", pane.pane_id);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let result = cli_output(&["read", &id]);
+        assert!(result.status.success());
+        if String::from_utf8_lossy(&result.stdout).contains(&expected) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn concurrent_first_launches_share_an_instance_without_losing_a_pane() {
+    let _guard = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let user = format!("micacold{unique}");
+    *TEST_USER
+        .get_or_init(|| Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = user.clone();
+    let iso = std::env::temp_dir().join(format!("mica-cold-{unique}"));
+    std::fs::create_dir_all(&iso).unwrap();
+    write_test_config(&iso);
+    let mut clients = Vec::new();
+    for label in ["one", "two"] {
+        clients.push(
+            Command::new(env!("CARGO_BIN_EXE_mica"))
+                .args([
+                    "new-tab",
+                    "--command",
+                    "cmd.exe /Q /K",
+                    "--env",
+                    &format!("MICA_TEST_VAR={label}"),
+                    "--json",
+                ])
+                .env("USERNAME", &user)
+                .env("APPDATA", &iso)
+                .env("LOCALAPPDATA", &iso)
+                .env("MICA_CRASH_NOPROMPT", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let outputs: Vec<_> = clients
+        .into_iter()
+        .map(|child| child.wait_with_output().unwrap())
+        .collect();
+    let pipe = connect(Duration::from_secs(3)).expect("cold instance exists");
+    let mut pid = 0;
+    unsafe {
+        windows::Win32::System::Pipes::GetNamedPipeServerProcessId(pipe, &mut pid).unwrap();
+        windows::Win32::Foundation::CloseHandle(pipe).ok();
+    }
+    struct ColdGui(u32);
+    impl Drop for ColdGui {
+        fn drop(&mut self) {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &self.0.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    let _gui = ColdGui(pid);
+    for output in &outputs {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let panes: Vec<mica_core::ipc::PaneInfo> = outputs
+        .into_iter()
+        .map(|o| serde_json::from_slice(&o.stdout).unwrap())
+        .collect();
+    assert_ne!(panes[0].pane_id, panes[1].pane_id);
+    assert_eq!(panes[0].window_id, panes[1].window_id);
+    assert_eq!(ordinary_pane_count(), 2);
 }

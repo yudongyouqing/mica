@@ -435,6 +435,7 @@ unsafe fn bootstrap_window(
     // T5/T7:后台线程共用的窗口哨兵,窗口创建后建立(两个线程都要投递)
     let hwnd_slot: SharedHwnd = Arc::new(Mutex::new(Some(hwnd.0 as isize)));
     SHARED_HWND.with(|s| *s.borrow_mut() = Some(Arc::clone(&hwnd_slot)));
+    window_ipc::register(hwnd);
     window_registry::register(&hwnd_slot); // T04:进程级窗口表
     WINDOW_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -448,23 +449,35 @@ unsafe fn bootstrap_window(
     };
     GPU.with(|g| *g.borrow_mut() = Some(gpu));
 
-    if is_primary {
-        // M3a:单实例 IPC 服务(管道被占说明已有实例——main 侧已分流,这里
-        // 只可能首实例到达;失败降级单开不致命)。必须在首帧前:晚于此,
-        // 启动窗口期内的 `mica new-tab` 会自启第二个实例
-        match ipc::serve() {
-            Ok(rx) => *IPC_RX.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx),
-            Err(false) => {} // 建管道失败:已在 ipc::serve 记日志
-            Err(true) => unreachable!("main 已分流,GUI 路径不会撞已占管道"),
-        }
-    }
-
     if drop_at.is_none() {
-        let profile = std::env::var("MICA_START_PROFILE").ok();
-        if profile.is_some() {
-            std::env::remove_var("MICA_START_PROFILE");
+        if let Some(req) = INITIAL_REQUEST.with(|r| r.borrow_mut().take()) {
+            let allowed = INITIAL_DEADLINE.with(|d| {
+                d.get()
+                    .is_none_or(|deadline| std::time::Instant::now() < deadline)
+            });
+            let response = if !allowed {
+                IpcResponse::error(req.id, IpcError::Timeout)
+            } else {
+                match start_tab_with_options(hwnd, &req) {
+                    Ok(info) => {
+                        IpcResponse::applied_with_data(req.id, serde_json::to_value(info).unwrap())
+                    }
+                    Err(error) => IpcResponse::error(req.id, error),
+                }
+            };
+            let failed = response.status == mica_core::ipc::IpcStatus::Error;
+            INITIAL_RESPONSE.with(|r| *r.borrow_mut() = Some(response));
+            if failed {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+                return None;
+            }
+        } else {
+            let profile = std::env::var("MICA_START_PROFILE").ok();
+            if profile.is_some() {
+                std::env::remove_var("MICA_START_PROFILE");
+            }
+            let _ = start_tab_with_profile(hwnd, profile.as_deref(), None);
         }
-        let _ = start_tab_with_profile(hwnd, profile.as_deref(), None);
     }
     // GPU 建后补一次 clear_color 与背景图(create_tab 不碰窗口资源)
     GPU.with(|g| {
@@ -495,16 +508,61 @@ unsafe fn bootstrap_window(
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
     }
+    window_ipc::mark_ready(hwnd);
     Some((hwnd, hwnd_slot))
 }
 
 pub fn run() {
     // #59 启动计时锚(exec 起点近似;MICA_DEBUG_TIMING 门控输出分段)
     let t0 = std::time::Instant::now();
+    // Take process startup metadata before any PTY can inherit private response paths.
+    let start_request = std::env::var("MICA_START_REQUEST").ok();
+    let start_response = std::env::var_os("MICA_START_RESPONSE");
+    unsafe {
+        std::env::remove_var("MICA_START_REQUEST");
+        std::env::remove_var("MICA_START_RESPONSE");
+    }
+    if let Some(raw) = start_request {
+        match serde_json::from_str::<IpcRequest>(&raw) {
+            Ok(req) => INITIAL_REQUEST.with(|r| *r.borrow_mut() = Some(req)),
+            Err(_) => {
+                if let Some(path) = start_response {
+                    let _ = std::fs::write(
+                        path,
+                        serde_json::to_vec(&IpcResponse::error(0, IpcError::BadJson)).unwrap(),
+                    );
+                }
+                return;
+            }
+        }
+    }
+
     // ConPTY 宿主消毒(1.0.6):进程内剔除第三方 OpenConsole 目录,
     // 见 pty.rs 的 sanitize_conpty_host_path 文档——必须在一切 spawn
     // 之前(profile 扫描/QT/主窗 pty 全部受益)
     mica_core::pty::sanitize_conpty_host_path();
+    // A fresh child has its own profile cache. Resolve explicit WSL profiles
+    // before creating a UI thread; cache-only lookup would race its discovery.
+    let profile_error = INITIAL_REQUEST.with(|request| {
+        let request = request.borrow();
+        let req = request.as_ref()?;
+        if req.command.is_some() {
+            return None;
+        }
+        let name = req.profile.as_deref()?;
+        match mica_core::profile::find_profile(name, Duration::from_millis(750)) {
+            Ok(Some(_)) => None,
+            Ok(None) => Some(IpcResponse::error(req.id, IpcError::BadProfile)),
+            Err(_) => Some(IpcResponse::error(req.id, IpcError::Timeout)),
+        }
+    });
+    if let Some(response) = profile_error {
+        if let Some(path) = start_response {
+            let _ = std::fs::write(path, serde_json::to_vec(&response).unwrap());
+        }
+        return;
+    }
+
     unsafe {
         let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
         let wc = WNDCLASSEXW {
@@ -524,11 +582,38 @@ pub fn run() {
             hIconSm: HICON::default(),
         };
         assert_ne!(RegisterClassExW(&wc), 0, "RegisterClassExW failed");
+        // Reserve the process-wide pipe before the expensive GPU bootstrap.
+        // Simultaneous first launches may race this reservation; the loser
+        // forwards exactly its original request and returns its real response.
+        match ipc::serve() {
+            Ok(rx) => {
+                *IPC_RX.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
+                events::serve();
+            }
+            Err(true) => {
+                let req = INITIAL_REQUEST
+                    .with(|r| r.borrow_mut().take())
+                    .unwrap_or_else(|| IpcRequest::new(0, "activate"));
+                let response = ipc::send_request(&req, 10_000)
+                    .unwrap_or_else(|e| IpcResponse::error(req.id, e));
+                if let Some(path) = start_response {
+                    let _ = std::fs::write(path, serde_json::to_vec(&response).unwrap());
+                }
+                return;
+            }
+            Err(false) => {}
+        }
 
         // T4:字号与字体链来自配置(%APPDATA%\mica\config;缺失 = 全默认)
         let settings = load_settings();
-        let Some((hwnd, hwnd_slot)) = bootstrap_window(hinstance, &settings, true, None, Some(t0))
-        else {
+        let window = bootstrap_window(hinstance, &settings, true, None, Some(t0));
+        if let Some(path) = start_response {
+            let response = INITIAL_RESPONSE
+                .with(|r| r.borrow_mut().take())
+                .unwrap_or_else(|| IpcResponse::error(0, IpcError::SpawnFailed));
+            let _ = std::fs::write(path, serde_json::to_vec(&response).unwrap());
+        }
+        let Some((hwnd, hwnd_slot)) = window else {
             return;
         };
 
@@ -786,4 +871,42 @@ unsafe fn message_loop(hwnd_slot: SharedHwnd) {
         pty_bridge::reserved_bytes(),
         exit_t0.elapsed().as_millis()
     );
+}
+
+thread_local! {
+    static INITIAL_REQUEST: RefCell<Option<IpcRequest>> = const {RefCell::new(None)};
+    static INITIAL_RESPONSE: RefCell<Option<IpcResponse>> = const {RefCell::new(None)};
+    static INITIAL_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const {std::cell::Cell::new(None)};
+}
+pub(super) fn spawn_controlled_window(
+    req: IpcRequest,
+    deadline: std::time::Instant,
+) -> IpcResponse {
+    let id = req.id;
+    let (tx, rx) = mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("mica-window".into())
+        .spawn(move || unsafe {
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            INITIAL_REQUEST.with(|r| *r.borrow_mut() = Some(req));
+            INITIAL_DEADLINE.set(Some(deadline));
+            let settings = load_settings();
+            let hinstance = HINSTANCE(GetModuleHandleW(None).expect("GetModuleHandleW").0);
+            let window = bootstrap_window(hinstance, &settings, false, None, None);
+            let response = INITIAL_RESPONSE
+                .with(|r| r.borrow_mut().take())
+                .unwrap_or_else(|| IpcResponse::error(id, IpcError::SpawnFailed));
+            let _ = tx.try_send(response);
+            if let Some((_, slot)) = window {
+                message_loop(slot);
+            }
+        })
+        .is_err()
+    {
+        return IpcResponse::error(id, IpcError::SpawnFailed);
+    }
+    rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or_else(|_| IpcResponse::error(id, IpcError::Timeout))
 }

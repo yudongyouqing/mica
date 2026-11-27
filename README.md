@@ -76,6 +76,38 @@ mica send --literal "C:\\raw\\path"     # 关闭转义(\r \e \)
 pane 开了 bracketed paste 会自动包边界——多行 prompt 注入
 coding agent 不会炸。连不上实例时报错退出,绝不误启新窗。
 
+使用稳定的 pane ID 驱动多窗口和分屏；标签换序或拆合窗口后 ID 保持不变。
+每个 shell 自动获得环境变量 `MICA_PANE_ID`，重开该 pane 时也保持相同 ID。
+
+```powershell
+$pane = mica new-tab --cwd C:\code --command 'pwsh -NoLogo' --env AGENT_NAME=codex --json | ConvertFrom-Json
+mica list --json
+mica send --pane=$($pane.pane_id) 'Get-Date\r'
+mica read --pane=$($pane.pane_id) --scrollback --lines 50
+mica focus --pane=$($pane.pane_id)
+mica badge --pane=$($pane.pane_id) --state attention --text '等待审批'
+mica watch --pane=$($pane.pane_id) --events cwd,prompt,badge,exit
+```
+
+`new-window` 接受相同的启动选项；`--env KEY=VALUE` 可重复，`--font-size N`
+覆盖该标签字号。无实例时只有新建命令会启动 Mica，并将目录、命令、环境和字号
+传给首个 pane；显式无效目录会返回错误。新建命令的 `--json` 返回 pane 元数据，
+`list --json` 返回数组；不加 `--json` 时 `list` 输出可读表格。
+
+`read` 默认读取当前屏幕，`--scrollback` 默认取最后 50 个物理行；软换行会拼接。
+`read --json` 返回 `pane_id/cols/rows/text/truncated`，超过请求行数或文本预算时
+`truncated` 为真。快照按 UTF-8 边界保留最近文本，上限 128 KiB，包含 JSON 转义
+后的响应仍小于协议 1 MiB 帧限制。读取不会切换焦点或改变回滚位置。
+
+徽标状态为 `none/idle/running/attention`，标签显示所有分屏的最高优先级状态。
+`attention` 在聚焦时自动清除，`--sticky` 可保留；备注最多 32 个字符。
+`watch` 逐行输出 NDJSON，可选事件包括 `lifecycle/exit/cwd/prompt/title/badge`；
+事件管道与控制管道独立，最多 8 个订阅者，积压过多或停止读取的客户端会断开，
+重连后可用 `list` 重新同步状态。目录与命令状态事件依赖 shell 发出的 OSC 7/133。
+
+`focus/send/read/badge` 也兼容 `--tab=N` 和 `--qt`，每次只能指定一种目标。
+控制请求超时或断开可能意味着命令已经执行，外部工具应先查询状态再决定是否重试。
+
 ## 配置
 
 用户配置位于 `%APPDATA%\mica\config`，采用 **Ghostty 的 `key = value` 语法**。

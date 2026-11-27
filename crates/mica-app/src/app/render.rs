@@ -188,6 +188,7 @@ pub(super) fn draw_frame() {
             })
             .collect();
         let tab_colors = guard.iter().map(|tab| tab.color).collect();
+        let tab_badges = super::strip::tab_badges(&guard);
         // pane 退出态(M5b/T3):strip 右侧标签(标题后缀会被长标题截断吃掉)
         let pane_exit = guard
             .get(ACTIVE.get())
@@ -432,6 +433,7 @@ pub(super) fn draw_frame() {
                         drop_slot: tab_drag::drop_slot(),
                         window_title: lock.clone().or_else(|| t.term.cwd().map(str::to_owned)),
                         tab_colors,
+                        tab_badges,
                         tab_shortcuts: tab_shortcuts(titles.len()),
                         exit_dot,
                         caption_x: Some(area_w - 3.0 * sm.caption_w),

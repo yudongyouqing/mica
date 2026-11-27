@@ -15,11 +15,101 @@
 //!   操作必须立即拒绝——解码器区分 `NeedMore / Complete / Invalid`,
 //!   坏帧不得当"未到齐"无限累积。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// 单帧上限(含长度前缀)。正常请求(几 KB 内的 profile 名/粘贴文本)
 /// 远低于此;越界立即拒绝,坏客户端不能借半帧把服务端缓冲撑到无界。
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Snapshot budget before JSON escaping. A control character can expand to six
+/// bytes in JSON; 128 KiB leaves ample room for the envelope below 1 MiB.
+pub const READ_TEXT_MAX_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptState {
+    Idle,
+    Running,
+    Unknown,
+}
+
+/// Declaration order is also the tab aggregation priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BadgeState {
+    None = 0,
+    Idle = 1,
+    Running = 2,
+    Attention = 3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneBadge {
+    pub state: BadgeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub sticky: bool,
+}
+
+impl PaneBadge {
+    pub fn new(state: BadgeState, text: Option<String>, sticky: bool) -> Self {
+        Self {
+            state,
+            text: text.map(|text| text.chars().take(32).collect()),
+            sticky,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneInfo {
+    pub window_id: u64,
+    pub is_quick_terminal: bool,
+    pub tab_index: usize,
+    pub pane_id: u64,
+    pub pid: Option<u32>,
+    pub title: String,
+    pub cwd: Option<String>,
+    pub prompt_state: PromptState,
+    pub is_active_tab: bool,
+    pub is_focused_pane: bool,
+    pub exited: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge: Option<PaneBadge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadTextResult {
+    pub pane_id: u64,
+    pub cols: usize,
+    pub rows: usize,
+    pub text: String,
+    pub truncated: bool,
+}
+
+impl ReadTextResult {
+    /// Keep the latest UTF-8 text and bound the *escaped* JSON response, not just
+    /// its raw text. All metadata is fixed-size numeric/boolean data.
+    pub fn into_response(mut self, id: u64) -> IpcResponse {
+        if self.text.len() > READ_TEXT_MAX_BYTES {
+            let mut start = self.text.len() - READ_TEXT_MAX_BYTES;
+            while !self.text.is_char_boundary(start) {
+                start += 1;
+            }
+            self.text.drain(..start);
+            self.truncated = true;
+        }
+        let response = IpcResponse::applied_with_data(
+            id,
+            serde_json::to_value(self).expect("read-text fields are serializable"),
+        );
+        debug_assert!(encode_frame(&response).len() <= MAX_FRAME_BYTES);
+        response
+    }
+}
 
 /// 客户端 → 服务端。op 语义:
 /// - `activate`:聚焦既有窗口(二次启动/new-tab 默认附带)
@@ -44,6 +134,24 @@ pub struct IpcRequest {
     /// Some(-1) = Quick Terminal
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_scrollback: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_state: Option<BadgeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub badge_sticky: Option<bool>,
 }
 
 impl IpcRequest {
@@ -55,12 +163,31 @@ impl IpcRequest {
             font_size: None,
             text: None,
             tab: None,
+            cwd: None,
+            command: None,
+            env: None,
+            pane_id: None,
+            lines: None,
+            include_scrollback: None,
+            badge_state: None,
+            badge_text: None,
+            badge_sticky: None,
         }
     }
 
     /// 服务端已知的操作集合(未知 op 在入队前即拒绝)。
     pub fn is_known_op(op: &str) -> bool {
-        matches!(op, "activate" | "new-tab" | "new-window" | "send-text")
+        matches!(
+            op,
+            "activate"
+                | "new-tab"
+                | "new-window"
+                | "send-text"
+                | "list"
+                | "focus"
+                | "read-text"
+                | "set-badge"
+        )
     }
 }
 
@@ -148,6 +275,8 @@ pub struct IpcResponse {
     /// error 时为 IpcError::code;成功时无
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 impl IpcResponse {
@@ -156,6 +285,7 @@ impl IpcResponse {
             id,
             status: IpcStatus::Queued,
             detail: None,
+            data: None,
         }
     }
     pub fn applied(id: u64) -> Self {
@@ -163,6 +293,13 @@ impl IpcResponse {
             id,
             status: IpcStatus::Applied,
             detail: None,
+            data: None,
+        }
+    }
+    pub fn applied_with_data(id: u64, data: serde_json::Value) -> Self {
+        Self {
+            data: Some(data),
+            ..Self::applied(id)
         }
     }
     pub fn error(id: u64, e: IpcError) -> Self {
@@ -170,6 +307,7 @@ impl IpcResponse {
             id,
             status: IpcStatus::Error,
             detail: Some(e.code().into()),
+            data: None,
         }
     }
 }

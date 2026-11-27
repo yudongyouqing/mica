@@ -15,6 +15,14 @@ impl<R> TabState<R> {
             .map(|p| {
                 let Terminal {
                     term,
+                    pane_id,
+                    initial_cwd,
+                    extra_env,
+                    badge,
+                    observed_cwd,
+                    observed_prompt,
+                    observed_title,
+                    output_pending,
                     session,
                     session_permit,
                     pty_buf,
@@ -37,6 +45,14 @@ impl<R> TabState<R> {
                     id: p.id,
                     terminal: Terminal {
                         term,
+                        pane_id,
+                        initial_cwd,
+                        extra_env,
+                        badge,
+                        observed_cwd,
+                        observed_prompt,
+                        observed_title,
+                        output_pending,
                         session,
                         session_permit,
                         pty_buf,
@@ -202,6 +218,7 @@ pub(super) fn receive(hwnd: HWND, token: usize, index: usize) {
         t.palette = current_palette();
         t.term.set_palette(&t.palette);
         t.pty_buf.move_wake(owner.clone());
+        window_ipc::set_owner(p.id, hwnd);
     }
     let idx = TABS.with(|tabs| {
         let mut tabs = tabs.borrow_mut();

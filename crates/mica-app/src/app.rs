@@ -68,6 +68,7 @@ const WM_APP_IPC: u32 = 0x8000 + 3;
 const WM_APP_TRANSFER: u32 = 0x8004;
 const WM_APP_CLOSE_EMPTY: u32 = 0x8005;
 const WM_APP_DETACH_READY: u32 = 0x8006;
+const WM_APP_WINDOW_IPC: u32 = 0x8007;
 /// watch/转发线程共持的窗口句柄哨兵,唯一语义是"窗口是否存活":退出序第一
 /// 步统一落 None,两个后台线程自此不再向窗口投递消息;Post 到死句柄本就无害,
 /// 纪律照守。存裸 isize 而非 HWND——windows-rs 的句柄包着 *mut c_void,不是
@@ -79,6 +80,7 @@ use config::{ReloadHandle, load_settings, reload_config, spawn_config_watcher};
 
 mod clipboard;
 pub(crate) mod crash;
+pub(crate) mod events;
 mod input;
 pub(crate) mod ipc;
 mod jumplist;
@@ -96,6 +98,7 @@ mod tabs;
 mod transfer;
 pub mod uia;
 mod window;
+mod window_ipc;
 pub mod window_registry; // pub:tests 直入(真窗口生命周期回归,T04)
 
 use input::*;
@@ -287,6 +290,14 @@ pub(crate) use pty_bridge::{PtyBacklog, WriteQueue};
 /// 单个标签的终端态:GPU 以外的一切(M1 时代的 Terminal 字段原样)。
 pub(crate) struct Terminal<R = DwriteRouter> {
     term: Surface,
+    pane_id: u64,
+    initial_cwd: Option<String>,
+    extra_env: std::collections::BTreeMap<String, String>,
+    badge: Option<mica_core::ipc::PaneBadge>,
+    observed_cwd: Option<String>,
+    observed_prompt: (mica_core::ipc::PromptState, Option<i32>),
+    observed_title: String,
+    output_pending: bool,
     /// 会话(控制面:kill/resize/轮询,全在 UI 线程;写端经
     /// writer_handle 分发给 writer 线程——锁分离,复核 3)
     session: PtySession,
@@ -514,6 +525,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 聚焦相位(2026-10-12):失焦洗白不再跳变——设目标后由
             // timer 5 以 150ms 渐近(wparam 低 16 位 0 = WA_INACTIVE)
             let active = (wparam.0 & 0xffff) != 0;
+            if active {
+                window_ipc::clear_active_attention();
+            }
             FOCUS_TARGET.with(|t| t.set(if active { 1.0 } else { 0.0 }));
             let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd), 5, 15, None);
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -888,6 +902,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         && pos != tab.focused
                     {
                         tab.focused = pos;
+                        if let Some(t) = tab.active_pane() {
+                            window_ipc::clear_attention(t);
+                        }
                         for p in tab.panes.iter_mut() {
                             p.terminal.force_full = true;
                         }
@@ -1279,6 +1296,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         && let Some(index) = tab.panes.iter().position(|p| p.id == pane_id)
                     {
                         tab.focused = index;
+                        if let Some(t) = tab.active_pane() {
+                            window_ipc::clear_attention(t);
+                        }
                         let t = &mut tab.panes[index].terminal;
                         let (point, side) = px_to_buffer_point(
                             px as f32 - rect.x,
@@ -1459,10 +1479,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // 消息循环,DSR 应答/输入不被长批饿死)
                 // T08 批预算:单批 ≤256 KiB;drain_batch 内部完成
                 // "清标记→复查→补通知"的防丢唤醒契约(含续批自唤醒)
-                let Some(bytes) = t.pty_buf.drain_batch(pty_bridge::UI_BATCH_BYTES) else {
-                    return; // 积压的重复唤醒:缓冲已被上一条取空,免重绘
-                };
-                t.term.feed(&bytes);
+                let pending = std::mem::take(&mut t.output_pending);
+                let bytes = t.pty_buf.drain_batch(pty_bridge::UI_BATCH_BYTES);
+                if bytes.is_none() && !pending {
+                    return;
+                }
+                if let Some(bytes) = bytes {
+                    t.term.feed(&bytes);
+                }
                 flush_input(t);
 
                 // 钉在历史区时仍有输出:保守全量(滚动期间通常无输出,量小)
@@ -1481,7 +1505,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // 2026 同步输出(D29):持帧只跳 draw,数据已照 feed,不丢。
                 // 先取状态到局部再写 guard,避开 t(&mut 借用)与 guard 交叉
                 // 全部 t 状态先取局部(t 是 guard 的 &mut,不再交叉借用 guard
-                let title_opt: Option<String> = t.term.take_title();
+                let title_opt: Option<String> = window_ipc::observe_output(t)
+                    .or_else(|| pending.then(|| t.observed_title.clone()));
                 // OSC 133 行属性表(D37):core 持久累积(上限内),app 不再
                 // 排空;jump(T2)与 exit 状态点(T3)经 shell_marks() 消费
                 let sync_open = t.term.sync_output_active();
@@ -1763,6 +1788,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_APP_WINDOW_IPC => {
+            window_ipc::drain(hwnd);
+            LRESULT(0)
+        }
         WM_APP_IPC => {
             // IPC 客户端请求(M3a → T06):主线程排空消息队列,逐条应用并
             // **应答**(请求带单槽回复通道,服务端在管道上等这个响应)
@@ -1826,6 +1855,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let slot = SHARED_HWND
                 .with(|s| s.borrow().clone())
                 .unwrap_or_else(|| Arc::new(Mutex::new(Some(hwnd.0 as isize))));
+            window_ipc::unregister(hwnd);
             window_registry::unregister(&slot);
             WINDOW_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             PostQuitMessage(0);
@@ -1838,116 +1868,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 /// T06:应用一条 IPC 请求并生成应答。参数校验在这里(服务端只挡未知
 /// op);send-text 成功仅承诺字节写入 PTY——不承诺 shell 执行完毕。
 unsafe fn apply_ipc_request(hwnd: HWND, req: &IpcRequest) -> Option<IpcResponse> {
-    match req.op.as_str() {
-        "activate" => Some(IpcResponse::applied(req.id)),
-        // new-window 是异步派发(窗口线程创建),此刻无法确知创建结果——
-        // 如实回 Queued(复核 3:仅派发线程不得回 Applied)
-        "new-window" => {
-            spawn_window(None);
-            Some(IpcResponse::queued(req.id))
-        }
-        "new-tab" => {
-            if let Some(fs) = req.font_size
-                && (!fs.is_finite() || !(6.0..=72.0).contains(&fs))
-            {
-                return Some(IpcResponse::error(req.id, IpcError::BadFontSize));
-            }
-            if let Some(profile) = req.profile.as_deref() {
-                let known = mica_core::profile::cached_profiles()
-                    .iter()
-                    .any(|p| p.name.eq_ignore_ascii_case(profile));
-                if !known {
-                    return Some(IpcResponse::error(req.id, IpcError::BadProfile));
-                }
-            }
-            // 真实结果(复核 3):创建失败(DEGRADED/spawn 失败)回错误,
-            // 不再假报 Applied
-            Some(
-                match start_tab_with_profile(hwnd, req.profile.as_deref(), req.font_size) {
-                    true => IpcResponse::applied(req.id),
-                    false if !lifecycle::spawn_capacity_ok() => {
-                        IpcResponse::error(req.id, IpcError::Degraded)
-                    }
-                    false => IpcResponse::error(req.id, IpcError::SpawnFailed),
-                },
-            )
-        }
-        "send-text" => send_text_ipc(req),
-        // 服务端已挡未知 op;防御性兜底
-        _ => Some(IpcResponse::error(req.id, IpcError::UnknownOp)),
-    }
-}
-
-/// send-text 的 IPC 语义(四轮返工复核 1/5):**UI 只做一次非阻塞接收**
-/// (stage_into,零等待)——窗口线程绝不阻塞在排水上;期间输入、关闭、
-/// 绘制与续灌定时器照常(生产入口回归见 input_flow_gui.rs 的
-/// saturated_send_keeps_window_responsive)。
-/// - Accepted → Applied(字节全部在写队列,writer 将写出)。
-/// - Debt → **Queued**:字节已接收、仍会随 writer 排水写出(心跳
-///   续灌推进,与客户端是否等待无关);不承诺 Applied,也绝不取消
-///   ——CLI 文案明示"已接收仍在推进,勿盲目重发"。等待/完成不在
-///   窗口线程上发生。
-/// - RejectedOverflow/Closed → 精确错误码(input_overflow/pty_write),
-///   事务零副作用(未接收任何字节)。
-fn send_text_ipc(req: &IpcRequest) -> Option<IpcResponse> {
-    let bytes = req.text.clone().unwrap_or_default().into_bytes();
-    let payload_for = |t: &mut Terminal| -> Vec<u8> {
-        if t.term.bracketed_paste_active() {
-            let mut w = b"\x1b[200~".to_vec();
-            w.extend_from_slice(&bytes);
-            w.extend_from_slice(b"\x1b[201~");
-            w
-        } else {
-            bytes.clone()
-        }
-    };
-    match req.tab {
-        Some(-1) => {
-            // QT:所属续灌调度 = QT id 7;错误码精确区分三种拒绝
-            if !quickterm::exists() {
-                return Some(IpcResponse::error(req.id, IpcError::BadTarget));
-            }
-            match quickterm::accept_qt(&bytes) {
-                pty_bridge::InputFlow::Accepted => Some(IpcResponse::applied(req.id)),
-                pty_bridge::InputFlow::Debt(_) => Some(IpcResponse::queued(req.id)),
-                pty_bridge::InputFlow::RejectedOverflow => {
-                    Some(IpcResponse::error(req.id, IpcError::InputOverflow))
-                }
-                pty_bridge::InputFlow::RejectedClosed => {
-                    Some(IpcResponse::error(req.id, IpcError::PtyWrite))
-                }
-            }
-        }
-        target => {
-            let flow = TABS.with(|tabs| {
-                let mut guard = tabs.borrow_mut();
-                let t = match target {
-                    Some(n) if n >= 0 => {
-                        guard.get_mut(n as usize).and_then(|tab| tab.active_pane())
-                    }
-                    _ => guard
-                        .get_mut(ACTIVE.get())
-                        .and_then(|tab| tab.active_pane()),
-                };
-                let t = t?;
-                let payload = payload_for(t);
-                Some(stage_input(t, &payload)) // stage_input 内武装主窗 id 8
-            });
-            let Some(flow) = flow else {
-                return Some(IpcResponse::error(req.id, IpcError::BadTarget));
-            };
-            Some(match flow {
-                pty_bridge::InputFlow::Accepted => IpcResponse::applied(req.id),
-                pty_bridge::InputFlow::Debt(_) => IpcResponse::queued(req.id),
-                pty_bridge::InputFlow::RejectedOverflow => {
-                    IpcResponse::error(req.id, IpcError::InputOverflow)
-                }
-                pty_bridge::InputFlow::RejectedClosed => {
-                    IpcResponse::error(req.id, IpcError::PtyWrite)
-                }
-            })
-        }
-    }
+    Some(window_ipc::apply(hwnd, req))
 }
 
 /// 粘贴入口(复核 3/4):**与提交同一个事务组件**——`stage_into`

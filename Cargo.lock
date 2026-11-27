@@ -682,6 +682,8 @@ dependencies = [
  "notify",
  "pollster",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "wgpu",
  "windows",
  "windows-core",

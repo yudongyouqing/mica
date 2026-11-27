@@ -59,6 +59,13 @@ fn launch_isolated() -> ChildGuard {
         .as_nanos();
     let iso = std::env::temp_dir().join(format!("mica-winlife-{unique}"));
     std::fs::create_dir_all(&iso).unwrap();
+    // Lifecycle timings must not depend on the user's PowerShell profile.
+    std::fs::create_dir_all(iso.join("mica")).unwrap();
+    std::fs::write(
+        iso.join("mica/config"),
+        "command = cmd.exe /Q /K\nquick-terminal-key = none\n",
+    )
+    .unwrap();
     let user = format!("micawin{unique}");
     *TEST_USER
         .get_or_init(|| Mutex::new(String::new()))
@@ -175,7 +182,7 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
         type_line(
             hwnd,
             format!(
-                "[IO.File]::WriteAllText('{}', \"$PID,$moveProof\")",
+                "[IO.File]::WriteAllText('{}', \"$PID,$env:MICA_PANE_ID,$moveProof\")",
                 path.display().to_string().replace('\'', "''")
             ),
         );
@@ -186,13 +193,68 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
             {
                 break value;
             }
-            assert!(Instant::now() < deadline, "no shell response at {step}");
+            if Instant::now() >= deadline {
+                let listing = Command::new(env!("CARGO_BIN_EXE_mica"))
+                    .args(["list", "--json"])
+                    .env("USERNAME", test_user())
+                    .output()
+                    .unwrap();
+                eprintln!(
+                    "pane diagnostics: {}",
+                    String::from_utf8_lossy(&listing.stdout)
+                );
+                if let Ok(panes) =
+                    serde_json::from_slice::<Vec<mica_core::ipc::PaneInfo>>(&listing.stdout)
+                {
+                    for pane in panes.into_iter().filter(|p| !p.is_quick_terminal) {
+                        let read = Command::new(env!("CARGO_BIN_EXE_mica"))
+                            .args(["read", &format!("--pane={}", pane.pane_id)])
+                            .env("USERNAME", test_user())
+                            .output()
+                            .unwrap();
+                        let text = String::from_utf8_lossy(&read.stdout);
+                        eprintln!(
+                            "pane {} tail: {}",
+                            pane.pane_id,
+                            text.chars()
+                                .rev()
+                                .take(2400)
+                                .collect::<String>()
+                                .chars()
+                                .rev()
+                                .collect::<String>()
+                        );
+                    }
+                }
+                panic!("no shell response at {step}");
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     };
     type_line(origin, "$moveProof='alive'".into());
     let initial = probe(origin, "before");
     assert!(initial.ends_with(",alive"));
+    let pane_id: u64 = initial
+        .split(',')
+        .nth(1)
+        .expect("pane identity")
+        .parse()
+        .unwrap();
+    let pane_arg = format!("--pane={pane_id}");
+    let listed_pane = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_mica"))
+            .args(["list", "--json"])
+            .env("USERNAME", test_user())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice::<Vec<mica_core::ipc::PaneInfo>>(&output.stdout)
+            .unwrap()
+            .into_iter()
+            .find(|pane| pane.pane_id == pane_id)
+            .expect("stable pane remains listed")
+    };
+    assert_eq!(listed_pane().window_id, origin.0 as u64);
     send(origin, WM_KEYDOWN, 0x2d, 0);
     type_line(origin, "$moveProof='right'".into());
     let other = probe(origin, "right-before");
@@ -217,6 +279,10 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
     let windows = wait_windows(app.0.id(), 2, Duration::from_secs(15));
     let detached = *windows.iter().find(|w| **w != origin).unwrap();
     assert_eq!(probe(detached, "detached"), initial);
+    assert_eq!(listed_pane().window_id, detached.0 as u64);
+    assert!(cli(&["send", &pane_arg, "$moveProof='routed'\\r"]));
+    assert!(probe(detached, "routed-detached").ends_with(",routed"));
+    type_line(detached, "$moveProof='alive'".into());
     type_line(
         detached,
         "$Host.UI.RawUI.WindowTitle='MovedLivePane'".into(),
@@ -231,7 +297,9 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
         "PTY output must wake the new UI thread"
     );
     unsafe {
-        SetWindowPos(origin, Some(HWND_TOP), 24, 24, 620, 400, SWP_SHOWWINDOW).unwrap();
+        // WindowFromPoint must hit our fixture rather than an unrelated
+        // always-on-top app. Only this test-owned window changes z-order.
+        SetWindowPos(origin, Some(HWND_TOPMOST), 24, 24, 620, 400, SWP_SHOWWINDOW).unwrap();
     }
     let mut a = RECT::default();
     let mut b = RECT::default();
@@ -251,6 +319,7 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
         !unsafe { IsWindow(Some(detached)) }.as_bool(),
         "empty detached window should close"
     );
+    assert_eq!(listed_pane().window_id, origin.0 as u64);
     assert_eq!(probe(origin, "rejoined"), initial);
     send(origin, WM_KEYDOWN, 0x23, 0);
     assert_eq!(probe(origin, "right-rejoined"), other);
@@ -273,6 +342,14 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
     let single = *windows.iter().find(|w| **w != origin).unwrap();
     let mut cursor = windows::Win32::Foundation::POINT::default();
     let mut moving = RECT::default();
+    struct CursorRestore(windows::Win32::Foundation::POINT);
+    impl Drop for CursorRestore {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = SetCursorPos(self.0.x, self.0.y);
+            }
+        }
+    }
     unsafe {
         GetCursorPos(&mut cursor).unwrap();
         for hwnd in [origin, single] {
@@ -289,13 +366,27 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
         }
         GetWindowRect(single, &mut moving).unwrap();
     }
-    send(
-        single,
-        WM_MOVING,
-        0,
-        std::ptr::from_mut(&mut moving) as isize,
-    );
+    let cursor_restore = CursorRestore(cursor);
+    // Native movement reads the real pointer, unlike tab-drag messages. Keep
+    // this brief gesture at the fixture's titlebar and exercise several hover
+    // frames so it models an actual drag through the destination preview.
+    for _ in 0..5 {
+        unsafe {
+            SetCursorPos(cursor.x, cursor.y).unwrap();
+        }
+        send(
+            single,
+            WM_MOVING,
+            0,
+            std::ptr::from_mut(&mut moving) as isize,
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        SetCursorPos(cursor.x, cursor.y).unwrap();
+    }
     send(single, WM_EXITSIZEMOVE, 0, 0);
+    drop(cursor_restore);
     let deadline = Instant::now() + Duration::from_secs(8);
     while unsafe { IsWindow(Some(single)) }.as_bool() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
