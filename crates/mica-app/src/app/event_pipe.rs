@@ -19,7 +19,7 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, ExitProcess, WaitForSingleObject};
 use windows::core::{HSTRING, PCWSTR};
 
 use super::{Bus, Filter, IpcError, MAX_WATCHERS, Ordering, Subscription, WatchEvent, bus};
@@ -227,11 +227,14 @@ pub(crate) fn watch(pane_id: Option<u64>, events: Option<&str>) -> Result<(), Ip
         }
     })?;
     let pipe = OwnedHandle(pipe);
-    static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     unsafe extern "system" fn interrupt(kind: u32) -> windows::core::BOOL {
         if kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT {
-            INTERRUPTED.store(true, Ordering::Release);
-            true.into()
+            // This handler is installed only by the watch CLI. Its main
+            // thread may be blocked writing to an unread stdout pipe, so a
+            // flag cannot wake it. Exit without Rust cleanup/stdio flushing:
+            // either can wait for the same stdout lock. Windows closes the
+            // event-pipe handle, allowing the server to reclaim this slot.
+            unsafe { ExitProcess(0) }
         } else {
             false.into()
         }
@@ -244,7 +247,6 @@ pub(crate) fn watch(pane_id: Option<u64>, events: Option<&str>) -> Result<(), Ip
             }
         }
     }
-    INTERRUPTED.store(false, Ordering::Release);
     // A detached GUI invocation may have no console; that should still read
     // the stream normally, with handle cleanup on process termination.
     let _interrupt = unsafe { SetConsoleCtrlHandler(Some(interrupt), true) }
@@ -254,9 +256,6 @@ pub(crate) fn watch(pane_id: Option<u64>, events: Option<&str>) -> Result<(), Ip
     impl std::io::Read for Reader {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
             loop {
-                if INTERRUPTED.load(Ordering::Acquire) {
-                    return Ok(0);
-                }
                 let mut available = 0;
                 if unsafe { PeekNamedPipe(self.0, None, 0, None, Some(&mut available), None) }
                     .is_err()
@@ -281,22 +280,23 @@ pub(crate) fn watch(pane_id: Option<u64>, events: Option<&str>) -> Result<(), Ip
     let mut reader = BufReader::new(Reader(pipe.0));
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
         if reader
-            .read_line(&mut line)
+            .read_until(b'\n', &mut line)
             .map_err(|_| IpcError::Transport)?
             == 0
-            || INTERRUPTED.load(Ordering::Acquire)
+            // read_until returns a final, unterminated fragment at EOF. The
+            // server may shut down or cancel a stalled write mid-event; only
+            // complete NDJSON records are events, and shutdown is a clean end.
+            || !line.ends_with(b"\n")
         {
             return Ok(());
         }
-        let event: WatchEvent = serde_json::from_str(&line).map_err(|_| IpcError::BadJson)?;
+        let event: WatchEvent = serde_json::from_slice(&line).map_err(|_| IpcError::BadJson)?;
         if filter.matches(&event)
-            && let Err(error) = output
-                .write_all(line.as_bytes())
-                .and_then(|_| output.flush())
+            && let Err(error) = output.write_all(&line).and_then(|_| output.flush())
         {
             return if error.kind() == std::io::ErrorKind::BrokenPipe {
                 Ok(())

@@ -46,6 +46,10 @@ impl Drop for ChildGuard {
 }
 
 fn launch_isolated() -> ChildGuard {
+    launch_isolated_config("")
+}
+
+fn launch_isolated_config(extra: &str) -> ChildGuard {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -53,6 +57,11 @@ fn launch_isolated() -> ChildGuard {
     let iso = std::env::temp_dir().join(format!("mica-ipc-{unique}"));
     std::fs::create_dir_all(&iso).unwrap();
     write_test_config(&iso);
+    if !extra.is_empty() {
+        let path = iso.join("mica/config");
+        let source = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, format!("{source}{extra}")).unwrap();
+    }
     // 唯一管道身份:USERNAME 派生管道名;LOCALAPPDATA 隔离状态目录
     // (pty 注册表不再写用户真实文件)
     let user = format!("micatest{unique}");
@@ -570,6 +579,169 @@ fn ordinary_pane_count() -> usize {
         .into_iter()
         .filter(|pane| !pane.is_quick_terminal)
         .count()
+}
+
+#[test]
+fn reopened_tab_restores_launch_env_and_registers_new_pane_owner() {
+    use mica_core::ipc::{PaneInfo, ReadTextResult};
+    use std::io::BufRead;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_KEYDOWN};
+    let _guard = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let _app = launch_isolated_config("keybind = insert=close_tab\nkeybind = home=reopen_tab\n");
+    assert!(wait_ready(Duration::from_secs(20)));
+    let mut create = IpcRequest::new(901, "new-tab");
+    create.command = Some("cmd.exe /D /Q /K".into());
+    create.env = Some(std::collections::BTreeMap::from([(
+        "MICA_REOPEN_PROOF".into(),
+        "retained".into(),
+    )]));
+    let response = exchange(&create);
+    assert_eq!(response.status, IpcStatus::Applied);
+    let original: PaneInfo = serde_json::from_value(response.data.unwrap()).unwrap();
+    let mut watch = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_mica"))
+            .args(["watch", "--events", "badge,lifecycle"])
+            .env("USERNAME", test_user())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let output = watch.0.stdout.take().unwrap();
+    let (events, received) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(output).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if events.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    // A real event is the subscription-ready barrier, not a startup sleep.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut badge = IpcRequest::new(900, "set-badge");
+        badge.pane_id = Some(original.pane_id);
+        badge.badge_state = Some(mica_core::ipc::BadgeState::Idle);
+        assert_eq!(exchange(&badge).status, IpcStatus::Applied);
+        if received
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok_and(|e| e["type"] == "badge_changed")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "watch did not subscribe");
+    }
+    let hwnd = HWND(original.window_id as usize as _);
+    unsafe {
+        SendMessageW(hwnd, WM_KEYDOWN, Some(WPARAM(0x2d)), Some(LPARAM(0)));
+    }
+    assert!(!pane_list().iter().any(|p| p.pane_id == original.pane_id));
+    unsafe {
+        SendMessageW(hwnd, WM_KEYDOWN, Some(WPARAM(0x24)), Some(LPARAM(0)));
+    }
+    let reopened = pane_list()
+        .into_iter()
+        .find(|p| !p.is_quick_terminal && p.is_active_tab)
+        .expect("reopened pane");
+    assert_ne!(reopened.pane_id, original.pane_id);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut closed, mut created) = (false, false);
+    while !(closed && created) {
+        if let Ok(event) = received.recv_timeout(Duration::from_millis(100)) {
+            closed |= event["type"] == "pane_closed" && event["pane_id"] == original.pane_id;
+            created |= event["type"] == "pane_created" && event["pane_id"] == reopened.pane_id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "closed={closed}, created={created}"
+        );
+    }
+    let mut send = IpcRequest::new(902, "send-text");
+    send.pane_id = Some(reopened.pane_id);
+    send.text = Some("echo REOPEN_%MICA_PANE_ID%_%MICA_REOPEN_PROOF%\r".into());
+    assert_eq!(
+        exchange(&send).status,
+        IpcStatus::Applied,
+        "reopened pane must be routable"
+    );
+    let expected = format!("REOPEN_{}_retained", reopened.pane_id);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let mut read = IpcRequest::new(903, "read-text");
+        read.pane_id = Some(reopened.pane_id);
+        let response = exchange(&read);
+        assert_eq!(response.status, IpcStatus::Applied);
+        let snapshot: ReadTextResult = serde_json::from_value(response.data.unwrap()).unwrap();
+        if snapshot.text.contains(&expected) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{:?}", snapshot.text);
+        std::thread::sleep(Duration::from_millis(75));
+    }
+    drop(watch);
+    drop(received);
+    reader.join().unwrap();
+}
+
+#[test]
+fn restarting_pane_keeps_id_and_explicit_environment() {
+    use mica_core::ipc::{PaneInfo, ReadTextResult};
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_KEYDOWN};
+    let _guard = guard().lock().unwrap_or_else(|e| e.into_inner());
+    let _app = launch_isolated_config("keybind = insert=restart_pane\n");
+    assert!(wait_ready(Duration::from_secs(20)));
+    let response = cli_output(&[
+        "new-tab",
+        "--command",
+        "cmd.exe /D /Q /K",
+        "--env",
+        "MICA_RESTART_PROOF=kept",
+        "--json",
+    ]);
+    assert!(response.status.success());
+    let original: PaneInfo = serde_json::from_slice(&response.stdout).unwrap();
+    unsafe {
+        SendMessageW(
+            HWND(original.window_id as usize as _),
+            WM_KEYDOWN,
+            Some(WPARAM(0x2d)),
+            Some(LPARAM(0)),
+        );
+    }
+    let restarted = pane_list()
+        .into_iter()
+        .find(|p| p.pane_id == original.pane_id)
+        .unwrap();
+    assert_ne!(restarted.pid, original.pid);
+    assert_eq!(restarted.cwd, original.cwd);
+    let target = format!("--pane={}", original.pane_id);
+    assert!(
+        cli_output(&[
+            "send",
+            &target,
+            "echo RESTART_%MICA_PANE_ID%_%MICA_RESTART_PROOF%\\r"
+        ])
+        .status
+        .success()
+    );
+    let expected = format!("RESTART_{}_kept", original.pane_id);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let output = cli_output(&["read", &target, "--json"]);
+        assert!(output.status.success());
+        let read: ReadTextResult = serde_json::from_slice(&output.stdout).unwrap();
+        if read.text.contains(&expected) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{:?}", read.text);
+        std::thread::sleep(Duration::from_millis(75));
+    }
 }
 
 fn cli_output(args: &[&str]) -> std::process::Output {

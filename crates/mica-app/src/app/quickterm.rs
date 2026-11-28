@@ -29,7 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, IsWindowVisible,
     LoadCursorW, RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP,
     WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER,
-    WNDCLASSEXW, WS_POPUP, WS_VISIBLE,
+    WNDCLASSEXW, WS_POPUP,
 };
 use windows::core::{HSTRING, w};
 
@@ -202,11 +202,12 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     })?;
     let probe = crate::app::orphan::before_spawn();
     let pane_id = super::window_ipc::next_pane_id();
-    let initial_cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned());
     let mut command = mica_core::pty::command_from_str(&shell_command);
     command.env("MICA_PANE_ID", pane_id.to_string());
+    let initial_cwd = super::effective_initial_cwd(None, command.get_env("USERPROFILE"));
+    if let Some(dir) = &initial_cwd {
+        command.cwd(dir);
+    }
     let (session, reader) = mica_core::pty::PtySession::spawn(command, cols, rows)
         .inspect_err(|e| eprintln!("quickterm: pty 失败 {e:?},QT 禁用"))
         .map_err(|_| ())?;
@@ -492,44 +493,54 @@ pub unsafe fn toggle() {
         return;
     }
     let hwnd = HWND(raw as *mut std::ffi::c_void);
-    let visible = (windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-        hwnd,
-        windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
-    ) as u32)
-        & WS_VISIBLE.0
-        != 0;
-    if visible {
+    if IsWindowVisible(hwnd).as_bool() {
         let _ = ShowWindow(hwnd, SW_HIDE);
     } else {
-        // #37:上次会话已退出 → 重开(同 shell 新会话)再显示
-        QT.with(|q| {
-            let mut guard = q.borrow_mut();
-            let Some(st) = guard.as_mut() else { return };
-            if st.terminal.exited.is_some() {
-                st.terminal.session.kill_child();
-                qt_respawn(&mut st.terminal, hwnd);
-            }
-        });
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-            hwnd,
-            Some(windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
-        );
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-        // 隐藏期不绘(damage 留存):显示即刻补一帧,不等新输出
-        QT.with(|q| {
-            let mut guard = q.borrow_mut();
-            let Some(st) = guard.as_mut() else { return };
+        show();
+    }
+}
+
+/// Showing via IPC has the same session/frame semantics as the hotkey, while
+/// repeated focus calls keep the terminal visible.
+pub(super) unsafe fn show() -> bool {
+    let raw = QT_HWND.with(std::cell::Cell::get);
+    if raw == 0 {
+        return false;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    let exists = QT.with(|q| {
+        let mut guard = q.borrow_mut();
+        let Some(st) = guard.as_mut() else {
+            return false;
+        };
+        if st.terminal.exited.is_some() {
+            qt_respawn(&mut st.terminal, hwnd);
+        }
+        super::window_ipc::clear_attention(&mut st.terminal);
+        true
+    });
+    if !exists {
+        return false;
+    }
+    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+        hwnd,
+        Some(windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST),
+        0,
+        0,
+        0,
+        0,
+        windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+            | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+            | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
+    );
+    let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+    QT.with(|q| {
+        if let Some(st) = q.borrow_mut().as_mut() {
             st.terminal.force_full = true;
             qt_draw(st);
-        });
-    }
+        }
+    });
+    true
 }
 
 unsafe extern "system" fn qt_wndproc(
@@ -983,16 +994,16 @@ pub(super) fn apply_ipc(
 ) -> mica_core::ipc::IpcResponse {
     use mica_core::ipc::{IpcError, IpcResponse};
     if req.op == "focus" {
-        QT.with(|q| {
-            if let Some(st) = q.borrow_mut().as_mut() {
-                super::window_ipc::clear_attention(&mut st.terminal);
-            }
+        let valid = QT.with(|q| {
+            q.borrow()
+                .as_ref()
+                .is_some_and(|st| req.pane_id.is_none_or(|id| id == st.terminal.pane_id))
         });
-        unsafe {
-            let _ = ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_SHOW);
-            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-        }
-        return IpcResponse::applied(req.id);
+        return if valid && unsafe { show() } {
+            IpcResponse::applied(req.id)
+        } else {
+            IpcResponse::error(req.id, IpcError::BadTarget)
+        };
     }
     QT.with(|q| {
         let mut q = q.borrow_mut();
@@ -1370,6 +1381,48 @@ mod tests {
         );
         assert!(state_exited, "hidden session exit must still be recorded");
         assert_eq!(draws, initial_draws, "hidden exit polling must not render");
+    }
+
+    #[test]
+    fn ipc_focus_shows_latest_hidden_output_and_never_toggles_it_off() {
+        let _lock = QT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let settings = mica_core::config::settings::resolve(
+            "command = cmd.exe /D /Q /K\nquick-terminal-key = none\n",
+        )
+        .unwrap();
+        crate::app::seed_tls_for_tests(&settings);
+        unsafe { init(HWND(std::ptr::null_mut())) }.expect("QT init");
+        let hwnd = HWND(QT_HWND.with(std::cell::Cell::get) as _);
+        let before = DRAW_COUNT.with(std::cell::Cell::get);
+        backlog_for_test()
+            .unwrap()
+            .push(0, b"HIDDEN_FOCUS_FRAME")
+            .unwrap();
+        unsafe {
+            SendMessageW(hwnd, WM_APP, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        assert_eq!(DRAW_COUNT.with(std::cell::Cell::get), before);
+        let mut invalid = mica_core::ipc::IpcRequest::new(54, "focus");
+        invalid.pane_id = Some(u64::MAX);
+        let invalid_response = apply_ipc(hwnd, &invalid);
+        let invalid_stayed_hidden = unsafe { !IsWindowVisible(hwnd).as_bool() };
+        let response = apply_ipc(hwnd, &mica_core::ipc::IpcRequest::new(55, "focus"));
+        let drawn = DRAW_COUNT.with(std::cell::Cell::get);
+        let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+        apply_ipc(hwnd, &mica_core::ipc::IpcRequest::new(56, "focus"));
+        let still_visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+        unsafe {
+            SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        forget_state();
+        assert_eq!(invalid_response.detail.as_deref(), Some("bad_target"));
+        assert!(invalid_stayed_hidden);
+        assert_eq!(response.status, mica_core::ipc::IpcStatus::Applied);
+        assert!(visible && still_visible);
+        assert!(
+            drawn > before,
+            "showing a hidden terminal must submit its latest frame"
+        );
     }
 
     #[test]

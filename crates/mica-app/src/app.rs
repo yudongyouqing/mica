@@ -346,6 +346,7 @@ pub(crate) struct Terminal<R = DwriteRouter> {
 struct ClosedTab {
     shell: String,
     cwd: Option<String>,
+    extra_env: std::collections::BTreeMap<String, String>,
     title: String,
     color: Option<[u8; 3]>,
 }

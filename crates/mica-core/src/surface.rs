@@ -222,6 +222,7 @@ pub struct Surface {
     /// Keep byte-stream order even when a command and its next prompt arrive
     /// together. This queue is independent of persistent scrollback row marks.
     pending_shell_marks: std::collections::VecDeque<crate::protocol::sidecar::ShellMark>,
+    shell_mark_overflow: bool,
     /// jump 锚(D37):上次 jump_prompt 的目标(行 + 单调 epoch);手动滚动即重置。
     jump_ref: Option<(i32, i64)>,
     /// 超出 SCROLLBACK_LIMIT 后从历史顶部淘汰的累计行数,用于构造单调 epoch。
@@ -278,6 +279,7 @@ impl Surface {
             sync_output: false,
             marks: Vec::new(),
             pending_shell_marks: std::collections::VecDeque::new(),
+            shell_mark_overflow: false,
             jump_ref: None,
             evicted_lines: 0,
             sel_end: Point::new(Line(0), Column(0)),
@@ -352,6 +354,7 @@ impl Surface {
                 SidecarEvent::Mark(mark) => {
                     if self.pending_shell_marks.len() == MAX_MARKS {
                         self.pending_shell_marks.pop_front();
+                        self.shell_mark_overflow = true;
                     }
                     self.pending_shell_marks.push_back(*mark);
                     // 先喂到事件位置,光标即标记行(视口坐标,0=顶)
@@ -421,6 +424,13 @@ impl Surface {
         self.pending_shell_marks.drain(..).collect()
     }
 
+    /// A bounded producer queue can lose transitions before a subscriber queue
+    /// fills. Consumers must invalidate their stream on this signal, then drain
+    /// the retained tail; silently treating it as a complete stream is unsafe.
+    pub fn take_shell_mark_overflow(&mut self) -> bool {
+        std::mem::take(&mut self.shell_mark_overflow)
+    }
+
     /// Read the latest physical rows without changing selection, viewport scroll
     /// or damage. Alternate screens never expose the main buffer's history.
     /// Construct backwards so even huge histories/combining sequences allocate
@@ -471,7 +481,11 @@ impl Surface {
                     continue;
                 }
                 let extra = cell.zerowidth().unwrap_or_default();
-                for ch in extra.iter().rev().copied().chain(std::iter::once(cell.c)) {
+                // Alacritty stores HT in its starting blank cell and leaves the
+                // cells it crossed intact. Export that one cell as a space;
+                // emitting HT plus the crossed cells would expand tabs twice.
+                let primary = if cell.c == '\t' { ' ' } else { cell.c };
+                for ch in extra.iter().rev().copied().chain(std::iter::once(primary)) {
                     if trim_spaces && ch == ' ' {
                         continue;
                     }

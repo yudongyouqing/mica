@@ -331,6 +331,9 @@ pub(super) fn clear_active_attention() {
     });
 }
 pub(super) fn observe_output(t: &mut Terminal) -> Option<String> {
+    if t.term.take_shell_mark_overflow() {
+        events::disconnect_lagged();
+    }
     let cwd = t
         .term
         .cwd()

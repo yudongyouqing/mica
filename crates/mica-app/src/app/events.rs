@@ -183,6 +183,21 @@ pub(crate) fn publish(mut event: WatchEvent) {
         .publish(Arc::new(line));
 }
 
+/// A producer lost event history before fanout. End every existing stream so
+/// subscribers cannot mistake an incomplete history for a complete one.
+pub(crate) fn disconnect_lagged() {
+    let mut state = bus().lock().unwrap_or_else(|e| e.into_inner());
+    state.disconnect_lagged();
+}
+
+impl Bus {
+    fn disconnect_lagged(&mut self) {
+        for subscriber in self.subscribers.drain(..) {
+            subscriber.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
+
 struct Filter<'a> {
     pane_id: Option<u64>,
     categories: Option<Vec<&'a str>>,
@@ -248,6 +263,26 @@ mod tests {
             .map(|_| Bus::subscribe(&bus).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(replacements.len(), MAX_WATCHERS);
+    }
+
+    #[test]
+    fn producer_lag_cancels_every_stream_and_reclaims_all_slots() {
+        let bus = Arc::new(Mutex::new(Bus::default()));
+        let subscriptions = (0..MAX_WATCHERS)
+            .map(|_| Bus::subscribe(&bus).unwrap())
+            .collect::<Vec<_>>();
+        bus.lock().unwrap().disconnect_lagged();
+        for subscription in &subscriptions {
+            assert!(subscription.cancelled.load(Ordering::Acquire));
+            assert!(matches!(
+                subscription.receiver.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+        }
+        let replacement = Bus::subscribe(&bus).unwrap();
+        drop(subscriptions);
+        assert!(!replacement.cancelled.load(Ordering::Acquire));
+        assert_eq!(bus.lock().unwrap().subscribers.len(), 1);
     }
 
     #[test]

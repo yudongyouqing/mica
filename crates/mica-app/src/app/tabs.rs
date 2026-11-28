@@ -4,6 +4,21 @@
 
 use super::*;
 
+/// Mirror portable-pty's Windows default: explicit directory, child USERPROFILE,
+/// then the process directory. Capture it once for both spawn and metadata.
+pub(super) fn effective_initial_cwd(
+    cwd: Option<&str>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    cwd.map(std::path::Path::new)
+        .filter(|p| p.is_dir())
+        .or_else(|| home.map(std::path::Path::new).filter(|p| p.is_dir()))
+        .map(std::path::absolute)
+        .unwrap_or_else(std::env::current_dir)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// 字号随 DPI:DWrite 光栅按 96dpi 像素出图,pt×scale 才与屏幕物理一致。
 /// reload_dpi 一直这么乘,其余建 router 站点曾全漏(单 150% 屏无
 /// WM_DPICHANGED,字体永远 ×1.0)——2026-10-06 统一单源
@@ -493,11 +508,6 @@ pub(super) unsafe fn create_pane_with_options(
         clipboard::get_text().unwrap_or_default()
     }));
     let pane_id = window_ipc::next_pane_id();
-    let initial_cwd = cwd.map(str::to_owned).or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-    });
     let extra_env = extra_env.cloned().unwrap_or_default();
     let mut cmd = mica_core::pty::command_from_str(shell_command);
     for (key, value) in &extra_env {
@@ -506,7 +516,8 @@ pub(super) unsafe fn create_pane_with_options(
         }
     }
     cmd.env("MICA_PANE_ID", pane_id.to_string());
-    if let Some(dir) = cwd {
+    let initial_cwd = effective_initial_cwd(cwd, cmd.get_env("USERPROFILE"));
+    if let Some(dir) = &initial_cwd {
         cmd.cwd(std::path::PathBuf::from(dir));
     }
     if !lifecycle::spawn_capacity_ok() {
@@ -778,10 +789,15 @@ pub(super) fn close_tab(idx: usize) {
             let first = removed.panes.first().map(|p| {
                 (
                     p.terminal.shell.clone(),
-                    p.terminal.term.cwd().map(str::to_string),
+                    p.terminal
+                        .term
+                        .cwd()
+                        .map(str::to_string)
+                        .or_else(|| p.terminal.initial_cwd.clone()),
+                    p.terminal.extra_env.clone(),
                 )
             });
-            if let Some((shell, cwd)) = first {
+            if let Some((shell, cwd, extra_env)) = first {
                 CLOSED_TABS.with(|h| {
                     let mut hist = h.borrow_mut();
                     if hist.len() >= 8 {
@@ -790,6 +806,7 @@ pub(super) fn close_tab(idx: usize) {
                     hist.push(ClosedTab {
                         shell,
                         cwd,
+                        extra_env,
                         title: removed.title.clone(),
                         color: removed.color,
                     });
@@ -838,4 +855,61 @@ pub(super) fn close_tab(idx: usize) {
         ensure_anim_timer();
     }
     draw_frame();
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    #[test]
+    fn initial_cwd_matches_cmd_when_home_differs_from_process_directory() {
+        let home = std::env::temp_dir().join(format!("mica-cwd-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut cmd = mica_core::pty::command_from_str(
+            "cmd.exe /D /Q /C echo MICA_ACTUAL_CWD=%CD%=MICA_CWD_END",
+        );
+        // Only this child receives the override; no process environment mutation.
+        cmd.env("uSeRpRoFiLe", &home);
+        let recorded = effective_initial_cwd(None, cmd.get_env("USERPROFILE")).unwrap();
+        let (session, reader) = PtySession::spawn(cmd, 160, 24).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut output = String::new();
+        let mut answered = 0;
+        while std::time::Instant::now() < deadline {
+            if let Some(bytes) = reader.recv_timeout(Duration::from_millis(50)) {
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                let pending = output.matches("\x1b[6n").count();
+                for _ in answered..pending {
+                    session.write(b"\x1b[1;1R").unwrap();
+                }
+                answered = pending;
+                if output.contains("=MICA_CWD_END") {
+                    break;
+                }
+            }
+        }
+        drop(session);
+        let _ = std::fs::remove_dir(&home);
+        let expected = format!("MICA_ACTUAL_CWD={recorded}=MICA_CWD_END");
+        assert!(
+            output.contains(&expected),
+            "recorded cwd {recorded:?}, CMD output {output:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_cwd_wins_and_missing_home_uses_process_directory() {
+        let process = std::env::current_dir().unwrap();
+        let missing = process.join("mica-missing-home-cwd-regression");
+        assert!(!missing.exists());
+        let process = process.to_string_lossy().into_owned();
+        assert_eq!(
+            effective_initial_cwd(Some(&process), Some(missing.as_os_str())),
+            Some(process.clone())
+        );
+        assert_eq!(
+            effective_initial_cwd(None, Some(missing.as_os_str())),
+            Some(process)
+        );
+    }
 }

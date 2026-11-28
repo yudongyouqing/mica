@@ -352,6 +352,14 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
     }
     unsafe {
         GetCursorPos(&mut cursor).unwrap();
+    }
+    let cursor_restore = CursorRestore(cursor);
+    // Keep the gesture inside the same controlled fixture scene instead of
+    // placing windows under the user's cursor (possibly over another monitor
+    // or the taskbar). Restore the original pointer when the gesture ends.
+    cursor.x = 200;
+    cursor.y = 150;
+    unsafe {
         for hwnd in [origin, single] {
             SetWindowPos(
                 hwnd,
@@ -366,7 +374,6 @@ fn drag_round_trip_keeps_the_live_shell_and_escape_cancels() {
         }
         GetWindowRect(single, &mut moving).unwrap();
     }
-    let cursor_restore = CursorRestore(cursor);
     // Native movement reads the real pointer, unlike tab-drag messages. Keep
     // this brief gesture at the fixture's titlebar and exercise several hover
     // frames so it models an actual drag through the destination preview.

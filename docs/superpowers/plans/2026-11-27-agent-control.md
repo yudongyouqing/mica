@@ -59,7 +59,7 @@ publication/destruction, per-pane titles and fast command-completion events.
 
 ## Validation
 
-The final suites account for 432 passing tests and seven existing ignored tests.
+The follow-up review suites account for 444 passing tests and eight ignored tests (including subprocess helper entry points explicitly exercised by parent tests).
 Core/render and all other application suites passed in the workspace run. Its
 desktop drag fixture was then made independent of unrelated topmost windows and
 pointer movement; the complete window-lifecycle suite passed (12 passed, one
@@ -75,3 +75,13 @@ after detach/rejoin. No product hit-testing rule was relaxed.
   application or modify personal shell configuration.
 - Specification and code-quality review dispositions are recorded in
   `docs/superpowers/reviews/2026-11-28-agent-control.md`.
+
+
+## Follow-up review dispositions
+
+Re-review found eight gaps missed by the initial tests: reopened-pane routing and
+launch environment, effective default cwd, hidden QT focus redraw, snapshot tabs,
+forwarded command flags, partial NDJSON/UTF-8 EOF, Ctrl+C during blocked stdout,
+and silent producer-side mark overflow. Each has a reproduction or regression;
+the implementation and updated review record include the fixes. Original green
+CI alone was not sufficient evidence for those paths.

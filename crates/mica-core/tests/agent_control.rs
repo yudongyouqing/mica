@@ -70,6 +70,16 @@ fn prompt_events_keep_fast_command_completion_in_a_single_feed() {
 }
 
 #[test]
+fn shell_event_overflow_is_observable_instead_of_silently_losing_completion() {
+    let mut surface = Surface::new(ScreenSize::new(20, 2));
+    surface.feed(b"\x1b]133;C\x07\x1b]133;D;0\x07");
+    surface.feed(&b"\x1b]133;B\x07".repeat(5000));
+    assert!(surface.take_shell_mark_overflow());
+    assert!(!surface.take_shell_mark_overflow());
+    assert_eq!(surface.take_shell_mark_events().len(), 4096);
+}
+
+#[test]
 fn snapshot_preserves_wide_combining_and_soft_wrap_spaces() {
     let mut surface = Surface::new(ScreenSize::new(5, 3));
     surface.feed("中e\u{301}  Q\r\nend".as_bytes());
@@ -130,6 +140,28 @@ fn snapshot_exact_budget_and_combining_on_a_space_are_preserved() {
     let snapshot = surface.dump_text(1, false, expected.len());
     assert_eq!(snapshot.text, expected);
     assert!(!snapshot.truncated);
+}
+
+#[test]
+fn snapshot_tabs_export_visible_cells_without_expanding_them_twice() {
+    for (input, expected) in [
+        ("a\tb", "a       b\n"),
+        ("a\t", "a\n"),
+        ("\tX", "        X\n"),
+        ("中\tb", "中      b\n"),
+        // Clear all tab stops, then put one at column five (one-based).
+        ("\x1b[3g\x1b[5G\x1bH\ra\tb", "a   b\n"),
+        // HT moves over existing text; it must not discard those cells.
+        ("abcdefghij\r\x1b[2G\x1b[X\tb", "a cdefghbj\n"),
+    ] {
+        let mut surface = Surface::new(ScreenSize::new(24, 1));
+        surface.feed(input.as_bytes());
+        assert_eq!(
+            surface.dump_text(1, false, 1024).text,
+            expected,
+            "{input:?}"
+        );
+    }
 }
 
 #[test]

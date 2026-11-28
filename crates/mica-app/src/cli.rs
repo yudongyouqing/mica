@@ -44,6 +44,17 @@ pub(crate) fn parse(args: &[String], id: u64) -> Result<Command, String> {
             let (flag, inline) = arg
                 .split_once('=')
                 .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+            // Text is variadic. Preserve command arguments such as
+            // `codex --resume --json`; only target/legacy send switches retain
+            // their old anywhere-in-the-argument-list interpretation.
+            if command == "send"
+                && !words.is_empty()
+                && !matches!(flag, "--pane" | "--tab" | "--qt" | "--literal")
+            {
+                words.push(arg.as_str());
+                i += 1;
+                continue;
+            }
             let takes_value = matches!(
                 flag,
                 "--pane"
@@ -283,6 +294,31 @@ mod tests {
         };
         assert_eq!(request.text.as_deref(), Some("--text\\r 中文"));
         assert_eq!(request.pane_id, Some(42));
+    }
+
+    #[test]
+    fn send_keeps_command_flags_after_the_first_text_word() {
+        let Command::Control { request, .. } = parse(
+            &args(&[
+                "send",
+                "--pane=42",
+                "codex",
+                "--resume",
+                "--json",
+                "--cwd",
+                "C:/work",
+                "\\r",
+            ]),
+            1,
+        )
+        .unwrap() else {
+            panic!("control")
+        };
+        assert_eq!(request.pane_id, Some(42));
+        assert_eq!(
+            request.text.as_deref(),
+            Some("codex --resume --json --cwd C:/work \r")
+        );
     }
 
     #[test]
