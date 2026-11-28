@@ -104,6 +104,7 @@ Tab 按屏幕中的实际列位置导出，不会被消费方二次展开。
 
 徽标状态为 `none/idle/running/attention`，标签显示所有分屏的最高优先级状态。
 `attention` 在聚焦时自动清除，`--sticky` 可保留；备注最多 32 个字符。
+`badge.text` 供 `list --json` 和事件消费者读取；当前标题栏只显示圆点，不提供备注 tooltip。
 `watch` 逐行输出 NDJSON，可选事件包括 `lifecycle/exit/cwd/prompt/title/badge`；
 事件管道与控制管道独立，最多 8 个订阅者，积压过多或停止读取的客户端会断开；
 终端侧事件队列溢出也会断开订阅，避免把缺失事件的流当成完整流继续使用。

@@ -780,8 +780,15 @@ pub fn strip_quads(
     if let Some(color) = single_badge
         && badge_d + badge_reserve <= right - left
     {
+        // Title layout already reserves the capsule's padding on both sides.
+        // Place the badge outside that padding, preserving the full badge gap.
+        let highlight_inset = if sm.title_highlight && text_w > 0.0 {
+            pad_x
+        } else {
+            0.0
+        };
         out.push(rounded(
-            text_x - badge_reserve,
+            text_x - badge_reserve - highlight_inset,
             (sm.title_h - badge_d) * 0.5,
             badge_d,
             badge_d,
@@ -2331,6 +2338,70 @@ mod tests {
                         .min_by(f32::total_cmp)
                         .expect("title after badge");
                     assert!(next >= end + gap - 0.01);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_badge_stays_outside_highlight_capsule_at_all_dpis() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for centered in [false, true] {
+                for width in [180.0, 300.0, 620.0] {
+                    let mut sm = StripMetrics::from_scale(scale);
+                    sm.hide_single = true;
+                    sm.title_highlight = true;
+                    sm.title_centered = centered;
+                    let d = (6.0 * scale).round();
+                    let gap = (6.0 * scale).round();
+                    let h = (metrics_8x16().line_height + 6.0 * scale)
+                        .min((sm.title_h - 6.0 * scale).max(0.0));
+                    let mut router = FakeRouter {
+                        atlas_w: 128.0,
+                        atlas_h: 128.0,
+                        glyph_w: 4.0 * scale,
+                        glyph_h: 8.0 * scale,
+                        wide: |_| false,
+                    };
+                    let total_w = width * scale;
+                    let caption = total_w - 3.0 * sm.caption_w;
+                    let output = strip_quads(
+                        &[("a long terminal title ".repeat(5), true)],
+                        &mut router,
+                        &metrics_8x16(),
+                        &Palette::DEFAULT,
+                        &sm,
+                        StripExtras {
+                            tab_badges: vec![BadgeState::Attention],
+                            caption_x: Some(caption),
+                            focus: 1.0,
+                            ..Default::default()
+                        },
+                    );
+                    let dot = output
+                        .iter()
+                        .find(|q| q.size_uv == [d, d, 0.0, 0.0] && q.bg[3] == d * 0.5)
+                        .expect("single-tab badge");
+                    let dot_right = dot.pos_uv[0] + d;
+                    assert!(dot.pos_uv[0] >= 28.0 * scale - 0.01);
+                    assert!(dot_right <= caption - 8.0 * scale + 0.01);
+                    if let Some(capsule) = output.iter().find(|q| {
+                        q.size_uv[2] == 0.0
+                            && q.size_uv[0] > d
+                            && (q.size_uv[1] - h).abs() < 0.01
+                            && (q.pos_uv[1] - (sm.title_h - h) * 0.5).abs() < 0.01
+                    }) {
+                        assert!(
+                            capsule.pos_uv[0] >= dot_right + gap - 0.01,
+                            "scale={scale} centered={centered} width={width}: badge right {dot_right}, capsule left {}",
+                            capsule.pos_uv[0]
+                        );
+                        if centered {
+                            let group_center =
+                                (dot.pos_uv[0] + capsule.pos_uv[0] + capsule.size_uv[0]) * 0.5;
+                            assert!((group_center - total_w * 0.5).abs() < 0.01);
+                        }
+                    }
                 }
             }
         }

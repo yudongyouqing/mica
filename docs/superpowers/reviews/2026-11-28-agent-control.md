@@ -32,3 +32,10 @@ Ctrl+C 回归使用单独创建的隐藏控制台，发送信号前核对成员�
 - 发布版继续验证独立实例的 JSON/NDJSON、cwd/env/pane ID、read 和 badge/focus；watch 传输回归也可通过 MICA_TEST_WATCH_BINARY 指向发布版。
 
 未替换本机安装版，未修改个人 PowerShell/oh-my-posh 配置。
+
+## 非默认标题栏组合的补充反馈
+
+- 同时开启 `strip-hide-single-tab` 和 `strip-title-highlight` 时，单标签圆点右缘与标题胶囊左缘确有重叠。宽度预算已预留高亮 padding，修复圆点定位时扣除该 padding，保留完整间距；未显示胶囊时沿用原位置。
+- 新回归先复现 2px 重叠，再验证 100%/125%/150%/200% DPI、左对齐/居中及窄窗口；28 项 frame 测试与渲染 crate 严格 clippy 通过。临时测试缓存使用 F 盘，并在验证后清理。
+- 原 #147 仅要求状态圆点；`badge.text` 保持数据面备注用途，README 已明确当前没有 tooltip。悬停文字作为可选后续，不纳入本次实现。
+- #148 继续指向 dev，并包含 649ff0a 的 1.5.0 版本准备（Cargo.toml、Cargo.lock 与说明文档）。建议先合 #144，再合 #148；不单独发布版本，也不自动合并这两个 PR。
