@@ -37,6 +37,19 @@ pub fn register(slot: &SharedHwnd) {
     }
 }
 
+pub(super) fn alive_windows() -> Vec<HWND> {
+    registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|s| {
+            s.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .map(|raw| HWND(raw as _))
+        })
+        .collect()
+}
+
 /// 注销窗口(WM_DESTROY 里、计数递减前调用)。
 pub fn unregister(slot: &SharedHwnd) {
     let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());

@@ -75,10 +75,12 @@ struct Globals {
     /// 图集纹理尺寸(纹素):UV 归一移到 shader,实例存纹素坐标——
     /// 页追加式高度增长不改变既有条目采样位置(2026-10-08)
     atlas_size: [f32; 2],
-    /// #77 背景图 (alpha, w, h, pad):alpha<0.5 = 无图(空 quad 直通);
-    /// 有图时空白 quad 的底混采样图(cover 平铺,alpha 即混合强度
+    /// #77 背景图 (alpha, w, h, pad):alpha=0 = 无图;
+    /// 有图时标记的终端底混采样图(cover 平铺,alpha 即混合强度
     /// = background-opacity 的图向部分)
     bg: [f32; 4],
+    /// Display RGB of the terminal background plus the pane content opacity.
+    pane_tint: [f32; 4],
 }
 
 const INSTANCE_CAPACITY: usize = 4096;
@@ -295,6 +297,7 @@ impl Renderer {
                 viewport: [1.0, 1.0],
                 atlas_size: [1.0, 1.0],
                 bg: [0.0, 1.0, 1.0, 0.0],
+                pane_tint: [0.0, 0.0, 0.0, 1.0],
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -958,6 +961,16 @@ impl Renderer {
         instances: &[CellInstance],
         scissor: Option<(u32, u32, u32, u32)>,
     ) {
+        self.draw_batch_with_opacity(instances, scissor, 1.0);
+    }
+
+    /// Fade a pane's final pixels into the terminal clear color.
+    pub fn draw_batch_with_opacity(
+        &mut self,
+        instances: &[CellInstance],
+        scissor: Option<(u32, u32, u32, u32)>,
+        opacity: f32,
+    ) {
         if self.frame.is_none() {
             return; // 未 begin_frame:静默丢批(与旧 draw 空帧同哲学)
         }
@@ -986,6 +999,12 @@ impl Renderer {
                 viewport: [vp_w as f32, vp_h as f32],
                 atlas_size: [atlas_w, atlas_h],
                 bg: self.bg_param,
+                pane_tint: [
+                    self.clear_color.r as f32,
+                    self.clear_color.g as f32,
+                    self.clear_color.b as f32,
+                    opacity,
+                ],
             }]),
         );
         self.upload_instances(instances);
@@ -1343,6 +1362,68 @@ mod tests {
             rb > 223 && rr < 32,
             "右半必须是 B 图集的蓝色,得 B={rb} R={rr}"
         );
+
+        let mut translucent = GlyphAtlas::new(256, 256);
+        let rect = translucent.insert(&GlyphBitmap::from_coverage(8, 12, vec![128; 8 * 12]));
+        let mut color_quad = quad(32.0, rect);
+        color_quad.fg = crate::frame::glyph_tint(color_quad.fg, true);
+        renderer.set_atlas(&translucent);
+        renderer.begin_frame_offscreen(&view, (256, 64));
+        renderer.draw_batch(&[quad(12.0, rect), color_quad], None);
+        renderer.end_frame();
+        let blended = read_pixels(&device, &queue, &target, size);
+        let red = |x: usize| blended[(32 * 256 + x) * 4 + 2];
+        assert!(
+            red(16).abs_diff(188) <= 1,
+            "grayscale blends in linear light"
+        );
+        assert!(
+            red(36).abs_diff(128) <= 1,
+            "colored glyph keeps native blend"
+        );
+
+        let path = std::env::temp_dir().join(format!("mica-wallpaper-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 255, 255]))
+            .save(&path)
+            .unwrap();
+        let wallpaper = renderer.set_background_image(Some(&path), 1.0);
+        std::fs::remove_file(&path).unwrap();
+        wallpaper.unwrap();
+        let solid = |x| CellInstance {
+            pos_uv: [x, 26.0, 0.0, 0.0],
+            size_uv: [8.0, 12.0, 0.0, 0.0],
+            fg: [0.0, 1.0, 0.0, 0.0],
+            bg: [0.0, 1.0, 0.0, 0.0],
+        };
+        let mut terminal_bg = solid(12.0);
+        terminal_bg.bg[3] = crate::frame::BACKGROUND_IMAGE_FILL;
+        renderer.begin_frame_offscreen(&view, (256, 64));
+        renderer.draw_batch(&[terminal_bg, solid(32.0)], None);
+        renderer.draw_batch(&[solid(52.0)], None);
+        renderer.end_frame();
+        let pixels = read_pixels(&device, &queue, &target, size);
+        let pixel = |x: usize| &pixels[(32 * 256 + x) * 4..(32 * 256 + x + 1) * 4];
+        assert_eq!(pixel(16), [255, 0, 255, 255], "terminal cell samples image");
+        assert_eq!(pixel(36), [0, 255, 0, 255], "pane rule keeps its fill");
+        assert_eq!(pixel(56), [0, 255, 0, 255], "UI overlay keeps its fill");
+
+        let p = Palette::DEFAULT;
+        renderer.set_clear_color(&p);
+        renderer.begin_frame_offscreen(&view, (256, 64));
+        renderer.draw_batch_with_opacity(&[terminal_bg, color_quad], None, 0.0);
+        renderer.draw_batch(&[solid(52.0)], None);
+        renderer.end_frame();
+        let faded = read_pixels(&device, &queue, &target, size);
+        let pixel = |x: usize| &faded[(32 * 256 + x) * 4..(32 * 256 + x + 1) * 4];
+        assert_eq!(pixel(16), [p.bg.b, p.bg.g, p.bg.r, 255], "wallpaper fades");
+        assert_eq!(
+            pixel(36),
+            [p.bg.b, p.bg.g, p.bg.r, 255],
+            "colored ink fades"
+        );
+        assert_eq!(pixel(56), [0, 255, 0, 255], "overlay stays opaque");
+        renderer.set_background_image(None, 0.0).unwrap();
+
         // A pixel-aligned 1:1 glyph must reproduce texels, not resample an
         // inset/shrunken UV domain. Alternating opaque/clear columns reveal blur.
         let mut strokes = GlyphAtlas::new(256, 256);

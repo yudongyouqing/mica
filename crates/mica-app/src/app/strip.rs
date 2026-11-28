@@ -4,6 +4,74 @@
 
 use super::*;
 
+thread_local! {
+    static WINDOW_DRAGGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SHORTCUTS: RefCell<Option<(Keymap,Vec<Option<String>>)>> = const { RefCell::new(None) };
+}
+
+pub(super) fn set_window_dragging(dragging: bool) {
+    if WINDOW_DRAGGING.replace(dragging) != dragging {
+        draw_frame();
+    }
+}
+
+pub(super) fn shortcuts_hidden() -> bool {
+    WINDOW_DRAGGING.get() || DRAG_TAB.get().is_some() || tab_drag::drop_slot().is_some()
+}
+
+/// Show only numeric accelerators that actually select this tab.
+pub(super) fn tab_shortcuts(count: usize) -> Vec<Option<String>> {
+    if shortcuts_hidden() {
+        return Vec::new();
+    }
+    KEYMAP.with(|keys| {
+        let keys = keys.borrow();
+        SHORTCUTS.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.as_ref().is_none_or(|(previous, _)| previous != &*keys) {
+                let hints = (1..=9)
+                    .map(|i| {
+                        if i > 9 {
+                            return None;
+                        }
+                        for mask in 1..16 {
+                            let mods = Mods {
+                                ctrl: mask & 1 != 0,
+                                shift: mask & 2 != 0,
+                                alt: mask & 4 != 0,
+                                win: mask & 8 != 0,
+                            };
+                            if keys.lookup(mods, TriggerKey::Digit(i as u8))
+                                == Some(Action::GotoTab(i as u8))
+                            {
+                                let mut label = String::new();
+                                for (enabled, name) in [
+                                    (mods.ctrl, "⌃"),
+                                    (mods.shift, "⇧"),
+                                    (mods.alt, "⎇"),
+                                    (mods.win, "⊞"),
+                                ] {
+                                    if enabled {
+                                        label.push_str(name);
+                                    }
+                                }
+                                label.push(char::from(b'0' + i as u8));
+                                return Some(label);
+                            }
+                        }
+                        None
+                    })
+                    .collect::<Vec<_>>();
+                *memo = Some((keys.clone(), hints));
+            }
+            let hints = &memo.as_ref().expect("shortcut cache initialized").1;
+            (0..count)
+                .map(|i| hints.get(i).cloned().flatten())
+                .collect()
+        })
+    })
+}
+
 /// strip/顶栏运行时几何(DPI 缩放 + 用户配置单源,渲染与 hit-test 同取):
 /// 150% 屏上物理常量曾致条高/× 与字体错位(2026-10-06 用户实测);
 /// strip-* 配置键热重载时经 STRIP_CFG 生效(2026-10-12 全量可配)
@@ -127,16 +195,6 @@ pub(super) fn strip_anim_step() -> bool {
     } else if t0 >= 0.0 {
         CAPS_T0.with(|t| t.set(-1.0));
     }
-    // 悬停反色动画:120ms ease-out,从下划线长到整块
-    if HOVER_PATH.with(|h| h.borrow().is_some()) {
-        let a = HOVER_ANIM.with(std::cell::Cell::get);
-        if a < 1.0 {
-            HOVER_ANIM.with(|a| a.set((a.get() + 0.015 / 0.120).min(1.0)));
-            busy = true;
-        }
-    } else {
-        HOVER_ANIM.with(|a| a.set(1.0)); // 不在路径上:无动画态
-    }
     // 邻位滑移:指数衰减(15ms 一拍 ×0.72 ≈ 105ms 收敛),全落定即停
     TAB_DX.with(|d| {
         let mut d = d.borrow_mut();
@@ -180,7 +238,7 @@ pub(super) fn strip_hit(px: i32, py: i32) -> Option<mica_render::frame::StripTab
     let right = mica_render::frame::tabs_right(area_w, &sm);
     // 溢出才显箭头(与渲染同判据);箭头绘制在固定屏幕坐标 [2k, 2k+arrow_w) /
     // [right-arrow_w, right),不随 TAB_SCROLL 偏移
-    if mica_render::frame::tabs_x0(&sm) + n as f32 * span > right + 0.5 {
+    if mica_render::frame::tab_scroll_max(n, area_w, &sm) > 0 {
         if x >= 2.0 * sm.k && x < 2.0 * sm.k + sm.arrow_w {
             return Some(StripTabHit::ArrowLeft);
         }
@@ -258,16 +316,9 @@ pub(super) fn tab_scroll_adjust(delta: i32) -> bool {
         .unwrap_or(0.0);
     let sm = strip_metrics();
     let n = TABS.with(|tabs| tabs.borrow().len());
-    let w = mica_render::frame::tab_w_now(n, area_w, &sm);
-    let need = mica_render::frame::tabs_x0(&sm) + n as f32 * (w + sm.tab_gap);
-    let right = mica_render::frame::tabs_right(area_w, &sm);
-    let max = if area_w <= 0.0 || need <= right {
-        0
-    } else {
-        ((need - right) / sm.tab_min_w).ceil() as i32
-    };
+    let max = mica_render::frame::tab_scroll_max(n, area_w, &sm);
     let old = TAB_SCROLL.with(std::cell::Cell::get);
-    let new = (old + delta).clamp(0, max);
+    let new = old.saturating_add(delta).clamp(0, max);
     if new != old {
         TAB_SCROLL.with(|s| s.set(new));
         true
@@ -283,26 +334,9 @@ pub(super) fn tab_follow_active() {
         .unwrap_or(0.0);
     let sm = strip_metrics();
     let n = TABS.with(|tabs| tabs.borrow().len());
-    let w = mica_render::frame::tab_w_now(n, area_w, &sm);
-    let right = mica_render::frame::tabs_right(area_w, &sm);
-    let visible = if area_w <= 0.0 {
-        i32::MAX
-    } else {
-        (((right - mica_render::frame::tabs_x0(&sm)) / (w + sm.tab_gap)).floor() as i32).max(1)
-    };
-    let active = ACTIVE.get() as i32;
-    let cur = TAB_SCROLL.with(std::cell::Cell::get);
-    let want = if active < cur + 1 {
-        (active - 1).max(0) // 左侧滚出:活跃前留一标签
-    } else if active > cur + visible.saturating_sub(1) {
-        active - visible + 1 // 右侧滚出
-    } else {
-        cur
-    };
-    if want != cur {
-        TAB_SCROLL.with(|s| s.set(want));
-        let _ = tab_scroll_adjust(0); // clamp
-    }
+    let cur = TAB_SCROLL.get();
+    let want = mica_render::frame::tab_follow_scroll(n, ACTIVE.get(), cur, area_w, &sm);
+    TAB_SCROLL.set(want);
 }
 
 /// 标签显示名(#81 导出文件名用):TITLE_LOCK 优先,回退标签自身标题
@@ -336,4 +370,57 @@ pub(super) fn pretty_title(raw: &str) -> String {
             .to_string();
     }
     t.to_string()
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    #[test]
+    fn moving_any_window_hides_hints_until_move_finishes() {
+        let original = KEYMAP.with(|keys| keys.replace(Settings::default().keymap));
+        for count in [1, 5] {
+            assert_eq!(tab_shortcuts(count).len(), count);
+            set_window_dragging(true);
+            assert!(tab_shortcuts(count).is_empty());
+            set_window_dragging(true);
+            assert!(tab_shortcuts(count).is_empty());
+            set_window_dragging(false);
+            assert_eq!(tab_shortcuts(count).len(), count);
+        }
+        KEYMAP.with(|keys| {
+            keys.replace(original);
+        });
+    }
+
+    #[test]
+    fn dragging_a_tab_suppresses_its_accelerator_hints() {
+        let original = KEYMAP.with(|keys| keys.replace(Settings::default().keymap));
+        DRAG_TAB.set(Some(0));
+        assert!(tab_shortcuts(2).is_empty());
+        DRAG_TAB.set(None);
+        assert_eq!(
+            tab_shortcuts(2),
+            vec![Some("⌃⇧1".into()), Some("⌃⇧2".into())]
+        );
+        KEYMAP.with(|keys| {
+            keys.replace(original);
+        });
+    }
+
+    #[test]
+    fn accelerators_follow_enabled_numeric_bindings() {
+        let original = KEYMAP.with(|keys| keys.replace(Settings::default().keymap));
+        assert_eq!(
+            tab_shortcuts(2),
+            vec![Some("⌃⇧1".into()), Some("⌃⇧2".into())]
+        );
+        KEYMAP.with(|keys| keys.borrow_mut().clear());
+        assert_eq!(tab_shortcuts(2), vec![None, None]);
+        let trigger = mica_core::keymap::parse_trigger("alt+1").unwrap();
+        KEYMAP.with(|keys| keys.borrow_mut().bind(trigger, Action::GotoTab(1)));
+        assert_eq!(tab_shortcuts(2), vec![Some("⎇1".into()), None]);
+        KEYMAP.with(|keys| {
+            keys.replace(original);
+        });
+    }
 }

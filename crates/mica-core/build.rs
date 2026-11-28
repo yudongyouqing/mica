@@ -62,13 +62,17 @@ fn main() {
     };
     let size: f32 = value("font-size").parse().expect("default font size");
     let contrast: f32 = value("minimum-contrast").parse().expect("default contrast");
+    let faint: f32 = value("faint-opacity")
+        .parse()
+        .expect("default faint opacity");
     let output = format!(
         "pub const DEFAULT_FAMILIES: &[&str] = &[{fonts}];\n\
          pub const DEFAULT_FONT_SIZE_PT: f32 = {size:?};\n\
          pub const DEFAULT_PALETTE: crate::config::palette::Palette = crate::config::palette::Palette {{\n\
-         colors: [{colors}], fg: {fg}, bg: {bg}, cursor: {},\n\
+         colors: [{colors}], fg: {fg}, bg: {bg}, cursor: {}, cursor_text: {}, faint_opacity: {faint:?},\n\
          selection_fg: {}, selection_bg: {}, minimum_contrast: {contrast:?} }};\n",
         derived("cursor-color", &fg),
+        derived("cursor-text", &bg),
         derived("selection-foreground", &bg),
         derived("selection-background", &fg),
     );

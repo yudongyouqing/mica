@@ -30,8 +30,103 @@ pub(super) fn path_hover_rect(
     })
 }
 
+thread_local! {
+    pub(super) static SEARCH_PANE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn search_bar_geometry(
+    r: mica_core::layout::Rect,
+    m: &FontMetrics,
+) -> (mica_core::layout::Rect, f32) {
+    let h = (m.line_height + 4.0).min(r.h);
+    let w = (52.0 * m.cell_width).min(r.w);
+    (
+        mica_core::layout::Rect::new(r.x, r.y + r.h - h, w, h),
+        (m.cell_width * 3.0).min(w / 4.0),
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchControl {
+    Query,
+    Previous,
+    Next,
+    Close,
+}
+
+thread_local! {
+    static PRESSED: std::cell::Cell<Option<(u64, SearchControl)>> = const { std::cell::Cell::new(None) };
+}
+
+fn search_control_at(x: i32, y: i32) -> Option<(u64, SearchControl)> {
+    if !SEARCH_OPEN.get() {
+        return None;
+    }
+    let rects = active_pane_rects();
+    TABS.with(|tabs| {
+        let tabs = tabs.borrow();
+        let tab = tabs.get(ACTIVE.get())?;
+        let id = tab.active_pane_id()?;
+        let (_, r) = rects.iter().find(|(p, _)| *p == id)?;
+        let (bar, button) = search_bar_geometry(*r, &tab.active_pane_ref()?.metrics);
+        let (x, y) = (x as f32, y as f32);
+        let end = bar.x + bar.w;
+        if x < bar.x || x >= end || y < bar.y || y >= bar.y + bar.h {
+            return None;
+        }
+        let control = if x >= end - button {
+            SearchControl::Close
+        } else if x >= end - 2.0 * button {
+            SearchControl::Next
+        } else if x >= end - 3.0 * button {
+            SearchControl::Previous
+        } else {
+            SearchControl::Query
+        };
+        Some((id, control))
+    })
+}
+
+pub(super) fn search_press(hwnd: HWND, x: i32, y: i32) -> bool {
+    let Some(hit) = search_control_at(x, y) else {
+        return false;
+    };
+    PRESSED.set(Some(hit));
+    unsafe {
+        let _ = SetCapture(hwnd);
+    }
+    true
+}
+
+pub(super) fn cancel_search_press() {
+    PRESSED.take();
+}
+
+pub(super) fn search_release(x: i32, y: i32) -> bool {
+    let Some(pressed) = PRESSED.take() else {
+        return false;
+    };
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+    if Some(pressed) == search_control_at(x, y) {
+        match pressed.1 {
+            SearchControl::Close => search_close(),
+            SearchControl::Next => search_jump(true),
+            SearchControl::Previous => search_jump(false),
+            SearchControl::Query => {}
+        }
+    }
+    true
+}
+
 /// #57 打开搜索:清查询/命中,首帧空条
 pub(super) fn search_open() {
+    SEARCH_PANE.set(TABS.with(|tabs| {
+        tabs.borrow()
+            .get(ACTIVE.get())
+            .and_then(TabState::active_pane_id)
+    }));
     SEARCH_OPEN.with(|o| o.set(true));
     SEARCH_QUERY.with(|q| q.borrow_mut().clear());
     SEARCH_MATCHES.with(|m| m.borrow_mut().clear());
@@ -248,7 +343,7 @@ pub(super) fn all_path_spans(text: &str, cell_of: &[usize]) -> Vec<(usize, usize
 
 pub(super) fn update_hover_path(px: i32, py: i32) -> bool {
     let span = hover_path_span(px, py);
-    let changed = HOVER_PATH.with(|h| {
+    HOVER_PATH.with(|h| {
         let mut old = h.borrow_mut();
         if *old == span {
             false
@@ -256,12 +351,7 @@ pub(super) fn update_hover_path(px: i32, py: i32) -> bool {
             *old = span;
             true
         }
-    });
-    if changed && span.is_some() {
-        HOVER_ANIM.with(|a| a.set(0.0));
-        ensure_anim_timer();
-    }
-    changed
+    })
 }
 
 fn hover_path_span(px: i32, py: i32) -> Option<PathHover> {
@@ -292,6 +382,14 @@ fn hover_path_span(px: i32, py: i32) -> Option<PathHover> {
         }
         let (text, cell_of) = mica_render::frame::row_string(t.term.grid(), point.line.0);
         let (column, cells) = span_of_token(&text, &cell_of, point.column.0)?;
+        let row = &t.term.grid()[point.line];
+        if (column..column + cells).any(|c| {
+            row[Column(c)]
+                .flags
+                .contains(mica_core::surface::CellFlags::HIDDEN)
+        }) {
+            return None;
+        }
         Some(PathHover {
             pane_id,
             line: point.line.0,
@@ -341,7 +439,11 @@ pub(super) fn link_at(px: i32, py: i32) -> Option<String> {
             return None;
         }
         let (line, col) = (point.line.0, point.column.0);
-        if let Some(l) = t.term.grid()[Line(line)][Column(col)].hyperlink() {
+        let cell = &t.term.grid()[Line(line)][Column(col)];
+        if cell.flags.contains(mica_core::surface::CellFlags::HIDDEN) {
+            return None;
+        }
+        if let Some(l) = cell.hyperlink() {
             return Some(l.uri().to_string());
         }
         // #58:OSC 8 未命中 → 行文本路径检测(编译器输出裸路径可点击)

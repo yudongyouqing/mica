@@ -3,6 +3,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::*;
+thread_local! {
+    static STRIP_CACHE: RefCell<mica_render::strip_cache::StripCache> = RefCell::new(Default::default());
+}
 
 /// 窗口级 GPU 一次建:TAB_SEED 供 NewTab 复用启动设置。
 pub(super) unsafe fn init_window_gpu(hwnd: HWND) -> anyhow::Result<WindowGpu> {
@@ -120,6 +123,7 @@ struct PaneBatch {
     pane_id: u64,
     scissor: (u32, u32, u32, u32),
     insts: Vec<mica_render::frame::CellInstance>,
+    opacity: f32,
 }
 
 /// 合帧窗:数据到 → 5ms 内的同批输出并成一帧(打字回显无感,突发
@@ -163,6 +167,7 @@ pub(super) fn draw_frame() {
         rebuild_gpu_after_loss();
     }
     // 条高先取(动态:单标签隐藏第二行;取值含 TABS 借用,须在 guard 外)
+    let _ = tab_scroll_adjust(0);
     let sh = strip_h();
     // T05 批次容器:TABS 闭包填充,GPU 阶段消费(闭包早退 = 空批,
     // GPU 阶段退化为纯清屏帧)
@@ -182,6 +187,7 @@ pub(super) fn draw_frame() {
                 )
             })
             .collect();
+        let tab_colors = guard.iter().map(|tab| tab.color).collect();
         // pane 退出态(M5b/T3):strip 右侧标签(标题后缀会被长标题截断吃掉)
         let pane_exit = guard
             .get(ACTIVE.get())
@@ -211,8 +217,10 @@ pub(super) fn draw_frame() {
             - sh;
         use mica_core::layout::Rect;
         let area = terminal_area(area_w, area_h + sh, sh);
-        let rects: Vec<(u64, Rect)> = active.layout.rects(area);
+        let divider_width = DPI_SCALE.with(std::cell::Cell::get).round().max(1.0);
+        let (rects, dividers) = active.layout.rects_and_dividers(area, divider_width);
         let focused_pane_id = active.active_pane_id().unwrap_or(0);
+        let unfocused_opacity = UNFOCUSED_SPLIT_OPACITY.with(std::cell::Cell::get);
 
         // T05 分批绘制:每 pane 一批(自己的图集 + scissor 到 pane 矩形),
         // strip/搜索 overlay 是焦点图集的独立批(pane 区外,无 scissor)。
@@ -238,6 +246,7 @@ pub(super) fn draw_frame() {
                 let shared_ui = (pane.id == focused_pane_id).then(|| {
                     (
                         &titles,
+                        shortcuts_hidden(),
                         SEARCH_OPEN.with(std::cell::Cell::get),
                         SEARCH_QUERY.with(|q| q.borrow().clone()),
                         HOVER_URL.with(|h| h.borrow().as_ref().map(|(url, _, _)| url.clone())),
@@ -296,9 +305,6 @@ pub(super) fn draw_frame() {
                     t.rows,
                 )
             {
-                let phase = HOVER_ANIM.with(std::cell::Cell::get);
-                let hh = 2.0 + (hl.h - 2.0) * (1.0 - (1.0 - phase).powi(3));
-                let y = hl.y + hl.h - hh;
                 let c = t.palette.colors[12];
                 let color = [
                     c.r as f32 / 255.0,
@@ -306,27 +312,24 @@ pub(super) fn draw_frame() {
                     c.b as f32 / 255.0,
                     0.0,
                 ];
-                for inst in &mut insts {
-                    if (inst.pos_uv[0] + inst.size_uv[0]).min(hl.x + hl.w)
-                        - inst.pos_uv[0].max(hl.x)
-                        > 0.01
-                        && (inst.pos_uv[1] + inst.size_uv[1]).min(y + hh) - inst.pos_uv[1].max(y)
-                            > 0.01
-                    {
-                        inst.fg = if inst.size_uv[2] > 0.0 {
-                            [0.05, 0.05, 0.05, 0.0]
-                        } else {
-                            color
-                        };
-                        inst.bg = color;
-                    }
-                }
+                let h = hl.h.min(2.0);
+                insts.push(mica_render::frame::CellInstance {
+                    pos_uv: [hl.x, hl.y + hl.h - h, 0.0, 0.0],
+                    size_uv: [hl.w, h, 0.0, 0.0],
+                    fg: color,
+                    bg: color,
+                });
             }
             let (sx, sy, sw, sh_r) = pane_scissor(rect, (area_w, area_h), sh);
             pane_batches.push(PaneBatch {
                 pane_id: pane.id,
                 scissor: (sx, sy, sw, sh_r),
                 insts,
+                opacity: if pane.id == focused_pane_id {
+                    1.0
+                } else {
+                    unfocused_opacity
+                },
             });
         }
 
@@ -345,6 +348,7 @@ pub(super) fn draw_frame() {
         });
         let sm = strip_metrics();
         if t.strip_router.is_none() {
+            STRIP_CACHE.with(|c| c.borrow_mut().clear());
             let cfg = STRIP_CFG.with(|c| c.borrow().clone());
             let mut fams: Vec<String> = match &cfg.font_family {
                 Some(f) => vec![f.clone()],
@@ -353,6 +357,7 @@ pub(super) fn draw_frame() {
             for fb in [
                 "Segoe UI",
                 "Microsoft YaHei UI",
+                "Segoe UI Symbol",
                 "Segoe UI Emoji",
                 "Segoe Fluent Icons",
             ] {
@@ -373,40 +378,91 @@ pub(super) fn draw_frame() {
             return; // 惰性建失败:本帧放弃,下帧重试
         };
         let ui_m = strip_r.metrics();
-        let mut strip = mica_render::frame::strip_quads(
-            &titles,
-            strip_r,
-            &ui_m,
-            &t.palette,
-            &sm,
-            mica_render::frame::StripExtras {
-                exit_dot,
-                caption_x: Some(area_w - 3.0 * sm.caption_w),
-                layout: mica_render::frame::StripLayout {
-                    tab_scroll: TAB_SCROLL.with(std::cell::Cell::get),
-                },
-                pane_exit,
-                hover: HOVER_STRIP.with(std::cell::Cell::get),
-                zoomed: SHARED_HWND
-                    .with(|h| h.borrow().as_ref().and_then(|s| *s.lock().unwrap()))
-                    .is_some_and(|v| unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::IsZoomed(
-                            windows::Win32::Foundation::HWND(v as _),
-                        )
-                        .as_bool()
-                    }),
-                focus: FOCUS_PHASE.with(std::cell::Cell::get),
-                capsule_dx: capsule_dx_now(),
-                drag: DRAG_TAB.with(std::cell::Cell::get).map(|i| {
-                    (
-                        i,
-                        DRAG_SLOT.with(std::cell::Cell::get),
-                        DRAG_X.with(std::cell::Cell::get),
-                    )
-                }),
-                tab_dx: TAB_DX.with(|d| d.borrow().clone()),
-            },
-        );
+        let channel = |bg: u8, fg: u8| (f32::from(bg) * 0.86 + f32::from(fg) * 0.14) / 255.0;
+        let (bg, fg) = (t.palette.bg, t.palette.fg);
+        let line = [
+            channel(bg.r, fg.r),
+            channel(bg.g, fg.g),
+            channel(bg.b, fg.b),
+            0.0,
+        ];
+        let mut strip: Vec<_> = dividers
+            .into_iter()
+            .map(|r| mica_render::frame::CellInstance {
+                pos_uv: [r.x, r.y, 0.0, 0.0],
+                size_uv: [r.w, r.h, 0.0, 0.0],
+                fg: line,
+                bg: line,
+            })
+            .collect();
+        if rects.len() > 1
+            && let Some((_, rect)) = rects.iter().find(|(id, _)| *id == focused_pane_id)
+        {
+            let ink = [
+                f32::from(fg.r) / 255.0,
+                f32::from(fg.g) / 255.0,
+                f32::from(fg.b) / 255.0,
+                0.0,
+            ];
+            strip.push(mica_render::frame::CellInstance {
+                pos_uv: [rect.x, rect.y, 0.0, 0.0],
+                size_uv: [
+                    (2.0 * sm.k).min(rect.w),
+                    t.metrics.line_height.min(rect.h),
+                    0.0,
+                    0.0,
+                ],
+                fg: ink,
+                bg: ink,
+            });
+        }
+        let atlas_key = {
+            let a = strip_r.atlas();
+            (a.identity(), a.version())
+        };
+        STRIP_CACHE.with(|cache| {
+            strip.extend_from_slice(
+                cache.borrow_mut().get(
+                    &titles,
+                    strip_r,
+                    &ui_m,
+                    &t.palette,
+                    &sm,
+                    mica_render::frame::StripExtras {
+                        drop_slot: tab_drag::drop_slot(),
+                        window_title: lock.clone().or_else(|| t.term.cwd().map(str::to_owned)),
+                        tab_colors,
+                        tab_shortcuts: tab_shortcuts(titles.len()),
+                        exit_dot,
+                        caption_x: Some(area_w - 3.0 * sm.caption_w),
+                        layout: mica_render::frame::StripLayout {
+                            tab_scroll: TAB_SCROLL.with(std::cell::Cell::get),
+                        },
+                        pane_exit,
+                        hover: HOVER_STRIP.with(std::cell::Cell::get),
+                        zoomed: SHARED_HWND
+                            .with(|h| h.borrow().as_ref().and_then(|s| *s.lock().unwrap()))
+                            .is_some_and(|v| unsafe {
+                                windows::Win32::UI::WindowsAndMessaging::IsZoomed(
+                                    windows::Win32::Foundation::HWND(v as _),
+                                )
+                                .as_bool()
+                            }),
+                        focus: FOCUS_PHASE.with(std::cell::Cell::get),
+                        capsule_dx: capsule_dx_now(),
+                        drag: DRAG_TAB.with(std::cell::Cell::get).map(|i| {
+                            (
+                                i,
+                                DRAG_SLOT.with(std::cell::Cell::get),
+                                DRAG_X.with(std::cell::Cell::get),
+                            )
+                        }),
+                        tab_dx: TAB_DX.with(|d| d.borrow().clone()),
+                    },
+                    atlas_key,
+                ),
+            )
+        });
         // D28 hover 气泡:悬停链接的 URI overlay(锚点在 WM_MOUSEHOVER 记录)
         if let Some((url, hx, hy)) = HOVER_URL.with(|h| h.borrow().clone()) {
             strip.extend(mica_render::frame::tooltip_quads(
@@ -420,6 +476,9 @@ pub(super) fn draw_frame() {
         }
         // #57 搜索:命中高亮 + 底部搜索条,收集进独立 overlay
         let mut search_overlay: Vec<mica_render::frame::CellInstance> = Vec::new();
+        if SEARCH_PANE.get() != Some(focused_pane_id) {
+            SEARCH_OPEN.set(false);
+        }
         let search_open = SEARCH_OPEN.with(std::cell::Cell::get);
         let rename_open = RENAME_OPEN.with(std::cell::Cell::get);
         if search_open || rename_open {
@@ -512,20 +571,11 @@ pub(super) fn draw_frame() {
                         }
                     }
                 }
-                let bar_y = pr.y + pr.h - t.metrics.line_height - 4.0;
-                let bar_w = (t.metrics.cell_width * 48.0).min(pr.w);
-                let bar_bg = [
-                    (t.palette.bg.r as u16 * 2 + 255) as u8 / 3,
-                    (t.palette.bg.g as u16 * 2 + 255) as u8 / 3,
-                    (t.palette.bg.b as u16 * 2 + 255) as u8 / 3,
-                ];
-                search_overlay.push(mk_quad(
-                    pr.x,
-                    bar_y,
-                    bar_w,
-                    t.metrics.line_height + 4.0,
-                    bar_bg,
-                ));
+                let (bar, button) = search_bar_geometry(pr, &t.metrics);
+                let blend = |bg: u8, fg: u8| ((u16::from(bg) * 7 + u16::from(fg)) / 8) as u8;
+                let (bg, fg) = (t.palette.bg, t.palette.fg);
+                let bar_bg = [blend(bg.r, fg.r), blend(bg.g, fg.g), blend(bg.b, fg.b)];
+                search_overlay.push(mk_quad(bar.x, bar.y, bar.w, bar.h, bar_bg));
                 let q = if rename_open {
                     RENAME_QUERY.with(|q| q.borrow().clone())
                 } else {
@@ -538,106 +588,65 @@ pub(super) fn draw_frame() {
                         format!("rename: {q}")
                     }
                 } else if q.is_empty() {
-                    "/(输入以搜索)".into()
+                    "搜索当前分屏".into()
+                } else if matches.is_empty() {
+                    format!("本分屏 · 无结果 · {q}")
                 } else {
-                    format!(
-                        "/{q}  {}/{}",
-                        if matches.is_empty() { 0 } else { cur + 1 },
-                        matches.len()
-                    )
+                    format!("本分屏 · {}/{} · {q}", cur + 1, matches.len())
                 };
-                let mut tx = pr.x + 2.0;
-                let ty = bar_y + 2.0;
-                for ch in label.chars().take(46) {
-                    let g = <DwriteRouter as mica_render::font::router::GlyphRouter>::route(
-                        &mut t.router,
-                        ch,
-                        mica_render::font::GlyphStyle::PLAIN,
-                    );
-                    if g.size_px[0] > 0.0 {
-                        search_overlay.push(mica_render::frame::CellInstance {
-                            pos_uv: [tx + g.offset_px[0], ty + g.offset_px[1], g.uv[0], g.uv[1]],
-                            size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
-                            fg: [
-                                t.palette.fg.r as f32 / 255.0,
-                                t.palette.fg.g as f32 / 255.0,
-                                t.palette.fg.b as f32 / 255.0,
-                                0.0,
-                            ],
-                            bg: [
-                                bar_bg[0] as f32 / 255.0,
-                                bar_bg[1] as f32 / 255.0,
-                                bar_bg[2] as f32 / 255.0,
-                                0.0,
-                            ],
-                        });
-                    }
-                    tx += g.size_px[0].max(t.metrics.cell_width);
-                }
-            }
-        }
-        // #58 静态下划线:全部可见路径常显
-        {
-            let offset_s = t.term.display_offset() as i32;
-            let grid = t.term.grid();
-            let u_c = [
-                t.palette.colors[12].r,
-                t.palette.colors[12].g,
-                t.palette.colors[12].b,
-            ];
-            let u_cf = [
-                u_c[0] as f32 / 255.0,
-                u_c[1] as f32 / 255.0,
-                u_c[2] as f32 / 255.0,
-                0.0,
-            ];
-            if let Some((_, pr)) = rects.iter().find(|(id, _)| *id == focused_pane_id) {
-                for view in 0..t.rows as i32 {
-                    let line = view - offset_s;
-                    let grid_row = &grid[Line(line)];
-                    if !(0..t.cols as usize).any(|c| matches!(grid_row[Column(c)].c, '/' | '\\')) {
-                        continue;
-                    }
-                    let (text, cell_of) = mica_render::frame::row_string(grid, line);
-                    for (col, cells) in all_path_spans(&text, &cell_of) {
-                        let x = pr.x + col as f32 * t.metrics.cell_width;
-                        let y = pr.y + (view as f32 + 1.0) * t.metrics.line_height - 2.0;
-                        let w = cells as f32 * t.metrics.cell_width;
-                        search_overlay.push(mica_render::frame::CellInstance {
-                            pos_uv: [x, y, 0.0, 0.0],
-                            size_uv: [w, 2.0, 0.0, 0.0],
-                            fg: u_cf,
-                            bg: u_cf,
-                        });
-                    }
-                }
-            }
-        }
-        // #87 标签色条(标签顶 2px):自定义色标签一眼区分(读 TabState.color)
-        if guard.iter().any(|tab| tab.color.is_some()) {
-            let sm2 = strip_metrics();
-            let w_tab = mica_render::frame::equal_tab_w(titles.len(), area_w, &sm2);
-            let shift_r = TAB_SCROLL.with(std::cell::Cell::get) as f32 * sm2.tab_min_w;
-            for (i, tab) in guard.iter().enumerate() {
-                let Some(c) = tab.color else {
-                    continue;
+                let end = bar.x + bar.w;
+                let labels = if rename_open {
+                    vec![(label.as_str(), bar.x, end)]
+                } else {
+                    vec![
+                        (label.as_str(), bar.x, end - 3.0 * button),
+                        ("↑", end - 3.0 * button, end - 2.0 * button),
+                        ("↓", end - 2.0 * button, end - button),
+                        ("×", end - button, end),
+                    ]
                 };
-                let x0 =
-                    mica_render::frame::tabs_x0(&sm2) + i as f32 * (w_tab + sm2.tab_gap) - shift_r;
-                let x1 = x0 + w_tab;
-                if x1 > 0.0 && x0 < area_w {
-                    let cf = [
-                        c[0] as f32 / 255.0,
-                        c[1] as f32 / 255.0,
-                        c[2] as f32 / 255.0,
-                        0.0,
-                    ];
-                    search_overlay.push(mica_render::frame::CellInstance {
-                        pos_uv: [x0.max(0.0), sm2.title_h + 2.0 * sm2.k, 0.0, 0.0],
-                        size_uv: [(x1 - x0).min(area_w - x0.max(0.0)), 2.0, 0.0, 0.0],
-                        fg: cf,
-                        bg: cf,
-                    });
+                let ty = bar.y + 2.0;
+                for (label, left, right) in labels {
+                    let mut tx = left + 2.0;
+                    for ch in label.chars() {
+                        let g = <DwriteRouter as mica_render::font::router::GlyphRouter>::route(
+                            &mut t.router,
+                            ch,
+                            mica_render::font::GlyphStyle::PLAIN,
+                        );
+                        if tx + g.offset_px[0] + g.size_px[0] > right
+                            || ty + g.offset_px[1] + g.size_px[1] > bar.y + bar.h
+                        {
+                            break;
+                        }
+                        if g.size_px[0] > 0.0 {
+                            search_overlay.push(mica_render::frame::CellInstance {
+                                pos_uv: [
+                                    tx + g.offset_px[0],
+                                    ty + g.offset_px[1],
+                                    g.uv[0],
+                                    g.uv[1],
+                                ],
+                                size_uv: [g.size_px[0], g.size_px[1], g.uv[2], g.uv[3]],
+                                fg: mica_render::frame::glyph_tint(
+                                    [
+                                        t.palette.fg.r as f32 / 255.0,
+                                        t.palette.fg.g as f32 / 255.0,
+                                        t.palette.fg.b as f32 / 255.0,
+                                        0.0,
+                                    ],
+                                    g.color,
+                                ),
+                                bg: [
+                                    bar_bg[0] as f32 / 255.0,
+                                    bar_bg[1] as f32 / 255.0,
+                                    bar_bg[2] as f32 / 255.0,
+                                    0.0,
+                                ],
+                            });
+                        }
+                        tx += g.size_px[0].max(t.metrics.cell_width);
+                    }
                 }
             }
         }
@@ -668,7 +677,8 @@ pub(super) fn draw_frame() {
                     return; // 批构建后 pane 已关:整批丢弃
                 };
                 gpu.renderer.set_atlas(&p.terminal.router.atlas());
-                gpu.renderer.draw_batch(insts, Some(*scissor));
+                gpu.renderer
+                    .draw_batch_with_opacity(insts, Some(*scissor), batch.opacity);
             });
         }
         // strip + 搜索 overlay:焦点图集,无 scissor(strip 在 pane 区外)
@@ -689,4 +699,70 @@ pub(super) fn draw_frame() {
         }
         gpu.renderer.end_frame();
     });
+}
+
+#[cfg(test)]
+mod titlebar_perf {
+    use super::*;
+    use mica_render::frame::{StripExtras, StripMetrics};
+    #[test]
+    #[ignore = "CPU titlebar layout benchmark using DirectWrite"]
+    fn titlebar_build_time() {
+        let mut router =
+            DwriteRouter::new_ui(11.0, &["Segoe UI", "Microsoft YaHei UI"], 600, None).unwrap();
+        let sm = StripMetrics::default();
+        let metrics = router.metrics();
+        let palette = Palette::DEFAULT;
+        for (name, title) in [
+            ("short", "PowerShell".to_string()),
+            ("long", "构建日志/Application/".repeat(256)),
+        ] {
+            let titles = vec![
+                (title, true),
+                ("tests".to_string(), false),
+                ("docs".to_string(), false),
+            ];
+            for animated in [false, true] {
+                let mut cache = mica_render::strip_cache::StripCache::default();
+                let mut samples = Vec::new();
+                for _ in 0..6 {
+                    let start = std::time::Instant::now();
+                    for i in 0..150 {
+                        let extras = StripExtras {
+                            caption_x: Some(840.0),
+                            focus: if animated {
+                                (i % 20) as f32 / 20.0
+                            } else {
+                                1.0
+                            },
+                            ..Default::default()
+                        };
+                        let owned = titles.clone();
+                        let mut out = Vec::new();
+                        let key = {
+                            let a = router.atlas();
+                            (a.identity(), a.version())
+                        };
+                        out.extend_from_slice(cache.get(
+                            &owned,
+                            &mut router,
+                            &metrics,
+                            &palette,
+                            &sm,
+                            extras,
+                            key,
+                        ));
+                        std::hint::black_box(out);
+                    }
+                    samples.push(start.elapsed().as_nanos() / 150);
+                }
+                samples.remove(0);
+                samples.sort_unstable();
+                eprintln!(
+                    "TITLEBAR {name} animated={animated} median_ns={}",
+                    samples[2]
+                );
+            }
+        }
+    }
 }

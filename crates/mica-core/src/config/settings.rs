@@ -19,7 +19,7 @@ pub use crate::config::defaults::{DEFAULT_FAMILIES, DEFAULT_FONT_SIZE_PT};
 /// `strip-tab-corner-radius`、`strip-wide-tabs`(Ghostty `gtk-wide-tabs`
 /// 同义)、`strip-hide-single-tab`、`strip-bar-color`/`-active-tab-color`/
 /// `-text-color`/`-dim-color`(auto|#rrggbb)、`strip-bar-wash`/
-/// `-unfocused`(0..1,auto 条底的提亮比例)、
+/// `-unfocused`(0..1,auto 条底的加深比例)、
 /// `strip-animation-duration`/`-focus`(ms,0=关)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StripCfg {
@@ -35,6 +35,10 @@ pub struct StripCfg {
     pub tab_h: f32,
     pub tab_min_w: f32,
     pub tab_corner_r: f32,
+    pub caption_width_ratio: f32,
+    pub caption_icon_padding: f32,
+    pub tab_close_width_ratio: f32,
+    pub tab_close_icon_padding: f32,
     pub wide_tabs: bool,
     pub hide_single: bool,
     pub bar: Option<Rgb>,
@@ -74,6 +78,7 @@ pub struct Settings {
     /// Symmetric content padding in logical pixels (scaled with DPI).
     pub window_padding_x: f32,
     pub window_padding_y: f32,
+    pub unfocused_split_opacity: f32,
     /// Quick Terminal height as a percentage of monitor height (creation only).
     pub quick_terminal_height: u8,
     /// 回退链按序;重复 `font-family` 追加(D9 链语义)
@@ -130,8 +135,8 @@ impl Default for Settings {
 
 // Neutral construction state, not a second table of product defaults. Every
 // user-facing value is populated from the default configuration before use.
-fn default_state() -> &'static (Settings, [bool; 3]) {
-    static DEFAULTS: std::sync::OnceLock<(Settings, [bool; 3])> = std::sync::OnceLock::new();
+fn default_state() -> &'static (Settings, [bool; 4]) {
+    static DEFAULTS: std::sync::OnceLock<(Settings, [bool; 4])> = std::sync::OnceLock::new();
     DEFAULTS.get_or_init(|| {
         let mut settings = Settings {
             command: None,
@@ -149,6 +154,7 @@ fn default_state() -> &'static (Settings, [bool; 3]) {
             window_size_pixels: None,
             window_padding_x: 0.0,
             window_padding_y: 0.0,
+            unfocused_split_opacity: 0.0,
             mouse_hide_while_typing: false,
             minimum_contrast: 0.0,
             window_position: None,
@@ -170,6 +176,10 @@ fn default_state() -> &'static (Settings, [bool; 3]) {
                 tab_h: 0.0,
                 tab_min_w: 0.0,
                 tab_corner_r: 0.0,
+                caption_width_ratio: 0.0,
+                caption_icon_padding: 0.0,
+                tab_close_width_ratio: 0.0,
+                tab_close_icon_padding: 0.0,
                 wide_tabs: false,
                 hide_single: false,
                 bar: None,
@@ -187,7 +197,7 @@ fn default_state() -> &'static (Settings, [bool; 3]) {
             parse,
             values: Vec::new(),
         };
-        let mut explicit = [false; 3];
+        let mut explicit = [false; 4];
         apply_pairs(&mut settings, pairs, &mut errors, &mut explicit);
         assert!(errors.is_empty(), "invalid built-in defaults: {errors:?}");
         finish_palette(&mut settings, &explicit);
@@ -211,6 +221,15 @@ impl ConfigError {
 
 /// 合成用户 config(可空串 = 全默认)。任何错误 → Err(调用方保旧)。
 pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
+    resolve_for_theme_mode(user_source, || true)
+}
+
+/// The UI shell supplies its system appearance. CLI and other core-only
+/// callers use the dark entry via `resolve`. Query the system only for a pair.
+pub fn resolve_for_theme_mode(
+    user_source: &str,
+    prefer_dark: impl FnOnce() -> bool,
+) -> Result<Settings, ConfigError> {
     let user_source = user_source.strip_prefix('\u{feff}').unwrap_or(user_source);
     let mut err = ConfigError::default();
     let (user_pairs, parse_errors) = parse::parse(user_source);
@@ -218,7 +237,7 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
 
     let mut settings = default_state().0.clone();
     // 选区/光标是否被任何层显式设置(theme 或用户);[0]=selection-fg
-    // [1]=selection-bg [2]=cursor——缺省派生(见尾部)不覆盖显式值
+    // [1]=selection-bg [2]=cursor-color [3]=cursor-text
     let mut explicit = default_state().1;
 
     // theme 片段在用户片段之前应用:用户键可以覆盖主题同名键
@@ -228,8 +247,22 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
         .find(|(k, _)| k == "theme")
         .map(|(_, v)| (!v.is_empty()).then(|| v.clone()))
         .unwrap_or_else(|| settings.theme_name.clone());
+    let mut selected_theme = None;
     if let Some(name) = theme_name {
-        match theme::find_theme(&name) {
+        match select_theme(&name, prefer_dark) {
+            Ok((name, other)) => {
+                selected_theme = Some(name.to_owned());
+                if let Some(other) = other
+                    && let Err(reason) = theme::find_theme(other)
+                {
+                    err.values.push(reason);
+                }
+            }
+            Err(reason) => err.values.push(reason),
+        }
+    }
+    if let Some(name) = &selected_theme {
+        match theme::find_theme(name) {
             Ok(source) => {
                 let (pairs, theme_errors) = parse::parse(&source);
                 err.parse.extend(theme_errors);
@@ -239,6 +272,7 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
         }
     }
     apply_pairs(&mut settings, user_pairs, &mut err, &mut explicit);
+    settings.theme_name = selected_theme;
 
     finish_palette(&mut settings, &explicit);
 
@@ -249,7 +283,43 @@ pub fn resolve(user_source: &str) -> Result<Settings, ConfigError> {
     }
 }
 
-fn finish_palette(settings: &mut Settings, explicit: &[bool; 3]) {
+fn select_theme(
+    value: &str,
+    prefer_dark: impl FnOnce() -> bool,
+) -> Result<(&str, Option<&str>), String> {
+    if !(value.starts_with("dark:") || value.starts_with("light:")) {
+        return Ok((value, None));
+    }
+    let mut dark = None;
+    let mut light = None;
+    let invalid = || "theme must specify one dark:NAME and one light:NAME".to_owned();
+    for part in value.split(',') {
+        let (mode, name) = part.trim().split_once(':').ok_or_else(invalid)?;
+        let name = name.trim();
+        let slot = match mode {
+            "dark" => &mut dark,
+            "light" => &mut light,
+            _ => return Err(invalid()),
+        };
+        if name.is_empty() || slot.is_some() {
+            return Err(invalid());
+        }
+        *slot = Some(name);
+    }
+    match (dark, light) {
+        (Some(dark), Some(light)) => {
+            let (selected, other) = if prefer_dark() {
+                (dark, light)
+            } else {
+                (light, dark)
+            };
+            Ok((selected, Some(other)))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn finish_palette(settings: &mut Settings, explicit: &[bool; 4]) {
     // Ghostty 缺省语义(上游 renderer/generic.zig 实证):selection/cursor
     // 未显式配置时**动态互换/跟前景**——选区底 = 前景、选区字 = 背景、
     // 光标 = 前景。不是常量:用户只改 foreground 时选区光标随之走
@@ -262,18 +332,21 @@ fn finish_palette(settings: &mut Settings, explicit: &[bool; 3]) {
     if !explicit[2] {
         settings.palette.cursor = settings.palette.fg;
     }
+    if !explicit[3] {
+        settings.palette.cursor_text = settings.palette.bg;
+    }
     // #90 minimum-contrast 是渲染参数非调色板项:合成尾写入
     settings.palette.minimum_contrast = settings.minimum_contrast;
 }
 
 /// 键集分派:font-family 追加、font-size 限幅、色键(含 selection-*)走
-/// Palette;未知键(含 cursor-text——块光标反色绘制已等价)静默跳过
+/// Palette;未知键静默跳过
 /// ——Ghostty 同款容忍。explicit 记录选区/光标是否显式设置(缺省派生用)。
 fn apply_pairs(
     settings: &mut Settings,
     pairs: Vec<(String, String)>,
     err: &mut ConfigError,
-    explicit: &mut [bool; 3],
+    explicit: &mut [bool; 4],
 ) {
     // 首个显式 font-family 重置默认链(Ghostty 配置语义:显式键覆盖默认值),
     // 之后的声明追加
@@ -384,20 +457,22 @@ fn apply_pairs(
                 }
             }
             "background-image" => settings.background_image = (!value.is_empty()).then_some(value),
-            "background-opacity" | "minimum-contrast" => {
+            "background-opacity"
+            | "minimum-contrast"
+            | "faint-opacity"
+            | "unfocused-split-opacity" => {
                 let lower = if key == "background-opacity" {
                     0.05
                 } else {
                     0.0
                 };
                 match value.parse::<f32>() {
-                    Ok(n) if n.is_finite() && (lower..=1.0).contains(&n) => {
-                        if key == "background-opacity" {
-                            settings.background_opacity = n;
-                        } else {
-                            settings.minimum_contrast = n;
-                        }
-                    }
+                    Ok(n) if n.is_finite() && (lower..=1.0).contains(&n) => match key.as_str() {
+                        "background-opacity" => settings.background_opacity = n,
+                        "faint-opacity" => settings.palette.faint_opacity = n,
+                        "unfocused-split-opacity" => settings.unfocused_split_opacity = n,
+                        _ => settings.minimum_contrast = n,
+                    },
                     _ => err
                         .values
                         .push(format!("{key} must be a finite number in {lower}..1")),
@@ -486,22 +561,24 @@ fn apply_pairs(
                     ));
                 }
             }
-            "cursor-color" | "selection-foreground" | "selection-background"
-                if value.is_empty() || value.eq_ignore_ascii_case("auto") =>
-            {
+            "cursor-color" | "cursor-text" | "selection-foreground" | "selection-background" => {
                 let slot = match key.as_str() {
                     "selection-foreground" => 0,
                     "selection-background" => 1,
-                    _ => 2,
+                    "cursor-color" => 2,
+                    _ => 3,
                 };
-                explicit[slot] = false;
+                if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+                    explicit[slot] = false;
+                } else if let Err(reason) = settings.palette.apply_pair(&key, &value) {
+                    err.values.push(format!("{key}: {reason}"));
+                } else {
+                    explicit[slot] = true;
+                }
             }
-            "palette" | "foreground" | "background" | "cursor-color" => {
+            "palette" | "foreground" | "background" => {
                 if let Err(reason) = settings.palette.apply_pair(&key, &value) {
                     err.values.push(format!("{key}: {reason}"));
-                }
-                if key == "cursor-color" {
-                    explicit[2] = true;
                 }
             }
             // strip 外观(2026-10-12 全量可配);gtk-wide-tabs 是 Ghostty
@@ -534,6 +611,24 @@ fn apply_pairs(
                     .values
                     .push(format!("strip-font-size 应为 4-24 的数字,得 `{value}`")),
             },
+            "strip-caption-width-ratio"
+            | "strip-caption-icon-padding"
+            | "strip-tab-close-width-ratio"
+            | "strip-tab-close-icon-padding" => {
+                let padding = key.ends_with("-padding");
+                let range = if padding { 0.0..=0.49 } else { 0.1..=4.0 };
+                match value.parse::<f32>() {
+                    Ok(n) if n.is_finite() && range.contains(&n) => match key.as_str() {
+                        "strip-caption-width-ratio" => settings.strip.caption_width_ratio = n,
+                        "strip-caption-icon-padding" => settings.strip.caption_icon_padding = n,
+                        "strip-tab-close-width-ratio" => settings.strip.tab_close_width_ratio = n,
+                        _ => settings.strip.tab_close_icon_padding = n,
+                    },
+                    _ => err
+                        .values
+                        .push(format!("{key} must be a finite number in {range:?}")),
+                }
+            }
             "strip-title-height"
             | "strip-tab-height"
             | "strip-tab-min-width"
@@ -600,13 +695,6 @@ fn apply_pairs(
                         .values
                         .push(format!("{key} 应为 0-2000 的毫秒数,得 `{value}`")),
                 }
-            }
-            "selection-foreground" | "selection-background" => {
-                if let Err(reason) = settings.palette.apply_pair(&key, &value) {
-                    err.values.push(format!("{key}: {reason}"));
-                }
-                let slot = if key == "selection-background" { 1 } else { 0 };
-                explicit[slot] = true;
             }
             _ => {}
         }
@@ -690,10 +778,12 @@ mod tests {
         assert_eq!(resolve(&source).unwrap(), Settings::default());
         assert_eq!(Settings::default().font_size_pt, 12.0);
         assert_eq!(Settings::default().palette, Palette::DEFAULT);
-        assert_eq!(Settings::default().strip.font_size_pt, 11.0);
+        assert_eq!(Settings::default().strip.font_size_pt, 9.5);
         assert_eq!(Settings::default().keymap, Keymap::wt_default());
         assert_eq!(Settings::default().window_width, 100);
         assert_eq!(Settings::default().window_height, 30);
+        assert_eq!(Settings::default().window_padding_x, 8.0);
+        assert_eq!(Settings::default().window_padding_y, 6.0);
         assert_eq!(Settings::default().quick_terminal_height, 40);
         // The old Rust table contained later duplicate arrow bindings. Lookup
         // used the first occurrence, so migration must preserve prompt jumps.
@@ -710,23 +800,27 @@ mod tests {
         assert_eq!(
             Settings::default().strip,
             StripCfg {
-                font_weight: 600,
-                title_centered: true,
-                title_highlight: true,
+                font_weight: 400,
+                title_centered: false,
+                title_highlight: false,
                 title_highlight_color: None,
                 title_highlight_opacity: 0.06,
                 title_highlight_radius: 4.0,
                 font_family: Some("Segoe UI".into()),
-                font_size_pt: 11.0,
+                font_size_pt: 9.5,
                 title_h: 32.0,
-                tab_h: 36.0,
-                tab_min_w: 88.0,
-                tab_corner_r: 8.0,
+                tab_h: 34.0,
+                tab_min_w: 128.0,
+                tab_corner_r: 12.0,
+                caption_width_ratio: 1.125,
+                caption_icon_padding: 0.34,
+                tab_close_width_ratio: 0.75,
+                tab_close_icon_padding: 0.33,
                 wide_tabs: true,
-                hide_single: true,
+                hide_single: false,
                 bar: None,
-                bar_wash: 0.08,
-                bar_wash_unfocused: 0.12,
+                bar_wash: 0.0,
+                bar_wash_unfocused: 0.04,
                 active_tab: None,
                 text: None,
                 dim: None,
@@ -749,6 +843,15 @@ mod tests {
             "minimum-contrast = inf",
             "minimum-contrast = -1",
             "minimum-contrast = 2",
+            "faint-opacity = -0.1",
+            "faint-opacity = 1.1",
+            "faint-opacity = NaN",
+            "strip-caption-icon-padding = 0.5",
+            "strip-tab-close-icon-padding = -0.01",
+            "strip-caption-width-ratio = NaN",
+            "strip-tab-close-width-ratio = 0",
+            "unfocused-split-opacity = 1.5",
+            "cursor-text = invalid",
             "window-position = one,2",
             "mouse-right-click = bad",
             "copy-on-select = bad",
@@ -840,6 +943,51 @@ mod tests {
         assert_eq!(s.theme_name.as_deref(), Some("Dracula"));
         assert_eq!(s.palette.bg.r, 0x00, "用户 background 覆盖主题");
         assert_eq!(s.palette.colors[1].r, 0xff, "palette 槽来自主题(#ff5555)");
+    }
+
+    #[test]
+    fn paired_theme_defaults_to_dark_without_a_system_preference() {
+        let source = "theme = light:Kanagawa Lotus, dark:Kanagawa Wave";
+        let settings = resolve(source).unwrap();
+        assert_eq!(settings.theme_name.as_deref(), Some("Kanagawa Wave"));
+        assert_eq!(settings.palette.bg, parse_hex("#1f1f28").unwrap());
+        let settings = resolve_for_theme_mode(source, || false).unwrap();
+        assert_eq!(settings.theme_name.as_deref(), Some("Kanagawa Lotus"));
+        assert_eq!(settings.palette.bg, parse_hex("#f2ecbc").unwrap());
+        assert!(
+            resolve_for_theme_mode("theme = Kanagawa Wave", || {
+                panic!("single themes should not query system appearance")
+            })
+            .is_ok()
+        );
+        for invalid in [
+            "theme = dark:Kanagawa Wave",
+            "theme = dark:Kanagawa Wave,dark:Kanagawa Lotus",
+            "theme = dark:Kanagawa Wave,light:",
+            "theme = dark:Kanagawa Wave,light:MissingTheme",
+            "theme = dark:Kanagawa Wave,light:Kanagawa Lotus,unknown:Foo",
+        ] {
+            assert!(resolve(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn cursor_text_preserves_theme_value_until_overridden_or_reset() {
+        let source = "theme = Kanagawa Wave\nbackground = #123456\nfaint-opacity = 0.25\n";
+        let p = resolve(source).unwrap().palette;
+        assert_eq!(p.cursor, parse_hex("#dcd7ba").unwrap());
+        assert_eq!(p.cursor_text, parse_hex("#1f1f28").unwrap());
+        assert_eq!(p.faint_opacity, 0.25);
+        let p = resolve(&format!("{source}cursor-text = #abcdef"))
+            .unwrap()
+            .palette;
+        assert_eq!(p.cursor_text, parse_hex("#abcdef").unwrap());
+        for reset in ["", "auto"] {
+            let p = resolve(&format!("{source}cursor-text = {reset}"))
+                .unwrap()
+                .palette;
+            assert_eq!(p.cursor_text, p.bg);
+        }
     }
 
     /// Ghostty 缺省选区/光标语义(上游 generic.zig):未显式配置时

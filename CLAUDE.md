@@ -30,10 +30,10 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 **三 crate 边界是本项目最重要的纪律**(spec §3):
 
 - `mica-core`:终端核心,**零 GUI 依赖**(Cargo.toml 里不得出现任何窗口/渲染库)。`surface.rs` 包装 alacritty_terminal(`vte::ansi::Processor::advance` 喂 `Term`,`Term` 实现的是 `Handler` 不是 `Perform`);`EventProxy` 收集应答类事件(DSR/OSC 回写、标题、尺寸查询),由 `take_pty_writes`/`take_title` 排空——**必须排空并写回 pty,否则 shell 会卡在等应答**。`pty.rs` 是 portable-pty 封装(读线程→mpsc;Drop 杀子并 reap)。`input.rs` 纯函数 xterm 键位编码。
-- `mica-render`:只认 grid 不认窗口。纯逻辑层(`color`/`frame` + `font/` 模块:样式与宽度判定、度量数学、字形图集、路由 trait,全部可 TDD)+ wgpu 管线(`pipeline.rs`)+ `#[cfg(windows)]` 的 DirectWrite 光栅化(`font/dwrite.rs`)。`CellInstance` 是 **64 字节** `#[repr(C)]`(pos_uv/size_uv/fg/bg 四个 vec4f,offset 0/16/32/48),与 WGSL 四个 location 锁死,有 size_of 测试兜底。**两遍发射契约**:`build_instances` 先产全部整格背景 quad、再产全部字形 quad(blend:None 下保证宽字形不被后续格背景擦除);空白格单实例(uv 尺寸 0 → ink_mask 0)。`GlyphRouter` trait 是"字符+样式→图集几何"的接缝,dwrite 与测试 Fake 各为其实现;图集**身份/双计数**:`identity` 区分真实 atlas(共享 grid/strip 同身份),`revision`(新增位图/grow 递增)门控按消费者的脏矩形上传,`version` 仅在帧边界资源回收时递增,清 router 字符/shaping 缓存并强制 row/overlay 重建；追加页与去重命中不移动既有纹素 UV。CPU 位图、去重索引、路由缓存与 GPU 缓存分别限额,不等于整个进程内存上限,见 `docs/superpowers/research/2026-11-10-render-resource-budgets.md`。**draw 前必须 set_atlas**(panic 契约)。dwrite 纹理类型必须匹配渲染模式:NATURAL_SYMMETRIC 配 `CLEARTYPE_3x1` 取 R 通道做灰度墨,配 `ALIASED_1x1` 则 bounds 恒空(黑屏,有回归测试)。
+- `mica-render`:只认 grid 不认窗口。纯逻辑层(`color`/`frame` + `font/` 模块:样式与宽度判定、度量数学、字形图集、路由 trait,全部可 TDD)+ wgpu 管线(`pipeline.rs`)+ `#[cfg(windows)]` 的 DirectWrite 光栅化(`font/dwrite.rs`)。`CellInstance` 是 **64 字节** `#[repr(C)]`(pos_uv/size_uv/fg/bg 四个 vec4f,offset 0/16/32/48),与 WGSL 四个 location 锁死,有 size_of 测试兜底。**两遍发射契约**:`build_instances` 先产全部整格背景 quad、再产全部字形 quad(blend:None 下保证宽字形不被后续格背景擦除);空白格单实例(uv 尺寸 0 → ink_mask 0)。`GlyphRouter` trait 是"字符+样式→图集几何"的接缝,dwrite 与测试 Fake 各为其实现;图集**身份/双计数**:`identity` 区分真实 atlas(共享 grid/strip 同身份),`revision`(新增位图/grow 递增)门控按消费者的脏矩形上传,`version` 仅在帧边界资源回收时递增,清 router 字符/shaping 缓存并强制 row/overlay 重建；追加页与去重命中不移动既有纹素 UV。CPU 位图、去重索引、路由缓存与 GPU 缓存分别限额,不等于整个进程内存上限,见 `docs/superpowers/research/2026-11-10-render-resource-budgets.md`。**draw 前必须 set_atlas**(panic 契约)。dwrite 纹理类型必须匹配渲染模式:NATURAL_SYMMETRIC 配 `CLEARTYPE_3x1` 平均三通道做灰度墨,配 `ALIASED_1x1` 则 bounds 恒空(黑屏,有回归测试)。
 - `mica-app`:Win32 壳,保持最薄——窗口/输入路由/系统集成,不含终端逻辑。持 `DwriteRouter`(T7 已接线),窗口尺寸/网格换算由真度量驱动;WM_CHAR 重组 UTF-16 代理对(emoji/扩展表意文字才进得来)。
 
-**数据流**(事件驱动,T7):WM_CHAR/WM_KEYDOWN → `input::encode`(Ctrl+字母走 WM_CHAR 原始字节,不经 encode)→ pty 写;pty 读线程 → app 转发线程 → `WM_APP_RENDER` → drain → `Surface::feed` → `take_damage()` → `build_rows`(行级脏区,两遍发射;光标格与 SGR7 反色格都是 fg/bg 互换;WIDE_CHAR 天然双宽、SPACER 空白)→ `repack` → `Renderer::draw`。config 变更走 notify 去抖 → `WM_APP_CONFIG` → 重合成 Settings → 重建 router/palette。
+**数据流**(事件驱动,T7):WM_CHAR/WM_KEYDOWN → `input::encode`(Ctrl+字母走 WM_CHAR 原始字节,不经 encode)→ pty 写;pty 读线程 → app 转发线程 → `WM_APP_RENDER` → drain → `Surface::feed` → `take_damage()` → `build_rows`(行级脏区,两遍发射;块光标使用 cursor-color/cursor-text,SGR7 反色格交换 fg/bg;WIDE_CHAR 天然双宽、SPACER 空白)→ `repack` → `Renderer::draw`。config 变更走 notify 去抖 → `WM_APP_CONFIG` → 重合成 Settings → 重建 router/palette。
 
 **度量与调色板单一来源**:格子尺寸由 `font::metrics::FontMetrics`(DirectWrite 设计单位换算)产出,流入 app 网格换算、`Surface::set_cell_metrics`(查询应答)与 blank 实例尺寸;8/16 硬编码常量已退役。调色板收敛于 mica-core `config::palette::Palette`(M1-B/T3),渲染着色、清屏色与 OSC 应答同源;配置合成见 `config::settings`(默认 < 主题 < 用户三层)。
 
@@ -43,7 +43,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 
 - **许可证**:MIT OR Apache-2.0;**禁止引入 GPL 依赖**(商业资产自持,加依赖前查 license)。
 - **配置语法**:兼容 Ghostty 的 `key = value` 语法是硬需求(spec D6)——主题生态靠它免费迁移。
-- **wgpu surface 格式必须非 sRGB**:shader 颜色路径无 gamma 转换,`Renderer::new` 有 assert 兜底(选格式是壳层的责任)。
+- **wgpu surface 格式必须非 sRGB**:纯色直出,仅灰度字形边缘在线性空间混色后编码回 sRGB,`Renderer::new` 有 assert 兜底(选格式是壳层的责任)。
 - **第三方 API 先核实再写**:wgpu/windows-rs/alacritty_terminal 都在快速变动,凭记忆写 API 必挂。写之前查 docs.rs 当前版本签名;`docs/superpowers/plans/` 里记录了 2026-09 已核实的签名与漂移点(wgpu 30 的 `Queue::present`、`CurrentSurfaceTexture` 枚举等)。
 
 ## 文档体系(权威顺序:spec > plan > 代码注释)
@@ -81,7 +81,7 @@ cargo run --bin mica                                    # 运行(仅 Windows 有
 - OSC 133(2026-11-10 修正):本机26300和当前CI Server2025 build26100(镜像windows-2025-vs2026/20261103.298.1,run42820078822)均实测完整透传。旧“26100及以下剥离”依据被PSReadLine输入回显早退假通过掩盖,不再按该阈值外推。CI用MICA_CONPTY_OSC133_EXPECT=passthrough严格锁当前能力,客户端26300+保留透传回归,其他未知旧版本只探测报告。OSC7透传仍用于新标签目录继承。
 - 标签溢出滚动:滚轮+左右箭头+活跃自动跟随齐备(1.1,#39)
 - 每标签字体族仍随 profile(字号已落:`mica new-tab --font-size N`,IPC font_size 字段)
-- 标签 tear-off(1.1 软版,#35):拖出标签行即撕开独立窗,同 shell/cwd/标题重开——**进程不迁移**(COM/线程本地 !Send 架构),活进程迁移留后续增强
+- 标签跨窗移动限同一进程。转移 Surface、PTY、输入队列与分屏布局，目标窗口按本地 DPI 重建 DirectWrite 路由并接管输出通知。
 - 输入管线控制字节纪律(1.2):**任何消费了 Ctrl+字母 键的分支都必须置 KEYMAP_ATE_CHAR**(keymap 分支 2026-10 修过,硬编码粘贴/复制分支 1.2 补齐——漏置 = 伴生控制字节泄漏 pty,PSReadLine 当二次快捷键,粘贴双份实证);新增硬编码键分支时照此
 - Tab 键族契约(1.4):Tab 全族走 WM_KEYDOWN 编码(普通=09、Shift=CSI Z,kitty 协商时 CSI-u),WM_CHAR 的伴随 09 必须吞(漏吞=双发);`vk_to_trigger` 与 `vkey_bytes` 的 VK 集合同步维护——缺 VK_TAB 曾令 Shift+Tab 丢修饰、Ctrl+Tab 快捷键整体不可达(#125);主窗与 QT 同契约
 - defterm 整体撤除(1.0.2):RRVA 一级注册实测是陷阱——装完即劫持默认终端且无 COM 实现接管,console 程序全弹 0xC0000142。真实现(ITerminalHandoff)完成前不再注册

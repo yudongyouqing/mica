@@ -487,7 +487,8 @@ pub(super) unsafe fn create_pane_with_size(
     if let Some(pid) = session.child_pid() {
         orphan::track_session_since(&probe, pid);
     }
-    let pane_id = NEXT_TAB_ID.with(|n| n.replace(n.get() + 1));
+    static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let pane_id = NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let slot = SHARED_HWND.with(|s| s.borrow().clone());
     let pty_buf = PtyBacklog::new(
         pane_id,

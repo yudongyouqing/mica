@@ -151,6 +151,9 @@ pub(super) fn flush_all_panes() {
             "[inputflow] timer-tick: debt_panes={debt_panes} armed={any_debt} flushed={flushed} q={q} s={s} acc={acc} infl={infl} wr={wr} fail={fail} bal={bal}"
         );
     }
+    if any_debt {
+        arm_input_flush_timer();
+    }
     if !any_debt && INPUT_TIMER_ARMED.with(std::cell::Cell::get) {
         if let Some(raw) = SHARED_HWND
             .with(|s| s.borrow().clone())

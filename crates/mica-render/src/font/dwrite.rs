@@ -53,6 +53,15 @@ impl FamilyFaces {
     }
 }
 
+/// Collapse the three horizontally offset ClearType samples symmetrically.
+fn grayscale_coverage(raw: &[u8]) -> Vec<u8> {
+    raw.as_chunks::<3>()
+        .0
+        .iter()
+        .map(|&[r, g, b]| ((u16::from(r) + u16::from(g) + u16::from(b) + 1) / 3) as u8)
+        .collect()
+}
+
 pub struct DwriteRouter {
     factory: IDWriteFactory,
     families: Vec<FamilyFaces>,
@@ -289,6 +298,10 @@ impl DwriteRouter {
         self.atlas.borrow().exhausted()
     }
 
+    pub fn font_size_pt(&self) -> f32 {
+        self.em_size_dip * 72.0 / 96.0
+    }
+
     pub fn metrics(&self) -> FontMetrics {
         self.metrics
     }
@@ -412,9 +425,7 @@ impl DwriteRouter {
                 .CreateAlphaTexture(DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, &mut raw)
                 .ok()?
         };
-        // 亚像素三通道即三份水平错位的 coverage:取 R 通道,单通道做墨量
-        // 是亚像素纹理转灰度的标准做法(等价灰度 AA,合 R8 图集)
-        let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
+        let coverage = grayscale_coverage(&raw);
         let rect = self
             .atlas
             .borrow_mut()
@@ -490,7 +501,7 @@ impl DwriteRouter {
             {
                 return blank_glyph();
             }
-            let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
+            let coverage = grayscale_coverage(&raw);
             let rect = self
                 .atlas
                 .borrow_mut()
@@ -594,7 +605,7 @@ impl DwriteRouter {
                     .CreateAlphaTexture(DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, &mut raw)
                     .ok()?
             };
-            let coverage: Vec<u8> = raw.as_chunks::<3>().0.iter().map(|px| px[0]).collect();
+            let coverage = grayscale_coverage(&raw);
             layers.push((bounds, coverage, [color.r, color.g, color.b, color.a]));
         }
         if layers.is_empty() {
@@ -967,6 +978,19 @@ fn shape_run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_modifier_icons_have_visible_glyphs() {
+        let mut router =
+            DwriteRouter::new_ui(9.5, &["Segoe UI", "Segoe UI Symbol"], 400, None).unwrap();
+        for ch in ['⌃', '⇧', '⎇', '⊞'] {
+            let glyph = router.route(ch, GlyphStyle::PLAIN);
+            assert!(
+                glyph.size_px[0] > 0.0 && glyph.size_px[1] > 0.0,
+                "missing keyboard icon {ch}"
+            );
+        }
+    }
+
     #[test]
     fn ui_semibold_selects_real_font_face_without_bolding_terminal_font() {
         let normal = super::DwriteRouter::new(11.0, &["Segoe UI"]).unwrap();

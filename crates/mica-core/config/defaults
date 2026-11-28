@@ -18,10 +18,12 @@ font-family = Segoe Fluent Icons
 font-size = 12
 
 # Colors: empty theme means built-in colors; auto follows foreground/background.
+# Set both dark:NAME,light:NAME to follow the Windows appearance.
 theme =
 foreground = #ffffff
 background = #282c34
 cursor-color = auto
+cursor-text = auto
 selection-foreground = auto
 selection-background = auto
 palette = 0=#1d1f21
@@ -41,6 +43,8 @@ palette = 13=#c397d8
 palette = 14=#70c0b1
 palette = 15=#eaeaea
 minimum-contrast = 0
+# Opacity for SGR 2 faint text (0..1).
+faint-opacity = 0.5
 
 # Window: width/height are cells (1..1000); applied when creating a window.
 # Position is x,y screen coordinates; empty uses the monitor under the pointer.
@@ -50,8 +54,10 @@ window-height = 30
 # Empty keeps cell-based sizing; affects new windows only.
 window-size-pixels =
 # Symmetric content padding in logical pixels (0..400), scaled with DPI.
-window-padding-x = 2
-window-padding-y = 2
+window-padding-x = 8
+window-padding-y = 6
+# Opacity of unfocused split content against the terminal background (0..1).
+unfocused-split-opacity = 0.94
 window-position =
 title =
 background-image =
@@ -73,26 +79,32 @@ quick-terminal-height = 40
 # Tab/title strip: geometry in logical pixels; animations in milliseconds.
 # UI fonts are separate from terminal grid fonts; strip-font-family is an alias.
 window-title-font-family = Segoe UI
-strip-font-size = 11
+strip-font-size = 9.5
 # DirectWrite weights: 400 regular, 600 semibold, 700 bold.
-strip-font-weight = 600
-strip-title-align = center
-strip-title-highlight = true
+strip-font-weight = 400
+strip-title-align = left
+strip-title-highlight = false
 strip-title-highlight-color = auto
 strip-title-highlight-opacity = 0.06
 strip-title-highlight-radius = 4
 strip-title-height = 32
-strip-tab-height = 36
-strip-tab-min-width = 88
-strip-tab-corner-radius = 8
+strip-tab-height = 34
+strip-tab-min-width = 128
+strip-tab-corner-radius = 12
+# Controls scale with their containing row. Padding is the fraction on each side.
+strip-caption-width-ratio = 1.125
+strip-caption-icon-padding = 0.34
+strip-tab-close-width-ratio = 0.75
+strip-tab-close-icon-padding = 0.33
 strip-wide-tabs = true
-strip-hide-single-tab = true
+strip-hide-single-tab = false
 strip-bar-color = auto
 strip-active-tab-color = auto
 strip-text-color = auto
 strip-dim-color = auto
-strip-bar-wash = 0.08
-strip-bar-wash-unfocused = 0.12
+# Auto strip colors shade toward black by these amounts (0..1).
+strip-bar-wash = 0
+strip-bar-wash-unfocused = 0.04
 strip-animation-duration = 120
 strip-focus-animation-duration = 150
 

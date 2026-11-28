@@ -5,6 +5,40 @@ use mica_core::config::settings::{self, ConfigError, Settings};
 use notify::{Event, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use windows::UI::ViewManagement::{UIColorType, UISettings};
+
+thread_local! {
+    // Some only for windows that loaded a dark/light theme pair.
+    static ADAPTIVE_THEME_MODE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn system_prefers_dark() -> bool {
+    // A light system foreground indicates a dark app appearance.
+    UISettings::new()
+        .and_then(|settings| settings.GetColorValue(UIColorType::Foreground))
+        .map(|color| 2 * u32::from(color.R) + 5 * u32::from(color.G) + u32::from(color.B) > 1024)
+        .unwrap_or(true)
+}
+
+fn resolve_settings(source: &str) -> Result<(Settings, Option<bool>), ConfigError> {
+    let mut system_mode = None;
+    let settings = settings::resolve_for_theme_mode(source, || {
+        let dark = system_prefers_dark();
+        system_mode = Some(dark);
+        dark
+    })?;
+    Ok((settings, system_mode))
+}
+
+pub(super) fn system_theme_changed() -> bool {
+    ADAPTIVE_THEME_MODE.with(|mode| {
+        mode.get().is_some_and(|old| {
+            let current = system_prefers_dark();
+            mode.set(Some(current));
+            current != old
+        })
+    })
+}
 
 /// 进程级配置监听保活句柄:存入 `CONFIG_WATCHER`,随进程生命期保活。
 pub(super) struct ReloadHandle {
@@ -33,11 +67,11 @@ pub(super) fn load_settings() -> Settings {
             return Settings::default();
         }
     };
-    // PowerShell 5 `Out-File` 等工具写 UTF-8 会带 BOM:不剥则首键(常是
-    // theme/font-family)被静默吞掉,配置"半生效"且无任何提示
-    let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
-    match settings::resolve(source) {
-        Ok(s) => s,
+    match resolve_settings(&source) {
+        Ok((settings, system_mode)) => {
+            ADAPTIVE_THEME_MODE.with(|mode| mode.set(system_mode));
+            settings
+        }
         Err(err) => {
             warn_box(&format_config_error(&path, &err, "已回退默认设置"));
             Settings::default()
@@ -59,32 +93,41 @@ fn format_config_error(path: &Path, err: &ConfigError, outcome: &str) -> String 
 }
 
 /// 配置热重载 watcher(最佳努力,绝不致命——T4 错误哲学同款):
-/// notify 推荐后端(Windows = ReadDirectoryChangesW;对文件路径它实际监视
-/// 父目录并按路径过滤,原子替换/重建不失联)监听 config 文件,事件经 mpsc
-/// 交给去抖线程。None = 未监听(文件缺失或 watch 失败,热重载降级关闭)。
+/// Watch the existing config directory so the first save and atomic
+/// replacements are handled even if the config file was absent at startup.
 /// 哨兵由 run() 统一建立后传入——与转发线程共用"窗口存活"这一个事实。
 pub(super) fn spawn_config_watcher() -> Option<ReloadHandle> {
     let path = config_path();
-    if !path.exists() {
-        eprintln!("config watcher: {} 不存在,热重载未启用", path.display());
+    let dir = path.parent()?;
+    let file_name = path.file_name()?.to_owned();
+    if !dir.is_dir() {
+        eprintln!("config watcher: {} 不存在,热重载未启用", dir.display());
         return None;
     }
-    // notify 的 EventHandler 直接支持 std mpsc Sender<Result<Event>>;
-    // watcher 持有发送端,Drop 时后端停止、通道断开,线程随之退出
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+    let (tx, rx) = mpsc::channel();
     // 创建/监听/起线程三步都按"绝不致命"降级:失败只记日志、热重载关闭,
     // 绝不 expect 崩终端
-    let mut watcher = match notify::recommended_watcher(tx) {
+    let mut watcher = match notify::recommended_watcher(move |event: notify::Result<Event>| {
+        if let Ok(event) = event
+            && !event.kind.is_access()
+            && event.paths.iter().any(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&file_name))
+            })
+        {
+            let _ = tx.send(());
+        }
+    }) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("config watcher: 创建失败:{e};热重载未启用");
             return None;
         }
     };
-    if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+    if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
         eprintln!(
             "config watcher: 无法监听 {}: {e};热重载未启用",
-            path.display()
+            dir.display()
         );
         return None;
     }
@@ -104,12 +147,12 @@ pub(super) fn spawn_config_watcher() -> Option<ReloadHandle> {
     })
 }
 
-/// 去抖线程:notify 后端已按被监视文件过滤事件,收到的必是 config 的动静。
+/// 去抖线程:只接收 config 文件事件。
 /// 编辑器原子保存 = Delete+Create+Write 连发,不去抖会触发多轮重载并撞上
 /// 瞬时缺失窗——故收首个事件后持续吞事件,直到 300ms 静默窗走完才投递一次;
 /// 路径在静默结束时仍不存在(原子替换途中)则跳过本轮。通道断开(watcher
 /// 已 Drop)即退出。
-fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<notify::Result<Event>>) {
+fn debounce_loop(path: PathBuf, rx: mpsc::Receiver<()>) {
     const QUIET: Duration = Duration::from_millis(300);
     loop {
         if rx.recv().is_err() {
@@ -145,10 +188,8 @@ pub(super) unsafe fn reload_config(hwnd: HWND) {
         ));
         return;
     };
-    // 与启动路径同一 BOM 剥离:热重载不该比首读更挑剔编码
-    let source = source.strip_prefix('\u{feff}').unwrap_or(&source);
-    let settings = match settings::resolve(source) {
-        Ok(s) => s,
+    let (settings, system_mode) = match resolve_settings(&source) {
+        Ok(resolved) => resolved,
         Err(err) => {
             warn_box(&format_config_error(&path, &err, "已保留当前设置"));
             return; // 保旧
@@ -236,6 +277,7 @@ pub(super) unsafe fn reload_config(hwnd: HWND) {
     SESSION_COMMAND.with(|s| *s.borrow_mut() = settings.command.clone());
     CONTENT_PADDING
         .with(|p| *p.borrow_mut() = (settings.window_padding_x, settings.window_padding_y));
+    UNFOCUSED_SPLIT_OPACITY.with(|opacity| opacity.set(settings.unfocused_split_opacity));
     QUICK_TERMINAL_HEIGHT.with(|h| h.set(settings.quick_terminal_height));
     QUICK_TERMINAL_KEY.with(|k| *k.borrow_mut() = settings.quick_terminal_key.clone());
     quickterm::apply_hotkey(settings.quick_terminal_key.as_deref());
@@ -260,6 +302,8 @@ pub(super) unsafe fn reload_config(hwnd: HWND) {
     });
     STRIP_CFG.with(|c| *c.borrow_mut() = settings.strip.clone());
     CURRENT_PALETTE.with(|p| *p.borrow_mut() = settings.palette);
+    ADAPTIVE_THEME_MODE.with(|mode| mode.set(system_mode));
+    window::apply_theme_chrome(hwnd, &settings.palette);
     // title 锁定值即时应用;清空 title = 时恢复当前活跃标签标题
     let win_title = TITLE_LOCK.with(|t| t.borrow().clone()).unwrap_or_else(|| {
         TABS.with(|tabs| {
@@ -272,6 +316,7 @@ pub(super) unsafe fn reload_config(hwnd: HWND) {
     });
     let _ = SetWindowTextW(hwnd, &HSTRING::from(win_title));
     resize_all_grids(rect.right.max(1) as f32, rect.bottom.max(1) as f32);
+    quickterm::reload_appearance(&settings);
     // draw_frame 自己也要借 TABS/GPU,必须在 with 之外调用
     draw_frame();
 }

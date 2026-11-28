@@ -50,8 +50,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ERASEBKGND, WM_GETOBJECT, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCALCSIZE, WM_NCHITTEST, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCMOUSEMOVE, WM_PAINT,
-    WM_RBUTTONDOWN, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW,
-    WS_OVERLAPPEDWINDOW,
+    WM_RBUTTONDOWN, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN,
+    WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTCLOSE, HTLEFT, HTMAXBUTTON,
@@ -65,6 +65,9 @@ use windows::core::{HSTRING, PCWSTR, w};
 const WM_APP_RENDER: u32 = 0x8000 + 1;
 const WM_APP_CONFIG: u32 = 0x8000 + 2;
 const WM_APP_IPC: u32 = 0x8000 + 3;
+const WM_APP_TRANSFER: u32 = 0x8004;
+const WM_APP_CLOSE_EMPTY: u32 = 0x8005;
+const WM_APP_DETACH_READY: u32 = 0x8006;
 /// watch/转发线程共持的窗口句柄哨兵,唯一语义是"窗口是否存活":退出序第一
 /// 步统一落 None,两个后台线程自此不再向窗口投递消息;Post 到死句柄本就无害,
 /// 纪律照守。存裸 isize 而非 HWND——windows-rs 的句柄包着 *mut c_void,不是
@@ -88,7 +91,9 @@ pub(crate) mod pty_bridge;
 pub(crate) mod quickterm;
 mod render;
 mod strip;
+mod tab_drag;
 mod tabs;
+mod transfer;
 pub mod uia;
 mod window;
 pub mod window_registry; // pub:tests 直入(真窗口生命周期回归,T04)
@@ -106,7 +111,7 @@ thread_local! {
     static GPU: RefCell<Option<WindowGpu>> = const { RefCell::new(None) };
     static TABS: RefCell<Vec<TabState>> = const { RefCell::new(Vec::new()) };
     static ACTIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static NEXT_TAB_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+
     /// SharedHwnd 的全局副本:NewTab 动作要起新 forwarder,而 hwnd 哨兵
     /// 只在 run() 手里有——建池时存一份进 TLS(与窗口同生命周期)
     static SHARED_HWND: RefCell<Option<SharedHwnd>> = const { RefCell::new(None) };
@@ -232,9 +237,8 @@ thread_local! {
     /// None = 光标不在路径上(WM_MOUSEMOVE 每次刷新,替代 300ms 气泡)
     static HOVER_PATH: RefCell<Option<PathHover>> =
         const { RefCell::new(None) };
-    /// #58 悬停反色动画相位(0 = 2px 下划线,1 = 整块):进入/换路径时
-    /// 归零,timer 5 推进(120ms ease-out)——"从下划线滑成整块"
-    static HOVER_ANIM: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+    static UNFOCUSED_SPLIT_OPACITY: std::cell::Cell<f32> =
+        std::cell::Cell::new(Settings::default().unfocused_split_opacity);
     /// strip 悬停态(2026-10 UI 对标):标签/加号/caption 按钮的反馈
     /// (const 初始化用字面量——Default::default 不是 const fn)
     static HOVER_STRIP: std::cell::Cell<mica_render::frame::StripHover> = const {
@@ -281,7 +285,7 @@ struct WindowGpu {
 pub(crate) use pty_bridge::{PtyBacklog, WriteQueue};
 
 /// 单个标签的终端态:GPU 以外的一切(M1 时代的 Terminal 字段原样)。
-pub(crate) struct Terminal {
+pub(crate) struct Terminal<R = DwriteRouter> {
     term: Surface,
     /// 会话(控制面:kill/resize/轮询,全在 UI 线程;写端经
     /// writer_handle 分发给 writer 线程——锁分离,复核 3)
@@ -299,7 +303,7 @@ pub(crate) struct Terminal {
     input_stage: pty_bridge::InputStage,
     /// 当前会话代(与 pty_buf 同源;重启递增,转发线程/写队列据此弃旧)
     session_gen: u64,
-    router: DwriteRouter,
+    router: R,
     metrics: FontMetrics,
     /// 配置合成出的调色板:渲染实例着色与 OSC 4/10/11/12 应答同源(T2 Settings)
     palette: Palette,
@@ -314,7 +318,7 @@ pub(crate) struct Terminal {
     /// (用户实报),strip 文字改 9.5pt 等宽(族链仍随配置)——与终端
     /// 路由共享图集(单 draw 单纹理约束)。放 Terminal 是渲染借用拓扑
     /// 需要(draw 时与 router 同一借用链)
-    strip_router: Option<DwriteRouter>,
+    strip_router: Option<R>,
     /// 上次消费的图集布局版本(grow 重排即变)——变了必须 force_full
     /// 重建行实例,否则旧 UV 指向重排后的错误条目(一块一块根因)
     last_atlas_ver: u64,
@@ -336,23 +340,23 @@ struct ClosedTab {
 }
 
 /// 标签池条目:pane 池 + 布局树 + 池簿记(T7 分屏)。
-struct TabState {
+struct TabState<R = DwriteRouter> {
     /// OSC 0 标题(strip 显示;shell 未设时用占位)
     title: String,
     /// #87 自定义色(标签顶部 2px 色条;None = 无)
     color: Option<[u8; 3]>,
     /// 后台标签有未渲染数据(D18:feed 照跑,渲染跳过)
     dirty: bool,
-    panes: Vec<PaneState>,
+    panes: Vec<PaneState<R>>,
     layout: mica_core::layout::Layout,
     /// focused pane 在 panes 里的下标
     focused: usize,
 }
 
 /// 单个 pane:Terminal + 全局 pane id(转发线程 WPARAM 用)。
-struct PaneState {
+struct PaneState<R = DwriteRouter> {
     id: u64,
-    terminal: Terminal,
+    terminal: Terminal<R>,
 }
 
 impl TabState {
@@ -442,6 +446,57 @@ pub(crate) fn spawn_qt_forwarder(
 /// WM_CHAR;方向/编辑键没有字符事件,走 WM_KEYDOWN 的 VK 映射。
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        tab_drag::PREVIEW => tab_drag::preview(hwnd, wparam.0 != 0, lparam),
+        windows::Win32::UI::WindowsAndMessaging::WM_MOVING => {
+            set_window_dragging(true);
+            tab_drag::native_move(hwnd, false);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE => {
+            tab_drag::native_move(hwnd, true);
+            set_window_dragging(false);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED if DRAG_TAB.get().is_some() => {
+            tab_drag::cancel();
+            draw_frame();
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
+            cancel_search_press();
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_KEYDOWN if wparam.0 == 0x1b && DRAG_TAB.get().is_some() => {
+            tab_drag::cancel();
+            KEYMAP_ATE_CHAR.set(true);
+            let _ = ReleaseCapture();
+            draw_frame();
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU => {
+            let (x, y) = mouse_xy(lparam);
+            let mut pt = windows::Win32::Foundation::POINT { x, y };
+            if x == -1 && y == -1 {
+                let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+            }
+            let mut local = pt;
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut local);
+            let tab = match strip_hit(local.x, local.y) {
+                Some(mica_render::frame::StripTabHit::Tab(i)) => Some(i),
+                _ if TAB_COUNT.get() == 1
+                    && local.y >= 0
+                    && (local.y as f32) < strip_metrics().title_h =>
+                {
+                    Some(0)
+                }
+                _ => None,
+            };
+            if let Some(i) = tab {
+                tab_drag::menu(hwnd, i, pt);
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_GETOBJECT => {
             if let Some(r) = uia::handle_getobject(hwnd, wparam, lparam) {
                 return r;
@@ -730,6 +785,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_LBUTTONDOWN => {
             let (px, py) = mouse_xy(lparam);
+            if search_press(hwnd, px, py) {
+                return LRESULT(0);
+            }
             // strip 区(T7):命中标签则切换、+ 新建、箭头步进滚动(#39)
             match strip_hit(px, py) {
                 Some(mica_render::frame::StripTabHit::Tab(idx)) => {
@@ -747,14 +805,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let local = px as f32 + shift
                         - mica_render::frame::tabs_x0(&sm)
                         - idx as f32 * (w + sm.tab_gap);
-                    if n > 1 && local >= w - sm.tab_close_w {
+                    if local >= 0.0 && local < sm.tab_close_w {
                         close_tab(idx);
                         return LRESULT(0);
                     }
                     switch_tab(idx);
                     // 按下即捕获,挤压式拖拽换序(× 区不进);手粘光标
-                    if n > 1 {
-                        DRAG_TAB.with(|d| d.set(Some(idx)));
+                    {
+                        tab_drag::begin(idx);
                         DRAG_SLOT.with(|s| s.set(idx));
                         let span = w + sm.tab_gap;
                         let local = px.max(0) as f32 + shift;
@@ -762,6 +820,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         DRAG_X.with(|x| x.set(idx as f32 * span));
                         CAPS_T0.with(|t| t.set(-1.0)); // 切换滑移让位给手粘光标
                         let _ = SetCapture(hwnd);
+                        draw_frame();
                     }
                     return LRESULT(0);
                 }
@@ -884,31 +943,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(di) = DRAG_TAB.with(std::cell::Cell::get) {
                 let px = (lparam.0 & 0xffff) as u16 as i16 as i32;
                 let py = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
-                // #35 tear-off(软):拖出标签行(上越窗顶 / 下入内容区)即
-                // 撕开——原标签关、独立新窗(同 shell/cwd/标题)。进程不
-                // 迁移(COM/TLS !Send),软撕开续工作流
-                if py < -20 || py > strip_h() as i32 + 40 {
-                    let seed = TABS.with(|tabs| {
-                        tabs.borrow().get(di).map(|t| {
-                            (
-                                t.panes
-                                    .first()
-                                    .map(|p| p.terminal.shell.clone())
-                                    .unwrap_or_else(|| launch_command(None)),
-                                t.panes
-                                    .first()
-                                    .and_then(|p| p.terminal.term.cwd().map(str::to_string)),
-                                t.title.clone(),
-                            )
-                        })
-                    });
-                    DRAG_TAB.with(|d| d.set(None));
+                if !tab_drag::owns(di) {
+                    tab_drag::cancel();
                     let _ = ReleaseCapture();
-                    if let Some((shell, cwd, title)) = seed {
-                        close_tab(di);
-                        spawn_window_tear(shell, cwd, title);
-                        return LRESULT(0);
-                    }
+                    draw_frame();
+                    return LRESULT(0);
+                }
+                if tab_drag::track(hwnd, px, py) {
+                    return LRESULT(0);
                 }
                 let sm = strip_metrics();
                 let area_w = GPU
@@ -1152,9 +1194,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            let (px, py) = mouse_xy(lparam);
+            if search_release(px, py) {
+                return LRESULT(0);
+            }
             MOUSE_DOWN.with(|m| m.set(false));
             // 拖拽换序提交:被拖标签从原位拔出插入目标槽,活跃跟过去
             if let Some(di) = DRAG_TAB.with(std::cell::Cell::take) {
+                let (x, y) = mouse_xy(lparam);
+                let external = !tab_drag::owns(di) || tab_drag::drop_external(hwnd, di, x, y);
+                if external {
+                    tab_drag::cancel();
+                    let _ = ReleaseCapture();
+                    draw_frame();
+                    return LRESULT(0);
+                }
                 let slot = DRAG_SLOT.with(std::cell::Cell::get);
                 if slot != di {
                     TABS.with(|tabs| {
@@ -1193,6 +1247,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_LBUTTONDBLCLK => {
+            let (px, py) = mouse_xy(lparam);
+            if search_press(hwnd, px, py) {
+                return LRESULT(0);
+            }
             let (px, py) = mouse_xy(lparam);
             // 双击记位(供随后 450ms 内第三下 WM_LBUTTONDOWN 升格行选择);
             // 连续第二次双击也兼容升格行选择
@@ -1637,17 +1695,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // 最大化态拖 caption = 还原并继续拖(#34):无边框窗 DefWindowProc
             // 不自动还原,手动 SC_RESTORE 后进入移动循环(SC_MOVE|HTCAPTION,
             // Chrome 同款手法)。还原位置暂取旧矩形(光标跟随重定位留打磨)
-            if wparam.0 as u32 == HTCAPTION
-                && windows::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd).as_bool()
-            {
-                let _ = SendMessageW(
-                    hwnd,
-                    WM_SYSCOMMAND,
-                    Some(WPARAM(SC_RESTORE as usize)),
-                    Some(LPARAM(0)),
-                );
-                let _ = SendMessageW(hwnd, WM_SYSCOMMAND, Some(WPARAM(0xF012)), Some(lparam));
-                return LRESULT(0);
+            if wparam.0 as u32 == HTCAPTION {
+                set_window_dragging(true);
+                let result = if windows::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd).as_bool() {
+                    let _ = SendMessageW(
+                        hwnd,
+                        WM_SYSCOMMAND,
+                        Some(WPARAM(SC_RESTORE as usize)),
+                        Some(LPARAM(0)),
+                    );
+                    SendMessageW(hwnd, WM_SYSCOMMAND, Some(WPARAM(0xF012)), Some(lparam))
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                };
+                // Also restore after a simple press or Esc-cancelled move.
+                set_window_dragging(false);
+                return result;
             }
             // 系统按钮(T8):SC 命令驱动最小化/最大化;关闭走销毁路径
             match wparam.0 as u32 {
@@ -1722,6 +1785,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_PAINT => {
             // 绘制节奏由消息循环控制;这里只清掉无效区积压
             let _ = ValidateRect(Some(hwnd), None);
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+            if config::system_theme_changed() {
+                let _ = PostMessageW(Some(hwnd), WM_APP_CONFIG, WPARAM(0), LPARAM(0));
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_APP_TRANSFER => {
+            transfer::receive(hwnd, wparam.0, lparam.0 as usize);
+            LRESULT(0)
+        }
+        WM_APP_CLOSE_EMPTY => {
+            if TABS.with(|t| t.borrow().is_empty()) {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_APP_DETACH_READY => {
+            window::finish_detach();
             LRESULT(0)
         }
         WM_APP_CONFIG => {

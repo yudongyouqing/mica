@@ -111,11 +111,43 @@ impl Layout {
     /// 递归二分求每 pane 的矩形。
     pub fn rects(&self, area: Rect) -> Vec<(u64, Rect)> {
         let mut out = Vec::new();
-        self.rects_into(area, &mut out);
+        self.rects_into(area, &mut out, &mut |_, _, _| {});
         out
     }
 
-    fn rects_into(&self, area: Rect, out: &mut Vec<(u64, Rect)>) {
+    /// Compute pane bounds and pixel-aligned rules on their shared edges.
+    pub fn rects_and_dividers(&self, area: Rect, thickness: f32) -> (Vec<(u64, Rect)>, Vec<Rect>) {
+        let mut panes = Vec::new();
+        let mut dividers = Vec::new();
+        self.rects_into(area, &mut panes, &mut |dir, area, boundary| {
+            if thickness <= 0.0 || area.w <= 0.0 || area.h <= 0.0 {
+                return;
+            }
+            let center = |start: f32, len: f32, width: f32| {
+                (boundary - width * 0.5)
+                    .round()
+                    .clamp(start, start + (len - width))
+            };
+            dividers.push(match dir {
+                SplitDir::Horizontal => {
+                    let w = thickness.min(area.w);
+                    Rect::new(center(area.x, area.w, w), area.y, w, area.h)
+                }
+                SplitDir::Vertical => {
+                    let h = thickness.min(area.h);
+                    Rect::new(area.x, center(area.y, area.h, h), area.w, h)
+                }
+            });
+        });
+        (panes, dividers)
+    }
+
+    fn rects_into(
+        &self,
+        area: Rect,
+        out: &mut Vec<(u64, Rect)>,
+        divider: &mut impl FnMut(SplitDir, Rect, f32),
+    ) {
         match self {
             Self::Leaf(id) => out.push((*id, area)),
             Self::Split {
@@ -128,13 +160,17 @@ impl Layout {
                 match dir {
                     SplitDir::Horizontal => {
                         let (w1, w2) = (area.w * r, area.w * (1.0 - r));
-                        first.rects_into(Rect::new(area.x, area.y, w1, area.h), out);
-                        second.rects_into(Rect::new(area.x + w1, area.y, w2, area.h), out);
+                        let boundary = area.x + w1;
+                        divider(*dir, area, boundary);
+                        first.rects_into(Rect::new(area.x, area.y, w1, area.h), out, divider);
+                        second.rects_into(Rect::new(boundary, area.y, w2, area.h), out, divider);
                     }
                     SplitDir::Vertical => {
                         let (h1, h2) = (area.h * r, area.h * (1.0 - r));
-                        first.rects_into(Rect::new(area.x, area.y, area.w, h1), out);
-                        second.rects_into(Rect::new(area.x, area.y + h1, area.w, h2), out);
+                        let boundary = area.y + h1;
+                        divider(*dir, area, boundary);
+                        first.rects_into(Rect::new(area.x, area.y, area.w, h1), out, divider);
+                        second.rects_into(Rect::new(area.x, boundary, area.w, h2), out, divider);
                     }
                 }
             }
@@ -189,6 +225,23 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_rules_share_the_split_geometry_without_resizing_panes() {
+        let mut layout = Layout::leaf(1);
+        layout.split(1, SplitDir::Horizontal, 2);
+        layout.split(2, SplitDir::Vertical, 3);
+        let area = Rect::new(8.0, 40.0, 101.0, 61.0);
+        let (panes, dividers) = layout.rects_and_dividers(area, 2.0);
+        assert_eq!(panes, layout.rects(area));
+        assert_eq!(
+            dividers,
+            [
+                Rect::new(58.0, 40.0, 2.0, 61.0),
+                Rect::new(58.5, 70.0, 50.5, 2.0)
+            ],
+        );
+    }
 
     const A: Rect = Rect::new(0.0, 0.0, 100.0, 80.0);
 
