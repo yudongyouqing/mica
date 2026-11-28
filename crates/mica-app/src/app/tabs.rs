@@ -4,6 +4,21 @@
 
 use super::*;
 
+/// Mirror portable-pty's Windows default: explicit directory, child USERPROFILE,
+/// then the process directory. Capture it once for both spawn and metadata.
+pub(super) fn effective_initial_cwd(
+    cwd: Option<&str>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    cwd.map(std::path::Path::new)
+        .filter(|p| p.is_dir())
+        .or_else(|| home.map(std::path::Path::new).filter(|p| p.is_dir()))
+        .map(std::path::absolute)
+        .unwrap_or_else(std::env::current_dir)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// 字号随 DPI:DWrite 光栅按 96dpi 像素出图,pt×scale 才与屏幕物理一致。
 /// reload_dpi 一直这么乘,其余建 router 站点曾全漏(单 150% 屏无
 /// WM_DPICHANGED,字体永远 ×1.0)——2026-10-06 统一单源
@@ -107,6 +122,10 @@ pub(super) fn poll_exits() -> bool {
                     && let Ok(Some(st)) = t.session.try_wait()
                 {
                     t.exited = Some(st.exit_code());
+                    events::publish(events::WatchEvent::PaneExited {
+                        pane_id: pane.id,
+                        exit_code: st.exit_code(),
+                    });
                     changed = true;
                 }
             }
@@ -140,13 +159,16 @@ pub(super) fn restart_active_pane() -> bool {
             return;
         };
         let t = &mut pane.terminal;
-        let restarted = lifecycle::restart_session_fields(
+        let restarted = lifecycle::restart_session_fields_with_options(
             &mut t.session,
             &mut t.session_permit,
             &mut t.writeq,
             &mut t.input_stage,
             &t.pty_buf,
             &t.shell,
+            t.pane_id,
+            t.initial_cwd.as_deref(),
+            &t.extra_env,
             cols,
             rows,
             &mut t.exited,
@@ -353,6 +375,7 @@ pub(super) fn focus_neighbor(dir: Key) {
             }
         }
     });
+    window_ipc::clear_active_attention();
     draw_frame();
 }
 
@@ -387,6 +410,7 @@ pub(super) fn close_pane_action() {
     if let Some(idx) = close_tab_idx {
         close_tab(idx);
     } else {
+        window_ipc::clear_active_attention();
         draw_frame();
     }
 }
@@ -415,6 +439,7 @@ pub(super) unsafe fn split_pane(hwnd: HWND, dir: mica_core::layout::SplitDir) {
         let pty_buf = Arc::clone(&pane.terminal.pty_buf);
         let fwd_epoch = pane.terminal.session_gen;
         tab.layout.split(target, dir, pane_id);
+        window_ipc::pane_created(hwnd, ACTIVE.get(), &pane);
         tab.panes.push(pane);
         tab.focused = tab.panes.len() - 1; // 新 pane 焦点(WT 语义)
         for p in tab.panes.iter_mut() {
@@ -439,6 +464,16 @@ pub(super) unsafe fn create_pane_with_size(
     shell_command: &str,
     font_size: Option<f32>,
     cwd: Option<&str>,
+) -> Result<(PaneState, PtyReader), String> {
+    create_pane_with_options(hwnd, shell_command, font_size, cwd, None)
+}
+
+pub(super) unsafe fn create_pane_with_options(
+    hwnd: HWND,
+    shell_command: &str,
+    font_size: Option<f32>,
+    cwd: Option<&str>,
+    extra_env: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<(PaneState, PtyReader), String> {
     let (families, size_pt) = TAB_SEED.with(|s| s.borrow().clone());
     let size_pt = font_size
@@ -472,8 +507,17 @@ pub(super) unsafe fn create_pane_with_size(
     term.set_clipboard_provider(std::sync::Arc::new(|| {
         clipboard::get_text().unwrap_or_default()
     }));
+    let pane_id = window_ipc::next_pane_id();
+    let extra_env = extra_env.cloned().unwrap_or_default();
     let mut cmd = mica_core::pty::command_from_str(shell_command);
-    if let Some(dir) = cwd {
+    for (key, value) in &extra_env {
+        if !key.eq_ignore_ascii_case("MICA_PANE_ID") {
+            cmd.env(key, value);
+        }
+    }
+    cmd.env("MICA_PANE_ID", pane_id.to_string());
+    let initial_cwd = effective_initial_cwd(cwd, cmd.get_env("USERPROFILE"));
+    if let Some(dir) = &initial_cwd {
         cmd.cwd(std::path::PathBuf::from(dir));
     }
     if !lifecycle::spawn_capacity_ok() {
@@ -487,8 +531,6 @@ pub(super) unsafe fn create_pane_with_size(
     if let Some(pid) = session.child_pid() {
         orphan::track_session_since(&probe, pid);
     }
-    static NEXT_PANE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let pane_id = NEXT_PANE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let slot = SHARED_HWND.with(|s| s.borrow().clone());
     let pty_buf = PtyBacklog::new(
         pane_id,
@@ -511,6 +553,14 @@ pub(super) unsafe fn create_pane_with_size(
 
     let terminal = Terminal {
         term,
+        pane_id,
+        initial_cwd: initial_cwd.clone(),
+        extra_env,
+        badge: None,
+        observed_cwd: initial_cwd,
+        observed_prompt: (mica_core::ipc::PromptState::Unknown, None),
+        observed_title: shell_command.to_string(),
+        output_pending: false,
         session,
         session_permit: Some(session_permit),
         pty_buf: Arc::clone(&pty_buf),
@@ -582,15 +632,99 @@ pub(super) unsafe fn start_tab_with_shell(
     cwd: Option<&str>,
     title: String,
 ) -> bool {
-    let old_active = ACTIVE.get();
-    let (pane, reader) = match create_pane_with_size(hwnd, shell, font_size, cwd) {
+    let pair = match create_pane_with_size(hwnd, shell, font_size, cwd) {
         Ok(pair) => pair,
         Err(e) => {
             warn_box(&e);
             return false;
         }
     };
+    install_tab(hwnd, pair, title);
+    true
+}
+
+pub(super) unsafe fn start_tab_with_options(
+    hwnd: HWND,
+    req: &IpcRequest,
+) -> Result<mica_core::ipc::PaneInfo, IpcError> {
+    if let Some(size) = req.font_size
+        && (!size.is_finite() || !(6.0..=72.0).contains(&size))
+    {
+        return Err(IpcError::BadFontSize);
+    }
+    if let Some(cwd) = &req.cwd
+        && !std::path::Path::new(cwd).is_dir()
+    {
+        return Err(IpcError::BadTarget);
+    }
+    let profiles = mica_core::profile::cached_profiles();
+    let profile = if req.command.is_none() {
+        match &req.profile {
+            Some(name) => Some(
+                profiles
+                    .iter()
+                    .find(|p| p.name.eq_ignore_ascii_case(name))
+                    .ok_or(IpcError::BadProfile)?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let shell = req
+        .command
+        .clone()
+        .unwrap_or_else(|| launch_command(profile));
+    let cwd = req.cwd.clone().or_else(|| {
+        TABS.with(|tabs| {
+            tabs.borrow()
+                .get(ACTIVE.get())
+                .and_then(|tab| tab.active_pane_ref())
+                .and_then(|t| {
+                    t.term
+                        .cwd()
+                        .map(str::to_owned)
+                        .or_else(|| t.initial_cwd.clone())
+                })
+        })
+    });
+    if !lifecycle::spawn_capacity_ok() {
+        return Err(IpcError::Degraded);
+    }
+    let pair = create_pane_with_options(
+        hwnd,
+        &shell,
+        req.font_size,
+        cwd.as_deref(),
+        req.env.as_ref(),
+    )
+    .map_err(|e| {
+        eprintln!("ipc spawn: {e}");
+        IpcError::SpawnFailed
+    })?;
+    let title = profile
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| shell.clone());
+    let pane_id = pair.0.id;
+    install_tab(hwnd, pair, title);
+    TABS.with(|tabs| {
+        let tabs = tabs.borrow();
+        let index = tabs.len() - 1;
+        Ok(window_ipc::pane_info(
+            hwnd,
+            index,
+            &tabs[index],
+            &tabs[index].panes[0],
+            false,
+        ))
+    })
+    .inspect(|info| debug_assert_eq!(info.pane_id, pane_id))
+}
+
+unsafe fn install_tab(hwnd: HWND, (pane, reader): (PaneState, PtyReader), title: String) {
+    let old_active = ACTIVE.get();
     let pane_id = pane.id;
+    window_ipc::pane_created(hwnd, TABS.with(|t| t.borrow().len()), &pane);
     let tab = TabState {
         title,
         color: None,
@@ -615,7 +749,6 @@ pub(super) unsafe fn start_tab_with_shell(
         let _ = &slot;
         spawn_render_forwarder(reader, pty_buf, id, fwd_epoch);
     }
-    true
 }
 
 /// 切到指定下标的标签:置活跃 + force_full(strip 也要换高亮)+ 重绘。
@@ -633,6 +766,7 @@ pub(super) fn switch_tab(idx: usize) {
             }
         }
     });
+    window_ipc::clear_active_attention();
     prime_capsule_slide(old, idx);
     ensure_anim_timer();
     tab_follow_active();
@@ -655,10 +789,15 @@ pub(super) fn close_tab(idx: usize) {
             let first = removed.panes.first().map(|p| {
                 (
                     p.terminal.shell.clone(),
-                    p.terminal.term.cwd().map(str::to_string),
+                    p.terminal
+                        .term
+                        .cwd()
+                        .map(str::to_string)
+                        .or_else(|| p.terminal.initial_cwd.clone()),
+                    p.terminal.extra_env.clone(),
                 )
             });
-            if let Some((shell, cwd)) = first {
+            if let Some((shell, cwd, extra_env)) = first {
                 CLOSED_TABS.with(|h| {
                     let mut hist = h.borrow_mut();
                     if hist.len() >= 8 {
@@ -667,6 +806,7 @@ pub(super) fn close_tab(idx: usize) {
                     hist.push(ClosedTab {
                         shell,
                         cwd,
+                        extra_env,
                         title: removed.title.clone(),
                         color: removed.color,
                     });
@@ -709,9 +849,67 @@ pub(super) fn close_tab(idx: usize) {
         }
         return;
     }
+    window_ipc::clear_active_attention();
     if let Some(na) = new_active {
         prime_capsule_slide(old_active, na);
         ensure_anim_timer();
     }
     draw_frame();
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    #[test]
+    fn initial_cwd_matches_cmd_when_home_differs_from_process_directory() {
+        let home = std::env::temp_dir().join(format!("mica-cwd-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut cmd = mica_core::pty::command_from_str(
+            "cmd.exe /D /Q /C echo MICA_ACTUAL_CWD=%CD%=MICA_CWD_END",
+        );
+        // Only this child receives the override; no process environment mutation.
+        cmd.env("uSeRpRoFiLe", &home);
+        let recorded = effective_initial_cwd(None, cmd.get_env("USERPROFILE")).unwrap();
+        let (session, reader) = PtySession::spawn(cmd, 160, 24).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut output = String::new();
+        let mut answered = 0;
+        while std::time::Instant::now() < deadline {
+            if let Some(bytes) = reader.recv_timeout(Duration::from_millis(50)) {
+                output.push_str(&String::from_utf8_lossy(&bytes));
+                let pending = output.matches("\x1b[6n").count();
+                for _ in answered..pending {
+                    session.write(b"\x1b[1;1R").unwrap();
+                }
+                answered = pending;
+                if output.contains("=MICA_CWD_END") {
+                    break;
+                }
+            }
+        }
+        drop(session);
+        let _ = std::fs::remove_dir(&home);
+        let expected = format!("MICA_ACTUAL_CWD={recorded}=MICA_CWD_END");
+        assert!(
+            output.contains(&expected),
+            "recorded cwd {recorded:?}, CMD output {output:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_cwd_wins_and_missing_home_uses_process_directory() {
+        let process = std::env::current_dir().unwrap();
+        let missing = process.join("mica-missing-home-cwd-regression");
+        assert!(!missing.exists());
+        let process = process.to_string_lossy().into_owned();
+        assert_eq!(
+            effective_initial_cwd(Some(&process), Some(missing.as_os_str())),
+            Some(process.clone())
+        );
+        assert_eq!(
+            effective_initial_cwd(None, Some(missing.as_os_str())),
+            Some(process)
+        );
+    }
 }

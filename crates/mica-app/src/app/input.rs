@@ -484,14 +484,19 @@ pub(super) fn execute_action(action: Action, hwnd: HWND) -> bool {
         };
         // SAFETY: 段外(TABS 借用已还),create/forwarder 与既有路径同款
         unsafe {
-            let (pane, reader) =
-                match create_pane_with_size(hwnd, &ct.shell, None, ct.cwd.as_deref()) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        warn_box(&e);
-                        return true;
-                    }
-                };
+            let (pane, reader) = match create_pane_with_options(
+                hwnd,
+                &ct.shell,
+                None,
+                ct.cwd.as_deref(),
+                Some(&ct.extra_env),
+            ) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn_box(&e);
+                    return true;
+                }
+            };
             let pane_id = pane.id;
             let tab = TabState {
                 title: ct.title,
@@ -503,6 +508,8 @@ pub(super) fn execute_action(action: Action, hwnd: HWND) -> bool {
             };
             let pty_buf = Arc::clone(&tab.panes[0].terminal.pty_buf);
             let fwd_epoch = tab.panes[0].terminal.session_gen;
+            let tab_index = TABS.with(|tabs| tabs.borrow().len());
+            window_ipc::pane_created(hwnd, tab_index, &tab.panes[0]);
             TABS.with(|tabs| tabs.borrow_mut().push(tab));
             ACTIVE.with(|a| a.set(TABS.with(|tabs| tabs.borrow().len() - 1)));
             TAB_COUNT.with(|c| c.set(TABS.with(|tabs| tabs.borrow().len())));

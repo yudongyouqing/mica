@@ -84,6 +84,16 @@ pub enum Damage {
     Lines(Vec<usize>),
 }
 
+/// Current terminal geometry and a bounded tail of its active buffer. Physical
+/// rows selected for the tail can become fewer logical lines after soft wraps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSnapshot {
+    pub cols: usize,
+    pub rows: usize,
+    pub text: String,
+    pub truncated: bool,
+}
+
 /// Visible screen dimensions. `total_lines` reports the screen only, matching
 /// upstream's `TermSize`; scrollback capacity comes from `Config::scrolling_history`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +219,10 @@ pub struct Surface {
     cwd: Option<String>,
     /// OSC 133 行属性表(D37):持久累积,超 `MAX_MARKS` 淘汰最旧。
     marks: Vec<MarkRecord>,
+    /// Keep byte-stream order even when a command and its next prompt arrive
+    /// together. This queue is independent of persistent scrollback row marks.
+    pending_shell_marks: std::collections::VecDeque<crate::protocol::sidecar::ShellMark>,
+    shell_mark_overflow: bool,
     /// jump 锚(D37):上次 jump_prompt 的目标(行 + 单调 epoch);手动滚动即重置。
     jump_ref: Option<(i32, i64)>,
     /// 超出 SCROLLBACK_LIMIT 后从历史顶部淘汰的累计行数,用于构造单调 epoch。
@@ -264,6 +278,8 @@ impl Surface {
             cwd: None,
             sync_output: false,
             marks: Vec::new(),
+            pending_shell_marks: std::collections::VecDeque::new(),
+            shell_mark_overflow: false,
             jump_ref: None,
             evicted_lines: 0,
             sel_end: Point::new(Line(0), Column(0)),
@@ -336,6 +352,11 @@ impl Surface {
                     self.cwd = Some(path);
                 }
                 SidecarEvent::Mark(mark) => {
+                    if self.pending_shell_marks.len() == MAX_MARKS {
+                        self.pending_shell_marks.pop_front();
+                        self.shell_mark_overflow = true;
+                    }
+                    self.pending_shell_marks.push_back(*mark);
                     // 先喂到事件位置,光标即标记行(视口坐标,0=顶)
                     self.advance_tracked(&bytes[last..le.offset]);
                     last = le.offset;
@@ -384,6 +405,105 @@ impl Surface {
                 })
             })
             .collect()
+    }
+
+    /// OSC 133 input/prompt/end markers mean idle; output means running. Keep
+    /// state even when the corresponding old row has left scrollback.
+    pub fn prompt_state(&self) -> crate::ipc::PromptState {
+        use crate::ipc::PromptState;
+        use crate::protocol::sidecar::ShellMark;
+        match self.marks.last().map(|record| record.mark) {
+            Some(ShellMark::OutputStart) => PromptState::Running,
+            Some(_) => PromptState::Idle,
+            None => PromptState::Unknown,
+        }
+    }
+
+    /// Drain newly received OSC 133 transitions once, in byte-stream order.
+    pub fn take_shell_mark_events(&mut self) -> Vec<crate::protocol::sidecar::ShellMark> {
+        self.pending_shell_marks.drain(..).collect()
+    }
+
+    /// A bounded producer queue can lose transitions before a subscriber queue
+    /// fills. Consumers must invalidate their stream on this signal, then drain
+    /// the retained tail; silently treating it as a complete stream is unsafe.
+    pub fn take_shell_mark_overflow(&mut self) -> bool {
+        std::mem::take(&mut self.shell_mark_overflow)
+    }
+
+    /// Read the latest physical rows without changing selection, viewport scroll
+    /// or damage. Alternate screens never expose the main buffer's history.
+    /// Construct backwards so even huge histories/combining sequences allocate
+    /// only the requested byte budget. On overflow, retain a UTF-8 suffix.
+    pub fn dump_text(
+        &self,
+        max_lines: usize,
+        include_scrollback: bool,
+        max_bytes: usize,
+    ) -> TextSnapshot {
+        let grid = self.term.grid();
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        let history = if include_scrollback && !self.term.mode().contains(TermMode::ALT_SCREEN) {
+            grid.history_size()
+        } else {
+            0
+        };
+        let available = rows + history;
+        let count = max_lines.min(available);
+        let mut truncated = count < available;
+        // Reversed UTF-8 *bytes*, reversed back once at the end. Never split a
+        // scalar, including when the first omitted scalar has several bytes.
+        let mut reversed = Vec::with_capacity(max_bytes.min(4096));
+        let mut push = |ch: char| {
+            if ch.len_utf8() > max_bytes.saturating_sub(reversed.len()) {
+                return false;
+            }
+            let mut bytes = [0; 4];
+            reversed.extend(ch.encode_utf8(&mut bytes).as_bytes().iter().rev());
+            true
+        };
+        'lines: for distance in 0..count {
+            let line = rows as i32 - 1 - distance as i32;
+            let row = &grid[Line(line)];
+            let wrapped = row[Column(cols - 1)].flags.contains(CellFlags::WRAPLINE);
+            if !wrapped && !push('\n') {
+                truncated = true;
+                break;
+            }
+            let mut trim_spaces = !wrapped;
+            for column in (0..cols).rev() {
+                let cell = &row[Column(column)];
+                if cell
+                    .flags
+                    .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let extra = cell.zerowidth().unwrap_or_default();
+                // Alacritty stores HT in its starting blank cell and leaves the
+                // cells it crossed intact. Export that one cell as a space;
+                // emitting HT plus the crossed cells would expand tabs twice.
+                let primary = if cell.c == '\t' { ' ' } else { cell.c };
+                for ch in extra.iter().rev().copied().chain(std::iter::once(primary)) {
+                    if trim_spaces && ch == ' ' {
+                        continue;
+                    }
+                    trim_spaces = false;
+                    if !push(ch) {
+                        truncated = true;
+                        break 'lines;
+                    }
+                }
+            }
+        }
+        reversed.reverse();
+        TextSnapshot {
+            cols,
+            rows,
+            text: String::from_utf8(reversed).expect("complete UTF-8 scalars reversed twice"),
+            truncated,
+        }
     }
 
     /// D37 状态点:最近一个 D 的 exit code;其后的 B(命令开始)清除。

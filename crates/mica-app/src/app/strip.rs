@@ -72,6 +72,20 @@ pub(super) fn tab_shortcuts(count: usize) -> Vec<Option<String>> {
     })
 }
 
+/// A split tab displays its highest-priority pane badge.
+pub(super) fn tab_badges(tabs: &[TabState]) -> Vec<mica_core::ipc::BadgeState> {
+    tabs.iter()
+        .map(|tab| {
+            tab.panes
+                .iter()
+                .filter_map(|pane| pane.terminal.badge.as_ref())
+                .map(|badge| badge.state)
+                .max()
+                .unwrap_or(mica_core::ipc::BadgeState::None)
+        })
+        .collect()
+}
+
 /// strip/顶栏运行时几何(DPI 缩放 + 用户配置单源,渲染与 hit-test 同取):
 /// 150% 屏上物理常量曾致条高/× 与字体错位(2026-10-06 用户实测);
 /// strip-* 配置键热重载时经 STRIP_CFG 生效(2026-10-12 全量可配)

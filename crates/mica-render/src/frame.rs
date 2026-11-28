@@ -11,6 +11,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 
 use mica_core::config::palette::Palette;
 use mica_core::config::settings::StripCfg;
+use mica_core::ipc::BadgeState;
 use mica_core::surface::{CursorShape, Damage, Surface};
 
 use crate::color::{mix, relative_luminance, resolve, rgb3};
@@ -408,6 +409,8 @@ pub struct StripExtras {
     /// Optional accents indexed like the tab titles.
     pub tab_colors: Vec<Option<[u8; 3]>>,
     pub tab_shortcuts: Vec<Option<String>>,
+    /// Highest-priority pane badge for each tab.
+    pub tab_badges: Vec<BadgeState>,
     /// D37 OSC 133 exit 状态点
     pub exit_dot: Option<ExitDot>,
     /// T8 系统按钮区起点(客户区坐标)
@@ -586,6 +589,7 @@ pub fn strip_quads(
         window_title,
         tab_colors,
         tab_shortcuts,
+        tab_badges,
         exit_dot,
         caption_x,
         layout,
@@ -619,6 +623,21 @@ pub fn strip_quads(
     };
     let ink2 = sm.dim_c.unwrap_or_else(|| mix(white, bar, dim_mix));
     let k = sm.k;
+    let badge_d = (6.0 * k).round();
+    let badge_gap = (6.0 * k).round();
+    let badge_color = |state: BadgeState, backdrop: [u8; 3]| {
+        let index = match state {
+            BadgeState::None => return None,
+            BadgeState::Idle => 2,
+            BadgeState::Running => 4,
+            BadgeState::Attention => 3,
+        };
+        Some(enforce_contrast(
+            rgb3(palette.colors[index]),
+            backdrop,
+            palette.minimum_contrast,
+        ))
+    };
     let cw = metrics.cell_width;
     // 等宽格步进的字符步长:宽字形(CJK)按墨宽推进,窄字符不小于格宽
     let adv = |g: &crate::font::router::GlyphInfo| g.size_px[0].max(cw);
@@ -662,11 +681,21 @@ pub fn strip_quads(
     let right = (caption_x.unwrap_or(strip_w) - 8.0 * k).max(left);
     let center = (strip_w * 0.5).clamp(left, right);
     let pad_x = if sm.title_highlight { 8.0 * k } else { 0.0 };
+    let single_badge = single
+        .then(|| tab_badges.first().copied())
+        .flatten()
+        .and_then(|state| badge_color(state, bar));
+    let badge_reserve = if single_badge.is_some() {
+        badge_d + badge_gap
+    } else {
+        0.0
+    };
     let title_avail = (if sm.title_centered {
         2.0 * (center - left).min(right - center)
     } else {
         right - left
-    } - 2.0 * pad_x)
+    } - 2.0 * pad_x
+        - badge_reserve)
         .max(0.0);
     let title = window_title.as_deref().unwrap_or_else(|| {
         titles
@@ -721,9 +750,9 @@ pub fn strip_quads(
         title_y = (sm.title_h - (ink_bottom - ink_top)) * 0.5 - ink_top;
     }
     let text_x = if sm.title_centered {
-        center - text_w * 0.5
+        center - (text_w + badge_reserve) * 0.5 + badge_reserve
     } else {
-        left + pad_x
+        left + pad_x + badge_reserve
     };
     let title_face = if sm.title_highlight && text_w > 0.0 {
         let accent = sm.title_highlight_color.unwrap_or(white);
@@ -746,6 +775,26 @@ pub fn strip_quads(
             title_face,
             bar,
             (r, r),
+        ));
+    }
+    if let Some(color) = single_badge
+        && badge_d + badge_reserve <= right - left
+    {
+        // Title layout already reserves the capsule's padding on both sides.
+        // Place the badge outside that padding, preserving the full badge gap.
+        let highlight_inset = if sm.title_highlight && text_w > 0.0 {
+            pad_x
+        } else {
+            0.0
+        };
+        out.push(rounded(
+            text_x - badge_reserve - highlight_inset,
+            (sm.title_h - badge_d) * 0.5,
+            badge_d,
+            badge_d,
+            color,
+            bar,
+            (badge_d * 0.5, badge_d * 0.5),
         ));
     }
     let mut tx = text_x;
@@ -945,7 +994,17 @@ pub fn strip_quads(
                 } else {
                     0.0
                 };
-            let available = (text_right - label_left).max(0.0);
+            let badge = tab_badges
+                .get(i)
+                .copied()
+                .and_then(|state| badge_color(state, backdrop));
+            let badge = badge.filter(|_| text_right - label_left >= badge_d);
+            let badge_reserve = if badge.is_some() {
+                badge_d + badge_gap
+            } else {
+                0.0
+            };
+            let available = (text_right - label_left - badge_reserve).max(0.0);
             let style = GlyphStyle {
                 bold: *active,
                 italic: false,
@@ -975,7 +1034,19 @@ pub fn strip_quads(
                     label_width += ell_advance;
                 }
             }
-            let mut tx = label_left + (available - label_width).max(0.0) * 0.5;
+            let content_x = label_left + (available - label_width).max(0.0) * 0.5;
+            if let Some(color) = badge {
+                out.push(rounded(
+                    content_x,
+                    pill_y + (pill_h - badge_d) * 0.5,
+                    badge_d,
+                    badge_d,
+                    color,
+                    backdrop,
+                    (badge_d * 0.5, badge_d * 0.5),
+                ));
+            }
+            let mut tx = content_x + badge_reserve;
             for (g, advance) in label {
                 out.push(glyph_instance_rgba(
                     tx,
@@ -2191,6 +2262,189 @@ mod tests {
                     (close.size_uv[0].max(close.size_uv[1]) / pill_height - 0.34).abs() < 0.001
                 );
             }
+        }
+    }
+
+    #[test]
+    fn badges_reserve_title_space_at_both_dpis_and_hover_states() {
+        for scale in [1.0, 1.5] {
+            for count in [1, 2, 6] {
+                for hovered in [false, true] {
+                    let mut sm = StripMetrics::from_scale(scale);
+                    sm.hide_single = count == 1;
+                    let d = (6.0 * scale).round();
+                    let gap = (6.0 * scale).round();
+                    let mut router = FakeRouter {
+                        atlas_w: 128.0,
+                        atlas_h: 128.0,
+                        glyph_w: 4.0 * scale,
+                        glyph_h: 8.0 * scale,
+                        wide: |_| false,
+                    };
+                    let titles = (0..count)
+                        .map(|i| ("long title ".repeat(30), i == 0))
+                        .collect::<Vec<_>>();
+                    let output = strip_quads(
+                        &titles,
+                        &mut router,
+                        &metrics_8x16(),
+                        &Palette::DEFAULT,
+                        &sm,
+                        StripExtras {
+                            tab_badges: vec![BadgeState::Attention],
+                            tab_shortcuts: vec![Some("⌃⇧1".into()); count],
+                            hover: StripHover {
+                                tab: hovered.then_some(0),
+                                ..Default::default()
+                            },
+                            caption_x: Some(900.0 * scale),
+                            focus: 1.0,
+                            ..Default::default()
+                        },
+                    );
+                    let dots = output
+                        .iter()
+                        .filter(|q| {
+                            q.size_uv == [d, d, 0.0, 0.0]
+                                && q.bg[3] == d * 0.5
+                                && q.fg[3] == d * 0.5
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(dots.len(), 1, "scale={scale} tabs={count} hover={hovered}");
+                    let dot = dots[0];
+                    let left = dot.pos_uv[0];
+                    let end = left + d;
+                    if count > 1 {
+                        assert!(left >= tabs_x0(&sm) + sm.tab_close_w);
+                    }
+                    let glyphs = output
+                        .iter()
+                        .filter(|q| {
+                            q.size_uv[2] > 0.0
+                                && q.pos_uv[1] < dot.pos_uv[1] + d
+                                && q.pos_uv[1] + q.size_uv[1] > dot.pos_uv[1]
+                        })
+                        .collect::<Vec<_>>();
+                    for glyph in &glyphs {
+                        assert!(
+                            glyph.pos_uv[0] + glyph.size_uv[0] <= left || glyph.pos_uv[0] >= end,
+                            "dot overlaps title/close/shortcut"
+                        );
+                    }
+                    let next = glyphs
+                        .iter()
+                        .filter(|q| q.pos_uv[0] >= end)
+                        .map(|q| q.pos_uv[0])
+                        .min_by(f32::total_cmp)
+                        .expect("title after badge");
+                    assert!(next >= end + gap - 0.01);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_badge_stays_outside_highlight_capsule_at_all_dpis() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for centered in [false, true] {
+                for width in [180.0, 300.0, 620.0] {
+                    let mut sm = StripMetrics::from_scale(scale);
+                    sm.hide_single = true;
+                    sm.title_highlight = true;
+                    sm.title_centered = centered;
+                    let d = (6.0 * scale).round();
+                    let gap = (6.0 * scale).round();
+                    let h = (metrics_8x16().line_height + 6.0 * scale)
+                        .min((sm.title_h - 6.0 * scale).max(0.0));
+                    let mut router = FakeRouter {
+                        atlas_w: 128.0,
+                        atlas_h: 128.0,
+                        glyph_w: 4.0 * scale,
+                        glyph_h: 8.0 * scale,
+                        wide: |_| false,
+                    };
+                    let total_w = width * scale;
+                    let caption = total_w - 3.0 * sm.caption_w;
+                    let output = strip_quads(
+                        &[("a long terminal title ".repeat(5), true)],
+                        &mut router,
+                        &metrics_8x16(),
+                        &Palette::DEFAULT,
+                        &sm,
+                        StripExtras {
+                            tab_badges: vec![BadgeState::Attention],
+                            caption_x: Some(caption),
+                            focus: 1.0,
+                            ..Default::default()
+                        },
+                    );
+                    let dot = output
+                        .iter()
+                        .find(|q| q.size_uv == [d, d, 0.0, 0.0] && q.bg[3] == d * 0.5)
+                        .expect("single-tab badge");
+                    let dot_right = dot.pos_uv[0] + d;
+                    assert!(dot.pos_uv[0] >= 28.0 * scale - 0.01);
+                    assert!(dot_right <= caption - 8.0 * scale + 0.01);
+                    if let Some(capsule) = output.iter().find(|q| {
+                        q.size_uv[2] == 0.0
+                            && q.size_uv[0] > d
+                            && (q.size_uv[1] - h).abs() < 0.01
+                            && (q.pos_uv[1] - (sm.title_h - h) * 0.5).abs() < 0.01
+                    }) {
+                        assert!(
+                            capsule.pos_uv[0] >= dot_right + gap - 0.01,
+                            "scale={scale} centered={centered} width={width}: badge right {dot_right}, capsule left {}",
+                            capsule.pos_uv[0]
+                        );
+                        if centered {
+                            let group_center =
+                                (dot.pos_uv[0] + capsule.pos_uv[0] + capsule.size_uv[0]) * 0.5;
+                            assert!((group_center - total_w * 0.5).abs() < 0.01);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn badge_color_uses_theme_semantics_and_minimum_contrast() {
+        let mut palette = Palette::DEFAULT;
+        palette.minimum_contrast = 0.6;
+        for (state, index) in [
+            (BadgeState::Idle, 2),
+            (BadgeState::Running, 4),
+            (BadgeState::Attention, 3),
+        ] {
+            let mut router = FakeRouter {
+                atlas_w: 128.0,
+                atlas_h: 128.0,
+                glyph_w: 4.0,
+                glyph_h: 8.0,
+                wide: |_| false,
+            };
+            let output = strip_quads(
+                &[("title".into(), true)],
+                &mut router,
+                &metrics_8x16(),
+                &palette,
+                &StripMetrics::default(),
+                StripExtras {
+                    tab_badges: vec![state],
+                    caption_x: Some(900.0),
+                    ..Default::default()
+                },
+            );
+            let dot = output
+                .iter()
+                .find(|q| q.size_uv == [6.0, 6.0, 0.0, 0.0] && q.bg[3] == 3.0)
+                .expect("badge dot");
+            let background =
+                [dot.fg[0], dot.fg[1], dot.fg[2]].map(|channel| (channel * 255.0).round() as u8);
+            let expected = enforce_contrast(rgb3(palette.colors[index]), background, 0.6);
+            let actual =
+                [dot.bg[0], dot.bg[1], dot.bg[2]].map(|channel| (channel * 255.0).round() as u8);
+            assert_eq!(actual, expected);
         }
     }
 

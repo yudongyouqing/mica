@@ -29,7 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, IDC_ARROW, IsWindowVisible,
     LoadCursorW, RegisterClassExW, SW_HIDE, ShowWindow, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP,
     WM_CHAR, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_PAINT, WM_SIZE, WM_TIMER,
-    WNDCLASSEXW, WS_POPUP, WS_VISIBLE,
+    WNDCLASSEXW, WS_POPUP,
 };
 use windows::core::{HSTRING, w};
 
@@ -201,13 +201,16 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
         eprintln!("quickterm: 并发会话已达上限,QT 本轮禁用");
     })?;
     let probe = crate::app::orphan::before_spawn();
-    let (session, reader) = mica_core::pty::PtySession::spawn(
-        mica_core::pty::command_from_str(&shell_command),
-        cols,
-        rows,
-    )
-    .inspect_err(|e| eprintln!("quickterm: pty 失败 {e:?},QT 禁用"))
-    .map_err(|_| ())?;
+    let pane_id = super::window_ipc::next_pane_id();
+    let mut command = mica_core::pty::command_from_str(&shell_command);
+    command.env("MICA_PANE_ID", pane_id.to_string());
+    let initial_cwd = super::effective_initial_cwd(None, command.get_env("USERPROFILE"));
+    if let Some(dir) = &initial_cwd {
+        command.cwd(dir);
+    }
+    let (session, reader) = mica_core::pty::PtySession::spawn(command, cols, rows)
+        .inspect_err(|e| eprintln!("quickterm: pty 失败 {e:?},QT 禁用"))
+        .map_err(|_| ())?;
     if let Some(pid) = session.child_pid() {
         crate::app::orphan::track_session_since(&probe, pid); // 入注册表(T02,同主窗)
     }
@@ -242,6 +245,14 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
 
     let terminal = Terminal {
         term,
+        pane_id,
+        initial_cwd: initial_cwd.clone(),
+        extra_env: Default::default(),
+        badge: None,
+        observed_cwd: initial_cwd,
+        observed_prompt: (mica_core::ipc::PromptState::Unknown, None),
+        observed_title: shell_command.clone(),
+        output_pending: false,
         session,
         session_permit: Some(session_permit),
         pty_buf: Arc::clone(&pty_buf),
@@ -277,6 +288,22 @@ pub unsafe fn init(hwnd_main: HWND) -> Result<(), ()> {
     // poll_exits 轮不到它
     let _ = windows::Win32::UI::WindowsAndMessaging::SetTimer(Some(hwnd_qt), 6, 1000, None);
     apply_hotkey(crate::app::quick_terminal_key().as_deref());
+    super::window_ipc::register(hwnd_qt);
+    super::window_ipc::set_owner(pane_id, hwnd_qt);
+    super::window_ipc::mark_ready(hwnd_qt);
+    // Publish only after the owner mailbox exists; list may run concurrently.
+    GLOBAL_QT_HWND.store(hwnd_qt.0 as isize, std::sync::atomic::Ordering::Release);
+    QT.with(|q| {
+        if let Some(st) = q.borrow().as_ref() {
+            super::events::publish(super::events::WatchEvent::PaneCreated {
+                window_id: hwnd_qt.0 as u64,
+                tab_index: 0,
+                pane_id,
+                pid: st.terminal.session.child_pid(),
+                cwd: st.terminal.initial_cwd.clone(),
+            });
+        }
+    });
     hwnd_guard.0 = None; // 初始化已全部成功,交由 QT 生命周期持有
     Ok(())
 }
@@ -289,13 +316,16 @@ unsafe fn qt_respawn(t: &mut crate::app::Terminal, hwnd: HWND) {
     // **r5-2 统一重启序**(同主窗):kill → Stopped 化 → 回收旧 PTY →
     // 放旧 permit → 取新 permit → spawn。修前 QT 反序(先 acquire 后
     // drop):峰值多占一槽,且 spawn 失败时新 permit 泄漏
-    let restarted = crate::app::lifecycle::restart_session_fields(
+    let restarted = crate::app::lifecycle::restart_session_fields_with_options(
         &mut t.session,
         &mut t.session_permit,
         &mut t.writeq,
         &mut t.input_stage,
         &t.pty_buf,
         &t.shell,
+        t.pane_id,
+        t.initial_cwd.as_deref(),
+        &t.extra_env,
         cols,
         rows,
         &mut t.exited,
@@ -327,6 +357,17 @@ pub fn forget_state() {
     QT_DRAW_PENDING.with(|p| p.set(false));
     QT_LAST_FRAME.with(|f| f.set(None));
     if let Some(st) = QT.with(|q| q.borrow_mut().take()) {
+        // Secondary window threads also run this cleanup, but do not own QT.
+        // Only the thread holding its state can remove the global route.
+        if let Some(raw) = *st.wake_hwnd.lock().unwrap_or_else(|e| e.into_inner()) {
+            let _ = GLOBAL_QT_HWND.compare_exchange(
+                raw,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+            super::window_ipc::unregister(HWND(raw as _));
+        }
         let QtState {
             terminal,
             wake_hwnd,
@@ -343,11 +384,6 @@ pub fn forget_state() {
         std::mem::forget(config);
         crate::app::lifecycle::close_terminal(terminal);
     }
-}
-
-/// QT 是否已建(供 IPC 区分 bad_target 与 pty_write)。
-pub fn exists() -> bool {
-    QT.with(|q| q.borrow().is_some())
 }
 
 /// 武装 QT 续灌定时器(id 7,30ms;清欠自动撤销)。
@@ -387,6 +423,7 @@ fn accept_qt_input(
 /// 按键与应答回写走 `accept_qt_input`(手持引用):WM_APP/WM_CHAR 处
 /// 理中已持 QT.borrow_mut(),这里再进全局面即双重借用 panic(2026-11-10
 /// 修复,回归见本模块 tests)。
+#[cfg(test)]
 pub fn accept_qt(bytes: &[u8]) -> crate::app::pty_bridge::InputFlow {
     QT.with(|q| {
         let mut guard = q.borrow_mut();
@@ -456,44 +493,54 @@ pub unsafe fn toggle() {
         return;
     }
     let hwnd = HWND(raw as *mut std::ffi::c_void);
-    let visible = (windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-        hwnd,
-        windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
-    ) as u32)
-        & WS_VISIBLE.0
-        != 0;
-    if visible {
+    if IsWindowVisible(hwnd).as_bool() {
         let _ = ShowWindow(hwnd, SW_HIDE);
     } else {
-        // #37:上次会话已退出 → 重开(同 shell 新会话)再显示
-        QT.with(|q| {
-            let mut guard = q.borrow_mut();
-            let Some(st) = guard.as_mut() else { return };
-            if st.terminal.exited.is_some() {
-                st.terminal.session.kill_child();
-                qt_respawn(&mut st.terminal, hwnd);
-            }
-        });
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
-            hwnd,
-            Some(windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
-                | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
-                | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
-        );
-        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-        // 隐藏期不绘(damage 留存):显示即刻补一帧,不等新输出
-        QT.with(|q| {
-            let mut guard = q.borrow_mut();
-            let Some(st) = guard.as_mut() else { return };
+        show();
+    }
+}
+
+/// Showing via IPC has the same session/frame semantics as the hotkey, while
+/// repeated focus calls keep the terminal visible.
+pub(super) unsafe fn show() -> bool {
+    let raw = QT_HWND.with(std::cell::Cell::get);
+    if raw == 0 {
+        return false;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    let exists = QT.with(|q| {
+        let mut guard = q.borrow_mut();
+        let Some(st) = guard.as_mut() else {
+            return false;
+        };
+        if st.terminal.exited.is_some() {
+            qt_respawn(&mut st.terminal, hwnd);
+        }
+        super::window_ipc::clear_attention(&mut st.terminal);
+        true
+    });
+    if !exists {
+        return false;
+    }
+    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+        hwnd,
+        Some(windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST),
+        0,
+        0,
+        0,
+        0,
+        windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+            | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+            | windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
+    );
+    let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+    QT.with(|q| {
+        if let Some(st) = q.borrow_mut().as_mut() {
             st.terminal.force_full = true;
             qt_draw(st);
-        });
-    }
+        }
+    });
+    true
 }
 
 unsafe extern "system" fn qt_wndproc(
@@ -503,14 +550,24 @@ unsafe extern "system" fn qt_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        super::WM_APP_WINDOW_IPC => {
+            super::window_ipc::drain(hwnd);
+            LRESULT(0)
+        }
         WM_HOTKEY => {
             unsafe { toggle() };
             LRESULT(0)
         }
         WM_ACTIVATE => {
             // WA_INACTIVE(0)=失焦 → 收起(spec §6)
-            if wparam.0 == 0 {
+            if wparam.0 & 0xffff == 0 {
                 let _ = ShowWindow(hwnd, SW_HIDE);
+            } else {
+                QT.with(|q| {
+                    if let Some(st) = q.borrow_mut().as_mut() {
+                        super::window_ipc::clear_attention(&mut st.terminal);
+                    }
+                });
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -547,6 +604,10 @@ unsafe extern "system" fn qt_wndproc(
                             && let Ok(Some(s)) = t.session.try_wait()
                         {
                             t.exited = Some(s.exit_code());
+                            super::events::publish(super::events::WatchEvent::PaneExited {
+                                pane_id: t.pane_id,
+                                exit_code: s.exit_code(),
+                            });
                             true
                         } else {
                             false
@@ -571,14 +632,17 @@ unsafe extern "system" fn qt_wndproc(
                 let mut guard = q.borrow_mut();
                 let Some(st) = guard.as_mut() else { return };
                 // T08 批预算(同主窗):drain_batch 内含补通知(含续批)
-                let Some(bytes) = st
+                let pending = std::mem::take(&mut st.terminal.output_pending);
+                let bytes = st
                     .terminal
                     .pty_buf
-                    .drain_batch(crate::app::pty_bridge::UI_BATCH_BYTES)
-                else {
+                    .drain_batch(crate::app::pty_bridge::UI_BATCH_BYTES);
+                if bytes.is_none() && !pending {
                     return;
-                };
-                st.terminal.term.feed(&bytes);
+                }
+                if let Some(bytes) = bytes {
+                    st.terminal.term.feed(&bytes);
+                }
                 // 应答必须写回 pty(否则 shell 卡在等应答)。走手持引用的
                 // 内入口而非 accept_qt 全局面:WM_APP 此处已持 QT 的
                 // borrow_mut,全局面再借即 panic(生产路径条件性崩溃,
@@ -587,7 +651,9 @@ unsafe extern "system" fn qt_wndproc(
                 for reply in st.terminal.term.take_pty_writes() {
                     let _ = accept_qt_input(&mut st.terminal, reply.as_bytes());
                 }
-                if let Some(t) = st.terminal.term.take_title() {
+                if let Some(t) = super::window_ipc::observe_output(&mut st.terminal)
+                    .or_else(|| pending.then(|| st.terminal.observed_title.clone()))
+                {
                     let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
                         hwnd,
                         &HSTRING::from(format!("QT: {t}")),
@@ -714,6 +780,8 @@ unsafe extern "system" fn qt_wndproc(
             // T04:QT 与主窗同线程——QT 销毁绝不能 PostQuitMessage(会把
             // 主窗消息循环一并掐死,主窗沦为未销毁的假退出)。QT 随进程退出
             let _ = unregister_hotkey();
+            QT_HWND.with(|c| c.set(0));
+            forget_state();
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -910,6 +978,93 @@ fn qt_draw(st: &mut QtState) {
     // the CPU revision has not changed. Renderer handles no-upload cache hits.
     st.renderer.set_atlas(&t.router.atlas());
     st.renderer.draw(&st.wgpu_surface, &st.config, &instances);
+}
+
+static GLOBAL_QT_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+pub(super) fn global_hwnd() -> Option<HWND> {
+    let raw = GLOBAL_QT_HWND.load(std::sync::atomic::Ordering::Acquire);
+    (raw != 0).then_some(HWND(raw as _))
+}
+pub(super) fn is_hwnd(hwnd: HWND) -> bool {
+    QT_HWND.with(|c| c.get()) == hwnd.0 as usize
+}
+pub(super) fn apply_ipc(
+    hwnd: HWND,
+    req: &mica_core::ipc::IpcRequest,
+) -> mica_core::ipc::IpcResponse {
+    use mica_core::ipc::{IpcError, IpcResponse};
+    if req.op == "focus" {
+        let valid = QT.with(|q| {
+            q.borrow()
+                .as_ref()
+                .is_some_and(|st| req.pane_id.is_none_or(|id| id == st.terminal.pane_id))
+        });
+        return if valid && unsafe { show() } {
+            IpcResponse::applied(req.id)
+        } else {
+            IpcResponse::error(req.id, IpcError::BadTarget)
+        };
+    }
+    QT.with(|q| {
+        let mut q = q.borrow_mut();
+        let Some(st) = q.as_mut() else {
+            return IpcResponse::error(req.id, IpcError::BadTarget);
+        };
+        let t = &mut st.terminal;
+        if req.pane_id.is_some_and(|id| id != t.pane_id) {
+            return IpcResponse::error(req.id, IpcError::BadTarget);
+        }
+        match req.op.as_str() {
+            "list" => {
+                let info = super::window_ipc::terminal_info(
+                    hwnd,
+                    0,
+                    t.pane_id,
+                    t,
+                    &t.observed_title,
+                    true,
+                    true,
+                    true,
+                );
+                IpcResponse::applied_with_data(req.id, serde_json::json!([info]))
+            }
+            "read-text" => {
+                if let Some(bytes) = t.pty_buf.drain_batch(super::pty_bridge::PANE_BUDGET_BYTES) {
+                    t.output_pending = true;
+                    unsafe {
+                        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            Some(hwnd),
+                            WM_APP,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                    for chunk in bytes.chunks(super::pty_bridge::UI_BATCH_BYTES) {
+                        t.term.feed(chunk);
+                        for reply in t.term.take_pty_writes() {
+                            let _ = accept_qt_input(t, reply.as_bytes());
+                        }
+                    }
+                    if t.term.display_offset() > 0 {
+                        t.force_full = true;
+                    }
+                }
+                super::window_ipc::observe_output(t);
+                super::window_ipc::read_terminal(req, t)
+            }
+            "set-badge" => super::window_ipc::badge_terminal(req, t),
+            "send-text" => {
+                let bytes = req.text.as_deref().unwrap_or_default().as_bytes();
+                let payload = if t.term.bracketed_paste_active() {
+                    [b"\x1b[200~".as_slice(), bytes, b"\x1b[201~"].concat()
+                } else {
+                    bytes.to_vec()
+                };
+                super::window_ipc::flow_response(req.id, accept_qt_input(t, &payload))
+            }
+            _ => IpcResponse::error(req.id, IpcError::UnknownOp),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1226,6 +1381,48 @@ mod tests {
         );
         assert!(state_exited, "hidden session exit must still be recorded");
         assert_eq!(draws, initial_draws, "hidden exit polling must not render");
+    }
+
+    #[test]
+    fn ipc_focus_shows_latest_hidden_output_and_never_toggles_it_off() {
+        let _lock = QT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let settings = mica_core::config::settings::resolve(
+            "command = cmd.exe /D /Q /K\nquick-terminal-key = none\n",
+        )
+        .unwrap();
+        crate::app::seed_tls_for_tests(&settings);
+        unsafe { init(HWND(std::ptr::null_mut())) }.expect("QT init");
+        let hwnd = HWND(QT_HWND.with(std::cell::Cell::get) as _);
+        let before = DRAW_COUNT.with(std::cell::Cell::get);
+        backlog_for_test()
+            .unwrap()
+            .push(0, b"HIDDEN_FOCUS_FRAME")
+            .unwrap();
+        unsafe {
+            SendMessageW(hwnd, WM_APP, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        assert_eq!(DRAW_COUNT.with(std::cell::Cell::get), before);
+        let mut invalid = mica_core::ipc::IpcRequest::new(54, "focus");
+        invalid.pane_id = Some(u64::MAX);
+        let invalid_response = apply_ipc(hwnd, &invalid);
+        let invalid_stayed_hidden = unsafe { !IsWindowVisible(hwnd).as_bool() };
+        let response = apply_ipc(hwnd, &mica_core::ipc::IpcRequest::new(55, "focus"));
+        let drawn = DRAW_COUNT.with(std::cell::Cell::get);
+        let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+        apply_ipc(hwnd, &mica_core::ipc::IpcRequest::new(56, "focus"));
+        let still_visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+        unsafe {
+            SendMessageW(hwnd, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+        forget_state();
+        assert_eq!(invalid_response.detail.as_deref(), Some("bad_target"));
+        assert!(invalid_stayed_hidden);
+        assert_eq!(response.status, mica_core::ipc::IpcStatus::Applied);
+        assert!(visible && still_visible);
+        assert!(
+            drawn > before,
+            "showing a hidden terminal must submit its latest frame"
+        );
     }
 
     #[test]

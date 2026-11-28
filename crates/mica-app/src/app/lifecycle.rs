@@ -285,6 +285,7 @@ fn swap_out_old(session: &mut mica_core::pty::PtySession, old_pid: Option<u32>) 
 /// 成功返回 `(reader, new_gen)`,渲染侧接线(新 Surface/forwarder)
 /// 由调用方完成。
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn restart_session_fields(
     session: &mut mica_core::pty::PtySession,
     permit: &mut Option<SessionPermit>,
@@ -292,6 +293,37 @@ pub fn restart_session_fields(
     input_stage: &mut super::pty_bridge::InputStage,
     pty_buf: &super::pty_bridge::PtyBacklog,
     shell: &str,
+    cols: u16,
+    rows: u16,
+    exited: &mut Option<u32>,
+) -> Result<(mica_core::pty::PtyReader, u64), RestartFailure> {
+    restart_session_fields_with_options(
+        session,
+        permit,
+        writeq,
+        input_stage,
+        pty_buf,
+        shell,
+        0,
+        None,
+        &Default::default(),
+        cols,
+        rows,
+        exited,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn restart_session_fields_with_options(
+    session: &mut mica_core::pty::PtySession,
+    permit: &mut Option<SessionPermit>,
+    writeq: &mut std::sync::Arc<super::pty_bridge::WriteQueue>,
+    input_stage: &mut super::pty_bridge::InputStage,
+    pty_buf: &super::pty_bridge::PtyBacklog,
+    shell: &str,
+    pane_id: u64,
+    cwd: Option<&str>,
+    env: &std::collections::BTreeMap<String, String>,
     cols: u16,
     rows: u16,
     exited: &mut Option<u32>,
@@ -315,11 +347,17 @@ pub fn restart_session_fields(
     };
     // ④ spawn 新会话(失败:permit RAII 归还,pane 留 Stopped 可重试)
     let probe = super::orphan::before_spawn();
-    let (new_session, reader) = match mica_core::pty::PtySession::spawn(
-        mica_core::pty::command_from_str(shell),
-        cols,
-        rows,
-    ) {
+    let mut command = mica_core::pty::command_from_str(shell);
+    if let Some(cwd) = cwd {
+        command.cwd(cwd);
+    }
+    for (key, value) in env {
+        if !key.eq_ignore_ascii_case("MICA_PANE_ID") {
+            command.env(key, value);
+        }
+    }
+    command.env("MICA_PANE_ID", pane_id.to_string());
+    let (new_session, reader) = match mica_core::pty::PtySession::spawn(command, cols, rows) {
         Ok(pair) => pair,
         Err(e) => {
             drop(new_permit);
@@ -380,6 +418,7 @@ pub fn reaper_stats() -> (usize, usize, usize, bool) {
 ///    Surface/行缓存/路由(COM)/调色板等 CPU 状态当场 Drop——config
 ///    热重载每轮都这么换 router,无内核阻塞面,有先例。
 pub fn close_terminal(mut t: super::Terminal) {
+    super::window_ipc::pane_closed(t.pane_id);
     // 关闭序(T08 二次返工):先关写队列与输出积压(全部等待者脱身;
     // writer 若阻塞在写端,由杀子引发的管道断/EOF 退场)→ 杀子(写端
     // 锁分离,绝不被阻塞写拖住)→ 会话**按值**交 reaper(Drop 完成 =
@@ -409,8 +448,7 @@ pub fn close_terminal(mut t: super::Terminal) {
         shell: _,
         exited: _,
         strip_router,
-        last_atlas_ver: _,
-        force_full: _,
+        ..
     } = t;
     // 会话(Arc):writer 线程持另一份;reaper drop 或 writer 退出,
     // 最后一份 Drop 时杀子+收割(非阻塞)——UI 线程不等
